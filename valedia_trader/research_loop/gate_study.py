@@ -37,15 +37,23 @@ DATA VERSIONS. "given": the prices as handed in. "detrended": `controls.detrend`
 on (for N4a and N4b: to each surrogate drawn from the detrended prices, so its drift is exactly zero as well).
 
 TWO RE-TIMING TESTS. The gate's `timing_null` slides the whole out-of-sample book along the calendar; where a symbol
-lists late, a slid copy "holds" it on bars before it existed, where its return is zero, so the real book beats its
-copies with no skill at all. The study therefore computes, beside the gate's own figures, the same test on the LISTED
+lists late, a slid copy "holds" it on bars before it existed, where its return is zero, so the real book's standing
+against its copies moves with no skill at all. Its size and its direction depend on the universe (how the late
+symbols drifted before and after they listed): it raises the gate's false passes where they rose and can lower them
+below 5% where they fell, so no figure from one universe is the size of the bias. The study therefore computes,
+beside the gate's own figures, the same test on the LISTED
 WINDOW (`timing_listed`): from the first out-of-sample bar on which every symbol the book ever holds there has a
 price, to the end; the same statistic, common shift and minimum shift (it calls `timing_null` on that stretch), and
 the "same average book, held throughout" built from that stretch only. Where that stretch is too short for the test,
 the listed-window figures are unavailable and every rule that needs them fails for that book (counted). With no late
 listing the stretch is the whole window and the two are the same number. Every rule that uses a re-timing p (R1, R2,
 R3) and R4's active return are judged twice: `_gate` (the gate's figures; the anchor concerns only these and R0) and
-`_listed`.
+`_listed`. In the `_listed` rules the re-timing p-value (R1, R2, R3) and R4's active return and its number of
+observations are measured on the listed window; the gate's own verdict and Sharpe test in R1 to R3, and the spread of
+the earlier attempts' Sharpes that R4 deflates by, come from the whole out-of-sample window. The listed versions
+therefore judge a shorter stretch for timing than for return; each book's `listed_bars` (and `listed_share`, both None
+for a book that holds nothing out of sample) in the report shows how short. A figure a rule reads that is missing or
+not finite fails that rule (R1 to R4, both versions) whatever the thresholds; R0 stays the gate's own verdict.
 
 CANDIDATE RULES. Each is "passes development under these conditions AND passes the sealed checks as today"; the
 development checks it does not name stay as the gate has them. N is the number of attempts counted on the market,
@@ -221,15 +229,23 @@ def _p_ok(p, threshold: float) -> bool:
     return p is not None and math.isfinite(p) and p <= threshold
 
 
+def _finite(moments: dict | None) -> bool:
+    """Moments a candidate rule may judge: present, and every number finite."""
+    return moments is not None and all(math.isfinite(float(moments[k])) for k in ("sharpe", "n_obs", "skew", "kurt"))
+
+
 def _r3_rest(material: dict, criteria: gt.Criteria) -> bool:
-    return _gate_checks_ok(material) and deflated_value(material["moments"], material["own"], (), one_trial=True) >= criteria.min_dsr
+    return (_finite(material["moments"]) and _gate_checks_ok(material)
+            and deflated_value(material["moments"], material["own"], (), one_trial=True) >= criteria.min_dsr)
 
 
 def develops(rule: str, material: dict, others: Sequence[float], criteria: gt.Criteria | None = None) -> bool:
     """Does the book pass development under `rule`, with `others` the other attempts counted on the market?
     Pure: everything comes from `material` (see `_Book`). `Rk_gate` reads the gate's re-timing figures (`timing_p`,
-    `strict_p`, `active_moments`), `Rk_listed` the listed window's (the same names with `_listed`); a figure that is
-    None (unavailable) fails the rule. R3 reads `strict_p...[N]`, which must be there whenever the rest of R3 passes
+    `strict_p`, `active_moments`), `Rk_listed` the listed window's (the same names with `_listed`). In R1 to R4 a
+    figure the rule reads that is None (unavailable) or not finite fails the rule whatever the thresholds, even at or
+    below zero (the Deflated Sharpe's stand-in value 0 for missing moments is never compared); R0 is the gate's own
+    verdict, as the gate computes it. R3 reads `strict_p...[N]`, which must be there whenever the rest of R3 passes
     (KeyError otherwise)."""
     c = criteria or gt.Criteria()
     if rule not in RULES:
@@ -242,16 +258,18 @@ def develops(rule: str, material: dict, others: Sequence[float], criteria: gt.Cr
     base, version = rule.split("_")
     p_key, strict_key, active_key = _KEYS[version]
     if base == "R1":
-        return develops("R0", material, others, c) and _p_ok(material[p_key], ALPHA)
+        return _finite(m) and develops("R0", material, others, c) and _p_ok(material[p_key], ALPHA)
     if base == "R2":
-        return (_gate_checks_ok(material) and deflated_value(m, own, others, leave_own_out=True) >= c.min_dsr
-                and _p_ok(material[p_key], ALPHA))
+        return (_finite(m) and _gate_checks_ok(material)
+                and deflated_value(m, own, others, leave_own_out=True) >= c.min_dsr and _p_ok(material[p_key], ALPHA))
     if base == "R3":
         if not _r3_rest(material, c):
             return False
         n = attempts_counted(material, others)
         return _p_ok(material[strict_key][n], ALPHA / n)
-    return _gate_checks_ok(material) and deflated_value(material[active_key], own, others, leave_own_out=True) >= c.min_dsr
+    active = material[active_key]
+    return (_finite(active) and _gate_checks_ok(material)
+            and deflated_value(active, own, others, leave_own_out=True) >= c.min_dsr)
 
 
 def sealed_ok(material: dict) -> bool:
@@ -433,14 +451,18 @@ def listed_start(weights: pd.DataFrame, prices: pd.DataFrame) -> int | None:
 
 def timing_listed(weights: pd.DataFrame, asset_returns: pd.DataFrame, prices: pd.DataFrame, n: int = GATE_SHIFTS) -> dict:
     """`gauntlet.timing_null` run on the listed window only (same statistic, common shift, minimum shift and seed),
-    plus `listed_start` and `listed_share` (the share of the window's bars inside it). Unavailable as timing_null is
-    (too short a stretch, no positions), or when no bar has every held symbol priced."""
+    plus `listed_start`, `listed_bars` and `listed_share` (the count and the share of the window's bars inside it;
+    both None for a book that holds nothing in the window, 0 and 0.0 when no bar has every held symbol priced).
+    Unavailable as timing_null is (too short a stretch, no positions), or when no bar has every held symbol priced."""
+    if not _held_cols(weights, prices):
+        return {**gt.timing_null(weights, asset_returns, n=n), "listed_start": 0, "listed_bars": None,
+                "listed_share": None}
     s = listed_start(weights, prices)
     if s is None:
         return {"unavailable": "no bar has a price for every symbol the book holds", "listed_start": None,
-                "listed_share": 0.0}
+                "listed_bars": 0, "listed_share": 0.0}
     out = gt.timing_null(weights.iloc[s:], asset_returns.iloc[s:], n=n)
-    return {**out, "listed_start": s, "listed_share": (len(weights) - s) / len(weights) if len(weights) else 0.0}
+    return {**out, "listed_start": s, "listed_bars": len(weights) - s, "listed_share": (len(weights) - s) / len(weights)}
 
 
 def held_average_book(weights: pd.DataFrame, asset_returns: pd.DataFrame) -> pd.Series | None:
@@ -511,7 +533,7 @@ class _Book:
         self.r3_seconds: dict[int, float] = {}
         if self.gate["refused"]:
             self.material.update(error=self.gate["error"], checks={}, own=[], moments=None, active_moments=None,
-                                 active_moments_listed=None, timing_p=None, timing_p_listed=None, listed_share=None,
+                                 active_moments_listed=None, timing_p=None, timing_p_listed=None, listed_share=None, listed_bars=None,
                                  development_sharpe=None)
             return
         rep = self.gate["report"]
@@ -528,7 +550,8 @@ class _Book:
         self.material["active_moments"] = _moments(active_returns(net, self._w, self._r).to_numpy(dtype=float))
         listed = timing_listed(self._w, self._r, px)
         self._start = listed["listed_start"] if listed.get("p_value") is not None else None
-        self.material.update(timing_p_listed=listed.get("p_value"), listed_share=listed["listed_share"])
+        self.material.update(timing_p_listed=listed.get("p_value"), listed_share=listed["listed_share"],
+                             listed_bars=listed["listed_bars"])
         self.material["active_moments_listed"] = None if self._start is None else _moments(active_returns(
             net.iloc[self._start:], self._w.iloc[self._start:], self._r.iloc[self._start:]).to_numpy(dtype=float))
         if listed.get("listed_start") == 0 and listed.get("p_value") != self.material["timing_p"]:
@@ -676,15 +699,17 @@ def _cell_report(fam: str, h, verdicts: list[dict], counts: list[int], sharpes: 
                  surrogate_of: list, *, dropped: dict | None = None, seed: int = 0, version: str = "given",
                  timing: list | None = None) -> dict:
     """One cell's counts, the books whose re-timing figures were unavailable (each kind; refused books count) and
-    the median share of out-of-sample bars inside the listed window. For N4a and N4b also, per rule and count: the surrogates with a pass, each surrogate's own pass share
-    (minimum, median, maximum), and `surrogate_bootstrap`'s interval (the same seeded resamples for every rule and
+    the median share of out-of-sample bars inside the listed window, with each book's `listed_bars` and
+    `listed_share` (`listed_window`, in book order). For N4a and N4b also, per rule and count: the surrogates with a
+    pass, each surrogate's own pass share (minimum, median, maximum), and `surrogate_bootstrap`'s interval (the same seeded resamples for every rule and
     count of the cell); and the cell's surrogates and dropped duplicates."""
     kind, _, horizon, _ = FAMILIES[fam]
     out: dict = {"hit_rate": h, "horizon": horizon, "runs": len(verdicts), "refused": refused,
                  "median_development_sharpe": _median(sharpes), "by_attempts": {}}
-    if timing is not None:                       # per book: (gate p available, listed p available, listed share)
-        out["timing_unavailable"] = {"gate": sum(not g for g, _, _ in timing), "listed": sum(not li for _, li, _ in timing)}
-        out["median_listed_share"] = _median([x for _, _, x in timing])
+    if timing is not None:          # per book: (gate p available, listed p available, listed share, listed bars)
+        out["timing_unavailable"] = {"gate": sum(not t[0] for t in timing), "listed": sum(not t[1] for t in timing)}
+        out["median_listed_share"] = _median([t[2] for t in timing])
+        out["listed_window"] = [{"listed_bars": t[3], "listed_share": t[2]} for t in timing]
     clusters = sorted({s for s in surrogate_of if s is not None})
     if kind == "surrogate_rules":
         out.update(surrogates=len(clusters), **{k: int((dropped or {}).get(k, 0))
@@ -756,7 +781,8 @@ def study(prices: pd.DataFrame, dollar_volume: pd.DataFrame | None, cost: CostMo
                     cell = cells.setdefault(h, {"verdicts": [], "sharpes": [], "refused": 0, "surrogate": [],
                                                 "timing": []})
                     cell["timing"].append((book.material["timing_p"] is not None,
-                                           book.material["timing_p_listed"] is not None, book.material["listed_share"]))
+                                           book.material["timing_p_listed"] is not None, book.material["listed_share"],
+                                           book.material["listed_bars"]))
                     cell["verdicts"].append(verdicts)
                     cell["sharpes"].append(book.material.get("development_sharpe"))
                     cell["refused"] += int(book.material["refused"])
@@ -908,6 +934,15 @@ def _reading(report: dict) -> list[str]:
     out.append("N4b (resampled in blocks of mean length 20): short-range dependence of the data kept: a rule that lives "
                "inside 20 bars keeps its edge here, so N4b is no-skill only for slower rules; N4a resamples rows "
                "independently, so nothing in time can be learned from it.")
+    out.append("Which window each figure of the _listed rules comes from: the re-timing p-value (R1, R2, R3) and R4's "
+               "active return and its number of observations are measured on the listed window; the gate's own verdict "
+               "and Sharpe test in R1 to R3, and the spread of the earlier attempts' Sharpes that R4 deflates by, come "
+               "from the whole out-of-sample window. The listed versions therefore judge a shorter stretch for timing "
+               "than for return; each book's listed_bars in the report shows how short.")
+    out.append("The gate's own re-timing bias where symbols list late is not a constant: its size and its direction "
+               "depend on the universe (how the late symbols drifted before and after they listed), raising the gate's "
+               "false passes where they rose and able to lower them below 5% where they fell; read the two versions "
+               "side by side on these data, not a figure measured on another universe.")
     if above:
         out.append("Rules whose false-pass interval (for N4a and N4b the bootstrap over whole surrogates) lies wholly "
                    "above 0.05 on at least one no-skill family: "
