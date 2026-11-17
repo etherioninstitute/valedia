@@ -1047,4 +1047,94 @@ class TMF5QueryCutTests(unittest.TestCase):
         self.assertIn("'X-Native-Query-Cut-From': str(native_cut_from)", texts["app/storage/embedding_service.py"])
 
 
+class TMF5PreflightTests(unittest.TestCase):
+    """Addendum 2: the observer side of the preflight. It verifies the host capsule with the run's own code, judges the START
+    rule on the latest sample as the run will, checks the staged pins with the run's own check, prints one JSON line and
+    exits 0 only when all hold, else 3. Fakes only: no sandbox, no model, no gate."""
+    KEY = "k" * 64
+    def setUp(self):
+        import mirofish_native_startup as startup, mirofish_native_run as native
+        self.startup, self.native = startup, native
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT); self.work = Path(self.temp.name) / "work"
+        (self.work / "builder").mkdir(parents=True); (self.work / "owned-source/observer-entry").mkdir(parents=True)
+        self.pinned = self.work / "owned-source/observer-entry/pinned.txt"; self.pinned.write_text("staged bytes")
+        manifest = {"outcome": native.OUTCOME, "files": [{"path": str(self.pinned), "sha256": startup.digest(self.pinned)}], "model_files": []}
+        (self.work / "builder/candidate-manifest.json").write_text(json.dumps(manifest))
+        self.host = self.work / "host"; self.host.mkdir()
+        self.env = {"MIROFISH_RESOURCE_CAPSULE": str(self.host / "sample.json"), "MIROFISH_RESOURCE_KEY": self.KEY, "MIROFISH_RESOURCE_NONCE": "b" * 32,
+                    "MIROFISH_RESOURCE_HOST": json.dumps({"pid": 123, "started": "fixed own host start"})}
+        startup._LAST.clear()
+    def tearDown(self): self.temp.cleanup()
+    def capsule(self, sign=True, drop=None, **fields):
+        import hashlib, hmac
+        from datetime import datetime, timezone
+        sample = HostResourceCapsuleTests().sample()
+        sample.update(monotonic=time.monotonic(), utc=datetime.now(timezone.utc).isoformat(), host_deadline=time.monotonic() + 30, source_sha256=self.startup.digest(self.startup.__file__),
+                      prompt_cache_route=dict(sample["prompt_cache_route"], device=self.startup.CACHE_DEVICE, ssd_device=self.startup.CACHE_DEVICE), **fields)
+        if drop: sample.pop(drop)
+        mac = hmac.new(self.KEY.encode(), encoded(sample), hashlib.sha256).hexdigest() if sign else "0" * 64
+        self.startup.atomic(self.host / "sample.json", {"sample": sample, "mac": mac})
+    def preflight(self, confined=lambda: None):
+        import io, contextlib, mirofish_startup_preflight as pf
+        from unittest.mock import patch
+        out = io.StringIO()
+        with patch.dict(os.environ, self.env), contextlib.redirect_stdout(out):
+            code = pf.main(self.work, confined=confined)
+        lines = out.getvalue().splitlines(); self.assertEqual(len(lines), 1, "exactly one JSON line")
+        self.assertNotIn(self.KEY, lines[0])
+        return code, json.loads(lines[0])
+    def test_healthy_capsule_exits_0_with_the_named_fields(self):
+        self.capsule(free_percent=80, pressure_level=1, swap_used_bytes=5, co_resident_rows=1, co_resident_rss_bytes=CO_GIB)
+        code, line = self.preflight()
+        self.assertEqual(code, 0, line); self.assertTrue(line["ok"])
+        self.assertEqual(set(line), {"ok", "reason", "free_percent", "start_threshold", "pressure_level", "swap_used_bytes", "co_resident_rows", "checks"})
+        self.assertEqual((line["free_percent"], line["start_threshold"], line["pressure_level"], line["swap_used_bytes"], line["co_resident_rows"]), (80, self.native.START_FREE_PERCENT, 1, 5, 1))
+        self.assertEqual([c.split(":")[0] for c in line["checks"]], ["confinement", "pins", "plan", "start"])
+    def test_each_refusal_exits_3_with_its_reason(self):
+        cases = [("free under the threshold", dict(free_percent=self.native.START_FREE_PERCENT - 1), "memory free threshold"),
+                 ("pressure level 2", dict(pressure_level=2), "kernel memory pressure not normal at start"),
+                 ("pressure level not a reading", dict(pressure_level=None), "resource reading not valid"),
+                 ("two co-residents", dict(co_resident_rows=2, co_resident_rss_bytes=2 * CO_GIB), "two processes serve the co-resident's file"),
+                 ("a stale sample", dict(monotonic=time.monotonic() - 4), "resource capsule stale/future/expired"),
+                 ("signature does not verify", dict(sign=False), "resource capsule signature"),
+                 ("a missing field", dict(drop="swap_used_bytes"), "resource capsule fields")]
+        for name, fields, reason in cases:
+            with self.subTest(case=name):
+                self.startup._LAST.clear(); self.capsule(**fields); code, line = self.preflight()
+                self.assertEqual(code, 3); self.assertFalse(line["ok"]); self.assertIn(reason, line["reason"])
+        self.startup._LAST.clear(); self.capsule(); self.pinned.write_text("changed after staging"); code, line = self.preflight()
+        self.assertEqual(code, 3); self.assertIn("frozen candidate input changed: pinned.txt", line["reason"])
+        self.assertIsNone(line["free_percent"])   # the pins are checked before the latest sample is judged
+    def test_no_capsule_binding_and_an_unconfined_observer_refuse(self):
+        self.capsule(); env = self.env; self.env = {}
+        code, line = self.preflight(); self.assertEqual(code, 3); self.assertIn("host resource binding missing", line["reason"]); self.env = env
+        def unconfined(): raise NativeRefused("observer is not OS-confined from original source/state")
+        code, line = self.preflight(confined=unconfined); self.assertEqual(code, 3); self.assertIn("not OS-confined", line["reason"])
+    def test_the_script_itself_run_unsandboxed_exits_3_one_line(self):
+        """The real file, run as the launcher runs it but without the sandbox: the run's own confinement check refuses."""
+        entry = self.work / "owned-source/observer-entry"
+        for name in ["mirofish_startup_preflight.py", "mirofish_native_run.py", "mirofish_native_gateway.py", "mirofish_native_startup.py", "mirofish_native_model.py"]:
+            (entry / name).write_bytes((Path(__file__).with_name(name)).read_bytes())
+        self.capsule()
+        done = subprocess.run([sys.executable, "-B", str(entry / "mirofish_startup_preflight.py")], cwd=self.work, env=dict(self.env, PATH="/usr/bin:/bin", PYTHONDONTWRITEBYTECODE="1"),
+                              capture_output=True, text=True, timeout=60)
+        lines = done.stdout.splitlines(); self.assertEqual(len(lines), 1, done.stderr[-300:])
+        line = json.loads(lines[0]); self.assertEqual(done.returncode, 3); self.assertIn("not OS-confined", line["reason"]); self.assertNotIn(self.KEY, done.stdout + done.stderr)
+    def test_the_run_and_the_preflight_share_one_start_rule(self):
+        import inspect, mirofish_startup_preflight as pf
+        source = inspect.getsource(pf)
+        for call in ["run.resource_sample(True)", "run.verify_candidate(", "run.require_plan_binding(", "run.require_confined"]: self.assertIn(call, source)
+        self.assertNotIn("def validate_capsule", source); self.assertNotIn("hmac", source)
+        execute = inspect.getsource(self.native.execute)
+        for call in ["require_confined()", "require_plan_binding(candidate,plan)", "save('pre_resource',sample=resource(True))"]: self.assertIn(call, execute)
+    def test_launcher_record_carries_the_observer_exit_and_line(self):
+        record = self.startup.observer_record('noise\n{"ok": false, "reason": "memory free threshold"}\n', 3)
+        self.assertEqual(record, {"exit": 3, "line": {"ok": False, "reason": "memory free threshold"}})
+        self.assertEqual(self.startup.observer_record("", 2), {"exit": 2, "line": None})
+        self.assertEqual(self.startup.observer_record("not json\n", 1), {"exit": 1, "line": None})
+        self.assertEqual(self.startup.observer_record("[1, 2]\n", 0), {"exit": 0, "line": None})
+        import inspect
+        self.assertIn("record['observer']=observer_record(out,process.returncode)", inspect.getsource(self.startup.launch))
+
+
 if __name__ == "__main__": unittest.main()

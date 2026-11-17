@@ -688,6 +688,15 @@ class TMF5Staging(unittest.TestCase):
             self.assertEqual(s.sha(s.SRC/name),pin,name);self.assertEqual(s.src_revision(name,pin),(s.SRC/name).read_bytes())
         self.assertNotEqual(s.STARTUP_SRC_SHA,s.STARTUP_ORIGINAL_SHA);self.assertNotEqual(s.GATEWAY_SRC_SHA,s.GATEWAY_ORIGINAL_SHA)
         self.assertEqual(s.MODEL_SRC_SHA,'e1cd97e15a990a8418fca22e044520eb19b5bf76edb7b227a4e471e431792115')   # the model module is not changed (ruling a)
+    def test_TMF5_addendum2_preflight_script_is_pinned_and_staged_beside_the_run_script(self):
+        self.assertEqual(s.sha(s.SRC/'mirofish_startup_preflight.py'),s.PREFLIGHT_SRC_SHA);self.assertEqual(s.PREFLIGHT_REL,'owned-source/observer-entry/mirofish_startup_preflight.py')
+        self.assertEqual(Path(s.PREFLIGHT_REL).parent,Path(sorted(s.RUN_COPIES)[1]).parent)   # beside the observer's run script
+        with tmf5_temp() as tmp:
+            work=Path(tmp);(work/'owned-source/observer-entry').mkdir(parents=True);pins=[];ancestry=[]
+            s.stage_preflight(work,pins,ancestry);target=work/s.PREFLIGHT_REL
+            self.assertEqual(target.read_bytes(),(s.SRC/'mirofish_startup_preflight.py').read_bytes());self.assertEqual(target.stat().st_mode&0o777,0o444)
+            self.assertEqual(pins,[{'path':str(target),'sha256':s.PREFLIGHT_SRC_SHA}]);self.assertEqual(ancestry[0]['kind'],'PINNED_SRC_STARTUP_PREFLIGHT')
+            with self.assertRaises(RuntimeError):s.stage_preflight(work,pins,ancestry)   # never replaced
     def test_TMF5_startup_and_gateway_deltas_are_reproved_against_the_src_revisions(self):
         startup,gateway=(s.SRC/'mirofish_native_startup.py').read_bytes(),(s.SRC/'mirofish_native_gateway.py').read_bytes()
         w16_startup,w16_gateway=(s.W16/sorted(s.STARTUP_COPIES)[0]).read_bytes(),(s.W16/sorted(s.GATEWAY_COPIES)[0]).read_bytes()
