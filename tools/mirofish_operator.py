@@ -93,13 +93,17 @@ START_MIN_DECISIONS = 5         # fewer than this in the window: too quiet to ju
 IDENTITY_WAIT_S = 60            # the observer identity file must appear this soon after launch (ruling 5)
 IDENTITY_FILE = 'observer-identity.json'
 LINK_DISABLED_LINE = 'You have disabled LM Link.'   # the real wording of `lms link status`, read 2026-11-17 (ruling 6)
-GROUP_STOP_SIGNAL = signal.SIGTERM                  # what the launcher's own group gets when the observer cannot be named
+LAUNCHER_STOP_SIGNAL = signal.SIGINT   # correction A: the launcher's KeyboardInterrupt path stops the observer group itself
+PICKS_BEFORE_S = 120            # correction C: no switch-off from 2 minutes before the pick reader's scheduled start ...
+PICKS_AFTER_S = 5               # ... until it is seen idle at least this long after that start (launchd starts it at once)
+HARMFUL_STATUSES = ('model_unavailable', 'tag_mismatch', 'late')   # correction B: any one fails collector_unharmed
+HARMFUL_ERRORS = 2              # correction B: this many `error` during the run fail it; a single one does not
 SAMPLE_S = 0.5                  # load-test memory samples
 BASELINE_S = 60                 # load-test baseline
 STOP_FLOOR = LIMITS.STOP_FLOOR_PERCENT     # 30: the run stops itself under this much free memory
 ROOM_POINTS = 10                # room_to_spare: the lowest sustained free reading at least this far above the floor
 CLEANUP_S = LIMITS.CLEANUP_S    # 120: the pipeline's own cleanup headroom
-STOP_WAIT_S = CLEANUP_S + 2 * WATCH_S      # after a TERM, how long the pipeline's cleanup is waited for
+STOP_WAIT_S = CLEANUP_S + 2 * WATCH_S      # after a stop signal, how long the pipeline's cleanup is waited for
 PREFLIGHT_S = 30 + CLEANUP_S    # the launcher's preflight deadline (30 s, mirofish_native_startup.py) plus cleanup
 GATE_S = 1800                   # gate expiry; the observer accepts at most 3600 s ahead
 CMD_S = 30                      # a read-only system command (launchctl, ps, sysctl, memory_pressure, lms)
@@ -144,12 +148,10 @@ def _http(method, url, body=None, timeout=HTTP_S):
 
 
 class Host:
-    def __init__(self, *, run=None, spawn=None, http=None, now=None, sleep=None, send_signal=None, send_group_signal=None,
-                 disk_free=None, uid=None, store=STORE, crew=CREW, record=RECORD, load_tests=LOAD_TESTS, load_path=None, out=None,
+    def __init__(self, *, run=None, spawn=None, http=None, now=None, sleep=None, send_signal=None, disk_free=None, uid=None, store=STORE, crew=CREW, record=RECORD, load_tests=LOAD_TESTS, load_path=None, out=None,
                  lms=LMS):
         self.run, self.spawn, self.http = run or _run, spawn or _spawn, http or _http   # _spawn: its own session and group
         self.now, self.sleep, self.send_signal = now or time.time, sleep or time.sleep, send_signal or os.kill
-        self.send_group_signal = send_group_signal or os.killpg
         self.disk_free = disk_free or (lambda path: shutil.disk_usage(path).free)
         self.uid = os.getuid() if uid is None else uid
         self.store, self.crew, self.record, self.load_tests = Path(store), Path(crew), Path(record), Path(load_tests)
@@ -208,16 +210,17 @@ def breach_of(decisions, heartbeat_age, listed):
 
 
 def launchd_print(host, label):
-    """`launchctl print` of a gui job: only the exit code and the `path`, `state` and `pid` lines are kept (the rest carries
-    the job's command line, which is never kept or printed)."""
+    """`launchctl print` of a gui job: only the exit code and the `path`, `state`, `pid` and calendar `"Minute" => N` lines are
+    kept (the rest carries the job's command line, which is never kept or printed)."""
     r = host.run(['/bin/launchctl', 'print', 'gui/%d/%s' % (host.uid, label)], timeout=CMD_S)
     if r.returncode != 0:
-        return {'listed': False, 'plist': None, 'state': None, 'pid': None}
+        return {'listed': False, 'plist': None, 'state': None, 'pid': None, 'minute': None}
     path = re.search(r'^\s*path = (.+?)\s*$', r.stdout or '', re.M)
     state = re.search(r'^\s*state = (.+?)\s*$', r.stdout or '', re.M)
     pid = re.search(r'^\s*pid = (\d+)\s*$', r.stdout or '', re.M)
+    minute = re.search(r'^\s*"Minute" => (\d+)\s*$', r.stdout or '', re.M)
     return {'listed': True, 'plist': path.group(1) if path else None, 'state': state.group(1) if state else None,
-            'pid': int(pid.group(1)) if pid else None}
+            'pid': int(pid.group(1)) if pid else None, 'minute': int(minute.group(1)) % 60 if minute else None}
 
 
 def collector_health(host, since=None):
@@ -353,7 +356,27 @@ def pick_reader_state(host):
     if s['running'] and s['pid'] is not None:
         seen = observed_identity(host, s['pid'])
         s['started'] = seen['start'] if seen else None
+    s['due'] = picks_due(host, s)
     return s
+
+
+def picks_due(host, reader):
+    """Correction C. Why the switch-offs may not begin now, or None: from PICKS_BEFORE_S before the reader's scheduled start
+    (its calendar minute from launchd, the full hour when none is read; local clock, injected) until it has been read listed
+    and idle at least PICKS_AFTER_S after that start, so that it cannot start between this read and the bootout. A reader
+    that is not loaded is left alone and has no window. A running reader is refused by its own rule."""
+    if not reader['listed']:
+        return None
+    minute = reader.get('minute') or 0
+    t = host.now(); lt = time.localtime(t)
+    since = (lt.tm_min * 60 + lt.tm_sec + (t % 1) - minute * 60) % 3600     # seconds since its last scheduled start
+    if 3600 - since <= PICKS_BEFORE_S:
+        return ('the hourly pick reader %s is due at :%02d in %d s; no switch-off begins from %d minutes before it until it '
+                'is seen idle after it' % (PICKS_LABEL, minute, round(3600 - since), PICKS_BEFORE_S // 60))
+    if since < PICKS_AFTER_S:
+        return ('the hourly pick reader %s was due at :%02d, %d s ago, and is not yet seen idle after it (%d s needed)' % (
+            PICKS_LABEL, minute, int(since), PICKS_AFTER_S))
+    return None
 
 
 # ============================================================================ profiles, durations, the announcement
@@ -429,6 +452,8 @@ def refusals(s):
         out.append('the hourly pick reader %s is running (pid %s, started %s); it runs a few minutes at the top of the hour '
                    'and is never booted out mid-run: start after it ends' % (
                        PICKS_LABEL, s['pick_reader']['pid'], s['pick_reader']['started'] or 'at an unknown time'))
+    if s['pick_reader'].get('due'):
+        out.append(s['pick_reader']['due'])
     level = s['memory']['pressure_level']
     if level != 1:
         out.append('the kernel memory pressure level %s is not 1' % level)
@@ -504,6 +529,8 @@ class SwitchOffs:
         if before['running']:      # it may have started since the check: never boot out a reader mid-run (ruling 4)
             raise Refused('the hourly pick reader %s is running (pid %s, started %s); it is never booted out mid-run: start '
                           'after it ends' % (PICKS_LABEL, before['pid'], before['started'] or 'at an unknown time'))
+        if before['due']:          # correction C: the clock may have entered its window since the check
+            raise Refused(before['due'])
         if before['listed']:
             if not before['plist']:
                 raise OperatorError('the pick reader\'s plist path is unknown, so it could not be bootstrapped back; not booted out')
@@ -638,10 +665,11 @@ def launch(host, work, gate, row):
 
 
 class Stopper:
-    """At most one stop signal. To the observer named in <work>/builder/observer-identity.json, only when its pid, start and
-    process group all match the live process. When that file has not appeared IDENTITY_WAIT_S after the launch: to the
-    launcher's own process group, only when the launcher was started by this tool in its own group and its pid, start and
-    group still match what was recorded at launch (addendum 1, ruling 5). Never on a pid alone."""
+    """At most one stop signal. TERM to the observer named in <work>/builder/observer-identity.json, only when its pid, start
+    and process group all match the live process. When that file has not appeared IDENTITY_WAIT_S after the launch: SIGINT to
+    the launcher this tool started (correction A), only when it was started in its own group and its pid, start and group
+    still match what was recorded at launch. The launcher's KeyboardInterrupt path then stops the observer group the
+    pipeline's own way; a TERM would kill it without that cleanup. Never a group signal, never on a pid alone."""
 
     def __init__(self, host, work, row, t_launch):
         self.host, self.path, self.row, self.t_launch = host, work / 'builder' / IDENTITY_FILE, row, t_launch
@@ -656,7 +684,7 @@ class Stopper:
         try:
             identity = json.loads(self.path.read_text())
         except (OSError, ValueError) as e:
-            return self._by_group('no readable observer identity (%s)' % type(e).__name__)
+            return self._by_launcher('no readable observer identity (%s)' % type(e).__name__)
         why = identity_mismatch(self.host, identity)
         if why:
             self.rec['not_signalled'] = why; return False
@@ -665,7 +693,7 @@ class Stopper:
         self.rec.update(signalled=True, by='observer', pid=identity['pid'], utc=utc(self.sent_t), not_signalled=None)
         return True
 
-    def _by_group(self, why):
+    def _by_launcher(self, why):
         if self.host.now() < self.t_launch + IDENTITY_WAIT_S:
             self.rec['not_signalled'] = why + '; waiting up to %d s after the launch for it' % IDENTITY_WAIT_S; return False
         launcher = self.row.get('launcher') or {}
@@ -675,18 +703,31 @@ class Stopper:
         if seen is None or seen['start'] != launcher['start'] or seen['pgid'] != launcher['pgid']:
             self.rec['not_signalled'] = why + ', and the launcher pid %s is no longer the process started (%s)' % (
                 launcher['pid'], 'gone' if seen is None else 'start or group differs'); return False
-        self.host.send_group_signal(launcher['pgid'], GROUP_STOP_SIGNAL)
+        self.host.send_signal(launcher['pid'], LAUNCHER_STOP_SIGNAL)
         self.sent_t = self.host.now()
-        self.rec.update(signalled=True, by='group', pid=launcher['pid'], pgid=launcher['pgid'], utc=utc(self.sent_t),
-                        not_signalled=None, why_group=why)
+        self.rec.update(signalled=True, by='launcher interrupt', signal='SIGINT', pid=launcher['pid'], pgid=launcher['pgid'],
+                        utc=utc(self.sent_t), not_signalled=None, why_launcher=why)
         return True
 
 
+def after_interrupt_check(host, stopper, row):
+    """Correction A: after a launcher interrupt, the same cleanup time as for the normal stop (STOP_WAIT_S from the signal),
+    then no mf-native-* instance may be loaded. One that is, is said in capitals; the tool unloads nothing it did not load."""
+    while host.now() < stopper.sent_t + STOP_WAIT_S:
+        host.sleep(min(WATCH_S, stopper.sent_t + STOP_WAIT_S - host.now()))
+    native = models_state(host)['native_loaded']
+    stopper.rec['after_check'] = {'utc': utc(host.now()), 'seconds_after_interrupt': round(host.now() - stopper.sent_t, 1),
+                                  'native_loaded': native}
+    if native:
+        row['alerts'].append('MF-NATIVE INSTANCE STILL LOADED AFTER THE LAUNCHER INTERRUPT: %s (THE TOOL DID NOT LOAD IT AND '
+                             'DOES NOT UNLOAD IT)' % ', '.join(native))
+
+
 def wait_after_stop(host, proc, stopper, row):
-    """After a stop is wanted: wait for the launcher to end (the pipeline's own cleanup), STOP_WAIT_S after the TERM at most."""
+    """After a stop is wanted: wait for the launcher to end (the pipeline's own cleanup), STOP_WAIT_S after the signal at most."""
     while proc.poll() is None:
         if stopper.sent_t is not None and host.now() > stopper.sent_t + STOP_WAIT_S:
-            row['alerts'].append('PIPELINE CLEANUP NOT SEEN WITHIN %d S OF THE TERM: THE LAUNCHER WAS LEFT RUNNING' % STOP_WAIT_S)
+            row['alerts'].append('PIPELINE CLEANUP NOT SEEN WITHIN %d S OF THE STOP SIGNAL: THE LAUNCHER WAS LEFT RUNNING' % STOP_WAIT_S)
             return None
         host.sleep(WATCH_S)
         if not stopper.rec['signalled']:
@@ -737,7 +778,9 @@ def memory_outcome(receipt, swap_start, swap_end, own):
 
 def verdicts(collector, pipeline, memory):
     low = memory.get('lowest_sustained_free_percent_10s')
-    return {'collector_unharmed': collector['breach'] is None and collector['over_8s'] == 0 and collector['model_failures'] == 0,
+    st = collector.get('statuses') or {}       # correction B: by the count of each status, which the record carries
+    return {'collector_unharmed': (collector['breach'] is None and collector['over_8s'] == 0
+                                   and not any(st.get(k, 0) for k in HARMFUL_STATUSES) and st.get('error', 0) < HARMFUL_ERRORS),
             'pipeline_clean': (pipeline.get('failed_calls') == 0 and pipeline.get('refused_calls') == 0
                                and pipeline.get('memory_stop') is False and pipeline.get('swaps_clean') is True
                                and pipeline.get('cleanup_proven') is True and pipeline.get('failure') is None),
@@ -823,9 +866,10 @@ def watch(host, row, proc, stopper, t_start, t_launch, wall_s, own):
         if (not row.get('identity_alerted') and host.now() >= t_launch + IDENTITY_WAIT_S
                 and not (stopper.path.is_file() or stopper.rec['signalled'])):
             row['identity_alerted'] = True
-            row['alerts'].append('OBSERVER IDENTITY FILE NOT WRITTEN WITHIN %d S OF LAUNCH: A BREACH WILL STOP THE LAUNCHER\'S '
-                                 'PROCESS GROUP %s' % (IDENTITY_WAIT_S, 'INSTEAD' if (row.get('launcher') or {}).get('own_group')
-                                                        else 'IS NOT POSSIBLE: THE LAUNCHER IS NOT IN ITS OWN GROUP'))
+            row['alerts'].append('OBSERVER IDENTITY FILE NOT WRITTEN WITHIN %d S OF LAUNCH: %s' % (
+                IDENTITY_WAIT_S, 'A BREACH WILL INTERRUPT THE LAUNCHER (SIGINT) INSTEAD'
+                if (row.get('launcher') or {}).get('own_group')
+                else 'A BREACH CANNOT INTERRUPT THE LAUNCHER: IT IS NOT IN ITS OWN GROUP'))
         if first is None:
             h = collector_health(host, since=t_start)
             if h['breach']:
@@ -836,7 +880,7 @@ def watch(host, row, proc, stopper, t_start, t_launch, wall_s, own):
             if not stopper.rec['signalled']:
                 stopper.attempt()
             if stopper.sent_t is not None and host.now() > stopper.sent_t + STOP_WAIT_S:
-                row['alerts'].append('PIPELINE CLEANUP NOT SEEN WITHIN %d S OF THE TERM: THE LAUNCHER WAS LEFT RUNNING' % STOP_WAIT_S)
+                row['alerts'].append('PIPELINE CLEANUP NOT SEEN WITHIN %d S OF THE STOP SIGNAL: THE LAUNCHER WAS LEFT RUNNING' % STOP_WAIT_S)
                 return None
     return proc.poll()
 
@@ -931,6 +975,11 @@ def cmd_run(host, args):
                 stopper.attempt(); wait_after_stop(host, proc, stopper, row)
         except BaseException as e:     # a second Ctrl-C while waiting: the restore below still runs
             row['alerts'].append('THE STOP WAS INTERRUPTED: %s' % type(e).__name__)
+        try:
+            if stopper is not None and stopper.rec['by'] == 'launcher interrupt':
+                after_interrupt_check(host, stopper, row)
+        except BaseException as e:
+            row['alerts'].append('THE CHECK AFTER THE LAUNCHER INTERRUPT DID NOT COMPLETE: %s' % type(e).__name__)
         if stopper is not None and stopper.rec['wanted'] and not stopper.rec['signalled']:
             row['alerts'].append('RUN NOT STOPPED: OBSERVER NOT SIGNALLED: %s' % stopper.rec['not_signalled'])
         restored = switch.restore()

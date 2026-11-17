@@ -52,6 +52,12 @@ For the whole window (the wall clock plus the 120 s cleanup), each named in the 
   3, `PICK READER NOT RESTORED` in capitals in the summary, and the record row says so. If it was not loaded, it is left alone.
   If it is RUNNING (it runs a few minutes at the top of the hour), the start is refused with its start time: a reader is never
   booted out mid-run. Its state is read again just before the bootout, so one that started after the check also refuses.
+  Besides those two reads, no switch-off begins from 2 minutes before the reader's scheduled start until it has been read
+  listed and idle after that start (at least 5 s after it, as launchd starts it at once), so that it cannot start between the
+  read and the bootout. The scheduled minute is the `"Minute" => N` of its calendar interval in `launchctl print`; the full
+  hour when none is read. The clock is the local one. At :57:59 an idle reader may be switched off; from :58:00 the start is
+  refused ("due at :00"); at :00:30 a reader seen running refuses and one seen idle again does not. The plist in this repo
+  (`tools/launchd/com.valedia.picks.hourly.plist`) schedules it at minute 7, so the window there is :05:00 to :07:05.
 - every loaded model that is neither the decision instance nor the embedding instance: unloaded by REST
   (`POST /api/v1/models/unload {"instance_id": ...}`) and named in the record. They are NOT reloaded: LM Studio loads each again
   on demand.
@@ -67,7 +73,8 @@ summary and the record say `DECISION INSTANCE NOT LOADED AND RIGHT` and the tool
 
 LM Link not disabled; the decision instance not loaded and right; an `mf-native-*` instance already loaded; the collector
 already in breach (the breach rule below over the decisions of the last 15 minutes, its last heartbeat and its job), or too
-quiet to judge (fewer than 5 decisions in those 15 minutes: a run must not start blind); the hourly pick reader running; the
+quiet to judge (fewer than 5 decisions in those 15 minutes: a run must not start blind); the hourly pick reader running, or
+due within 2 minutes, or due and not yet seen idle after its start; the
 kernel pressure level not 1; no free reading; an unexpired gate file (`root-one-native-attempt.json` whose `expires_at_utc` is still ahead) or a live observer
 (`builder/observer-identity.json` whose pid, start and process group all match a running process) of an earlier run under the
 crew folder; and, after staging, a free reading under the staged folder's own start threshold (the manifest's
@@ -93,15 +100,20 @@ revision without it refuses with "the staged pipeline revision is too old"; no g
 On a breach `run` stops the run the documented way: TERM to the observer named in `<work>/builder/observer-identity.json`
 (`{"pid", "start", "pgid", "written_utc"}`, written by the pipeline at spawn), only after its pid, start time and process group
 all match the live process; never on a pid alone, and at most once. It then waits for the pipeline's own cleanup (the launcher
-ending, at most 180 s after the TERM), verifies that no `mf-native-*` instance is loaded and that the decision instance is still
+ending, at most 180 s after the signal), verifies that no `mf-native-*` instance is loaded and that the decision instance is still
 loaded and right, restores, and records `stopped: collector breach` with the figures. `load-test` unloads its test model
 through the pipeline's own unload instead. Ctrl-C stops the run the same way before restoring.
 
 The launcher is started by this tool in its own session and process group, and its pid, start and group are recorded at
 launch. If the identity file has not appeared 60 s after the launch, the summary says so in capitals and the watch goes on; at
-the first breach the stop signal then goes to the launcher's process group, only when the launcher is still the process that
-was started (pid, start and group all match), and the record says `stop.by: group`. A launcher that is not in a group of its
-own is never signalled; that is said in capitals as well.
+the first breach the stop signal is then SIGINT to the launcher this tool started, never TERM and never a group signal, and only
+when the launcher is still the process that was started (pid, start and group all match); the record says
+`stop.by: "launcher interrupt"`. SIGINT raises KeyboardInterrupt in the launcher, whose own handler stops the observer group
+the pipeline's way (`src/mirofish_native_startup.py`, lines 169 to 190); a TERM would kill the launcher without that cleanup.
+After it the tool waits the same 180 s as for the normal stop, counted from the signal, then reads the model list: an
+`mf-native-*` instance still loaded is said as `MF-NATIVE INSTANCE STILL LOADED AFTER THE LAUNCHER INTERRUPT` in capitals in the
+summary and the record (`stop.after_check`); the tool unloads nothing it did not load. A launcher that is not in a group of its
+own, or whose start or group has changed, is never signalled; that is said in capitals as well.
 
 ## What a breach costs
 
@@ -144,7 +156,9 @@ failed and refused calls, both swaps, cleanup proven, `report_usable`), memory (
 `resource.max_pressure_level`, `resource.co_resident_rss_bytes_max` from the receipt where present, else `null` and a note;
 swap at the start and end; the tool's own 30 s readings), the collector during the run and three verdicts:
 
-- `collector_unharmed`: no breach, no decision over 8 s, no model-failure status;
+- `collector_unharmed`: false when there was a breach, or any decision over 8 s, or any `model_unavailable`, `tag_mismatch` or
+  `late`, or two or more `error` during the run. A single `error` does not fail it. The row's `collector.statuses` carries the
+  count of each status, so a person can read it;
 - `pipeline_clean`: no failed or refused call, no stop on the memory rule, both swaps clean (one model: not applicable),
   cleanup proven, no stop. A near-neutral report is not a pipeline fault: it is recorded as `report_usable: false`;
 - `room_to_spare`: the lowest sustained free reading over 10 s is at least 10 points above the 30 stop floor (40 or more).
