@@ -80,7 +80,11 @@ class RevisionCapReached(GauntletError):
 
 @dataclass(frozen=True)
 class Prediction:
-    """What the researcher expects, and what would count as failure, stated before any backtest."""
+    """What the researcher expects, and what would count as failure, stated before any backtest.
+    Every figure is a finite real number, never a bool (numpy reals are taken as floats), judged when it is made:
+    `annual_return`, `sharpe`: any finite number. `win_rate`: from 0 to 1. `fail_if_sharpe_below`: any finite number;
+    a negative floor is allowed, since a Sharpe can lie below any finite floor and the check can still fail.
+    `fail_if_drawdown_above`: above 0 and at most 1 (a limit of 0 would fail every book)."""
     annual_return: float
     win_rate: float                 # share of closed trades that make money
     sharpe: float
@@ -92,14 +96,18 @@ class Prediction:
     def __post_init__(self):
         if not isinstance(self.claim, str) or self.claim not in CLAIMS:
             raise ValueError(f"the claim is one of {CLAIMS}, not {self.claim!r}")
-        if not 0.0 <= self.win_rate <= 1.0 or not 0.0 < self.fail_if_drawdown_above <= 1.0:
-            raise ValueError("win_rate must be in [0, 1] and fail_if_drawdown_above in (0, 1]")
-        if not all(math.isfinite(x) for x in (self.annual_return, self.sharpe, self.fail_if_sharpe_below)):
-            raise ValueError("the prediction must be numbers")
+        for name in ("annual_return", "sharpe", "fail_if_sharpe_below"):
+            _judge_mark(self, name, -math.inf, math.inf, lo_open=True, hi_open=True)
+        _judge_mark(self, "win_rate", 0.0, 1.0)
+        _judge_mark(self, "fail_if_drawdown_above", 0.0, 1.0, lo_open=True)
 
 
 @dataclass(frozen=True)
 class Criteria:
+    """The gate's pass marks, each a finite real number (never a bool; numpy reals are taken as floats), judged when
+    made, in a range that leaves its check able to fail and able to pass: `min_dsr` strictly between 0 and 1;
+    `min_positive_windows` above 0 and at most 1 (0 would let a book with no winning window pass); `min_stress_sharpe`
+    any finite number (negative allowed: a Sharpe can lie below any finite floor); `sealed_fraction` from 0.2 to 0.3."""
     min_dsr: float = 0.95
     min_positive_windows: float = 0.6
     min_stress_sharpe: float = 0.0
@@ -112,12 +120,11 @@ class Criteria:
     min_train_days: int = 504
 
     def __post_init__(self):
-        d = self.min_dsr
-        if isinstance(d, bool) or not isinstance(d, (int, float)) or not 0.0 < d < 1.0:
-            raise ValueError("min_dsr is a probability strictly between 0 and 1: a pass mark that nothing can miss, "
-                             "or nothing can meet, is refused")
-        if not 0.2 <= self.sealed_fraction <= 0.3:
-            raise ValueError("the sealed period is the most recent 20 to 30 percent of the data")
+        _judge_mark(self, "min_dsr", 0.0, 1.0, lo_open=True, hi_open=True,
+                    why="a probability: a pass mark that nothing can miss, or nothing can meet, is refused")
+        _judge_mark(self, "min_positive_windows", 0.0, 1.0, lo_open=True)
+        _judge_mark(self, "min_stress_sharpe", -math.inf, math.inf, lo_open=True, hi_open=True)
+        _judge_mark(self, "sealed_fraction", 0.2, 0.3, why="the sealed period is the most recent 20 to 30 percent")
         if not 3 <= self.max_revisions <= 5:
             raise ValueError("revisions per idea are capped at 3 to 5")
         if self.walk_forward_windows < 3:
@@ -318,6 +325,20 @@ def _count(x) -> bool:
     return not isinstance(x, (bool, np.bool_)) and isinstance(x, (int, np.integer)) and int(x) >= 1
 
 
+def _judge_mark(obj, field: str, lo: float, hi: float, lo_open: bool = False, hi_open: bool = False,
+                why: str = "") -> None:
+    """Judge one figure of a `Prediction` or `Criteria` when it is made: a finite real number (never a bool) inside
+    [lo, hi] (an end open where asked), or ValueError naming the field. A numpy real is stored as a Python float."""
+    x = getattr(obj, field)
+    inside = _real(x) and (lo < x if lo_open else lo <= x) and (x < hi if hi_open else x <= hi)
+    if not inside:
+        span = f"{'(' if lo_open else '['}{lo}, {hi}{')' if hi_open else ']'}"
+        raise ValueError(f"{type(obj).__name__}.{field} must be a finite real number (never a bool) in {span}, "
+                         f"not {x!r}" + (f": {why}" if why else ""))
+    if isinstance(x, (np.integer, np.floating)):
+        object.__setattr__(obj, field, float(x))
+
+
 def _p_ok(p, threshold: float) -> bool:
     return _real(p) and 0.0 <= p <= 1.0 and p <= threshold
 
@@ -391,11 +412,11 @@ def one_trial_sharpe(net: pd.Series, min_dsr: float) -> tuple[float | None, bool
         m = research.sharpe_moments(r)
     except ValueError as exc:
         return None, False, f"fails: no Sharpe moments ({str(exc)[:80]})"
-    if not (_real(m.sharpe) and _real(m.skew) and _real(m.kurt) and _count(m.n_obs)):
+    if not (all(_real(getattr(m, k, None)) for k in ("sharpe", "skew", "kurt")) and _count(getattr(m, "n_obs", None))):
         return None, False, "fails: the Sharpe moments are not finite numbers (or the count is not a whole number)"
     try:
         v = research.probabilistic_sharpe_ratio(m.sharpe, 0.0, m.n_obs, m.skew, m.kurt)
-    except ValueError as exc:
+    except (ValueError, TypeError, ArithmeticError) as exc:
         return None, False, f"fails: no Probabilistic Sharpe from these moments ({str(exc)[:80]})"
     if not (_real(v) and 0.0 <= v <= 1.0):
         return None, False, f"fails: the Probabilistic Sharpe is not a number from 0 to 1 ({v!r})"
@@ -597,8 +618,10 @@ class Gauntlet:
             checks["timing"] = (bool(timing["passed"]), timing["detail"] + (
                 f" ({counted['ledger']} attempts in the ledger, {counted['label']} on this market label)"))
         else:
-            checks["deflated_sharpe"] = (bool(_fin(dsr["value"]) and dsr["value"] >= c.min_dsr), f"{dsr['value']:.3f} against {c.min_dsr} "
-                                         f"({dsr['variations_of_idea']} variations of the idea, {dsr['attempts_on_market']} on the market)")
+            counts = f"({dsr['variations_of_idea']} variations of the idea, {dsr['attempts_on_market']} on the market)"
+            checks["deflated_sharpe"] = ((False, f"fails: {dsr['fault']} {counts}") if "fault" in dsr else
+                                         (bool(_fin(dsr["value"]) and dsr["value"] >= c.min_dsr),
+                                          f"{dsr['value']:.3f} against {c.min_dsr} {counts}"))
         checks.update({
             "walk_forward": (bool(_fin(positive) and positive >= c.min_positive_windows), f"{positive:.0%} of {len(per_window)} windows made money"),
             "double_costs": (bool(_fin(stress_sharpe) and stress_sharpe > c.min_stress_sharpe),
@@ -685,6 +708,14 @@ class Gauntlet:
             m = research.sharpe_moments(r)
         except ValueError:
             return {**out, "value": 0.0, "for_idea": 0.0, "for_market": 0.0, "variance_leaving_idea_out": None}
+
+        def fault(why: str) -> dict:     # a figure not of its kind: no figures, and the value 0.0 (it fails), as above
+            return {**out, "value": 0.0, "for_idea": None, "for_market": None, "variance_leaving_idea_out": None,
+                    "fault": why}
+        moments = {k: getattr(m, k, None) for k in ("sharpe", "skew", "kurt", "n_obs")}
+        if not (all(_real(moments[k]) for k in ("sharpe", "skew", "kurt")) and _count(moments["n_obs"])):
+            return fault("the Sharpe moments are not finite numbers or the count is not a whole number ("
+                         + ", ".join(f"{k} {v!r}" for k, v in moments.items()) + ")")
         # variance of trial Sharpes: from the market's own attempts once there are several, else the
         # sampling variance of a zero-skill Sharpe estimate
         var = float(mkt.var(ddof=1)) if len(mkt) >= 3 else 1.0 / m.n_obs
@@ -692,7 +723,16 @@ class Gauntlet:
             if n < 2:
                 return research.probabilistic_sharpe_ratio(m.sharpe, 0.0, m.n_obs, m.skew, m.kurt)
             return research.deflated_sharpe_ratio(m.sharpe, m.n_obs, n, var, m.skew, m.kurt)
-        for_idea, for_market = float(dsr(max(len(idea), 1))), float(dsr(max(len(mkt), 1)))
+        figures = {}
+        for name, n in (("for_idea", max(len(idea), 1)), ("for_market", max(len(mkt), 1))):
+            try:
+                x = dsr(n)
+            except (ValueError, TypeError, ArithmeticError) as exc:
+                return fault(f"no Deflated Sharpe {name} from these figures ({str(exc)[:80]})")
+            if not (_real(x) and 0.0 <= x <= 1.0):
+                return fault(f"the Deflated Sharpe {name} is not a number from 0 to 1 ({x!r})")
+            figures[name] = float(x)
+        for_idea, for_market = figures["for_idea"], figures["for_market"]
         others = [float(x) for x in mkt]
         for s in idea:                                                   # the label's attempts, the idea's own taken out
             if float(s) in others:
