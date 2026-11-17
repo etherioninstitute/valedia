@@ -1202,7 +1202,8 @@ def test_t50_a_live_name_in_the_trading_file_stops_the_page_and_nothing_of_it_is
         op.build(env, out=out)
     why = str(exc.value)
     clean = T50_SECRET not in why
-    assert clean and "LiveNameInReach" in why and not out.exists() and "WEBULL_LIVE_APP_SECRET" not in os.environ
+    assert clean and "WEBULL_LIVE_APP_SECRET" in why and "nothing was registered" in why   # addendum 4: in words
+    assert not out.exists() and "WEBULL_LIVE_APP_SECRET" not in os.environ
 
 
 def test_t50_a3_a_trading_file_that_is_the_live_file_stops_the_page_before_it_is_opened(bare_world, monkeypatch, tmp_path):
