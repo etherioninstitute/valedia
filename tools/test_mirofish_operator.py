@@ -1720,6 +1720,14 @@ class Addendum4(Base):
         for t in texts:
             self.assertNotIn(SECRET, t)
 
+    def assertNotOursAndRecovered(self, rc):
+        """Addendum 5: the proof was made and the answer is no: reported by pid only, never signalled, and with no proven
+        survivor and a scan that succeeded, the recovery goes on: the reader back, the row appended, the file removed."""
+        self.assertEqual(rc, 0, self.w.text()); self.assertEqual(self.w.signals, []); self.assertFalse(self.intent.exists())
+        self.assertTrue(self.w.picks_loaded); row = self.w.rows()[-1]
+        self.assertEqual(row['command'], 'recover'); self.assertTrue(row['not_ours']); self.assertNoSecret()
+        self.assertIn('NOT SIGNALLED', self.w.text())
+
     def assertNothingSignalledAndKept(self, rc):
         self.assertNotEqual(rc, 0); self.assertEqual(self.w.signals, []); self.assertTrue(self.intent.exists()); self.assertNoSecret()
 
@@ -1727,14 +1735,14 @@ class Addendum4(Base):
     def test_A_a_launcher_written_as_the_collector_is_never_signalled(self):
         self.only_hostile()
         self.edit_intent(launcher={'pid': COLLECTOR_PID, 'start': COLLECTOR_START, 'pgid': COLLECTOR_PID})
-        self.assertNothingSignalledAndKept(self.main(['recover', '--stop']))
+        self.assertNotOursAndRecovered(self.main(['recover', '--stop']))
         self.assertIn('NOT SIGNALLED', self.w.text()); self.assertIn('COLLECTOR', self.w.text())
 
     def test_A_launcher_pid_1_and_an_identity_naming_the_collector_send_nothing(self):
         self.only_hostile()
         self.edit_intent(launcher={'pid': 1, 'start': None, 'pgid': None})
         self.identity_names(COLLECTOR_PID, COLLECTOR_START, COLLECTOR_PID)
-        self.assertNothingSignalledAndKept(self.main(['recover', '--stop']))
+        self.assertNotOursAndRecovered(self.main(['recover', '--stop']))
 
     def test_A_the_collector_and_the_pick_reader_proposed_every_way_with_a_matching_command_are_never_signalled(self):
         for who in ('collector', 'picks'):
@@ -1755,14 +1763,14 @@ class Addendum4(Base):
                         self.edit_intent(launcher={'pid': pid, 'start': start, 'pgid': pid})
                     if how == 'identity':
                         self.identity_names(pid, start, pid)
-                    self.assertNothingSignalledAndKept(self.main(['recover', '--stop']))
+                    self.assertNotOursAndRecovered(self.main(['recover', '--stop']))
                     self.assertIn('JOB', self.w.text())
 
     def test_A_pids_not_above_1_never_signalled_and_mistyped_pids_refused_whole(self):
         for pid in (1, 0, -5):
             with self.subTest(pid=pid):
                 self.fresh(); self.only_hostile(); self.edit_intent(launcher={'pid': pid, 'start': None, 'pgid': None})
-                self.assertNothingSignalledAndKept(self.main(['recover', '--stop']))
+                self.assertNotOursAndRecovered(self.main(['recover', '--stop']))
         for pid in (True, '4242', 4242.0):
             with self.subTest(pid=pid):
                 self.fresh(); self.killed_run(); self.edit_intent(launcher={'pid': pid, 'start': LAUNCHER_START, 'pgid': LAUNCHER_PID})
@@ -1776,28 +1784,28 @@ class Addendum4(Base):
                 work = json.loads(self.intent.read_text())['work']
                 self.w.commands[pid] = '/x/python -B mirofish_native_startup.py --work %s --gate g' % work
                 self.edit_intent(launcher={'pid': pid, 'start': self.w.procs[pid]['start'], 'pgid': self.w.procs[pid]['pgid']})
-                self.assertNothingSignalledAndKept(self.main(['recover', '--stop'])); self.assertIn('ANCESTOR', self.w.text())
+                self.assertNotOursAndRecovered(self.main(['recover', '--stop'])); self.assertIn('ANCESTOR', self.w.text())
 
     def test_A_right_pid_and_start_with_the_wrong_command_is_never_signalled(self):
         self.killed_run()
         self.w.commands[LAUNCHER_PID] = '/usr/bin/vim notes.txt %s' % SECRET
         self.w.commands[OBSERVER_PID] = '/usr/bin/less %s/owned-source/observer-entry/mirofish_native_run.py' % (
             json.loads(self.intent.read_text())['work'])
-        self.assertNothingSignalledAndKept(self.main(['recover', '--stop'])); self.assertIn('COMMAND', self.w.text())
-        self.assertFalse(self.w.picks_loaded)
+        self.assertNotOursAndRecovered(self.main(['recover', '--stop'])); self.assertIn('COMMAND', self.w.text())
+        self.assertTrue(self.w.picks_loaded)        # addendum 5: definitely not ours does not hold the reader off
 
     def test_A_another_runs_launcher_and_observer_are_never_signalled(self):
         self.killed_run()
         other = str(self.w.crew / 'valedia-native-20261116-swarm8-op999999')
         self.w.commands[LAUNCHER_PID] = '/x/python -B mirofish_native_startup.py --work %s --gate g' % other
         self.w.commands[OBSERVER_PID] = '/x/python -B %s/owned-source/observer-entry/mirofish_native_run.py' % other
-        self.assertNothingSignalledAndKept(self.main(['recover', '--stop'])); self.assertIn('COMMAND', self.w.text())
+        self.assertNotOursAndRecovered(self.main(['recover', '--stop'])); self.assertIn('COMMAND', self.w.text())
 
     def test_A_the_right_command_with_a_wrong_start_is_never_signalled(self):
         self.killed_run()
         self.w.procs[LAUNCHER_PID]['start'] = 'Mon Nov 16 13:33:33 2026'
         self.w.procs[OBSERVER_PID]['start'] = 'Mon Nov 16 13:33:34 2026'
-        self.assertNothingSignalledAndKept(self.main(['recover', '--stop'])); self.assertIn('START', self.w.text())
+        self.assertNotOursAndRecovered(self.main(['recover', '--stop'])); self.assertIn('START', self.w.text())
 
     def test_A_a_command_that_cannot_be_read_sends_nothing_and_says_nothing_of_it(self):
         self.killed_run(); self.w.command_raises = RuntimeError
@@ -2033,6 +2041,151 @@ class Addendum4(Base):
     def test_H_recover_keeps_the_intent_while_the_reader_is_still_off(self):
         self.killed_run(); self.w.procs.pop(OBSERVER_PID); self.w.procs.pop(LAUNCHER_PID); self.w.bootstrap_rc = 1
         self.assertEqual(self.main(['recover']), 3); self.assertTrue(self.intent.exists()); self.assertFalse(self.w.picks_loaded)
+
+
+class Addendum5(Base):
+    """The rulings on 1719c80."""
+    LT = LoadTest.LT
+    intent = Addendum3.intent
+    killed_run = Addendum3.killed_run
+    at = Addendum3.at
+    fresh = Addendum3.fresh
+    changing = Addendum3.changing
+    assertNoSecret = Addendum4.assertNoSecret
+
+    # ---- G (1): the decision and embedding instances are never unloaded, whatever the listing says
+    def test_G1_the_decision_and_embedding_instances_are_never_unloaded_whatever_the_listing_says(self):
+        hostile = ([{'key': 'other/key', 'type': 'llm', 'loaded_instances': [{'id': 'elephant-1', 'config': {}}]}],
+                   [{'key': 'elephant-1', 'type': 'llm', 'loaded_instances': [{'id': 'copy', 'config': {}}]}],
+                   [{'key': 'x/emb', 'type': 'embedding', 'loaded_instances': [{'id': 'ym-research-embedding', 'config': {}}]}],
+                   [{'key': 'y', 'type': 'llm', 'loaded_instances': [{'id': 'elephant-1-b', 'config': {}}]}],
+                   [{'key': 'google/embedding-gemma-300m', 'type': 'embedding', 'loaded_instances': [{'id': 'emb-2', 'config': {}}]}])
+        for extra in hostile:
+            for argv in (RUN, self.LT):
+                with self.subTest(extra=extra, argv=argv[0]):
+                    self.fresh(); self.w.models['models'] += copy.deepcopy(extra)
+                    self.main(argv)
+                    ids = [b['instance_id'] for _, _, b in self.w.posts()]
+                    self.assertNotIn('elephant-1', ids); self.assertNotIn('ym-research-embedding', ids)
+                    self.assertFalse(any(i.startswith('elephant-1') for i in ids), ids)
+                    keys = {i['id']: e['key'] for e in self.w.models['models'] for i in e['loaded_instances']}
+                    self.assertFalse([i for i in ids if keys.get(i) == 'elephant-1'], ids)
+
+    # ---- G (2): every unloaded instance is announced (key and id) before the first switch-off and in the row
+    def test_G2_every_unloaded_instance_is_named_before_the_first_switch_off_and_in_the_row(self):
+        said = []
+        out = lambda line: (said.append((len(self.w.posts()), len(self.w.bootouts()), str(line))), self.w.out.append(line))
+        self.w.models['models'].append({'key': 'other/model', 'type': 'llm', 'loaded_instances': [{'id': 'copy', 'config': {}}]})
+        self.assertEqual(self.main(RUN, out=out), 0, self.w.text())
+        posts, boots, line = next(x for x in said if x[2].startswith('check passed and staged'))
+        self.assertEqual((posts, boots), (0, 0))
+        row = self.w.rows()[-1]
+        unloaded = [(m['key'], m['instance_id']) for m in row['switch_offs']['models_unloaded'] if m['unloaded']]
+        self.assertEqual(sorted(unloaded), [('other/model', 'copy'), ('qwen/qwen3.8-27b', 'qwen3.8-27b-chat')])
+        for key, iid in unloaded:
+            self.assertIn('%s (%s)' % (iid, key), line); self.assertIn('%s (%s)' % (iid, key), row['announcement'])
+        self.assertEqual(sorted(b['instance_id'] for _, _, b in self.w.posts()), ['copy', 'qwen3.8-27b-chat'])
+
+    def test_G2_a_model_that_appears_after_the_announcement_is_reported_and_left_alone(self):
+        orig = self.w.http; added = []
+        def http(method, url, body=None, timeout=None):
+            reply = orig(method, url, body, timeout)
+            if method == 'POST' and not added:
+                added.append(1)
+                self.w.models['models'].append({'key': 'late/model', 'type': 'llm', 'loaded_instances': [{'id': 'late-1', 'config': {}}]})
+            return reply
+        self.assertEqual(self.main(RUN, http=http), 0, self.w.text())
+        self.assertEqual([b['instance_id'] for _, _, b in self.w.posts()], ['qwen3.8-27b-chat'])
+        row = self.w.rows()[-1]
+        self.assertTrue(any('LOADED AFTER THE ANNOUNCEMENT' in a and 'late-1' in a for a in row['alerts']), row['alerts'])
+        self.assertTrue(row['launched'])
+
+    # ---- G (3): the load path's own instance, named before its load, is the only thing its unload names
+    def test_G3_the_load_tests_instance_is_named_before_its_load_and_is_all_its_unload_names(self):
+        seen = {}
+        orig = FakeLoadPath.load
+        def load(lp):
+            seen['intent'] = json.loads(self.intent.read_text()); return orig(lp)
+        FakeLoadPath.load = load
+        try:
+            self.assertEqual(self.main(self.LT), 0, self.w.text())
+        finally:
+            FakeLoadPath.load = orig
+        ident = 'mf-native-' + 'a' * 32
+        self.assertEqual(seen['intent']['load_identifier'], ident); self.assertEqual(self.w.unloads_via_pipeline, [ident])
+        self.assertNotIn(ident, [b['instance_id'] for _, _, b in self.w.posts()])
+
+    def test_G3_the_pipeline_load_path_names_its_own_identifier_in_load_and_unload_only(self):
+        calls = []
+        class SDK:
+            def call(self, op, timeout, **kw):
+                calls.append((op, kw))
+                return {'info': {'instanceReference': 'ref-own'}} if op == 'load' else {'unloaded': kw.get('identifier')}
+        lp = object.__new__(OP.PipelineLoadPath)
+        lp.q = types.SimpleNamespace(LOAD_S=1, UNLOAD_S=1, BASELINE_S=1, unload_confirmed=lambda reply, ident: reply.get('unloaded') == ident)
+        lp.identifier = OP.NATIVE_PREFIX + 'b' * 32; lp.owned = {}; lp.profile = 'qwen3-8b'; lp.embedding = 'ref-emb'
+        lp.sdk = SDK(); lp.loaded = None
+        lp.modules = types.SimpleNamespace(run=types.SimpleNamespace(check_load_readback=lambda *a: None))
+        named_before = lp.identifier
+        lp.load(); proven, _ = lp.unload()
+        self.assertTrue(proven)
+        self.assertEqual([kw['identifier'] for op, kw in calls], [named_before, named_before])
+        unload = [kw for op, kw in calls if op == 'unload'][0]
+        self.assertEqual(unload['instanceReference'], 'ref-own')      # the embedding reference is a check, never a target
+        self.assertEqual(sorted(unload), ['embeddingReference', 'identifier', 'instanceReference'])
+
+    # ---- recover: could not be made, against made and no
+    def reused_launcher(self):
+        self.w.procs[LAUNCHER_PID]['start'] = 'Mon Nov 16 14:44:44 2026'
+        self.w.commands[LAUNCHER_PID] = '/usr/bin/vim notes.txt --k=%s' % SECRET
+
+    def test_R_a_reused_pid_alone_does_not_hold_the_reader_off(self):
+        self.killed_run(); self.w.procs.pop(OBSERVER_PID); self.reused_launcher()
+        self.assertEqual(self.main(['recover']), 0, self.w.text())
+        self.assertEqual(self.w.signals, []); self.assertTrue(self.w.picks_loaded); self.assertFalse(self.intent.exists())
+        row = self.w.rows()[-1]
+        self.assertEqual([x['pid'] for x in row['not_ours']], [LAUNCHER_PID]); self.assertNoSecret()
+
+    def test_R_a_reused_pid_beside_a_real_survivor_is_never_signalled_and_the_survivor_holds_the_reader_off(self):
+        self.killed_run(); self.reused_launcher()
+        self.assertEqual(self.main(['recover']), 3)
+        self.assertEqual(self.w.signals, []); self.assertFalse(self.w.picks_loaded); self.assertTrue(self.intent.exists())
+        self.assertIn('OBSERVER STILL RUNNING', self.w.text())
+        def reap(world):
+            if world.procs.get(OBSERVER_PID, {}).get('termed_at') is not None:
+                world.procs.pop(OBSERVER_PID, None)
+        self.w.on_sleep.append(reap); self.w.out.clear()
+        self.assertEqual(self.main(['recover', '--stop']), 0, self.w.text())
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)])        # never the reused pid
+        self.assertTrue(self.w.picks_loaded); self.assertFalse(self.intent.exists()); self.assertNoSecret()
+
+    def test_R_an_unreadable_job_list_keeps_everything(self):
+        self.killed_run(); self.w.procs.pop(OBSERVER_PID); self.w.procs.pop(LAUNCHER_PID)
+        orig = self.w.run
+        def run(argv, cwd=None, env=None, timeout=None):
+            if argv[:2] == ['/bin/launchctl', 'print'] and str(argv[2]).endswith(OP.COLLECTOR_LABEL):
+                raise OSError('fake: launchctl unreadable')
+            return orig(argv, cwd, env, timeout)
+        self.assertEqual(self.main(['recover', '--stop'], run=run), 3)
+        self.assertIn('COULD NOT BE MADE', self.w.text()); self.assertTrue(self.intent.exists()); self.assertFalse(self.w.picks_loaded)
+
+    def test_R_an_unreadable_start_keeps_everything(self):
+        self.killed_run(); self.w.procs.pop(OBSERVER_PID); self.w.ps_raises = {LAUNCHER_PID: OSError}
+        self.assertEqual(self.main(['recover', '--stop']), 3)
+        self.assertTrue(self.intent.exists()); self.assertFalse(self.w.picks_loaded); self.assertEqual(self.w.signals, [])
+
+    # ---- the reader loaded from another plist: refused before any switch-off; the constant one: booted out
+    def test_P_the_reader_from_its_own_plist_is_booted_out_and_from_another_refused_before_any_change(self):
+        self.assertEqual(self.main(RUN), 0); self.assertEqual(len(self.w.bootouts()), 1)
+        self.assertEqual(self.w.bootouts()[0][2], 'gui/501/%s' % OP.PICKS_LABEL)
+        for argv in (RUN, self.LT):
+            with self.subTest(argv=argv[0]):
+                self.fresh()
+                self.assertEqual(self.main(argv, picks_plist='/fake/LaunchAgents/elsewhere.plist'), 2)
+                self.assertEqual(self.changing(), []); self.assertEqual(self.w.stages(), []); self.assertFalse(self.intent.exists())
+                self.assertTrue(self.w.picks_loaded)
+                if argv is RUN:
+                    self.assertIn('elsewhere.plist', self.w.rows()[-1]['refused'])
 
 
 if __name__ == '__main__':
