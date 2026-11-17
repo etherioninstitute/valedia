@@ -277,9 +277,10 @@ def test_default_roster_builds_the_requested_panel():
     roster = pn.load_roster()
     panel = pn.build_panel(roster)
     by_role = {r: [m.name for m in panel.members if m.role == r] for r in ("decider", "vetter", "scout")}
-    assert by_role["decider"] == ["valedia-trading-decider", "elephant-1"]
+    assert by_role["decider"] == ["elephant-1"]
     assert by_role["vetter"] == ["valedia-trading-auditor", "elephant-1-risk"] and by_role["scout"] == []
     assert len(by_role["decider"]) >= roster["min_deciders"] and len(by_role["vetter"]) >= roster["min_vetters"]
+    assert roster["min_deciders"] == 1      # T44-5: Elephant-1 is the only decider (owner, 2026-11-16)
     specs = {s["name"]: s for s in roster["members"]}
     for name, role in (("elephant-1", "decider"), ("elephant-1-risk", "vetter")):
         assert specs[name] == {"name": name, "role": role, "backend": "systemone", "timeout": 150,
@@ -291,7 +292,12 @@ def test_default_roster_builds_the_requested_panel():
         assert "Nimble" not in text and "nimble" not in text and "Qwen 8B" not in text
     assert "Elephant-1" in json.loads((pn.DEFAULT_ROSTER.parent / "team.json").read_text())["local_forecasters"]
     disabled = [m["name"] for m in roster["members"] if not m.get("enabled", True)]
-    assert disabled == ["valedia-trading-scout", "qwen3.8-27b"]        # both load the 27B model; opt in deliberately
+    assert disabled == ["valedia-trading-scout", "valedia-trading-decider", "qwen3.8-27b"]   # the 27B pair opt in deliberately; the Hermes decider no longer votes
+    hermes = specs["valedia-trading-decider"]                              # kept in the file: its stored history keeps its name
+    assert hermes == {"name": "valedia-trading-decider", "role": "decider", "backend": "hermes", "profile": "valedia-trading-decider",
+                      "timeout": 180, "enabled": False, "model_label": None, "unseen_after": None, "unseen_after_source": None}
+    notes = roster["notes"]
+    assert "2026-11-16" in notes and "Elephant-1 is the only decider" in notes and "Hermes decider no longer votes" in notes
     assert json.loads(pn.DEFAULT_ROSTER.read_text())["veto_rule"] == "any"
     with pytest.raises(ValueError):
         pn.build_panel({"members": [{"name": "x", "role": "decider", "backend": "carrier-pigeon"}]})
@@ -311,3 +317,33 @@ def test_t44_2_no_file_of_the_write_set_names_the_ollama_path(rel):
     root = pn.DEFAULT_ROSTER.resolve().parents[2]
     text = (root / rel).read_text()
     assert [w for w in OLLAMA_WORDS if w in text] == [], rel
+
+
+# ---- T44-5: Elephant-1 is the panel's only decider; the single-decider arithmetic is pinned on the real roster's thresholds
+
+def _roster_panel(*members):
+    """The default roster's panel (thresholds, veto rule, minimums) with its members swapped for scripted ones: no model is asked."""
+    panel = pn.build_panel(pn.load_roster())
+    assert [(m.name, m.role) for m in panel.members] == [("elephant-1", "decider"), ("valedia-trading-auditor", "vetter"), ("elephant-1-risk", "vetter")]
+    panel.members = list(members)
+    return panel
+
+
+def _vetters(veto=False):
+    return [fixed("valedia-trading-auditor", "vetter", 0.1, veto), fixed("elephant-1-risk", "vetter", 0.1, False)]
+
+
+def test_t44_5_a_decider_that_errors_leaves_no_approval_and_one_decider_is_enough_otherwise():
+    d = _roster_panel(boom("elephant-1", "decider"), *_vetters()).evaluate("c", CASE)
+    assert not d.approve and d.probability is None
+    assert d.reasons == ("no usable answer from: elephant-1", "only 0 valid decider(s); need 1")
+    refusing = _roster_panel(fixed("elephant-1", "decider", 0.40), *_vetters()).evaluate("c", CASE)     # a refusal: below the 0.55 threshold
+    assert not refusing.approve and refusing.probability == pytest.approx(0.40) and "below 0.55" in refusing.reasons[0]
+
+
+def test_t44_5_a_lone_decider_above_the_threshold_approves_unless_a_vetter_vetoes():
+    d = _roster_panel(fixed("elephant-1", "decider", 0.70), *_vetters()).evaluate("c", CASE)
+    assert d.approve and not d.vetoed and d.reasons == () and d.dissent == 0.0
+    assert d.probability == pytest.approx(0.70)                       # one decider: the pool is that decider's own probability
+    veto = _roster_panel(fixed("elephant-1", "decider", 0.95), *_vetters(veto=True)).evaluate("c", CASE)
+    assert veto.vetoed and not veto.approve and veto.reasons == ("vetoed by: valedia-trading-auditor",)

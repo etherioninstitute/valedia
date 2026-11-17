@@ -127,3 +127,25 @@ def test_profile_settings_a_seat_depends_on_are_checked_and_applied(tmp_path):
                      "agent": {"run_budget_seconds": 1800}}                                     # merged, nothing lost
     assert (home / "profiles" / "valedia-trading-scout" / "backups" / "config.yaml.before-team-sync-20261111-100000").is_file()
     assert T.check(team, home, panel) == [] and T.sync_settings(team, home, now=NOW) == []
+
+
+def test_t44_5_the_hermes_decider_bot_proposes_and_writes_but_no_longer_votes_in_the_panel():
+    team = T.load_team()
+    bot = team["bots"]["decider"]
+    assert bot["profile"] == "valedia-trading-decider" and bot["model"] == "sonnet" and bot["title"] == "Proposer"
+    assert "panel" not in bot["card"].lower() and "vote" not in bot["card"].lower()
+    assert not any("panel" in d.lower() for d in bot["duties"]) and len(bot["duties"]) == 2
+    assert "decide" not in bot["motto"].lower() and "propos" in bot["motto"].lower()
+    assert "only decider" in team["local_forecasters"] and "risk vetter" in team["local_forecasters"] and "Elephant-1" in team["local_forecasters"]
+    assert team["research_round"]["proposer"] == "decider" and team["desk"]["orchestrator"]["bot"] == "decider" and team["desk"]["librarian"]["bot"] == "decider"
+    line = [l for l in T.card(team).splitlines() if "`valedia-trading-decider`" in l][0]
+    assert line.startswith("- Proposer (`valedia-trading-decider`):") and "panel" not in line and "votes" not in line
+    seats = {(r[0], r[1]) for r in T.table(team) if "valedia-trading-decider" in r[2]}
+    assert ("decision panel", "decider") not in seats and ("research round", "proposer (price, macro, fundamentals)") in seats
+
+
+def test_t44_5_the_real_team_and_roster_show_no_drift_from_the_decider_change(tmp_path):
+    team = T.load_team()
+    home = home_for(team, tmp_path)
+    T.sync(team, home, now=NOW)
+    assert T.check(team, home) == []        # against the real panel_roster.json: the Hermes decider is disabled there, the bot is still on the team

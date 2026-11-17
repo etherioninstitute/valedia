@@ -1080,11 +1080,16 @@ def test_a_read_only_open_never_attempts_a_schema_change(tmp_path):
 def test_t44_2_the_default_forecasters_name_elephant_1_and_the_removed_names_are_refused():
     roster = panel_mod.load_roster()
     names = [m.name for m in tm.forecasters(roster=roster)]
-    assert names == ["valedia-trading-decider", "elephant-1"]
+    assert names == ["elephant-1"]                                     # T44-5: Elephant-1 is the only enabled decider
     assert isinstance(tm.forecasters(["elephant-1"], roster=roster)[0], panel_mod.SystemOneMember)
     for gone in ("nimble-v3", "qwen3-8b"):
         with pytest.raises(ValueError, match="not a decider in the panel roster"):
             tm.forecasters([gone], roster=roster)
+    # a member switched off stays in the file and, as before, can still be named here (its stored history keeps its name);
+    # the panel itself never builds it
+    named = tm.forecasters(["valedia-trading-decider"], roster=roster)
+    assert [(m.name, type(m)) for m in named] == [("valedia-trading-decider", panel_mod.HermesProfileMember)]
+    assert "valedia-trading-decider" not in [m.name for m in panel_mod.build_panel(roster).members]
 
 
 def test_t44_2_an_open_question_answered_under_the_old_name_is_kept_and_scored_beside_the_new_seat():
