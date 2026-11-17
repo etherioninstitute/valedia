@@ -73,6 +73,9 @@ class Exchange:
         self.place_mode = "ok"
         self.cancel_mode = "ok"                              # "ignore": the cancel is answered but the order stays open
         self.bp = "1000"                                     # the Events balance: buying power only (None: left out)
+        self.cash = None                                     # cents: when set, buying power is this, moved by each fill
+        self.charged_extra = 0                               # cents a sale costs beyond the fee the venue reports
+        self.fees_given, self.price_given = True, True      # False: the order row withholds the fee or the price
         self.account_v2 = SimpleNamespace(get_account_list=lambda: self._log(("accounts",), ACCOUNTS),
                                           get_account_balance=lambda a: self._log(("balance",), self._balance()),
                                           get_account_position=lambda a: self._log(("positions",), self._rows()))
@@ -87,7 +90,8 @@ class Exchange:
     def _balance(self):
         if self.bp == "raise":
             raise ServerException("INTERNAL", "boom", 500)
-        entry = {"currency": "USD"} if self.bp is None else {"currency": "USD", "buying_power": self.bp}
+        bp = self.bp if self.cash is None else f"{self.cash / 100:.2f}"
+        entry = {"currency": "USD"} if bp is None else {"currency": "USD", "buying_power": bp}
         return {"total_asset_currency": "USD", "account_currency_assets": [entry]}
 
     def _rows(self):
@@ -118,16 +122,22 @@ class Exchange:
         if o["side"] == "BUY" and name in self.asks and limit >= self.asks[name]:
             o.update(status="FILLED", filled=q, price=str(self.asks[name]))
             self.held[name] = self.held.get(name, 0) + q
+            if self.cash is not None:                        # the price of each contract and the one 0.01 fee entry
+                self.cash -= int(self.asks[name] * 100) * q + 1
         elif o["side"] == "SELL" and name in self.bids and limit <= self.bids[name]:
             o.update(status="FILLED", filled=q, price=str(self.bids[name]))
             self.held[name] = self.held.get(name, 0) - q
+            if self.cash is not None:
+                self.cash += int(self.bids[name] * 100) * q - 1 - self.charged_extra
 
     def _row(self, cid):
         o = self.orders[cid]
-        fees = [] if o["status"] == "CANCELLED" else [{"type": "EXCHANGE_FEE", "actual_value": "0.01", "receivable_value": "0.01"}]
+        fees = [] if o["status"] == "CANCELLED" or not self.fees_given else [
+            {"type": "EXCHANGE_FEE", "actual_value": "0.01", "receivable_value": "0.01"}]
         return {"client_order_id": cid, "order_id": "ORD-1", "symbol": o["symbol"], "side": o["side"], "status": o["status"],
                 "fees": fees, "commission": {}, "order_type": "LIMIT", "instrument_type": "EVENT", "entrust_type": "QTY",
-                "total_quantity": o["quantity"], "filled_quantity": str(o["filled"]), "filled_price": o["price"],
+                "total_quantity": o["quantity"], "filled_quantity": str(o["filled"]),
+                "filled_price": o["price"] if self.price_given else "0",
                 "limit_price": o["limit_price"], "time_in_force": "DAY", "event_outcome": o["event_outcome"]}
 
     def _detail(self, a, cid):
@@ -705,7 +715,8 @@ def test_the_17_november_case_with_no_earlier_reading_is_pending_until_a_person_
     w.markets[T] = TONIGHT
     out = w.run(reconcile_only=True)
     assert pending(out, w), out
-    assert "no earlier reading" in out["reason"] and "--confirm-settlement" in out["reason"]
+    assert "no earlier clean reading" in out["reason"] and "--confirm-settlement" in out["reason"]
+    assert "payouts expected 0 cents" in out["reason"]
     p = w.entries("settlement_pending")
     assert len(p) == 1 and p[0]["symbol"] == f"{T}:yes" and p[0]["kalshi"] == TONIGHT and p[0]["price"] == 0.0
     pid = p[0]["pending_id"]
@@ -1006,9 +1017,13 @@ def test_a_held_loss_settles_only_when_the_cash_is_unchanged_to_the_cent(tmp_pat
     w = baseline_world(tmp_path)                                          # a clean reading of 1000 with T held
     out = vanish(w, {f"{T}:yes": TONIGHT}, bp)
     assert (settled(out, w) if ok else pending(out, w)), out
+    assert out["win_cash_observed"] is False                             # a loss never sets the flag
     if not ok:                                                            # e.g. sold by hand for 0.60: never a settlement
         assert "difference of" in out["reason"] and w.state().settlements() == []
-        assert out["win_cash_observed"] is False
+        moved = int(round(float(bp) * 100)) - 100000
+        for words in ("buying power 100000 cents at reading", f"{100000 + moved} cents at reading",
+                      "the known cash between them 0 cents", "payouts expected 0 cents", f"a difference of {moved} cents"):
+            assert words in out["reason"], (words, out["reason"])
 
 
 @pytest.mark.parametrize("bp, ok", [("1002", True), ("1002.00", True), ("1001.99", False), ("1002.01", False),
@@ -1114,14 +1129,20 @@ def test_a_settlement_between_the_two_readings_is_inside_the_known_cash(tmp_path
     assert settled(vanish(w2, {f"{T}:yes": WIN}, "1002"), w2, n=2)
 
 
-def test_a_fill_without_a_fee_makes_the_known_cash_unknown(tmp_path, monkeypatch):
-    w = bought_world(tmp_path)
-    real = OrderLedger.fills
-    monkeypatch.setattr(OrderLedger, "fills", lambda self, tag=None: [{**f, "fee": None} for f in real(self, tag)])
+@pytest.mark.parametrize("withheld", ["fee", "price", None])
+def test_a_fill_without_a_fee_or_a_price_makes_the_known_cash_unknown(tmp_path, withheld):
+    w = World(tmp_path)
+    w.exchange.fees_given, w.exchange.price_given = withheld != "fee", withheld != "price"
+    w.quote(f"{T}:yes", 0.70, 0.71)
+    assert buy(w)["status"] == "done"
+    w.clock.t += 10
+    assert w.run(reconcile_only=True)["status"] == "done"
+    w.clock.t = NOW
     out = vanish(w, {f"{T}:yes": WIN}, "1001")
-    assert pending(out, w) and "known cash" in out["reason"], out
-    monkeypatch.setattr(OrderLedger, "fills", lambda self, tag=None: [{**f, "price_covers_units": 0.5} for f in real(self, tag)])
-    assert pending(w.run(reconcile_only=True), w)
+    if withheld:
+        assert pending(out, w) and "known cash" in out["reason"], out
+    else:                                                                 # the other way: both given, it settles
+        assert settled(out, w), out
 
 
 # ---- R2: the time guard uses the time the ledger submitted the order
@@ -1211,21 +1232,181 @@ def test_the_inner_guards_on_their_own():
     with pytest.raises(ep.NotSettled, match="open"):
         ep._settle_blockers(f"{T}:yes", unapplied=set(), busy={f"{T}:yes"})
     assert ep._settle_blockers(f"{T}:yes", unapplied={"KXB-1:no"}, busy={"KXB-1:no"}) is None
-    fills = [{"symbol": f"{T}:yes", "units": 2.0}, {"symbol": f"{T}:yes", "units": -1.0}, {"symbol": "KXB-1:no", "units": 3.0}]
+    led, venue = OrderLedger(), CashVenue()
+    trade(led, venue, f"{T}:yes", 2, [(2, 50, 1)])
+    trade(led, venue, f"{T}:yes", -1, [(1, 60, 1)])
+    trade(led, venue, "KXB-1:no", 3, [(3, 20, 1)])
+    fills = led.fills()
     assert ep._program_owned(f"{T}:yes", fills, []) == 1.0
     assert ep._program_owned(f"{T}:yes", fills, [{"symbol": f"{T}:yes", "program_units": 1.0}]) == 0.0
     assert ep._program_owned(f"{T}:yes", fills, [{"symbol": "KXB-1:no", "program_units": 3.0}]) == 1.0
 
 
-def test_known_cash_in_cents_on_its_own():
-    f = lambda units, price, fee, pcu=None: {"units": units, "price": price, "fee": fee, "applied": 1,
-                                              "price_covers_units": units if pcu is None else pcu}
-    assert ep.known_cents([f(1.0, 0.71, 0.01), f(-1.0, 0.70, 0.01)], []) == (-3, None)
+class CashVenue:
+    """A venue for the real OrderLedger that keeps its own cash in cents. A purchase pays price times contracts plus
+    the fee; a sale brings price times contracts less the fee; a settlement pays 1.00 a contract on a win. It reports
+    the filled amount, the average over everything filled and the fee total, as the ledger's protocol says."""
+    name = "cash-events"
+
+    def __init__(self):
+        self.cash, self.held, self.orders = 100000, {}, {}
+        self.give_price, self.give_fee = True, True
+
+    def submit(self, symbol, units, tag, price=None, limit_price=None):
+        self.orders[tag] = {"symbol": symbol, "units": units, "filled": 0, "value": 0, "fee": 0, "state": "open"}
+        return {"status": "accepted", "venue_order_id": tag}
+
+    def fill(self, tag, qty, price_cents, fee_cents):
+        o = self.orders[tag]
+        o["filled"] += qty
+        o["value"] += price_cents * qty
+        o["fee"] += fee_cents
+        buy = o["units"] > 0
+        self.cash += (-price_cents * qty if buy else price_cents * qty) - fee_cents
+        self.held[o["symbol"]] = self.held.get(o["symbol"], 0) + (qty if buy else -qty)
+        o["state"] = "filled" if o["filled"] == abs(o["units"]) else "partly_filled"
+
+    def order_status(self, tag):
+        o = self.orders.get(tag)
+        if o is None:
+            return None
+        avg = o["value"] / o["filled"] / 100 if o["filled"] and self.give_price else None
+        fee = o["fee"] / 100 if o["filled"] and self.give_fee else None
+        return {"state": o["state"], "filled_units": float(o["filled"]), "avg_price": avg, "fee": fee,
+                "venue_order_id": tag, "raw_status": o["state"]}
+
+    def cancel(self, tag):
+        o = self.orders[tag]
+        if o["state"] in ("open", "partly_filled"):
+            o["state"] = "cancelled"
+
+    def positions(self):
+        return {k: float(v) for k, v in self.held.items() if v}
+
+
+def book_of_ledger(led, settlements):
+    out = {}
+    for f in led.fills():
+        if f["applied"]:
+            out[f["symbol"]] = out.get(f["symbol"], 0.0) + float(f["units"])
+    for r in settlements:
+        out[r["symbol"]] = out.get(r["symbol"], 0.0) - float(r["units"])
+    return {k: v for k, v in out.items() if abs(v) > 1e-9}
+
+
+def read(led, venue, settlements):
+    """A reconcile as the program makes it, the fills applied, then the known cash."""
+    led.reconcile(venue, book_of_ledger(led, settlements))
+    led.mark_applied([f["id"] for f in led.unapplied_fills()])
+    return ep.known_cents(led.fills(), settlements)
+
+
+_TAGS = iter(range(10 ** 9))
+
+
+def trade(led, venue, symbol, units, pieces, settlements=(), cancel_after=False, readings=None):
+    """One order through the real ledger: intended, sent once, filled in `pieces` (contracts, price cents, fee cents),
+    each piece read by a reconcile; cancelled after its pieces when asked; read once more at the end. Each reading is
+    kept in `readings` with the venue's cash at that moment."""
+    tag = f"t{next(_TAGS)}"
+    read(led, venue, list(settlements))                                   # submit needs a recent clean reconcile
+    led.intend(tag, symbol, float(units), 0.5, limit_price=0.99 if units > 0 else 0.01)
+    assert led.submit_once(venue, tag)["state"] == "accepted"
+    for qty, price, fee in pieces:
+        venue.fill(tag, qty, price, fee)
+        got = read(led, venue, list(settlements))
+        if readings is not None:
+            readings.append((got, venue.cash))
+    if cancel_after:
+        venue.cancel(tag)
+    got = read(led, venue, list(settlements))
+    if readings is not None:
+        readings.append((got, venue.cash))
+    return tag
+
+
+def test_known_cash_follows_the_ledger_as_it_stores_a_purchase_and_a_sale():
+    led, venue = OrderLedger(), CashVenue()
+    trade(led, venue, f"{T}:yes", 1, [(1, 71, 1)])
+    trade(led, venue, f"{T}:yes", -1, [(1, 70, 1)])
+    sale = [f for f in led.fills() if f["units"] < 0]
+    assert [(f["units"], f["price"], f["price_covers_units"], f["fee"]) for f in sale] == [(-1.0, 0.7, 1.0, 0.01)]
+    assert ep.known_cents(led.fills(), []) == (-3, None) and venue.cash - 100000 == -3
     assert ep.known_cents([], [{"units": 2.0, "price": "1.00"}, {"units": 1.0, "price": "0.00"}]) == (200, None)
-    for bad in (f(1.0, None, 0.01), f(1.0, 0.71, None), f(1.0, 0.71, 0.01, pcu=0.5), f(1.0, 0.715, 0.01),
-                f(1.0, 0.71, 0.001), {**f(1.0, 0.71, 0.01), "applied": 0}, f(float("nan"), 0.71, 0.01)):
-        cents, why = ep.known_cents([bad], [])
-        assert cents is None and why, bad
+
+
+@pytest.mark.parametrize("withheld", ["price", "fee", "unapplied", None])
+def test_known_cash_is_unknown_when_the_venue_withholds_a_piece(withheld):
+    led, venue = OrderLedger(), CashVenue()
+    venue.give_price, venue.give_fee = withheld != "price", withheld != "fee"
+    trade(led, venue, f"{T}:yes", 2, [(1, 40, 1), (1, 42, 1)])
+    fills = led.fills()
+    if withheld == "unapplied":
+        fills = [{**fills[0], "applied": 0}] + fills[1:]
+    cents, why = ep.known_cents(fills, [])
+    if withheld:
+        assert cents is None and why, withheld
+    else:
+        assert (cents, why) == (-84, None) and venue.cash - 100000 == -84
+
+
+def test_known_cash_takes_a_late_price_and_a_late_fee_as_the_ledger_writes_them():
+    led, venue = OrderLedger(), CashVenue()
+    venue.give_price = False
+    tag = trade(led, venue, f"{T}:yes", 2, [(2, 33, 1)])
+    assert ep.known_cents(led.fills(), [])[0] is None                     # not priced yet: unknown
+    venue.give_price = True
+    venue.orders[tag]["fee"] += 1                                          # the venue posts one more cent of fee
+    venue.cash -= 1
+    assert read(led, venue, []) == (venue.cash - 100000, None) == (-68, None)
+
+
+@pytest.mark.parametrize("seed", range(200))
+def test_known_cash_change_equals_the_venues_cash_change_at_every_reading(seed):
+    # purchases, sales, partial fills (some then cancelled), late fees and settlements, all through the real ledger
+    rng = random.Random(seed)
+    led, venue, settlements = OrderLedger(), CashVenue(), []
+    names = [f"KXP{i}-26NOV20-B{i}:{rng.choice(['yes', 'no'])}" for i in range(3)]
+    start = venue.cash
+    readings = [(read(led, venue, []), venue.cash)]
+    for _ in range(rng.randint(3, 10)):
+        held = book_of_ledger(led, settlements)
+        gone = {r["symbol"] for r in settlements}
+        live = [n for n in names if n not in gone]
+        sellable = [n for n in live if held.get(n, 0.0) >= 1]
+        kind = rng.choice(["buy", "buy", "sell", "settle", "fee"]) if sellable else "buy"
+        if kind in ("buy", "sell") and live:
+            name = rng.choice(live if kind == "buy" else sellable)
+            size = rng.randint(1, 5) if kind == "buy" else rng.randint(1, int(held[name]))
+            cut = rng.randint(1, size)
+            pieces = [(q, rng.randint(1, 99), rng.randint(0, 3)) for q in _split(rng, cut)]
+            trade(led, venue, name, size if kind == "buy" else -size, pieces, settlements, cancel_after=cut < size,
+                  readings=readings)
+            continue
+        if kind == "settle":
+            name = rng.choice(sellable)
+            units, win = held[name], rng.random() < 0.5
+            venue.held[name] = 0
+            venue.cash += int(units) * 100 if win else 0
+            settlements.append({"symbol": name, "units": units, "price": "1.00" if win else "0.00"})
+        elif kind == "fee":                                               # a fee posted late on a filled order
+            done = [t for t, o in venue.orders.items() if o["filled"]]
+            if done:
+                venue.orders[rng.choice(done)]["fee"] += 1
+                venue.cash -= 1
+        readings.append((read(led, venue, settlements), venue.cash))
+    assert len(readings) >= 4
+    for got, cash in readings:                                            # exactly, in cents, at every reading
+        assert got == (cash - start, None), (seed, got, cash - start)
+
+
+def _split(rng, n):
+    out = []
+    while n:
+        q = rng.randint(1, n)
+        out.append(q)
+        n -= q
+    return out
 
 
 # ---- the state file's layout 4, migrated from layout 1 with the baseline and sends untouched
@@ -1357,3 +1538,72 @@ def test_a_layout_3_file_of_4c58a4f_with_an_open_pending_record_is_refused_uncha
     with pytest.raises(ep.PracticeError):
         ep.PracticeState(p)
     assert p.read_bytes() == data
+
+
+# ---- a sale through the real ledger, then a settlement: the equation still decides
+
+@pytest.mark.parametrize("result, off", [("yes", 0), ("no", 0), ("yes", 1), ("no", 1)])
+def test_after_a_sale_a_later_settlement_still_rests_on_the_equation(tmp_path, result, off):
+    w = World(tmp_path)
+    w.exchange.cash = 100000
+    assert w.run(reconcile_only=True)["status"] == "done"                # nothing held; a reading of 1000.00
+    w.quote(f"{T}:yes", 0.70, 0.71)
+    assert buy(w)["status"] == "done"                                     # A at 0.71 and 0.01
+    w.clock.t += 10
+    w.quote(f"{OTHER}:yes", 0.40, 0.41)
+    assert w.run(ticker=OTHER, outcome="yes", contracts=1, side="buy")["status"] == "done"   # B at 0.41 and 0.01
+    w.clock.t += 10
+    w.exchange.charged_extra = off                                        # the venue takes a cent more than it reports
+    assert sell(w)["status"] == "done"                                    # A sold at 0.70 less 0.01, after the reading
+    sale = [f for f in w.entries("fill") if f["units"] < 0]
+    assert [(f["units"], f["price"], f["price_covers_units"], f["fee"]) for f in sale] == [(-1.0, 0.70, 1.0, 0.01)]
+    w.clock.t = NOW
+    w.exchange.held[f"{OTHER}:yes"] = 0
+    w.markets[OTHER] = {**(WIN if result == "yes" else TONIGHT), "ticker": OTHER}
+    w.exchange.cash += 100 if result == "yes" else 0
+    out = w.run(reconcile_only=True)
+    if off:
+        assert pending(out, w) and "a difference of -1 cents" in out["reason"], out
+    else:
+        assert settled(out, w), out
+        assert w.entries("settlement")[0]["witnesses"] == "kalshi_record+cash_equation"
+        assert out["win_cash_observed"] is (result == "yes")
+
+
+def test_a_confirmation_is_refused_when_a_late_fill_changed_the_expected_holding(tmp_path):
+    w = World(tmp_path)
+    w.quote(f"{T}:yes", 0.70, 0.71)
+    assert buy(w, contracts=2, limit="0.50")["status"] == "done"          # rests
+    cid = w.exchange.placed()[-1]["client_order_id"]
+    w.exchange.orders[cid].update(status="CANCELLED", filled=1, price="0.50")   # one filled, the rest cancelled
+    w.exchange.held[f"{T}:yes"] = 1
+    w.clock.t += 10
+    assert w.run(reconcile_only=True)["status"] == "done"
+    w.clock.t = NOW
+    assert pending(vanish(w, {f"{T}:yes": TONIGHT}, "1000"), w)
+    p = w.state().open_pending()[0]
+    assert p["units"] == 1.0
+    w.exchange.orders[cid]["filled"] = 2                                  # a late fill posted on the finished order
+    assert pending(w.run(reconcile_only=True), w)                         # applied; the record waits
+    before = person_state(w)
+    out = confirm(w, p["id"])
+    assert out["status"] == "refused" and "expects 2" in out["reason"], out
+    assert person_state(w) == before
+
+
+def test_a_confirmation_is_refused_when_kalshi_now_gives_another_result(tmp_path):
+    w, pid = pending_world(tmp_path)                                      # pending on "no": 0.00 a contract
+    before = person_state(w)
+    w.markets[T] = WIN
+    out = confirm(w, pid)
+    assert out["status"] == "refused" and "another result" in out["reason"] and person_state(w) == before, out
+    w.markets[T] = TONIGHT
+    assert confirm(w, pid)["status"] == "confirmed"
+
+
+def test_a_win_settled_by_a_person_leaves_the_flag_false(tmp_path):
+    w = baseline_world(tmp_path)
+    assert pending(vanish(w, {f"{T}:yes": WIN}, "1000.50"), w)
+    pid = w.entries("settlement_pending")[0]["pending_id"]
+    assert confirm(w, pid)["status"] == "confirmed"
+    assert w.state().win_cash_observed() is False and w.run(reconcile_only=True)["win_cash_observed"] is False
