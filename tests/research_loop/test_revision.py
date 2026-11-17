@@ -1,4 +1,6 @@
+import dataclasses
 import json
+import re
 
 import numpy as np
 import pandas as pd
@@ -34,12 +36,12 @@ def crippled(version="1.0.0"):
 EXPENSIVE = CostModel(fees_bps=25.0, slippage_bps=25.0, borrow_annual=0.02, funding_annual=0.0)
 
 
-def desk(tmp_path, prices, criteria=None, cost=COST):
+def desk(tmp_path, prices, criteria=None, cost=COST, prediction=PRED):
     paths = LoopPaths(tmp_path).ensure()
     ledger = lg.HypothesisLedger(paths.ledger)
     g = gt.Gauntlet(prices, None, cost, ledger, paths, criteria)
     hid = ledger.propose("Assets with a persistent drift keep drifting the same way", "price-analyst", "synthetic")
-    gt.write_prediction(ledger, paths, hid, "trend_fix", PRED)
+    gt.write_prediction(ledger, paths, hid, "trend_fix", prediction)
     return paths, ledger, g, hid
 
 
@@ -66,7 +68,8 @@ def test_proposer_reads_the_report_and_separates_how_from_what():
 
 
 def test_a_repairable_strategy_is_repaired_and_every_probe_is_counted(tmp_path):
-    paths, ledger, g, hid = desk(tmp_path, market(), cost=EXPENSIVE)
+    # T39-2b: on constant drifts the repaired rule earns exposure, not timing: the idea states the exposure claim
+    paths, ledger, g, hid = desk(tmp_path, market(), cost=EXPENSIVE, prediction=dataclasses.replace(PRED, claim="exposure"))
     base = crippled()
     first = g.develop(hid, base, "strategies/trend_fix.json")
     assert first["verdict"] == "fail" and first["exits"]["stop loss"]["count"] > 0
@@ -129,3 +132,14 @@ def test_a_pairs_strategy_is_refused_cleanly_and_nothing_is_counted(tmp_path):
     with pytest.raises(st.SpecError, match="only rule strategies can be revised"):
         rv.RevisionEngine(g, ledger, paths).revise(hid, s)
     assert ledger.variations(hid) == before and not (paths.backtests / "trend_fix-revisions.json").exists()
+
+
+def test_an_edge_claims_revision_lesson_states_its_own_checks_not_the_deflated_sharpe(tmp_path):
+    """T39-2b: for an edge claim the Deflated Sharpe decides nothing, so the lesson states the one-trial Sharpe test
+    and the timing p instead."""
+    paths, ledger, g, hid = desk(tmp_path, market(seed=1, drift=(0.0,) * 6), gt.Criteria(max_revisions=3))
+    base = crippled()
+    g.develop(hid, base, "strategies/trend_fix.json")
+    rv.RevisionEngine(g, ledger, paths, k=1).revise(hid, base)
+    lines = [ln for ln in ledger.get(hid)["lessons_learned"].splitlines() if re.search(r"Revision v[\d.]+: .*\. Sharpe -?\d", ln)]
+    assert lines and all("one-trial Sharpe test" in ln and "timing p" in ln and "Deflated Sharpe" not in ln for ln in lines), lines

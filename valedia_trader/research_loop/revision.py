@@ -46,6 +46,19 @@ def _set(path: str, value) -> dict:
     return {"op": "set", "path": path, "value": value}
 
 
+
+def _bar_text(report: dict) -> str:
+    """What the lesson says about the bar the revision met: for an edge claim its two checks (the Deflated Sharpe decides
+    nothing there), otherwise the Deflated Sharpe as before."""
+    if report.get("claim", "edge") == "edge" and "timing" in report:
+        t, one = report["timing"], report["deflated_sharpe"].get("one_trial")
+        p = t.get("drawn_p_value") if t.get("region") == "drawn" else t.get("p_exact")
+        return (f"one-trial Sharpe test {one if one is None else format(one, '.3f')}, timing p "
+                f"{p if p is None else format(p, '.5f')} ({t.get('region') or 'unavailable'}) against 0.05 / "
+                f"{t.get('attempts_counted')} after {t.get('attempts_counted')} attempts in the ledger.")
+    return (f"Deflated Sharpe {report['deflated_sharpe']['value']:.3f} after "
+            f"{report['deflated_sharpe']['variations_of_idea']} variations.")
+
 class SpecProposer:
     """Edits for a rule-library strategy, read off its test report. INV edits change how positions
     are managed; DOM edits change the signal or where it is applied. Each kind is proposed at most
@@ -190,8 +203,7 @@ class RevisionEngine:
             record.update({"composed": layer.rationale, "sharpe": report["result"].get("sharpe"), "verdict": report["verdict"],
                            "deflated_sharpe": report["deflated_sharpe"]["value"], "regressed": archive.regressed(child.candidate_id)})
             ledger.add_lesson(hypothesis_id, f"Revision v{version}: {layer.rationale}. Sharpe {evidence[parent.candidate_id]['score']:.2f} -> "
-                              f"{report['result'].get('sharpe', float('nan')):.2f}, Deflated Sharpe {report['deflated_sharpe']['value']:.3f} after "
-                              f"{report['deflated_sharpe']['variations_of_idea']} variations."
+                              f"{report['result'].get('sharpe', float('nan')):.2f}, " + _bar_text(report)
                               + (" It regressed and will not be built on." if record["regressed"] else ""), "revision")
         best = archive.best()
         passed = str(verdicts[best.candidate_id]).startswith("pass")
