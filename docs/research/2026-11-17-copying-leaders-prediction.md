@@ -1,6 +1,6 @@
 # Copying the leaders of a prediction market: prediction written before any look (2026-11-17)
 
-Written 2026-11-17, about 08:50 UTC, before any program for this test exists. The owner asked (2026-11-17)
+Written 2026-11-17 and committed at 08:46 UTC, before any program for this test exists. The owner asked (2026-11-17)
 whether Valedia could copy the positions of the top five or ten traders on Polymarket's leaderboard, find the
 same questions on Webull, and have Elephant-1 judge them. Before any of that is built, this asks the question
 it all rests on, on history, cheaply: **after a leader's new position has become visible, is the price still
