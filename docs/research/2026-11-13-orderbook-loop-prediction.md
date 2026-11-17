@@ -419,7 +419,7 @@ were made (slots 05:19 and 05:24), both ok. The stop of 22 minutes earlier the s
 (decisions resumed in the first minute). A later declaration of a long stop counts the half hour after it as well.
 A later run of this kind is declared here before it happens.
 
-## Amendment: the model's server and file change (declared at 00:40 UTC on 17 November, 16:40 PST on 16 November, before any restart; no answer has been scored)
+## Amendment: the model's server and file change (declared at 00:35 UTC on 17 November, 16:35 PST on 16 November, before any restart; no answer has been scored)
 
 Under note 4 above, and on the owner's instruction of 16 November that every local model on this Mac runs through
 one server, LM Studio, and none through Ollama.
