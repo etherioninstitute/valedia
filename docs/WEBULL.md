@@ -173,9 +173,12 @@ Live mode exists only as attended commands, run by you at a terminal, from the r
     .venv/bin/python -m valedia_trader.research_loop order-step --live --propose --capital C
     .venv/bin/python -m valedia_trader.research_loop order-step --live --approve NUMBER --capital C
 
-`--check` sends nothing: it prints each lock and, once locks 1 to 3 are met, the class and last 4 characters of the
-account the venue would trade. `--propose` writes a ticket and sends nothing; `--approve NUMBER` sends only that
-ticket's orders, each after fresh checks. Whole shares only (`--fractional` is refused).
+`--check` places nothing: it prints each lock and, once locks 1 to 3 are met, reads the production account: it
+connects to `api.webull.com` with the live pair (Webull may ask for a one-time approval in its app the first time the
+key is used) and asks for the account list, to print the class and last 4 characters of the account the venue would
+trade. It places, changes or cancels no order. `--propose` writes a ticket and sends no order; `--approve NUMBER` sends
+only that ticket's orders, each after fresh checks. Whole shares only (`--fractional` is refused). The command line
+takes no abbreviation of any flag: `--liv`, `--li`, `--l` and every other prefix are errors, never `--live`.
 
 **The live key pair** lives in a file of its own, `~/.hermes/secrets/webull-live.env`, beside `trading.env`. The code
 computes the place exactly as `<home>/.hermes/secrets/webull-live.env`, where `<home>` is your home folder as the
@@ -184,13 +187,28 @@ system's user record gives it (not `$HOME`), so no environment variable moves it
     WEBULL_LIVE_APP_KEY=...
     WEBULL_LIVE_APP_SECRET=...
 
+The format is exact: the two names once each, in either order, each line `NAME=value` ended by a single line feed (the
+last one may be left off), and nothing else: no comment, no blank line, no `export`, no quote, no space or tab
+anywhere, no carriage return (CRLF line ends are refused), no byte-order mark, only printable ASCII in a value, and a
+value of 8 to 512 characters. Every departure is a refusal that names it (a byte-order mark as a byte-order mark, a
+carriage return as a carriage return) and shows no value.
+
 It must be a regular file (not a link, no link in a folder above it, one name on disk) and yours. It must not be
 readable or writable by your group or others: mode 600 or 400 passes, 644 is refused (stricter than the owner's JSON
 files, which may be 644, because this file holds a key). The folder that holds it, `~/.hermes/secrets/`, must be yours
-and writable by you alone; that is the one folder checked (the folders above it are checked for links only). Any other
-line, a repeated name, an empty value
-or wrong permissions is a refusal that names the fault and shows no value. Only the live commands read it. They never
-take a key from the process environment or from `trading.env`, fix the environment to production and the host to
+and writable by you alone; the reader checks that folder each time it reads the file (the folders above it are checked
+for links only); the doctor does not check it. A wrong permission or owner is a refusal that names the fault and
+shows no value.
+
+Only the live commands read it. The ordinary loader (the one every other command uses for `trading.env`) refuses the
+live file however it is named (through `VALEDIA_ENV_FILE`, a link, another spelling of the path or a second name on
+disk: it compares the real paths and the file's device and inode before reading anything), and refuses any file that
+names either live name anywhere, setting nothing from it; the refusal names the fault and no value. One exception
+remains, outside this change: the alerts commands (`python -m valedia_trader.core.alerts`) read the trading file's
+bytes themselves before handing it to the loader, so pointed at the live file they read it into memory (never into
+the environment or any output) before they refuse.
+
+The live commands never take a key from the process environment or from `trading.env`, fix the environment to production and the host to
 `api.webull.com` in code, pass no account id (the account is chosen by the class in your confirmation, and its last 4
 characters are checked before any other account read), and refuse when `trading.env` or the process environment holds
 `WEBULL_ENV` other than `sandbox` (absent counts as `sandbox`) or either live name: `trading.env` stays a practice
@@ -199,16 +217,22 @@ file. The values are handed to the output guard, so they are masked in anything 
 **Needs a terminal.** Every live command, `--check` included, refuses when standard input is not a terminal, so a
 job, a pipe or a schedule cannot run it. This stops an accident only: a program that fakes a terminal is not caught by
 it. The other half is the doctor's `jobs` check: it fails, naming the file, when any job file in `tools/launchd/`, any
-installed LaunchAgent whose label starts with `com.valedia.`, or any file such an agent's program arguments name (one
-level down) holds `--live` or either live name.
+installed LaunchAgent whose label starts with `com.valedia.`, or any script such a job runs (one level down: its
+program given as a path, the first argument after an interpreter such as `bash` or `python`, any argument ending in
+`.sh`, `.zsh`, `.bash`, `.py` or `.command`) holds `--live` or either live name. A property list is read as launchd
+reads it, text or binary, and every string in it is tested as well as its raw text. Anything the check cannot read or
+find (a folder, a job file, a property list it cannot parse, a script a job runs) fails the check, named, and a
+folder that does not exist on this machine is said to be so.
 
 **Practice runs never reach production.** The order step without `--live` (the 06:55 and 07:10 jobs), the events
 probe (`python -m valedia_trader.venues.webull_events probe`) and the connection check
 (`python -m valedia_trader.venues.webull check`) refuse to build a venue when either live name is in their process
-environment or in `trading.env`, refuse any environment or host but the test one, and never open `webull-live.env`.
-The doctor's `venues` check fails and the owner page flags a row while a live name is in reach. The event practice
-(`python -m valedia_trader.execution_and_risk.event_practice`) is refused by the venue builder it shares (its line
-names only the error's class); its own refusal, naming the live name, is not built yet.
+environment or in `trading.env`, refuse any environment or host but the test one, and never open `webull-live.env`
+(pointed at it, the ordinary loader refuses it before reading). The doctor's `venues` check fails while a live name is
+in reach, and fails, saying why, when `trading.env` cannot be loaded. The owner page flags a row while a live name is
+in the process environment, and is not built, saying so, when `trading.env` names one or is the live file. The event
+practice (`python -m valedia_trader.execution_and_risk.event_practice`) is refused by the loader and the venue builder
+it shares (its line names only the error's class); its own refusal, naming the live name, is not built yet.
 
 **The files only you write**, each read without trusting it (a link, a second name, a file others can write, a
 repeated key, NaN and the rest are refused):
