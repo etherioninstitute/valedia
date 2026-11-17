@@ -1228,7 +1228,8 @@ class Addendum2(Base):
         self.assertEqual(damaged, 3); self.assertEqual(OP.streaks(rows)['9']['streak'], 2)       # neither reset nor counted
 
     def test_6_every_append_is_synced(self):
-        self.main(RUN); self.assertGreaterEqual(len(self.w.fsyncs), 1)
+        self.main(RUN); self.assertEqual(len(self.w.fsyncs), 2)          # a new file: the file and its folder
+        self.main(RUN); self.assertEqual(len(self.w.fsyncs), 3)          # an existing file: the file itself
 
     # ---- 7: the intent to restore is set before the bootout
     def test_7_ctrl_c_right_after_the_bootout_still_bootstraps(self):
