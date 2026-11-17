@@ -15,6 +15,7 @@ def load(name):
 
 OP = load('mirofish_operator')
 T0 = 1794830400.0                      # 2026-11-16 12:00 UTC
+START = T0 + 600                        # the world starts 10 minutes past a full hour: clear of the pick reader's window
 SCHEMA = """CREATE TABLE decisions (id INTEGER PRIMARY KEY, watch_id INTEGER, ticker TEXT, slot_iso TEXT, slot_ts REAL,
     decision_iso TEXT, decision_ts REAL, status TEXT, forced INTEGER, battery_id TEXT, state_json TEXT, request_sha256 TEXT,
     model_tag TEXT, model_digest TEXT, latency_s REAL, raw_response TEXT, answers_json TEXT, input_tokens INTEGER,
@@ -25,6 +26,8 @@ PICKS_PLIST = '/fake/LaunchAgents/com.valedia.picks.hourly.plist'
 OBSERVER_PID, OBSERVER_START = 5151, 'Mon Nov 16 12:00:05 2026'
 LAUNCHER_PID, LAUNCHER_START = 4242, 'Mon Nov 16 12:00:04 2026'
 LINK_OFF = 'You have disabled LM Link. To re-enable it, run lms link enable.\n'
+TOOL_PID, TOOL_PARENT, TOOL_START = 3131, 3030, 'Mon Nov 16 11:59:00 2026'      # the operator tool itself and its parent
+NEAR_NEUTRAL = 'derived report not usable evidence'          # src/mirofish_provenance.py:437, via mirofish_native_run.py:806
 
 
 def decision_entry():
@@ -60,12 +63,15 @@ class FakeLauncher:
             receipt = copy.deepcopy(w.receipt)
             if termed is not None:
                 receipt.update(complete=False, failure={'type': 'NativeRefused', 'reason': 'supervisor interrupted'})
-            (self.work / 'builder/native-run-receipt.json').write_text(json.dumps(receipt))
+            if w.receipt_raw is not None:
+                (self.work / 'builder/native-run-receipt.json').write_text(w.receipt_raw)
+            elif w.write_receipt:
+                (self.work / 'builder/native-run-receipt.json').write_text(json.dumps(receipt))
             (self.work / 'builder/gateway-ledger.json').write_text(json.dumps(w.ledger))
             if w.procs.get(LAUNCHER_PID, {}).get('termed_at') is not None and w.native_left_after_interrupt:
                 w.models['models'].append({'key': 'qwen3-8b', 'type': 'llm', 'loaded_instances': [{'id': 'mf-native-left', 'config': {}}]})
             w.procs.pop(OBSERVER_PID, None); w.procs.pop(LAUNCHER_PID, None)
-            self.returncode = 0 if receipt.get('complete') else 1
+            self.returncode = w.exit_override if w.exit_override is not None else (0 if receipt.get('complete') else 1)
         return self.returncode
 
     def wait(self, timeout=None):
@@ -100,7 +106,7 @@ class FakeLoadPath:
 
 class World:
     def __init__(self, tmp):
-        self.tmp = Path(tmp); self.t = T0 + 30            # half a minute past a full hour: clear of the pick reader's start
+        self.tmp = Path(tmp); self.t = START
         self.store = self.tmp / 'orderbook_loop.sqlite'
         with sqlite3.connect(self.store) as db:
             db.executescript(SCHEMA)
@@ -111,9 +117,14 @@ class World:
         self.link_text = LINK_OFF; self.link_rc = 0
         self.write_identity = True; self.pipeline_writes_identity = True; self.launcher_pgid = LAUNCHER_PID
         self.native_left_after_interrupt = False; self.picks_minute = None
+        self.link_err = ''; self.identity = None; self.write_receipt = True; self.receipt_raw = None; self.exit_override = None
+        self.bootout_raises_after = None; self.bootstrap_raises = None; self.bootstrap_raises_after = None
+        self.fsyncs = []; self.timed = []
         self.free, self.free_after_load, self.pressure, self.swap_mb = 80, 60, 1, 100.0
         self.models = listing(); self.unload_status = 200
-        self.procs = {}; self.calls = []; self.http_calls = []; self.signals = []; self.out = []
+        self.procs = {TOOL_PID: {'start': TOOL_START, 'pgid': TOOL_PARENT, 'ppid': TOOL_PARENT},
+                      TOOL_PARENT: {'start': 'Mon Nov 16 09:00:00 2026', 'pgid': TOOL_PARENT, 'ppid': 1}}
+        self.calls = []; self.http_calls = []; self.signals = []; self.out = []
         self.spawned = []; self.spawn_error = None; self.stage_rc = 0; self.preflight_rc = 0; self.threshold = 56
         self.on_sleep = []; self.run_s = 180; self.cleanup_s = 5; self.identity_start = OBSERVER_START
         self.loads = []; self.unloads_via_pipeline = []; self.load_error = None; self.load_t = None
@@ -122,7 +133,7 @@ class World:
                         'resource': {'lowest_sustained_free_percent_10s': 47, 'max_pressure_level': 1,
                                      'co_resident_rss_bytes_max': 21 * 2**30}}
         self.ledger = {'calls': [{'id': 'c1', 'kind': 'chat', 'state': 'complete'}, {'id': 'c2', 'kind': 'embedding', 'state': 'complete'}]}
-        self.last_minute = int((T0 - 600) // 60)
+        self.last_minute = int((START - 600) // 60)
         self.collector_step()
 
     # ---- the collector writing its store, once a minute
@@ -146,9 +157,9 @@ class World:
 
     # ---- commands
     def run(self, argv, cwd=None, env=None, timeout=None):
-        argv = [str(a) for a in argv]; self.calls.append(argv)
+        argv = [str(a) for a in argv]; self.calls.append(argv); self.timed.append((self.t, argv))
         if argv[0].endswith('lms') and argv[1:] == ['link', 'status']:
-            return done(self.link_rc, self.link_text)
+            return done(self.link_rc, self.link_text, self.link_err)
         if argv[:2] == ['/bin/launchctl', 'print']:
             label = argv[2].rsplit('/', 1)[1]
             if label == OP.COLLECTOR_LABEL:
@@ -165,10 +176,16 @@ class World:
         if argv[:2] == ['/bin/launchctl', 'bootout']:
             if self.bootout_rc == 0:
                 self.picks_loaded = False
+            if self.bootout_raises_after:
+                raise self.bootout_raises_after()                  # Ctrl-C right after the bootout took effect
             return done(self.bootout_rc)
         if argv[:2] == ['/bin/launchctl', 'bootstrap']:
+            if self.bootstrap_raises:
+                raise self.bootstrap_raises()                      # before it took effect
             if self.bootstrap_rc == 0 and argv[3] == PICKS_PLIST:
                 self.picks_loaded = True
+            if self.bootstrap_raises_after:
+                raise self.bootstrap_raises_after()
             return done(self.bootstrap_rc)
         if argv == ['/usr/bin/memory_pressure']:
             return done(0, 'The system has 68719476736 (4194304 pages with a page size of 16384).\n'
@@ -181,7 +198,8 @@ class World:
             proc = self.procs.get(int(argv[2]))
             if proc is None:
                 return done(1, '')
-            return done(0, '%d %d %s\n' % (int(argv[2]), proc['pgid'], proc['start']))
+            assert argv[3:] == ['-o', 'pid=,ppid=,pgid=,lstart='], argv          # never a command line
+            return done(0, '%d %d %d %s\n' % (int(argv[2]), proc.get('ppid', 1), proc['pgid'], proc['start']))
         if any(a.endswith('mirofish_native_stage.py') for a in argv):
             work = Path(argv[argv.index('--work') + 1])
             if self.stage_rc:
@@ -204,9 +222,12 @@ class World:
         if self.spawn_error:
             raise self.spawn_error
         work = Path(argv[argv.index('--work') + 1])
-        self.procs[LAUNCHER_PID] = {'start': LAUNCHER_START, 'pgid': self.launcher_pgid}
-        self.procs[OBSERVER_PID] = {'start': OBSERVER_START, 'pgid': OBSERVER_PID}
-        if self.write_identity:
+        self.procs[LAUNCHER_PID] = {'start': LAUNCHER_START, 'pgid': self.launcher_pgid, 'ppid': TOOL_PID}
+        self.procs[OBSERVER_PID] = {'start': OBSERVER_START, 'pgid': OBSERVER_PID, 'ppid': LAUNCHER_PID}
+        if self.identity is not None:
+            (work / 'builder/observer-identity.json').write_text(
+                self.identity if isinstance(self.identity, str) else json.dumps(self.identity))
+        elif self.write_identity:
             (work / 'builder/observer-identity.json').write_text(json.dumps(
                 {'pid': OBSERVER_PID, 'start': self.identity_start, 'pgid': OBSERVER_PID, 'written_utc': '2026-11-16T12:00:05+00:00'}))
         self.launcher = FakeLauncher(self, work); return self.launcher
@@ -216,8 +237,11 @@ class World:
         if pid in self.procs:
             self.procs[pid].setdefault('termed_at', self.t)
 
+    def fsync(self, fd):
+        self.fsyncs.append(fd); os.fsync(fd)
+
     def http(self, method, url, body=None, timeout=None):
-        self.http_calls.append((method, url, copy.deepcopy(body)))
+        self.http_calls.append((method, url, copy.deepcopy(body))); self.timed.append((self.t, [method, url]))
         if method == 'GET' and url.endswith('/api/v1/models'):
             return 200, copy.deepcopy(self.models)
         if method == 'POST' and url.endswith('/api/v1/models/unload'):
@@ -233,7 +257,7 @@ class World:
                       send_signal=self.send_signal, disk_free=lambda path: 400 * 10**9, uid=501, store=self.store,
                       crew=self.crew, record=self.tmp / 'artifacts/runs.jsonl', load_tests=self.tmp / 'artifacts/load-tests',
                       load_path=lambda work, out, profile, hold_s: FakeLoadPath(self, work, out, profile),
-                      out=self.out.append, lms='/fake/bin/lms')
+                      out=self.out.append, lms='/fake/bin/lms', self_pid=TOOL_PID, parent_pid=TOOL_PARENT, fsync=self.fsync)
         values.update(overrides)
         return OP.Host(**values)
 
@@ -249,7 +273,13 @@ class World:
 
     def rows(self, path=None):
         path = path or self.tmp / 'artifacts/runs.jsonl'
-        return [json.loads(line) for line in path.read_text().splitlines()] if path.is_file() else []
+        rows = []
+        for line in (path.read_text().splitlines() if path.is_file() else []):
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                pass                                                 # a torn line (addendum 2, item 6)
+        return rows
 
     def text(self):
         return '\n'.join(str(x) for x in self.out)
@@ -308,12 +338,20 @@ class StoreRules(Base):
 
 class Pure(unittest.TestCase):
     def test_lm_link_wording_addendum_6(self):
-        self.assertTrue(OP.link_disabled(LINK_OFF, 0))
-        self.assertTrue(OP.link_disabled('\n   You have disabled LM Link. To re-enable it, run lms link enable.  \n', 0))
+        self.assertTrue(OP.link_disabled(LINK_OFF, '', 0))
+        self.assertTrue(OP.link_disabled('\n   You have disabled LM Link. To re-enable it, run lms link enable.  \n', '', 0))
         for text, rc in (('You have enabled LM Link.', 0), ('', 0), ('   \n', 0), (LINK_OFF, 1),
                          ('LM Link status\nYou have disabled LM Link.', 0), (LINK_OFF.lower(), 0),
                          ('LM Link: disabled', 0), ('you have disabled LM Link.', 0)):
-            self.assertFalse(OP.link_disabled(text, rc), (text, rc))
+            self.assertFalse(OP.link_disabled(text, '', rc), (text, rc))
+            self.assertFalse(OP.link_disabled('', text, rc), ('stderr', text, rc))     # the same cases on standard error
+
+    def test_lm_link_status_on_standard_error_addendum_2_item_12(self):
+        self.assertTrue(OP.link_disabled('', LINK_OFF, 0))                 # measured: 0 bytes out, the line on stderr, exit 0
+        self.assertTrue(OP.link_disabled(' \n', '\n' + LINK_OFF, 0))       # standard output blank: standard error decides
+        self.assertFalse(OP.link_disabled('', LINK_OFF, 1))
+        self.assertFalse(OP.link_disabled('You have enabled LM Link.', LINK_OFF, 0))   # standard output not empty: it decides
+        self.assertFalse(OP.link_disabled('', '', 0)); self.assertFalse(OP.link_disabled(None, None, 0))
 
     def test_breach_statuses_addendum_1(self):
         def rows(*statuses):
@@ -460,11 +498,11 @@ class Refusals(Base):
         self.assertEqual(self.main(RUN), 0, self.w.text())
 
     def test_a_single_error_in_the_window_does_not_refuse(self):
-        self.w.status = lambda t: 'error' if t == T0 + 60 else 'ok'; self.w.per_minute = 1; self.w.sleep(5 * 60)
+        self.w.status = lambda t: 'error' if t == START + 60 else 'ok'; self.w.per_minute = 1; self.w.sleep(5 * 60)
         self.assertEqual(self.main(RUN), 0, self.w.text())
 
     def test_two_errors_of_three_refuse(self):
-        self.w.status = lambda t: 'error' if t == T0 + 60 else 'ok'; self.w.sleep(5 * 60)   # two a minute: both error
+        self.w.status = lambda t: 'error' if t == START + 60 else 'ok'; self.w.sleep(5 * 60)   # two a minute: both error
         self.assertRefused('two of three')
 
     def test_pick_reader_running_refuses_and_says_when_it_started(self):
@@ -502,11 +540,37 @@ class Refusals(Base):
         self.at_local(0, 30); self.reader(True); self.assertRefused('is running')
 
     def test_c_00_30_reader_idle_again_launches(self):
-        self.at_local(0, 30); self.reader(False)
+        # addendum 2, item 10: the window closes once the reader was seen RUNNING after its minute and is idle again
+        self.at_local(0, 20); self.reader(True); self.assertEqual(self.main(RUN), 2, self.w.text())
+        self.w.sleep(10); self.reader(False)
         self.assertEqual(self.main(RUN), 0, self.w.text())
 
+    def test_c_00_30_idle_but_never_seen_running_is_refused(self):
+        self.at_local(0, 30); self.reader(False); self.assertRefused('not yet seen running')
+
     def test_c_on_the_hour_second_is_not_yet_after_it(self):
-        self.at_local(0, 2); self.reader(False); self.assertRefused('not yet seen idle')
+        self.at_local(0, 2); self.reader(False); self.assertRefused('not yet seen running')
+
+    def test_c_running_seen_in_the_previous_hour_does_not_close_this_window(self):
+        self.at_local(30, 0); self.reader(True); self.assertEqual(self.main(RUN), 2)
+        self.at_local(0, 30); self.reader(False); self.assertRefused('not yet seen running')
+
+    def test_c_a_missed_start_closes_the_window_after_3_minutes_idle(self):
+        self.at_local(2, 59); self.reader(False); self.assertRefused('not yet seen running')
+        self.dir.cleanup(); self.setUp()
+        self.at_local(3, 0); self.reader(False); self.assertEqual(self.main(RUN), 0, self.w.text())
+
+    def test_reader_started_between_the_check_and_the_bootout_is_never_booted_out(self):
+        orig = OP.refusals
+        def start_it(s):
+            out = orig(s); self.reader(True); return out
+        OP.refusals = start_it
+        try:
+            rc = self.main(RUN)
+        finally:
+            OP.refusals = orig
+        self.assertEqual(rc, 2); self.assertIn('is running', self.w.rows()[-1]['refused'])
+        self.assertEqual(self.w.bootouts(), []); self.assertEqual(self.w.posts(), [])
 
     def test_c_the_scheduled_minute_is_read_from_launchd(self):
         self.w.picks_minute = 7
@@ -530,6 +594,8 @@ class Refusals(Base):
     def test_pipeline_too_old_to_name_its_observer_is_not_launched(self):
         self.w.pipeline_writes_identity = False
         self.assertRefused('too old', switched=True)
+        self.assertEqual(self.w.bootouts(), []); self.assertEqual(self.w.posts(), [])   # addendum 2, item 5: before any switch-off
+        self.assertEqual(len(self.w.stages()), 2)
         work = Path(self.w.rows()[-1]['staged_folder'])
         self.assertFalse((work / 'root-one-native-attempt.json').exists())     # no gate written
 
@@ -549,7 +615,7 @@ class Refusals(Base):
         self.w.beating = False; self.w.sleep(180); self.assertRefused('heartbeat')
 
     def test_collector_slow_heartbeat_under_150_s_does_not_refuse(self):
-        self.w.beating = False; self.w.sleep(90)                                 # T0 + 120: the last heartbeat 120 s ago
+        self.w.beating = False; self.w.sleep(120)                                # the last heartbeat 120 s ago
         self.w.on_sleep.append(lambda world: setattr(world, 'beating', True))    # it writes again at its next minute
         self.assertEqual(self.main(RUN), 0, self.w.text())
 
@@ -607,10 +673,12 @@ class Restore(Base):
         row = self.w.rows()[-1]
         self.assertIn('launcher would not start', row['error']); self.assertTrue(row['switch_offs']['pick_reader']['restored'])
 
-    def test_failing_unload_restores_and_stops_before_staging(self):
+    def test_failing_unload_restores_and_stops_before_the_launch(self):
         self.w.unload_status = 500
         rc = self.main(RUN)
-        self.assertEqual(rc, 1); self.assertRestored(); self.assertEqual(self.w.stages(), []); self.assertEqual(self.w.spawned, [])
+        self.assertEqual(rc, 1); self.assertRestored(); self.assertEqual(self.w.spawned, [])
+        self.assertEqual(len(self.w.stages()), 2)          # addendum 2, item 5: staging comes before the switch-offs
+        self.assertFalse(any(c for c in self.w.calls if '--preflight' in c))
         self.assertIn('qwen3.8-27b-chat', self.w.rows()[-1]['error'])
 
     def test_ctrl_c_in_the_watch_loop_stops_once_and_restores(self):
@@ -704,17 +772,16 @@ class RunRecipe(Base):
         self.assertFalse(row['verdicts']['collector_unharmed']); self.assertFalse(row['counts'])
         self.assertTrue(self.w.picks_loaded)
 
-    def test_a_pid_whose_start_differs_is_never_signalled(self):
-        self.w.identity_start = 'Sun Nov 15 01:02:03 2026'
+    def test_a_pid_whose_start_differs_is_never_sent_term_and_the_launcher_is_interrupted(self):
+        self.w.identity_start = 'Sun Nov 15 01:02:03 2026'; self.w.cleanup_s = 120
         def slow(world):
             if world.launcher is not None and world.t >= world.launcher.started + 30:
                 world.latency = lambda t: 9.5
         self.w.on_sleep.append(slow)
         self.main(RUN)
-        self.assertEqual(self.w.signals, [])
+        self.assertEqual(self.w.signals, [(LAUNCHER_PID, signal.SIGINT)])     # addendum 2, item 3: a reused pid -> fallback
         row = self.w.rows()[-1]
-        self.assertIn('start', row['stop']['not_signalled'])
-        self.assertTrue(any('NOT SIGNALLED' in a for a in row['alerts']))
+        self.assertEqual(row['stop']['by'], 'launcher interrupt'); self.assertIn('start', row['stop']['why_launcher'])
 
     def slow_after(self, seconds):
         def slow(world):
@@ -793,7 +860,7 @@ class RunRecipe(Base):
     # ---- correction B, end to end: the record carries every status count
     def run_with(self, statuses, run_s=180):
         self.w.per_minute = 1; self.w.run_s = run_s
-        self.w.status = lambda t: statuses.get(int(t - T0), 'ok')          # keyed by seconds after T0, one decision a minute
+        self.w.status = lambda t: statuses.get(int(t - START), 'ok')    # keyed by seconds after START, one decision a minute
         self.assertIn(self.main(RUN), (0, 3), self.w.text())
         return self.w.rows()[-1]
 
@@ -837,11 +904,18 @@ class RunRecipe(Base):
         self.assertEqual(self.w.rows()[-1]['post']['native_loaded'], ['mf-native-ff'])
         self.assertIn('MF-NATIVE INSTANCE STILL LOADED', self.w.text())
 
-    def test_neutral_report_is_recorded_unusable_and_still_counts(self):
+    def test_paper_refused_report_is_recorded_unusable_and_still_counts(self):
         self.w.receipt['paper_handoff'] = False
         self.main(RUN)
         row = self.w.rows()[-1]
         self.assertFalse(row['pipeline']['report_usable']); self.assertTrue(row['verdicts']['pipeline_clean'])
+
+    def test_near_neutral_report_is_clean_with_exactly_its_reason_addendum_2_item_4(self):
+        self.w.receipt.update(complete=False, paper_handoff=None, failure={'type': 'Refused', 'reason': NEAR_NEUTRAL})
+        self.main(RUN)
+        row = self.w.rows()[-1]
+        self.assertEqual(row['launcher']['exit'], 1); self.assertEqual(row['pipeline']['launcher_exit'], 1)
+        self.assertTrue(row['verdicts']['pipeline_clean']); self.assertTrue(row['counts'])
 
     def test_missing_receipt_memory_fields_are_null_with_a_note(self):
         del self.w.receipt['resource']
@@ -944,6 +1018,273 @@ class LoadTest(Base):
         self.assertEqual(self.main(self.LT + ['--dry-run']), 0, self.w.text())
         self.assertEqual(self.w.loads, []); self.assertEqual(self.w.bootouts(), []); self.assertEqual(self.w.stages(), [])
         self.assertFalse((self.w.tmp / 'artifacts/load-tests').exists())
+
+
+class Addendum2(Base):
+    """The repair after the failed blind check of 13b8029, item by item."""
+    LT = LoadTest.LT
+
+    def slow_after(self, seconds):
+        def slow(world):
+            if world.launcher is not None and world.t >= world.launcher.started + seconds:
+                world.latency = lambda t: 9.5
+        self.w.on_sleep.append(slow)
+
+    def fresh(self):
+        self.dir.cleanup(); self.setUp()
+
+    def bootstraps(self):
+        return [c for c in self.w.calls if c[:2] == ['/bin/launchctl', 'bootstrap']]
+
+    # ---- 1: the restore runs to its end through KeyboardInterrupt and SystemExit, then re-raises
+    def test_1_an_interrupt_inside_the_bootstrap_still_runs_every_step_writes_the_row_and_summary_then_reraises(self):
+        for exc in (KeyboardInterrupt, SystemExit):
+            with self.subTest(exc=exc.__name__):
+                self.fresh(); self.w.bootstrap_raises = exc
+                with self.assertRaises(exc):
+                    self.main(RUN)
+                row = self.w.rows()[-1]; pr = row['switch_offs']['pick_reader']
+                self.assertIsNotNone(pr['after']); self.assertFalse(pr['after']['listed'])   # the next step still ran
+                self.assertFalse(pr['restored'])
+                self.assertTrue(any('PICK READER NOT RESTORED' in a for a in row['alerts']))
+                self.assertIn('RUN SUMMARY', self.w.text()); self.assertTrue(row['launched'])
+
+    def test_1_an_interrupt_after_the_bootstrap_took_effect_is_restored_and_reraised(self):
+        self.w.bootstrap_raises_after = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.main(RUN)
+        self.assertTrue(self.w.picks_loaded)
+        row = self.w.rows()[-1]
+        self.assertTrue(row['switch_offs']['pick_reader']['restored']); self.assertIn('RUN SUMMARY', self.w.text())
+
+    def test_1_load_test_restore_runs_to_its_end_too(self):
+        self.w.bootstrap_raises = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.main(self.LT)
+        files = sorted((self.w.tmp / 'artifacts/load-tests').glob('*.json'))
+        self.assertEqual(len(files), 1)
+        r = json.loads(files[0].read_text())
+        self.assertFalse(r['switch_offs']['pick_reader']['restored']); self.assertIsNotNone(r['switch_offs']['pick_reader']['after'])
+        self.assertIn('LOAD TEST', self.w.text())
+
+    # ---- 2: TERM only to a child of the launcher this tool started
+    def breach_naming(self, pid, start, ppid, pgid=None):
+        self.w.procs[pid] = {'start': start, 'pgid': pid if pgid is None else pgid, 'ppid': ppid}
+        self.w.identity = {'pid': pid, 'start': start, 'pgid': pid if pgid is None else pgid, 'written_utc': 'x'}
+        self.w.cleanup_s = 120; self.slow_after(30)
+        self.main(RUN)
+        return self.w.rows()[-1]
+
+    def assertNoTerm(self, row, pid):
+        self.assertNotIn((pid, signal.SIGTERM), self.w.signals)
+        self.assertFalse(any(sig == signal.SIGTERM for _, sig in self.w.signals), self.w.signals)
+        self.assertEqual(self.w.signals, [(LAUNCHER_PID, signal.SIGINT)])          # item 3: the fallback instead
+        self.assertEqual(row['stop']['by'], 'launcher interrupt')
+
+    def test_2_the_tools_own_pid_is_never_sent_term_even_as_a_child_of_the_launcher(self):
+        row = self.breach_naming(TOOL_PID, TOOL_START, LAUNCHER_PID, pgid=TOOL_PID); self.assertNoTerm(row, TOOL_PID)
+
+    def test_2_the_tools_parent_is_never_sent_term(self):
+        row = self.breach_naming(TOOL_PARENT, 'Mon Nov 16 09:00:00 2026', LAUNCHER_PID); self.assertNoTerm(row, TOOL_PARENT)
+
+    def test_2_pid_1_and_pid_0_are_never_sent_term(self):
+        for pid in (1, 0):
+            with self.subTest(pid=pid):
+                self.fresh()
+                row = self.breach_naming(pid, 'Mon Nov 16 00:00:01 2026', LAUNCHER_PID); self.assertNoTerm(row, pid)
+
+    def test_2_an_unrelated_live_pid_is_never_sent_term(self):
+        row = self.breach_naming(7777, 'Mon Nov 16 10:00:00 2026', 1); self.assertNoTerm(row, 7777)
+
+    def test_2_a_child_of_a_different_parent_is_never_sent_term(self):
+        self.w.procs[9999] = {'start': 'Mon Nov 16 10:00:00 2026', 'pgid': 9999, 'ppid': 1}
+        row = self.breach_naming(8888, 'Mon Nov 16 10:00:01 2026', 9999); self.assertNoTerm(row, 8888)
+
+    def test_2_a_child_of_a_recycled_launcher_pid_is_never_signalled(self):
+        def recycle(world):
+            if world.launcher is not None and LAUNCHER_PID in world.procs and world.t >= world.launcher.started + 10:
+                world.procs[LAUNCHER_PID]['start'] = 'Mon Nov 16 12:30:00 2026'
+        self.w.on_sleep.append(recycle); self.slow_after(30)
+        self.main(RUN)
+        self.assertEqual(self.w.signals, [])
+        self.assertTrue(any('NOT SIGNALLED' in a for a in self.w.rows()[-1]['alerts']))
+
+    def test_2_the_true_observer_child_of_the_launcher_is_sent_term(self):
+        self.w.cleanup_s = 120; self.slow_after(30); self.main(RUN)
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)])
+
+    # ---- 3: no usable identity for any reason -> the fallback; the watch has a hard deadline
+    def test_3_a_malformed_or_reused_identity_and_a_breach_interrupt_the_launcher(self):
+        for raw in ('{not json', json.dumps({'pid': 'x'}), json.dumps([OBSERVER_PID]), json.dumps({'pid': OBSERVER_PID}),
+                    json.dumps({'pid': OBSERVER_PID, 'start': 'Sun Nov 15 01:02:03 2026', 'pgid': OBSERVER_PID}),
+                    json.dumps({'pid': True, 'start': OBSERVER_START, 'pgid': OBSERVER_PID})):
+            with self.subTest(raw=raw):
+                self.fresh(); self.w.identity = raw; self.w.cleanup_s = 120; self.w.run_s = 14400; self.slow_after(30)
+                self.main(RUN)
+                row = self.w.rows()[-1]
+                self.assertEqual(self.w.signals, [(LAUNCHER_PID, signal.SIGINT)]); self.assertEqual(row['stopped'], 'collector breach')
+                self.assertLess(self.w.t - START, 900)
+
+    def test_3_past_the_profiles_wall_plus_cleanup_the_run_is_stopped_as_wall_exceeded(self):
+        self.w.run_s = 20000; self.w.cleanup_s = 60
+        self.main(RUN)
+        row = self.w.rows()[-1]
+        self.assertEqual(row['stopped'], 'wall exceeded'); self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)])
+        wall = OP.run_durations('swarm8', {'model': 'qwen3-8b'})['wall_s']
+        sent = OP._dt.datetime.fromisoformat(row['stop']['utc']).timestamp()
+        launched = OP._dt.datetime.fromisoformat(row['utc_launch']).timestamp()
+        self.assertGreaterEqual(sent - launched, wall + OP.CLEANUP_S); self.assertLessEqual(sent - launched, wall + OP.CLEANUP_S + OP.WATCH_S)
+
+    def test_3_a_run_that_cannot_be_stopped_still_ends_the_watch(self):
+        self.w.run_s = 50000; self.w.write_identity = False; self.w.launcher_pgid = 1
+        self.main(RUN)
+        wall = OP.run_durations('swarm8', {'model': 'qwen3-8b'})['wall_s']
+        self.assertLess(self.w.t - START, wall + OP.CLEANUP_S + OP.IDENTITY_WAIT_S + 2 * OP.STOP_WAIT_S)
+        row = self.w.rows()[-1]
+        self.assertEqual(row['stopped'], 'wall exceeded'); self.assertEqual(self.w.signals, [])
+        self.assertTrue(any('NOT SIGNALLED' in a for a in row['alerts'])); self.assertTrue(self.w.picks_loaded)
+
+    # ---- 4: pipeline_clean reads the receipt and the launcher's exit
+    def clean(self, **receipt):
+        self.w.receipt.update(receipt); self.main(RUN)
+        return self.w.rows()[-1]
+
+    def test_4_complete_false_without_a_failure_is_not_clean(self):
+        row = self.clean(complete=False); self.assertFalse(row['verdicts']['pipeline_clean']); self.assertFalse(row['counts'])
+
+    def test_4_a_failure_in_the_receipt_is_not_clean_even_when_complete(self):
+        row = self.clean(failure={'type': 'NativeRefused', 'reason': 'something else'})
+        self.assertFalse(row['verdicts']['pipeline_clean'])
+
+    def test_4_only_the_exact_near_neutral_reason_is_clean(self):
+        for failure in ({'type': 'Refused', 'reason': NEAR_NEUTRAL + '.'}, {'type': 'Refused', 'reason': NEAR_NEUTRAL.upper()},
+                        {'type': 'Refused'}, {'type': 'Refused', 'reason': [NEAR_NEUTRAL]}, {'type': 'Refused', 'reason': None},
+                        NEAR_NEUTRAL, {'type': 'NativeRefused', 'reason': NEAR_NEUTRAL}):
+            with self.subTest(failure=failure):
+                self.fresh()
+                row = self.clean(complete=False, failure=failure); self.assertFalse(row['verdicts']['pipeline_clean'])
+
+    def test_4_a_zero_exit_with_complete_false_is_not_clean(self):
+        self.w.exit_override = 0
+        row = self.clean(complete=False, failure={'type': 'Refused', 'reason': NEAR_NEUTRAL})
+        self.assertEqual(row['launcher']['exit'], 0); self.assertFalse(row['verdicts']['pipeline_clean'])
+
+    def test_4_a_nonzero_exit_with_complete_true_is_not_clean(self):
+        self.w.exit_override = 1
+        row = self.clean(); self.assertEqual(row['launcher']['exit'], 1); self.assertFalse(row['verdicts']['pipeline_clean'])
+
+    def test_4_a_missing_or_unreadable_receipt_is_not_clean(self):
+        self.w.write_receipt = False
+        row = self.clean(); self.assertFalse(row['pipeline']['receipt_found']); self.assertFalse(row['verdicts']['pipeline_clean'])
+        self.fresh(); self.w.receipt_raw = '{"complete": tr'
+        row = self.clean(); self.assertFalse(row['pipeline']['receipt_readable']); self.assertFalse(row['verdicts']['pipeline_clean'])
+
+    def test_4_the_clean_run_records_its_exit(self):
+        row = self.clean(); self.assertEqual(row['launcher']['exit'], 0); self.assertTrue(row['verdicts']['pipeline_clean'])
+
+    # ---- 5: refusals that need no switch-off, and staging, come before any switch-off; the free reading after settling
+    def changing(self):
+        return self.w.bootouts() + self.w.posts() + self.w.spawned + self.w.signals
+
+    def test_5_a_check_refusal_and_a_staging_refusal_have_zero_changing_actions(self):
+        for setup in (lambda w: setattr(w, 'link_text', 'You have enabled LM Link.'), lambda w: setattr(w, 'stage_rc', 3),
+                      lambda w: setattr(w, 'pipeline_writes_identity', False)):
+            self.fresh(); setup(self.w)
+            self.assertEqual(self.main(RUN), 2 if self.w.stage_rc == 0 else 1, self.w.text())
+            self.assertEqual(self.changing(), []); self.assertTrue(self.w.picks_loaded)
+            self.assertEqual(list(self.w.crew.glob('*/' + OP.GATE_NAME)), [])
+
+    def test_5_the_free_reading_is_taken_after_the_unloads_settled(self):
+        self.main(RUN)
+        post = [t for t, c in self.w.timed if c[0] == 'POST'][-1]
+        after = [t for t, c in self.w.timed if c == ['/usr/bin/memory_pressure'] and t > post]
+        self.assertGreaterEqual(after[0] - post, OP.SETTLE_S)
+
+    def test_5_under_the_staged_threshold_names_the_unloaded_models_and_how_they_come_back(self):
+        self.w.free = 55
+        self.assertEqual(self.main(RUN), 2)
+        refused = self.w.rows()[-1]['refused']
+        self.assertIn('qwen3.8-27b-chat', refused); self.assertIn('LM Studio loads', refused)
+        self.assertTrue(self.w.picks_loaded); self.assertEqual(self.w.spawned, [])
+
+    # ---- 6: a torn record line
+    def test_6_a_torn_line_is_ended_before_the_append_skipped_and_counted(self):
+        path = self.w.tmp / 'artifacts/runs.jsonl'; path.parent.mkdir(parents=True)
+        good = {'command': 'run', 'profile': 'swarm8', 'launched': True, 'counts': True, 'plan': None, 'utc_start': 'a'}
+        path.write_text(json.dumps(good) + '\n' + '{"command": "run", "launched": tr')
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+        rows, damaged = OP.read_rows(path)
+        self.assertEqual(damaged, 1); self.assertEqual(len(rows), 2); self.assertTrue(rows[-1]['launched'])
+        self.w.out.clear(); self.assertEqual(self.main(['record']), 0)
+        self.assertIn('1 damaged line', self.w.text())
+
+    def test_6_a_damaged_line_never_counts_in_either_direction(self):
+        path = self.w.tmp / 'artifacts/runs.jsonl'; path.parent.mkdir(parents=True)
+        good = json.dumps({'command': 'run', 'profile': 'swarm8', 'launched': True, 'counts': True, 'plan': None})
+        bad_counted = '{"command": "run", "profile": "swarm8", "launched": true, "counts": tru'
+        path.write_text('\n'.join([good, bad_counted, '[1, 2]', '"text"', good]) + '\n')
+        rows, damaged = OP.read_rows(path)
+        self.assertEqual(damaged, 3); self.assertEqual(OP.streaks(rows)['9']['streak'], 2)       # neither reset nor counted
+
+    def test_6_every_append_is_synced(self):
+        self.main(RUN); self.assertGreaterEqual(len(self.w.fsyncs), 1)
+
+    # ---- 7: the intent to restore is set before the bootout
+    def test_7_ctrl_c_right_after_the_bootout_still_bootstraps(self):
+        self.w.bootout_raises_after = KeyboardInterrupt
+        rc = self.main(RUN)
+        self.assertEqual(rc, 1); self.assertTrue(self.w.picks_loaded)
+        self.assertEqual(self.bootstraps(), [['/bin/launchctl', 'bootstrap', 'gui/501', PICKS_PLIST]])
+        self.assertTrue(self.w.rows()[-1]['switch_offs']['pick_reader']['restored'])
+
+    # ---- 8: an interrupt while the row is finished still appends a minimal row
+    def test_8_ctrl_c_while_finishing_the_row_appends_a_minimal_row_then_reraises(self):
+        orig = OP.post_state
+        def interrupted(host, row):
+            raise KeyboardInterrupt
+        OP.post_state = interrupted
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self.main(RUN)
+        finally:
+            OP.post_state = orig
+        row = self.w.rows()[-1]
+        self.assertIn('interrupted while recording', row['recording']); self.assertFalse(row['counts'])
+        self.assertTrue(row['launched']); self.assertIn('RUN SUMMARY', self.w.text()); self.assertTrue(self.w.picks_loaded)
+
+    # ---- 9: a second instance of the decision model refuses and is never unloaded
+    def test_9_a_second_decision_model_instance_refuses_and_is_never_unloaded(self):
+        for add in (lambda m: m['models'][0]['loaded_instances'].append({'id': 'elephant-1:2', 'config': {}}),
+                    lambda m: m['models'].append(dict(decision_entry(), loaded_instances=[{'id': 'elephant-copy', 'config': {}}]))):
+            with self.subTest():
+                self.fresh(); add(self.w.models)
+                self.assertEqual(self.main(RUN), 2, self.w.text())
+                self.assertIn('decision', self.w.rows()[-1]['refused']); self.assertEqual(self.w.posts(), [])
+                self.assertEqual(self.w.bootouts(), [])
+
+    # ---- 11: load-test reads the collector right after the load call returns
+    def test_11_a_breach_during_the_load_call_is_seen_when_it_returns(self):
+        orig = FakeLoadPath.load
+        def slow_load(lp):
+            out = orig(lp); lp.world.latency = lambda t: 9.5; lp.world.sleep(150); return out
+        FakeLoadPath.load = slow_load
+        try:
+            rc = self.main(self.LT)
+        finally:
+            FakeLoadPath.load = orig
+        self.assertEqual(rc, 1)
+        files = sorted((self.w.tmp / 'artifacts/load-tests').glob('*.json')); r = json.loads(files[0].read_text())
+        self.assertEqual(r['stopped'], 'collector breach'); self.assertIsNotNone(r['collector_after_load']['breach'])
+        self.assertIsNone(r['after_load']['median']); self.assertTrue(r['unload']['proven'])
+
+    # ---- 12: LM Link's status on standard error, end to end
+    def test_12_the_status_line_on_standard_error_launches(self):
+        self.w.link_text = ''; self.w.link_err = LINK_OFF
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+
+    def test_12_the_enabled_line_on_standard_error_refuses(self):
+        self.w.link_text = ''; self.w.link_err = 'You have enabled LM Link.\n'
+        self.assertEqual(self.main(RUN), 2); self.assertEqual(self.changing(), [])
 
 
 if __name__ == '__main__':
