@@ -387,9 +387,12 @@ class World:
         return path
 
 
+SKILLED_SIZE = {"pros": 16, "per_month": 40}          # enough trades that a 3-cent edge is seen
+
+
 @pytest.fixture(scope="module")
 def skilled(tmp_path_factory):
-    return World(7, edge=0.08, move=0.02).write(tmp_path_factory.mktemp("w") / "skilled.sqlite")
+    return World(7, edge=0.08, move=0.02, **SKILLED_SIZE).write(tmp_path_factory.mktemp("w") / "skilled.sqlite")
 
 
 def test_no_skill_fails_at_step_1(tmp_path):
@@ -416,7 +419,7 @@ def test_skill_with_a_small_move_passes_step_1(skilled, tmp_path):
 
 
 def test_price_absorbing_the_whole_edge_within_the_hour_fails(tmp_path):
-    store = World(7, edge=0.08, move=0.08).write(tmp_path / "s.sqlite")
+    store = World(7, edge=0.08, move=0.08, **SKILLED_SIZE).write(tmp_path / "s.sqlite")
     s = cl.run_develop(store=store, out_dir=tmp_path / "out")["result"]["step_1"]
     assert s["verdict"] == "FAIL"
 
@@ -467,7 +470,7 @@ def test_develop_never_reads_or_uses_a_sealed_month(skilled, tmp_path):
     data = cl.load(skilled, "development")
     assert max(t.ts for ts in data.trades.values() for t in ts) < cl.SEALED_START + cl.SPILL
     # poison everything after the spill: huge winners, flipped resolutions, absurd prices
-    w = World(7, edge=0.08, move=0.02)
+    w = World(7, edge=0.08, move=0.02, **SKILLED_SIZE)
     for rows in w.trades.values():
         for r in rows:
             if r["timestamp"] >= cl.SEALED_START + cl.SPILL:
