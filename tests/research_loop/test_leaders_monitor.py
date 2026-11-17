@@ -550,10 +550,18 @@ KILL_SCRIPT = textwrap.dedent(r'''
     world.held = spec["held"]
     world.boards = spec.get("boards", world.boards)
     if spec.get("barrier"):
+        # both processes wait inside their last board read, so both are past the "already fixed" check before
+        # either claims: only the claim itself can decide which one fixes
         import time
-        open(spec["barrier"] + "." + str(os.getpid()), "w").close()
-        while len([f for f in os.listdir(os.path.dirname(spec["barrier"])) if f.startswith("go.")]) < 2:
-            time.sleep(0.01)
+        answer = world.__call__
+        def gated(url):
+            if "category=crypto" in url:
+                open(spec["barrier"] + "." + str(os.getpid()), "w").close()
+                while len([f for f in os.listdir(os.path.dirname(spec["barrier"])) if f.startswith("go.")]) < 2:
+                    time.sleep(0.01)
+            return answer(url)
+        world = gated
+        world.urls = []
     wall = T.Wall(spec["t"])
     code, out = T.run([spec["cmd"]], world, wall, spec["store"])
     print("STATEMENTS %d CODE %d" % (count[0], code))
