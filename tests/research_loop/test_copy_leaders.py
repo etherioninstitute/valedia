@@ -4,9 +4,16 @@ Specification: docs/research/2026-11-17-copying-leaders-prediction.md (10ad062, 
 09:11 UTC in dec8dd7, second amendment of 09:35 UTC in a7b9379: the follower's price is the first point of the
 token's public price history at or after the hour, asked for over twelve hours, at a grain of three hours or finer)."""
 import json
+import os
 import random
+import re
+import shutil
 import socket
+import sqlite3
+import subprocess
+import sys
 import urllib.parse
+from pathlib import Path
 from collections import Counter
 from decimal import Decimal
 
@@ -314,6 +321,10 @@ def test_leaders_are_ranked_on_the_exact_profit():
     st = {"a": cl.Standing(1_000_004_000, 30, 1), "b": cl.Standing(1_000_006_000, 30, 1),
           "c": cl.Standing(1_000_005_000, 30, 1)}
     assert cl.pick_leaders(st)[0] == ["b", "c", "a"]
+    # 1000.0040 and 1000.0049 dollars are both 100,000 cents: rounded, the name would put "a" first
+    st = {"a": cl.Standing(1_000_004_000, 30, 1), "b": cl.Standing(1_000_004_900, 30, 1),
+          "c": cl.Standing(999_000_000, 30, 1)}
+    assert cl.pick_leaders(st)[0] == ["b", "a", "c"]
     assert cl.qualifies(_qualifier(shares_per_dollar=50)) == "20_or_more_shares_per_dollar"
 
 
@@ -491,7 +502,7 @@ class World:
     def write(self, path, unfinished_wallet=None, skip_window=None, phase2=True):
         """`skip_window(target)` -> None, "unfinished" (started, never finished) or "unstarted", for every price
         window of that planned position."""
-        with cl.Store(path) as s:
+        with cl.Store(path, make_id=True) as s:                  # the pull makes the store and its id
             self.write_phase1(s, unfinished_wallet)
             if phase2:
                 plan = cl.plan_store(s, leave_out=[unfinished_wallet] if unfinished_wallet else [])
@@ -767,17 +778,69 @@ def test_default_output_folders_are_named_for_the_stores_id(tmp_path, monkeypatc
     assert json.loads(fa.read_bytes())["provenance"]["store_id"] == cl.store_id(a)
 
 
-def test_the_store_id_is_written_once():
-    import tempfile
-    from pathlib import Path
-    with tempfile.TemporaryDirectory() as d:
-        p = Path(d) / "x.sqlite"
-        with cl.Store(p):
-            pass
-        first = cl.store_id(p)
-        with cl.Store(p):
-            pass
-        assert cl.store_id(p) == first and len(first) == 32
+def test_the_store_id_is_written_once_by_the_pull_only(tmp_path):
+    p = tmp_path / "x.sqlite"
+    with cl.Store(p):
+        pass
+    assert cl.store_id(p) is None                              # opening a store never makes an id
+    with cl.Store(p, make_id=True):
+        pass
+    first = cl.store_id(p)
+    with cl.Store(p, make_id=True):
+        pass
+    assert cl.store_id(p) == first and re.fullmatch("[0-9a-f]{32}", first)
+    q = tmp_path / "pulled.sqlite"
+    cl.pull(q, _client(FakeService()), phase=1, say=lambda m: None)
+    assert re.fullmatch("[0-9a-f]{32}", cl.store_id(q))
+
+
+def _cheap(tmp_path, name="c.sqlite"):
+    return World(5, edge=0.0, move=0.0, pros=6, per_month=12).write(tmp_path / name)
+
+
+def _set_meta_raw(store, key, raw):
+    db = sqlite3.connect(str(store))
+    if raw is None:
+        db.execute("DELETE FROM meta WHERE key=?", (key,))
+    else:
+        db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, raw))
+    db.commit()
+    db.close()
+
+
+def test_a_store_without_an_id_or_with_a_malformed_one_is_refused_in_words_and_never_given_one(tmp_path):
+    store = _cheap(tmp_path)
+    for raw in (None, "not json{", '"xyz"', "null", "17"):
+        _set_meta_raw(store, "store_id", raw)
+        for run in (lambda: cl.run_develop(store=store, out_dir=tmp_path / "o"),
+                    lambda: cl.run_sealed(store=store, out_dir=tmp_path / "o", flag=True)):
+            with pytest.raises(cl.Refused, match="id"):
+                run()
+        db = sqlite3.connect(str(store))
+        row = db.execute("SELECT value FROM meta WHERE key='store_id'").fetchone()
+        db.close()
+        assert (row[0] if row else None) == raw                # nothing written
+        assert not (tmp_path / "o" / "develop.json").exists()
+
+
+@pytest.mark.parametrize("raw", ["null", "not json{", '"x"', "{}"])
+def test_the_markers_key_present_with_any_value_means_spent(tmp_path, raw):
+    store = _cheap(tmp_path)
+    _set_meta_raw(store, "sealed_marker", raw)
+    with pytest.raises(cl.Refused, match="already"):
+        cl.run_sealed(store=store, out_dir=tmp_path / "o", flag=True)
+    assert not (tmp_path / "o").exists()
+
+
+def test_with_an_out_dir_a_marker_in_the_stores_default_folder_also_refuses(tmp_path, monkeypatch):
+    monkeypatch.setattr(cl, "REPO", tmp_path / "repo")
+    store = _cheap(tmp_path)
+    default = tmp_path / "repo" / cl.OUT_DIR / cl.store_id(store)
+    default.mkdir(parents=True)
+    (default / "sealed.used").write_text("{}")
+    with pytest.raises(cl.Refused, match="default folder"):
+        cl.run_sealed(store=store, out_dir=tmp_path / "elsewhere", flag=True)
+    assert not (tmp_path / "elsewhere").exists()
 
 
 def test_sealed_refuses_when_development_failed(tmp_path):
@@ -1008,3 +1071,156 @@ def test_command_line(skilled, tmp_path, capsys):
     assert "step 1" in out and "information: decides nothing" in out
     assert "sold beyond what their trades show" in out
     assert "readings where the document is silent" in out
+
+
+# ------------------------------------------------------------------ before the claim, nothing of a sealed position is read
+_ID = re.compile(r"\b(?:cond|tok|mmc|mmt)\d+\b")
+
+
+def _sealed_only(w):
+    """Conditions and tokens whose every trade is in the sealed period (or later)."""
+    first: dict = {}
+    for rows in w.trades.values():
+        for r in rows:
+            for k in (r["condition_id"], r["token_id"]):
+                first[k] = min(first.get(k, 2 ** 62), r["timestamp"])
+    return {k for k, t in first.items() if t >= cl.SEALED_START}
+
+
+class _Counting:
+    """Counts every fetched row of the store that names a sealed-only market or token."""
+
+    def __init__(self, ids):
+        self.ids, self.hits, self.examples = ids, 0, []
+
+    def look(self, row):
+        for v in row:
+            if isinstance(v, str):
+                found = self.ids.intersection(_ID.findall(v))
+                if found:
+                    self.hits += 1
+                    if len(self.examples) < 3:
+                        self.examples.append(v[:120])
+                    return
+
+    def install(self, monkeypatch):
+        counter = self
+
+        class Cursor:
+            def __init__(self, cur):
+                self.cur = cur
+
+            def __iter__(self):
+                for row in self.cur:
+                    counter.look(row)
+                    yield row
+
+            def fetchone(self):
+                row = self.cur.fetchone()
+                if row is not None:
+                    counter.look(row)
+                return row
+
+            def fetchall(self):
+                return list(self)
+
+        class Conn(sqlite3.Connection):
+            def execute(self, *a):
+                return Cursor(super().execute(*a))
+
+        real = sqlite3.connect
+        monkeypatch.setattr(cl.sqlite3, "connect", lambda *a, **k: real(*a, factory=Conn, **k))
+
+
+def test_a_development_run_fetches_no_row_of_a_sealed_only_market(tmp_path, monkeypatch):
+    w = World(7, edge=0.08, move=0.02, **SKILLED_SIZE)
+    store = w.write(tmp_path / "s.sqlite")
+    ids = _sealed_only(w)
+    assert len(ids) > 1000
+    c = _Counting(ids)
+    c.install(monkeypatch)
+    assert cl.run_develop(store=store, out_dir=tmp_path / "o")["result"]["step_1"]["verdict"] == "PROCEED"
+    assert c.hits == 0, c.examples
+
+
+def test_sealed_fetches_no_row_of_a_sealed_only_market_before_its_claim(tmp_path, monkeypatch):
+    w = World(7, edge=0.08, move=0.02, **SKILLED_SIZE)
+    store = w.write(tmp_path / "s.sqlite")
+    out = tmp_path / "o"
+    cl.run_develop(store=store, out_dir=out)
+    c = _Counting(_sealed_only(w))
+    c.install(monkeypatch)
+
+    class AtTheClaim(Exception):
+        pass
+
+    def stop():
+        raise AtTheClaim()
+    monkeypatch.setattr(cl, "_BEFORE_CLAIM", stop)
+    with pytest.raises(AtTheClaim):
+        cl.run_sealed(store=store, out_dir=out, flag=True)
+    assert c.hits == 0, c.examples
+    assert cl.store_sealed_marker(store) is None
+
+
+# ------------------------------------------------------------------ the claim is one atomic act: real processes
+CHILD = r"""
+import os, sys, time
+from pathlib import Path
+from valedia_trader.research_loop import copy_leaders as cl
+store, out, dev, barrier, me, repo = sys.argv[1:7]
+cl.REPO = Path(repo)
+def meet():
+    Path(barrier + "." + me).touch()
+    other = barrier + "." + ("b" if me == "a" else "a")
+    t = time.time()
+    while not os.path.exists(other) and time.time() - t < 120:
+        time.sleep(0.001)
+cl._BEFORE_CLAIM = meet
+try:
+    cl.run_sealed(store=store, out_dir=out, flag=True, develop_file=dev)
+    print("RAN")
+except cl.Refused as e:
+    print("REFUSED " + str(e))
+"""
+
+
+def test_thirty_pairs_of_real_processes_claim_the_sealed_period_once_each(tmp_path):
+    assert hasattr(cl, "_BEFORE_CLAIM")
+    base = World(7, edge=0.08, move=0.02, **SKILLED_SIZE).write(tmp_path / "base.sqlite")
+    root = str(Path(cl.__file__).resolve().parents[2])
+    env = dict(os.environ, PYTHONPATH=root, PYTHONDONTWRITEBYTECODE="1")
+    script = tmp_path / "child.py"
+    script.write_text(CHILD)
+    for i in range(30):
+        d = tmp_path / ("pair%02d" % i)
+        d.mkdir()
+        store = d / "s.sqlite"
+        shutil.copyfile(base, store)
+        cl.run_develop(store=store, out_dir=d / "dev")
+        procs = [subprocess.Popen([sys.executable, "-B", str(script), str(store), str(d / me), str(d / "dev" /
+                                   "develop.json"), str(d / "barrier"), me, str(d / "repo")], env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for me in ("a", "b")]
+        outs = [p.communicate(timeout=600) for p in procs]
+        said = sorted(o[0].strip().split(" ", 1)[0] for o in outs)
+        assert said == ["RAN", "REFUSED"], (i, outs)
+        ran = [me for me in ("a", "b") if (d / me / "sealed.json").exists()]
+        assert len(ran) == 1, (i, ran)
+        loser = "b" if ran == ["a"] else "a"
+        assert not (d / loser).exists(), (i, list((d / loser).iterdir()))     # nothing written for the loser
+
+
+# ------------------------------------------------------------------ the outputs print the store's counts by reason
+def test_the_outputs_print_the_stores_counts_by_reason(tmp_path):
+    store = _cheap(tmp_path)
+    db = sqlite3.connect(str(store))
+    db.executemany("INSERT INTO rejects VALUES (?,?,?,?,?)", [
+        ("prices", "k1", "conflicting_row", "{}", "t"), ("prices", "k1", "conflicting_row", "{}", "t"),
+        ("trades", "pro01", "repeated_row", "{}", "t"), ("trades", "pro02", "timestamp_out_of_span", "{}", "t")])
+    db.commit()
+    db.close()
+    doc = cl.run_develop(store=store, out_dir=tmp_path / "o")
+    assert doc["result"]["store_counts"] == {"prices": {"conflicting_row": 2},
+                                             "trades": {"repeated_row": 1, "timestamp_out_of_span": 1}}
+    text = cl.format_table(doc)
+    assert "rows the store set aside" in text and "conflicting_row" in text and "timestamp_out_of_span" in text

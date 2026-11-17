@@ -116,6 +116,15 @@ def test_default_transport_sends_only_a_get_with_the_generic_name(monkeypatch):
     assert fake.requests == [("GET", "market-data-reader/1.0", pd.BASE_URL + "/v2/resolutions?condition=0x1", None)]
 
 
+@pytest.mark.parametrize("url", [pd.BASE_URL + "/v2/resolutions?condition=0x1%2C0x2",
+                                 pd.BASE_URL + "/v2/prices-history?token_id=111&start=1&end=2",
+                                 pd.BASE_URL + "/v2/leaderboard"])
+def test_the_addresses_the_reader_builds_are_allowed(monkeypatch, url):
+    fake = fake_network(monkeypatch)
+    pd.urllib_get(url)
+    assert len(fake.requests) == 1
+
+
 @pytest.mark.parametrize("status", [301, 302, 307, 308])
 @pytest.mark.parametrize("where", ["https://example.com/v2/trades", pd.BASE_URL + "/v2/trades?user=0xother"])
 def test_a_redirect_is_never_followed_one_request_and_an_error(monkeypatch, status, where):
@@ -143,7 +152,17 @@ def test_any_other_non_200_answer_is_an_error(monkeypatch):
                                  "https://data-api.polymarket.com/v2/%2e%2e/v1/x",
                                  "https://data-api.polymarket.com//v2/trades",
                                  "https://user@data-api.polymarket.com/v2/trades",
-                                 "https://data-api.polymarket.com:8443/v2/trades"])
+                                 "https://data-api.polymarket.com:8443/v2/trades",
+                                 "https://data-api.polymarket.com/v2/%252e%252e/v1/x",
+                                 "https://data-api.polymarket.com/v2%2fx",
+                                 " https://data-api.polymarket.com/v2/trades",
+                                 "https://data-api.polymarket.com/v2/trades ",
+                                 "https://data-api.polymarket.com/v2/trades\n",
+                                 "https://data-api.polymarket.com/v2/trades#x",
+                                 "https://data-api.polymarket.com/v2/Trades",
+                                 "https://data-api.polymarket.com/v2/",
+                                 "https://data-api.polymarket.com/v2/trades?user=0x1 x",
+                                 "HTTPS://data-api.polymarket.com/v2/trades"])
 def test_default_transport_refuses_any_other_address(monkeypatch, url):
     fake = fake_network(monkeypatch)
     with pytest.raises(pd.PolymarketDataError):
@@ -223,6 +242,38 @@ def test_a_success_after_a_timeout_is_returned():
     assert c.get_json("/v2/resolutions", {"condition": "0x1"}) == {"data": []} and len(calls) == 3
 
 
+def test_a_connection_dropped_mid_body_is_retried():
+    import http.client
+    calls = []
+
+    def h(p, q):
+        calls.append(1)
+        return http.client.IncompleteRead(b'{"da') if len(calls) == 1 else {"data": []}
+
+    c, t, clock = client(h)
+    assert c.get_json("/v2/resolutions", {"condition": "0x1"}) == {"data": []} and len(calls) == 2
+
+
+def test_a_short_body_through_urllib_is_retried(monkeypatch):
+    import http.client
+
+    class Short(io.BytesIO):
+        def read(self, *a):
+            raise http.client.IncompleteRead(b"{")
+
+    class Once(FakeHTTPS):
+        def https_open(self, req):
+            resp = super().https_open(req)
+            if len(self.requests) == 1:
+                resp.fp = Short(b"")
+                resp.read = resp.fp.read
+            return resp
+    fake = Once()
+    monkeypatch.setattr(pd, "_HANDLERS", (urllib.request.ProxyHandler({}), fake))
+    c = pd.PolymarketData(pd.urllib_get, sleep=lambda s: None)
+    assert c.get_json("/v2/resolutions", {"condition": "0x1"}) == {"data": []} and len(fake.requests) == 2
+
+
 def test_a_400_or_404_is_not_retried():
     calls = []
     c, t, clock = client(lambda p, q: (calls.append(1), pd.HttpError(400, p))[1])
@@ -239,7 +290,8 @@ def test_not_json_is_a_clear_error():
 
 def test_only_v2_paths_are_asked():
     c, t, clock = client(lambda p, q: {"data": []})
-    for bad in ("/v1/trades", "trades", "/v2/../admin", "//evil.io/v2/trades"):
+    for bad in ("/v1/trades", "trades", "/v2/../admin", "//evil.io/v2/trades", "/v2/%2e%2e/x", "/v2/trades ",
+                "/v2/T", "/v2/", " /v2/trades"):
         with pytest.raises(pd.PolymarketDataError):
             c.get_json(bad, {})
     assert t.urls == []
@@ -527,3 +579,22 @@ def test_a_price_point_or_resolution_time_outside_the_span_is_a_counted_reject()
         "timestamp_out_of_span"
     assert pd.validate_resolution({"condition_id": "0x1", "status": "resolved", "payouts": [1_000_000, 0],
                                    "resolved_at": "2019-06-01T00:00:00Z"})[1] == "resolved_at_out_of_span"
+
+
+# ------------------------------------------------------------------ rows that disagree are a conflict, not a repeat
+def test_price_points_alike_in_identity_but_not_in_price_are_a_conflict_and_neither_is_kept():
+    pts = [{"price": 0.4, "resolution_seconds": 300, "timestamp": 1_700_000_100},
+           {"price": 0.6, "resolution_seconds": 300, "timestamp": 1_700_000_100},
+           {"price": 0.5, "resolution_seconds": 300, "timestamp": 1_700_000_200},
+           {"price": 0.5, "resolution_seconds": 300, "timestamp": 1_700_000_200}]
+    c, t, clock = client(lambda p, q: page(pts))
+    w = c.prices_history("111", 1_700_000_050, 1_700_000_300)
+    assert [(r["timestamp"], r["price"]) for r in w.rows] == [(1_700_000_200, 0.5)]
+    assert dict(w.rejects) == {"conflicting_row": 2, "repeated_row": 1}
+    assert [why for _, why in w.raw] == ["conflicting_row", "conflicting_row", None, "repeated_row"]
+
+
+def test_trades_alike_in_identity_but_not_elsewhere_are_a_conflict():
+    c, t, clock = client(lambda p, q: page([trade(1), trade(1, title="another"), trade(1)]))
+    w = c.trades("0xabc")
+    assert len(w.rows) == 1 and dict(w.rejects) == {"conflicting_row": 1, "repeated_row": 1}
