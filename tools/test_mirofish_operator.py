@@ -160,6 +160,7 @@ class World:
         # addendum 7: a command read that fails for a live pid (pid -> what the read returns), a garbled start, an
         # unreadable model list, the plist the reader is loaded from
         self.commands_unreadable = {}; self.ps_garbled = set(); self.models_unreadable = False; self.picks_plist_path = PICKS_PLIST
+        self.ps_failing = set()
         self.free, self.free_after_load, self.pressure, self.swap_mb = 80, 60, 1, 100.0
         self.models = listing(); self.unload_status = 200
         self.procs = {TOOL_PID: {'start': TOOL_START, 'pgid': TOOL_PARENT, 'ppid': TOOL_PARENT},
@@ -256,6 +257,8 @@ class World:
             return done(r.returncode, r.stdout, '')
         if argv[:2] == ['/bin/ps', '-p'] and int(argv[2]) in self.ps_garbled:
             return done(0, 'garbled\n')
+        if argv[:2] == ['/bin/ps', '-p'] and int(argv[2]) in self.ps_failing:
+            return done(1, '', 'ps: fake failure\n')            # exit 1 with a message: not ps's "no such process"
         if argv[:2] == ['/bin/ps', '-p'] and int(argv[2]) in self.ps_raises:
             raise self.ps_raises.pop(int(argv[2]))()              # once
         if argv[:2] == ['/bin/ps', '-p'] and int(argv[2]) in self.ps_unreadable:
@@ -2340,6 +2343,9 @@ class Addendum7(Base):
         self.killed_run()
         if case in ('swapped', 'the intent alone'):
             self.edit_intent(launcher={'pid': OBSERVER_PID, 'start': OBSERVER_START, 'pgid': OBSERVER_PID})
+        if case == 'swapped, the intent holding the launcher\'s start':     # held for the launcher role only
+            self.edit_intent(launcher={'pid': OBSERVER_PID, 'start': LAUNCHER_START, 'pgid': OBSERVER_PID})
+            self.identity_names(LAUNCHER_PID, LAUNCHER_START, LAUNCHER_PID)
         if case in ('swapped', 'the identity file alone'):
             self.identity_names(LAUNCHER_PID, LAUNCHER_START, LAUNCHER_PID)
         if case == 'unrelated live pids':
@@ -2349,7 +2355,8 @@ class Addendum7(Base):
             self.identity_names(8802, 'Mon Nov 16 10:00:00 2026', 8802)
 
     def test_A_the_launcher_and_observer_are_found_in_their_true_roles_whatever_the_files_propose(self):
-        for case in ('swapped', 'the intent alone', 'the identity file alone', 'unrelated live pids'):
+        for case in ('swapped', 'swapped, the intent holding the launcher\'s start', 'the intent alone', 'the identity file alone',
+                     'unrelated live pids'):
             with self.subTest(case=case):
                 self.fresh(); self.crafted(case)
                 self.assertHeldBack(self.main(['recover']))
@@ -2384,11 +2391,27 @@ class Addendum7(Base):
                     self.assertNotIn(pid, [x['pid'] for x in self.w.rows()[-1]['not_ours']] if len(self.w.rows()) > self.rows_before else [])
 
     def test_B_a_start_that_could_not_be_read_holds_everything_back(self):
-        for pid in (LAUNCHER_PID, OBSERVER_PID):
-            with self.subTest(pid=pid):
-                self.fresh(); self.killed_run(); self.reap_on_term(); self.w.ps_garbled = {pid}
-                self.assertHeldBack(self.main(['recover', '--stop']))
-                self.assertNotIn(pid, self.signalled()); self.assertIn('COULD NOT BE MADE', self.w.text())
+        for how in ('garbled', 'failing'):
+            for pid in (LAUNCHER_PID, OBSERVER_PID):
+                with self.subTest(how=how, pid=pid):
+                    self.fresh(); self.killed_run(); self.reap_on_term()
+                    if how == 'garbled':
+                        self.w.ps_garbled = {pid}
+                    else:
+                        self.w.ps_failing = {pid}
+                    self.assertHeldBack(self.main(['recover', '--stop']))
+                    self.assertNotIn(pid, self.signalled()); self.assertIn('COULD NOT BE MADE', self.w.text())
+
+    def test_B_a_survivor_whose_command_cannot_be_read_after_the_scan_is_not_signalled_and_counts_as_running(self):
+        self.killed_run()
+        original = OP.find_survivors
+        def then_unreadable(host, intent):
+            found = original(host, intent)
+            self.w.commands_unreadable = {LAUNCHER_PID: None, OBSERVER_PID: None}      # alive, the read now fails
+            return found
+        with unittest.mock.patch.object(OP, 'find_survivors', then_unreadable):
+            self.assertHeldBack(self.main(['recover', '--stop']))
+        self.assertEqual(self.w.signals, [])
 
     def test_B_a_scan_that_does_not_list_this_tool_could_not_be_made(self):
         self.killed_run(); self.w.procs.pop(OBSERVER_PID); self.w.procs.pop(LAUNCHER_PID)
@@ -2418,6 +2441,20 @@ class Addendum7(Base):
                 rc = self.main(RUN, **({'http': unread_http} if where == 'after the unloads' else {'run': unread_run}))
                 self.assertRefusedUnread(rc, self.w.rows()[-1])
                 self.assertFalse(any(p.name == OP.GATE_NAME for p in self.w.crew.rglob('*')))
+                preflights = [c for c in self.w.calls if '--preflight' in c]
+                self.assertEqual(len(preflights), 0 if where == 'after the unloads' else 1)    # refused at that very read
+
+    def test_D_a_protected_pair_broken_after_the_check_refuses_before_the_spawn(self):
+        http = self.w.http
+        def broken(method, url, body=None, timeout=None):
+            reply = http(method, url, body, timeout)
+            if method == 'POST':
+                self.w.models['models'][1]['loaded_instances'][0]['id'] = 'emb-2'
+            return reply
+        self.assertEqual(self.main(RUN, http=broken), 2, self.w.text())
+        row = self.w.rows()[-1]
+        self.assertFalse(row['launched']); self.assertEqual(self.w.spawned, []); self.assertIn('the tool does not guess', row['refused'])
+        self.assertEqual([b['instance_id'] for _, _, b in self.w.posts()], ['qwen3.8-27b-chat'])
 
     def test_C_an_unreadable_model_list_before_the_load_call_refuses(self):
         def hook(world):
@@ -2532,6 +2569,8 @@ class Addendum7(Base):
                 self.fresh()
                 self.assertEqual(self.main(argv), 2); self.assertTrue(self.w.text().startswith('refused: '), self.w.text())
                 self.assertEqual(self.changing(), []); self.assertEqual(self.w.stages(), [])
+                if '--setup-model' in argv:
+                    self.assertIn('the same model', self.w.text())
 
     def strict_stdout(self):
         return io.TextIOWrapper(io.BytesIO(), encoding='ascii', errors='strict')
@@ -2545,11 +2584,14 @@ class Addendum7(Base):
         stream.flush(); said = stream.buffer.getvalue().decode('ascii')
         self.assertEqual(rc, 2, said); self.assertIn('work', said); self.assertTrue(self.intent.exists()); self.assertEqual(self.w.signals, [])
         self.fresh()
+        # a listing's text the stream cannot carry (a non-ASCII id on an ASCII stdout; a lone surrogate in a key)
+        self.w.models['models'].append({'key': 'x/clé', 'type': 'llm', 'loaded_instances': [{'id': 'other-modèle', 'config': {}}]})
         self.w.models['models'].append({'key': 'x/\udcff', 'type': 'llm', 'loaded_instances': [{'id': 'other-\ud800', 'config': {}}]})
         stream = self.strict_stdout()
         with contextlib.redirect_stdout(stream):
             self.assertEqual(self.main(['check'], out=None), 0)
-        stream.flush(); self.assertIn('other-', stream.buffer.getvalue().decode('ascii'))
+        stream.flush(); said = stream.buffer.getvalue().decode('ascii')
+        self.assertIn('other-mod\\xe8le', said); self.assertIn('the tool does not guess', said)
 
     # ---- F: the tests the surviving mutants showed missing
     def test_F_an_intent_naming_a_work_folder_outside_the_crew_folder_or_not_a_staged_one_is_refused_whole(self):
