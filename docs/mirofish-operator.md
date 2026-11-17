@@ -30,6 +30,12 @@ Read-only. It prints, and with `--json-out FILE` (or `--json`) returns as JSON:
   `ym-research-embedding` loaded; every other loaded instance by name (what a run would unload); any `mf-native-*` instance.
   A second instance of the decision model (its key, or an id beginning `elephant-1`) makes the decision model "not right"
   (the collector needs exactly one right instance), so the start is refused; it is never an "other" model and never unloaded.
+  An instance is the decision or the embedding instance only as its expected PAIR of instance id and model key
+  (`elephant-1` under `elephant-1`; `ym-research-embedding` under `google/embedding-gemma-300m`, the key
+  `src/mirofish_native_model.py:293` requires). A listing in which a protected id is loaded under another key (the
+  embedding's id under the 27B's key, say), a protected key under another id, or any loaded instance has an id or a key that
+  is not a plain string, is refused before any switch-off (`check` prints it as `REFUSED: the model list cannot be judged:
+  ...; the tool does not guess ...`): the tool never decides which instance is meant. A list that cannot be read refuses too.
 - The collector: its launchd job `com.valedia.orderbook-collector` listed; the last 10 decisions' status and latency (shown);
   the decisions of the last 15 minutes (judged by the breach rule below); the age of the last heartbeat. The store is opened read-only (`file:<path>?mode=ro`) and only `decisions.status`,
   `decisions.latency_s`, `decisions.decision_ts` and `heartbeats.ts` are ever read; the three statements are the module's
@@ -84,7 +90,14 @@ For the whole window (the wall clock plus the 120 s cleanup), each named in the 
   just before the gate; for a load test, just before the load call) nothing is launched, everything is restored and the
   row is a refusal naming it (exit 2), since the start check and what the owner was told no longer hold; AFTER the spawn
   (seen at every 30 s check and once more at the end) it is said at once in capitals (`MODEL LOADED AFTER THE
-  ANNOUNCEMENT`), the stop rule governs the run as before, and the run does NOT count, whatever else it shows. The load test's own `mf-native-<hex>` instance is
+  ANNOUNCEMENT`), the stop rule governs the run as before, and the run does NOT count, whatever else it shows. A model that
+  appears and goes again between two checks is still named and still keeps the run from counting once one check saw it.
+  A model list that cannot be read at one of these checks is never a pass: BEFORE the spawn (the read after the unloads,
+  the read just before the gate, or before a load test's load call) it is a refusal (`THE MODEL LIST COULD NOT BE READ`,
+  not launched or not loaded, everything restored, `model_list_unread: true` in the row, exit 2); AFTER the spawn it is
+  said in capitals at the first check of each unreadable stretch, every such check's time is kept in
+  `model_list_unread_at`, and the run counts only if the last check, the one at its end, reads the list again (a model
+  that came and went entirely inside the stretch could not be seen by any check). The load test's own `mf-native-<hex>` instance is
   named in the intent file before its load call and is the only instance its unload names
   (`POST /api/v1/models/unload {"instance_id": ...}`) and named in the record. They are NOT reloaded: LM Studio loads each again
   on demand.
@@ -189,7 +202,9 @@ A hang-up that is already ignored when the tool starts (it was started under `no
 
 **The lock.** `run` and `load-test` hold an exclusive advisory lock (`flock`) on `artifacts/mirofish/operator.lock` from
 before their first changing action until after their row; `recover` holds it while it works. Each takes it without
-waiting and refuses in capitals (`ANOTHER OPERATOR COMMAND HOLDS THE LOCK`) when it is held. The kernel drops the lock when
+waiting and refuses in capitals (`ANOTHER OPERATOR COMMAND HOLDS THE LOCK`) when it is held. A command refused by the lock
+writes NOTHING: its one refusal line on standard output and exit 2; no record row, no load-test result file (two load
+tests started in the same second would otherwise share the holder's result path), no intent file. The kernel drops the lock when
 its holder ends, however it ends (a KILL included), so whether the tool that wrote an intent file is still alive is asked
 of the kernel, never read from a pid. The launcher does not inherit it. The lock file is never removed.
 
@@ -207,28 +222,40 @@ a row nor the intent file. While it exists, `check`, `run` and `load-test` refus
 **`recover`** is for after such an end. In order:
 
 1. It takes the lock (a live writer holds it: refused, exit 2). No intent file: "no intent file", exit 0.
-2. The intent is parsed against its one typed shape (every field and its type, nothing else); a field that fails is named
-   and nothing is done, the file kept (exit 2). Then it is checked against the tool's constants: the pick reader's label
+2. The intent is parsed against its one typed shape (every field and its type, nothing else; a string with a lone
+   surrogate, which a JSON file can carry as an escape, is not a string of the shape); a field that fails is named
+   and nothing is done, the file kept (exit 2). The pick reader's launchd job is read once before anything else; a read that
+   raises is a refusal in words with the error's type only (nothing done, the file kept, exit 2); one that raises later
+   holds the reader off and keeps the file (exit 3). Then it is checked against the tool's constants: the pick reader's label
    `com.valedia.picks.hourly`, its one plist `~/Library/LaunchAgents/com.valedia.picks.hourly.plist`, and a work folder that
    is a staged `valedia-native-*` folder of the crew folder; a `MISMATCH` is printed and nothing is done (exit 2). (`check`,
    `run` and `load-test`, for their part, refuse before any change when the reader is loaded from any other plist.)
-3. Survivors are looked for: the intent's launcher entry, the observer identity file in the staged folder, and a scan of
-   this user's processes (pids only) for the two commands. Each proposed pid is put to the proof, and only a pid that
-   passes ALL of it is a survivor: above 1; not this process or any ancestor; not the job pid of
-   `com.valedia.orderbook-collector` or of `com.valedia.picks.hourly` (read from launchd by those fixed labels); its start
-   equal to the one held for it, when one is held; and its own command naming BOTH the staged folder and the script of its
-   role: the launcher `... -B mirofish_native_startup.py --work <staged folder> ...`, the observer
+3. Survivors are found by the scan of this user's processes ALONE (`ps -U <uid> -o pid=`; a scan that fails, or that does
+   not list this very tool, could not be made). EVERY process it lists is put to the proof in BOTH roles, launcher and
+   observer, whatever any file proposed. The intent's launcher entry and the staged folder's observer identity file are
+   hints only: they add nothing except the start the intent holds for its launcher, which is compared in the launcher role
+   alone; a proposed pid proven in no role is reported by its pid as not this run's (so an intent naming the observer as
+   the launcher, an identity file naming the launcher, or both naming unrelated live pids, still leave the true launcher
+   and observer found in their true roles). Only a pid that passes ALL of the proof is a survivor: above 1; not this
+   process or any ancestor; not the job pid of `com.valedia.orderbook-collector` or of `com.valedia.picks.hourly` (read
+   from launchd by those fixed labels); its start read, and equal to the one held for it when one is held; and its own
+   command read and naming BOTH the staged folder and the script of its role: the launcher
+   `... -B mirofish_native_startup.py --work <staged folder> ...`, the observer
    `... -B <staged folder>/owned-source/observer-entry/mirofish_native_run.py`. The command is read (`ps -ww -p PID -o
    command=`) for that test alone and dropped at once: it is never printed, logged, stored, put in a row or in an exception
-   text; only "it names them" or "it does not" leaves the test. An identity file never suffices by itself: it only proposes
-   a pid. A proposed process that is alive but fails a test is never signalled. Two cases are kept apart: when the proof
-   could NOT be made (a command or a start unreadable, the job list unreadable, the scan failed) nothing is changed, the
-   file is kept and it says so in capitals (exit 3); when the proof was made and the answer is no (the command does not
-   name this run's folder and script, the start differs, or the pid is 1 or less, this tool, an ancestor or a job's pid:
-   a reused pid), the process is reported by its pid only, never signalled, and does not hold the recovery back.
+   text; only "it names them" or "it does not" leaves the test. A process whose command names neither role and that no file
+   proposed is not a candidate. Two cases are kept apart: when the proof could NOT be made, nothing is changed, the file is
+   kept and it says so in capitals (exit 3): a command that could not be read (the read raised, ps failed, or it answered
+   with no string or an empty one, for a pid that is still alive), a start that could not be read (any ps answer other than
+   its own "no such process": exit 1 with nothing on either stream), the job list unreadable, the scan failed. When the
+   proof was made and the answer is no (a command that WAS read does not name this run's folder and script, the start
+   differs from the intent's, or the pid is 1 or less, this tool, an ancestor or a job's pid: a reused pid), the process
+   is reported by its pid only, never signalled, and does not hold the recovery back.
 4. Every proven survivor is reported in capitals (`LAUNCHER STILL RUNNING`, `OBSERVER STILL RUNNING`). Only with `--stop`
-   is it stopped the documented way, each proven again just before its signal: TERM to a proven observer, then, if a
-   proven launcher still runs, SIGINT to it; it waits up to 180 s for them to end.
+   is it stopped the documented way, each proven again (start and command) immediately before its own signal, so a pid
+   that passed the scan and was replaced by another process is not signalled: TERM to a proven observer, then, if a
+   proven launcher still runs, SIGINT to it; it waits up to 180 s for them to end. A survivor whose proof can no longer be
+   made counts as still running.
 5. While a proven survivor lives, or while a proof or the scan could not be made, the
    pick reader is NOT put back (the reader beside a live run is what the switch-off exists to prevent) and the intent file
    is kept. Without `--stop` it then changes nothing at all and writes no row (exit 3).
@@ -240,6 +267,12 @@ a row nor the intent file. While it exists, `check`, `run` and `load-test` refus
 
 Exit 0 when the recovery is complete with no alert, else 3. `recover --dry-run` reads, proves and prints, and changes
 nothing.
+
+Refusals are in words, never a traceback: `--setup-model` and `--turns-model` naming the same model (one model is
+`--model`), or a model or plan that `tools/mirofish_swarm_limits.py` does not know, print `refused: ...` and exit 2 before
+anything is changed. Every line the tool prints is made safe for the encoding of its standard output (a character it
+cannot carry, a lone surrogate read from a file or a listing included, is written as a backslash escape), so no print of
+text read from a file can raise.
 
 A long run should not depend on the terminal that started it. Start it detached from the terminal, so that closing the
 window or ending the session neither hangs it up nor kills it, and read its output from the log:
