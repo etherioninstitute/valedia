@@ -398,8 +398,10 @@ class World:
     the first usable point 120 s after `start` at the grain of its age (five minutes from 2026 on, three hours
     before), and a terminal point of grain 0 one second before `end`."""
 
-    def __init__(self, seed, edge, move, pros=12, per_month=30, months=ALL_MONTHS, market_makers=2, late_rich=False):
+    def __init__(self, seed, edge, move, pros=12, per_month=30, months=ALL_MONTHS, market_makers=2, late_rich=False,
+                 event_every=2):
         self.rng = random.Random(seed)
+        self.event_every = event_every               # positions to an event (2: a pair; more: events with many trades)
         self.trades: dict[str, list[dict]] = {}
         self.res: dict[str, dict] = {}
         self.prices: dict[str, list] = {}            # token -> [t1, price before t1, price from t1 on]
@@ -443,7 +445,7 @@ class World:
     def position(self, wallet, ym, edge, move, win=None, cash=None):
         self.n += 1
         n = self.n
-        token, cond, event = "tok%d" % n, "cond%d" % n, "ev%d" % (n // 2)
+        token, cond, event = "tok%d" % n, "cond%d" % n, "ev%d" % (n // self.event_every)
         t1 = self._ts(ym)
         p = self.rng.randrange(20, 81) / 100
         size = round((cash or self.rng.uniform(1100, 3000)) / p, 2)
@@ -624,9 +626,9 @@ def test_a_wallet_rich_only_after_month_m_is_not_a_leader_of_m(tmp_path):
 
 def test_develop_never_reads_or_uses_a_sealed_month(skilled, tmp_path):
     base = cl.run_develop(store=skilled, out_dir=tmp_path / "o1")["result"]
-    data = cl.load(skilled, "development")
-    assert max(t.ts for ts in data.trades.values() for t in ts) < cl.SEALED_START + cl.SPILL
-    assert max(p.ts for ps in data.points.values() for p in ps) < cl.SEALED_START + cl.DAY + cl.PRICE_SPAN
+    rows, points = _reads_of(lambda: cl.load(skilled, "development"))             # every row the reads build
+    assert rows and max(r["timestamp"] for r in rows) < cl.SEALED_START + cl.SPILL
+    assert points and max(p.ts for p in points) < cl.SEALED_START + cl.DAY + cl.PRICE_SPAN
     w = World(7, edge=0.08, move=0.02, **SKILLED_SIZE)
     for rows in w.trades.values():
         for r in rows:
@@ -640,7 +642,7 @@ def test_develop_never_reads_or_uses_a_sealed_month(skilled, tmp_path):
         if pr[0] >= cl.SEALED_START:
             pr[1] = pr[2] = 0.06
     poisoned = cl.run_develop(store=w.write(tmp_path / "p.sqlite"), out_dir=tmp_path / "o2")["result"]
-    assert poisoned == base
+    assert cl._dump(poisoned) == cl._dump(base)                                      # byte for byte
 
 
 def test_sealed_needs_the_flag_the_development_file_and_runs_once(skilled, tmp_path):
@@ -1016,7 +1018,8 @@ def test_pull_phase_2_reads_price_windows_only_for_the_leaders_qualifying_positi
     ten = {(tg.token, tg.t1 + 600, tg.t1 + 600 + 12 * HOUR) for tg in plan.values() if w.grain(tg.t1) <= 300}
     assert plan and ten and asked == base | ten and len(urls) == len(asked) == len(windows)
     assert meta["ten_minute_windows_added"] is True
-    assert "%d" % len(base) in said[0] and "requests" in said[0]           # counted before the first request
+    first = [m for m in said if "planning" not in m][0]                 # after the planning step's own lines
+    assert "%d" % len(base) in first and "requests" in first              # counted before the first request
     for tg in plan.values():                          # only the month's leaders, only the month's positions
         assert set(tg.wallets) <= set(cl.leaders_of(books, tg.month)[0]) or tg.month >= (2026, 7)
         assert cl.month_of(tg.t1) == tg.month
@@ -2262,3 +2265,345 @@ def test_the_end_of_walk_numbering_is_done_in_bounded_chunks(tmp_path, monkeypat
     assert max(rows) >= 3
     assert len([st for st in statements if st.startswith("UPDATE price_points SET seq")]) == sum(r // 2 + 1
                                                                                                for r in rows)
+
+
+# ------------------------------------------------------------------ T47c: the reads wallet by wallet
+BEFORE_T47C = "a49faab"                                # the code as it was at the start of T47c: the reference
+
+
+def _code_before(tmp_path):
+    """copy_leaders.py as it was at BEFORE_T47C, loaded as its own module (its own file, so its own code hash)."""
+    import types
+    root = Path(cl.__file__).resolve().parents[2]
+    src = subprocess.run(["git", "-C", str(root), "show", "%s:valedia_trader/research_loop/copy_leaders.py"
+                          % BEFORE_T47C], capture_output=True, text=True, check=True).stdout
+    path = tmp_path / "copy_leaders_before.py"
+    path.write_text(src)
+    name = "copy_leaders_before_t47c"
+    mod = types.ModuleType(name)
+    mod.__file__ = str(path)
+    sys.modules[name] = mod
+    exec(compile(src, str(path), "exec"), mod.__dict__)
+    return mod
+
+
+def _reads_of(fn):
+    """(every trade row the reads turn into trades, every price point built) while `fn` runs."""
+    rows, points = [], []
+    real_t, real_p = cl.trade_from_row, cl.Point
+
+    def t(wallet, seq, row):
+        rows.append(dict(row))
+        return real_t(wallet, seq, row)
+
+    class P(real_p):
+        def __new__(cls, *a):
+            p = real_p.__new__(cls, *a)
+            points.append(real_p(*a))
+            return p
+    cl.trade_from_row, cl.Point = t, P
+    try:
+        fn()
+    finally:
+        cl.trade_from_row, cl.Point = real_t, real_p
+    return rows, points
+
+
+def _variety(seed):
+    rng = random.Random(4700 + seed)
+    return dict(edge=rng.choice([0.0, 0.1, 0.3, 0.3]), move=rng.choice([0.0, 0.02]), pros=rng.randrange(3, 8),
+                per_month=rng.choice([6, 9, 11, 14, 20]), market_makers=rng.randrange(0, 3),
+                event_every=rng.choice([2, 2, 30]), months=SMALL_MONTHS)
+
+
+def _outcome(fn):
+    try:
+        return "ok", fn()
+    except cl.Refused as e:
+        return "refused", str(e)
+
+
+def test_t47c_planning_develop_and_sealed_equal_the_code_before_on_40_seeded_stores(tmp_path, monkeypatch):
+    old = _code_before(tmp_path)
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    monkeypatch.setattr(old, "_now", lambda: FIXED)
+    seen = Counter()
+    for seed in range(40):
+        w = World(seed, **_variety(seed))
+        leave = ["pro01"] if seed % 5 == 3 else []
+        d = tmp_path / ("s%02d" % seed)
+        d.mkdir()
+        store = d / "s.sqlite"
+        client = _paged_client(PagedWorld(w, seed))
+        cl.pull(store, client, phase=1, say=lambda m: None)
+        a, b = d / "a.sqlite", d / "b.sqlite"                        # the planning step, old and new
+        shutil.copy(store, a)
+        shutil.copy(store, b)
+        with old.Store(a) as s:
+            old.plan_store(s, leave)
+            s.commit()
+        with cl.Store(b) as s:
+            cl.plan_store(s, leave, say=lambda m: None)
+            s.commit()
+        ta, tb = _tables(a), _tables(b)
+        assert ta == tb, seed
+        seen["planned"] += len(tb["plan"])
+        cl.pull(store, client, phase=2, leave_out=leave, say=lambda m: None)
+        o_old, o_new = d / "o_old", d / "o_new"                      # develop, old and new, on the same store
+        r_old = _outcome(lambda: old.run_develop(store=store, out_dir=o_old, leave_out=leave))
+        r_new = _outcome(lambda: cl.run_develop(store=store, out_dir=o_new, leave_out=leave, say=lambda m: None))
+        assert r_old[0] == r_new[0] and (r_old[0] == "ok" or r_old[1] == r_new[1]), (seed, r_old, r_new)
+        if r_old[0] != "ok":
+            seen["develop_refused"] += 1
+            continue
+        sha_old, sha_new = r_old[1]["provenance"]["code_sha256"], r_new[1]["provenance"]["code_sha256"]
+        assert sha_old != sha_new
+        raw_old = (o_old / "develop.json").read_bytes().replace(sha_old.encode(), sha_new.encode())
+        assert raw_old == (o_new / "develop.json").read_bytes(), seed
+        res = r_new[1]["result"]
+        seen["months_left_out"] += sum(res["months_left_out"].values())
+        seen["leave_out"] += len(res["wallets_left_out"])
+        seen[res["step_1"]["verdict"]] += 1
+        c_old, c_new = d / "c_old.sqlite", d / "c_new.sqlite"        # sealed, old and new, on two copies
+        shutil.copy(store, c_old)
+        shutil.copy(store, c_new)
+        q_old = _outcome(lambda: old.run_sealed(store=c_old, out_dir=o_old, flag=True, leave_out=leave,
+                                                develop_file=o_old / "develop.json"))
+        q_new = _outcome(lambda: cl.run_sealed(store=c_new, out_dir=o_new, flag=True, leave_out=leave,
+                                               develop_file=o_new / "develop.json", say=lambda m: None))
+        assert q_old[0] == q_new[0], (seed, q_old, q_new)
+        if q_old[0] != "ok":
+            assert q_old[1].replace(str(c_old), str(c_new)).replace(str(o_old), str(o_new)) == q_new[1], seed
+            continue
+        seen["sealed"] += 1
+        swap = [(sha_old, sha_new), (str(c_old.resolve()), str(c_new.resolve())),
+                (str(o_old / "develop.json"), str(o_new / "develop.json"))]
+        raw_old = (o_old / "sealed.json").read_bytes()
+        for x, y in swap:
+            raw_old = raw_old.replace(x.encode(), y.encode())
+        assert raw_old == (o_new / "sealed.json").read_bytes(), seed
+        m_old, m_new = (json.loads((o / "sealed.used").read_text()) for o in (o_old, o_new))
+        for m in (m_old, m_new):
+            m.pop("time")
+            m.pop("store")
+            m.pop("development_file")
+        assert m_old == m_new, seed
+    assert seen["planned"] > 0 and seen["months_left_out"] > 0 and seen["leave_out"] > 0, seen
+    assert seen["PROCEED"] > 0 and seen["FAIL"] > 0 and seen["sealed"] > 0, seen
+
+
+class _Live:
+    """Live objects of a kind: made less freed, with the peak."""
+
+    def __init__(self):
+        self.now = self.peak = self.made = 0
+
+    def up(self):
+        self.now += 1
+        self.made += 1
+        self.peak = max(self.peak, self.now)
+
+    def down(self):
+        self.now -= 1
+
+
+def _counting(monkeypatch):
+    trades, points = _Live(), _Live()
+
+    class LiveTrade(cl.Trade):
+        def __new__(cls, *a, **k):
+            trades.up()
+            return object.__new__(cls)
+
+        def __del__(self):
+            trades.down()
+
+    real_p = cl.Point
+
+    class LivePoint(real_p):
+        def __new__(cls, *a):
+            points.up()
+            return real_p.__new__(cls, *a)
+
+        def __del__(self):
+            points.down()
+    monkeypatch.setattr(cl, "Trade", LiveTrade)
+    monkeypatch.setattr(cl, "Point", LivePoint)
+    return trades, points
+
+
+def test_no_step_holds_all_trades_of_a_wallet_or_every_price_point_at_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    w = World(5, edge=0.3, move=0.0, pros=3, per_month=300, months=SMALL_MONTHS, market_makers=1)
+    biggest = max(len(rows) for rows in w.trades.values())
+    assert biggest >= 2400
+    out = tmp_path / "out"
+    steps = {}
+    for name, fn in (("planning", lambda: w.write(tmp_path / "s.sqlite")),
+                     ("develop", lambda: cl.run_develop(store=tmp_path / "s.sqlite", out_dir=out)),
+                     ("sealed", lambda: cl.run_sealed(store=tmp_path / "s.sqlite", out_dir=out, flag=True))):
+        import gc
+        gc.collect()
+        trades, points = _counting(monkeypatch)
+        doc = fn()
+        steps[name] = (trades.made, trades.peak, points.made, points.peak)
+        monkeypatch.undo()
+        monkeypatch.setattr(cl, "_now", lambda: FIXED)
+        if name == "develop":
+            assert doc["result"]["step_1"]["verdict"] == "PROCEED"
+    for name, (made, peak, pmade, ppeak) in steps.items():
+        assert made >= biggest and peak < 200, (name, steps)          # never a wallet's trades at once
+        if name != "planning":
+            assert pmade > 1000 and ppeak < 100, (name, steps)        # never every price point at once
+
+
+_SAID = re.compile(r"^(develop|sealed|sealed \(development recomputed\)|phase 2: planning): wallet (\d+) of (\d+) "
+                   r"\(([^)]{1,10})\): [\d,]+ rows read, \d+ s, memory \d+ MB$")
+_ANY_ID = re.compile(r"\b(?:tok|mmt|cond|mmc|ev|mmev)\d+\b|0x[0-9a-f]{6,}")
+
+
+def _wallet_lines(said, prefix, wallets):
+    lines = [m for m in said if m.startswith(prefix + ": wallet")]
+    got = [_SAID.match(m) for m in lines]
+    assert all(got), lines
+    assert [int(g.group(2)) for g in got] == list(range(1, len(lines) + 1))
+    assert {int(g.group(3)) for g in got} == {len(lines)}
+    assert [g.group(4) for g in got] == [x[:10] for x in wallets]
+    return lines
+
+
+def test_each_step_prints_one_flushed_line_a_wallet_naming_nothing_else(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    w = World(7, edge=0.08, move=0.02, **SKILLED_SIZE)
+    store = w.write(tmp_path / "s.sqlite", phase2=False)
+    with cl.Store(store) as s:
+        wallets = [x for x in s.candidates() if x in s.finished_keys("trades")]
+    said = []
+
+    def transport(url):
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+        rows = w.history(q["token_id"], int(q["start"]), int(q["end"]))
+        return json.dumps({"data": rows, "pagination": {"has_more": False, "next_cursor": None}}).encode()
+    cl.pull(store, _client(transport), phase=2, say=said.append)
+    _wallet_lines(said, "phase 2: planning", wallets)
+    dev = []
+    cl.run_develop(store=store, out_dir=tmp_path / "out", say=dev.append)
+    _wallet_lines(dev, "develop", wallets)
+    sealed = []
+    cl.run_sealed(store=store, out_dir=tmp_path / "out", flag=True, say=sealed.append)
+    _wallet_lines(sealed, "sealed (development recomputed)", wallets)
+    _wallet_lines(sealed, "sealed", wallets)
+    for m in said + dev + sealed:
+        assert not _ANY_ID.search(m), m
+    capsys.readouterr()
+    assert cl.main(["develop", "--store", str(store), "--out-dir", str(tmp_path / "o2")]) == 0
+    err = capsys.readouterr().err.splitlines()
+    assert len([m for m in err if m.startswith("develop: wallet")]) == len(wallets)
+
+
+def test_develop_stops_for_memory_at_a_wallet_with_nothing_written(tmp_path, monkeypatch):
+    store = _cheap(tmp_path)
+    monkeypatch.setattr(cl, "rss_mb", lambda: 5000.0)
+    with pytest.raises(cl.PullStopped, match="above the limit of 1000 MB"):
+        cl.run_develop(store=store, out_dir=tmp_path / "o", max_memory_mb=1000, say=lambda m: None)
+    assert not (tmp_path / "o").exists()
+    assert cl.main(["develop", "--store", str(store), "--out-dir", str(tmp_path / "o"), "--max-memory-mb",
+                    "1000"]) == 4
+    assert not (tmp_path / "o").exists()
+    monkeypatch.setattr(cl, "rss_mb", lambda: 100.0)
+    cl.run_develop(store=store, out_dir=tmp_path / "o", max_memory_mb=1000, say=lambda m: None)
+    assert (tmp_path / "o" / "develop.json").is_file()
+
+
+def test_sealed_stops_for_memory_before_its_claim_and_the_period_is_not_spent(tmp_path, monkeypatch):
+    store = _twin(tmp_path, "s.sqlite")
+    out = tmp_path / "out"
+    cl.run_develop(store=store, out_dir=out, say=lambda m: None)
+    before = _sha(store)
+    monkeypatch.setattr(cl, "rss_mb", lambda: 5000.0)
+    with pytest.raises(cl.PullStopped, match="above the limit of 1000 MB"):
+        cl.run_sealed(store=store, out_dir=out, flag=True, max_memory_mb=1000, say=lambda m: None)
+    assert _no_marker(store, out) and not (out / "sealed.json").exists() and _sha(store) == before
+    claimed = []
+    real_claim = cl._claim
+
+    def claim(*a):
+        real_claim(*a)
+        claimed.append(True)
+    monkeypatch.setattr(cl, "_claim", claim)                # above the limit only once the period is claimed
+    monkeypatch.setattr(cl, "rss_mb", lambda: 5000.0 if claimed else 100.0)
+    said = []
+    doc = cl.run_sealed(store=store, out_dir=out, flag=True, max_memory_mb=1000, say=said.append)
+    assert claimed and doc["result"]["verdict"]["verdict"] in ("PASS", "FAIL") and (out / "sealed.json").is_file()
+    assert any("claimed" in m and "above the limit" in m for m in said)    # said, not stopped: the period is spent
+
+
+def test_the_planning_step_stops_for_memory_with_no_plan_written(tmp_path, monkeypatch):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    w = World(9, edge=0.1, move=0.0, pros=6, per_month=12, months=SMALL_MONTHS)
+    store = w.write(tmp_path / "s.sqlite", phase2=False)
+    said = []
+    with pytest.raises(cl.PullStopped):
+        cl.pull(store, _client(lambda url: pytest.fail("no request")), phase=2, say=said.append,
+                max_memory_mb=1000, memory=lambda: 5000.0)
+    with cl.Store(store) as s:
+        assert s.db.execute("SELECT COUNT(*) FROM plan").fetchone() == (0,) and s.meta("plan") is None
+        assert s.db.execute("SELECT COUNT(*) FROM plan_windows").fetchone() == (0,)
+    assert any(m.startswith("stopped: resident memory") for m in said)
+
+
+def test_sealed_reads_no_sealed_row_before_its_claim_on_the_new_path(tmp_path, monkeypatch):
+    store = _twin(tmp_path, "s.sqlite")
+    out = tmp_path / "out"
+    cl.run_develop(store=store, out_dir=out, say=lambda m: None)
+    claimed, early, late = [], [], []
+    real_claim, real_t, real_p = cl._claim, cl.trade_from_row, cl.Point
+
+    def claim(*a):
+        real_claim(*a)
+        claimed.append(True)
+
+    def t(wallet, seq, row):
+        (late if claimed else early).append(("trade", row["timestamp"]))
+        return real_t(wallet, seq, row)
+
+    class P(real_p):
+        def __new__(cls, *a):
+            (late if claimed else early).append(("point", a[0]))
+            return real_p.__new__(cls, *a)
+    monkeypatch.setattr(cl, "_claim", claim)
+    monkeypatch.setattr(cl, "trade_from_row", t)
+    monkeypatch.setattr(cl, "Point", P)
+    cl.run_sealed(store=store, out_dir=out, flag=True, say=lambda m: None)
+    assert early and max(ts for k, ts in early if k == "trade") < cl.SEALED_START + cl.SPILL
+    assert max(ts for k, ts in early if k == "point") < cl.SEALED_START + cl.DAY + cl.PRICE_SPAN
+    assert max(ts for k, ts in late if k == "trade") >= cl.SEALED_START + cl.SPILL   # the sealed rows, after it
+
+
+def test_a_development_run_fetches_no_row_of_a_market_only_sealed_positions_touch(skilled, tmp_path, monkeypatch):
+    w = World(7, edge=0.08, move=0.02, **SKILLED_SIZE)
+    by_cond = {}
+    for rows in w.trades.values():
+        for r in rows:
+            by_cond.setdefault(r["condition_id"], []).append(r["timestamp"])
+    sealed_only = {c for c, ts in by_cond.items() if min(ts) >= cl.SEALED_START + cl.SPILL}
+    sealed_tokens = {r["token_id"] for rows in w.trades.values() for r in rows if r["condition_id"] in sealed_only}
+    assert len(sealed_only) > 100
+    statements, fetched = [], Counter()
+    real_connect, real_r = sqlite3.connect, cl.resolution_from_row
+
+    def traced(*a, **k):
+        db = real_connect(*a, **k)
+        db.set_trace_callback(statements.append)
+        return db
+
+    def r(row):
+        fetched["resolution"] += row["condition_id"] in sealed_only
+        return real_r(row)
+    monkeypatch.setattr(cl.sqlite3, "connect", traced)
+    monkeypatch.setattr(cl, "resolution_from_row", r)
+    rows, _ = _reads_of(lambda: cl.run_develop(store=skilled, out_dir=tmp_path / "o", say=lambda m: None))
+    fetched["trade"] = sum(1 for x in rows if x["condition_id"] in sealed_only)
+    fetched["price window"] = sum(1 for st in statements if "price_points" in st
+                                  and any("'%s@" % tok in st for tok in sealed_tokens))
+    assert rows and fetched == Counter({"trade": 0, "resolution": 0, "price window": 0}), fetched
