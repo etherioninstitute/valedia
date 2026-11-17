@@ -704,6 +704,9 @@ class SignalGuard:
     def install(self):
         for sig in OPERATOR_SIGNALS:
             self.old[sig] = self.host.install_signal(sig, self.handler)
+            if sig == signal.SIGHUP and self.old[sig] == signal.SIG_IGN:
+                # started under `nohup`: the operator chose that a hang-up does not end the run; it stays ignored
+                self.host.install_signal(sig, signal.SIG_IGN); self.row['hup_ignored'] = True
 
     def handler(self, signum, frame):
         name = signal.Signals(signum).name
