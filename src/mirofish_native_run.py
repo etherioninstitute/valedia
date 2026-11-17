@@ -433,6 +433,8 @@ def verify_launch(work, gate, candidate_digest, run_id=None):
 # TMF5 addendum 1 (d): the start check is one reading; the running phase stops only on what endangers the machine.
 START_FREE_PERCENT=65         # the start check (one reading); staging sets it from the start table in tools/mirofish_swarm_limits.py
 STOP_FREE_PERCENT=30          # (iii): the reviewed floor's number, now held on every sample for SUSTAIN_SECONDS
+HARD_FLOOR_PERCENT=15         # beside it, one sample under this stops at once (the lowest single sample on record is 27)
+GAP_FAILURES=('resource capsule stale/future/expired','resource UTC stale/future','invalid JSON','nonfinite JSON','duplicate JSON field')  # (iv), not a verification failure
 SUSTAIN_SECONDS=10.0
 READING_GAP_SECONDS=3.0       # (iv): no fresh, valid reading for this long fails closed
 OWNED_RSS_BOUND=40*1024**3    # the conservative owned resident-memory bound, unchanged (the co-resident is outside it)
@@ -456,6 +458,13 @@ class ResourceRule:
         self.last_valid=started;self.sequence=None;self.first=None;self.low_since=None;self.warn_since=None
         self.window=collections.deque();self.lowest_sustained=None;self.max_level=None;self.co_max=0
     def observe(self,sample):
+        # On every sample whose own fields are valid, whatever its pressure level reads: the hard floor, the owned memory bound and
+        # two co-residents stop at once.
+        if type(sample) is dict:
+            free,owned,co_rows=sample.get('free_percent'),sample.get('owned_scope_rss_bytes'),sample.get('co_resident_rows')
+            if type(free) is int and 0<=free<HARD_FLOOR_PERCENT:return 'memory free below %d on one sample'%HARD_FLOOR_PERCENT
+            if type(co_rows) is int and co_rows>=2:return TWO_CO_RESIDENTS
+            if type(owned) is int and owned>OWNED_RSS_BOUND:return 'conservative owned-model RSS upper bound exceeded'
         if not valid_reading(sample):return None   # not a reading: only (iv) can follow from it
         stamp=float(sample['monotonic']);self.last_valid=max(self.last_valid,stamp)
         if sample.get('sequence') is not None and sample.get('sequence')==self.sequence:return None   # the same capsule read again
@@ -472,8 +481,6 @@ class ResourceRule:
         if level==4:return 'kernel memory pressure critical (level 4)'
         if self.warn_since is not None and stamp-self.warn_since>=SUSTAIN_SECONDS:return 'kernel memory pressure warning or worse for 10 s'
         if self.low_since is not None and stamp-self.low_since>=SUSTAIN_SECONDS:return 'memory free below %d for 10 s'%STOP_FREE_PERCENT
-        if type(sample.get('co_resident_rows')) is int and sample['co_resident_rows']>=2:return TWO_CO_RESIDENTS
-        if type(sample.get('owned_scope_rss_bytes')) is int and sample['owned_scope_rss_bytes']>OWNED_RSS_BOUND:return 'conservative owned-model RSS upper bound exceeded'
         return None
     def gap(self,now):
         return 'no fresh valid resource reading for 3 s' if now-self.last_valid>READING_GAP_SECONDS else None
@@ -499,7 +506,12 @@ def observe_resource(rule,lock,now=None):
     """Feed the freshest capsule to the rule. A capsule that cannot be read or validated is no reading (rule iv decides)."""
     from mirofish_native_startup import resource_from_capsule
     try:sample=resource_from_capsule()
-    except Exception:sample=None
+    except FileNotFoundError:sample=None   # missing: rule (iv) decides
+    except NativeRefused as exc:
+        if str(exc) not in GAP_FAILURES:   # a capsule that fails verification (signature, identity, field set, shape) stops at once
+            failure=NativeRefused('resource capsule failed verification: '+str(exc));failure.resource_sample=None
+            raise failure from None
+        sample=None   # stale or unparseable: rule (iv) decides
     with lock:reason=rule.observe(sample) or rule.gap(time.monotonic() if now is None else now)
     if reason:
         failure=NativeRefused(reason);failure.resource_sample=sample

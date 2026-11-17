@@ -528,7 +528,7 @@ class PlanStaging(unittest.TestCase):
         s.storage_guard();cls.temp_root=s.RESUME/'build/staging-test-tmp';cls.temp_root.mkdir(exist_ok=True);cls.base=base_manifest()
     def test_tmf4b_src_pins_moved_to_the_tmf4a_revisions_of_this_repository(self):
         self.assertEqual(s.SRC,Path(s.__file__).absolute().parents[1]/'src')                       # the tool's own repository, never another tree
-        self.assertEqual((s.MODEL_SRC_SHA,s.RUN_SRC_SHA),('e1cd97e15a990a8418fca22e044520eb19b5bf76edb7b227a4e471e431792115','87e25cb380bcd6a44787b41a15b6e12f0d05ce3f0509e13c9232fc33632d93d6'))   # TMF5 moved the run pin (was 0426dd5a; f09d4870 before addendum 2)
+        self.assertEqual((s.MODEL_SRC_SHA,s.RUN_SRC_SHA),('e1cd97e15a990a8418fca22e044520eb19b5bf76edb7b227a4e471e431792115','30a068cf82cf967bc3644b82c4518706611756719ac3336056feb2677ad18b79'))   # TMF5 moved the run pin (was 0426dd5a; f09d4870 before addendum 2)
         self.assertEqual((s.sha(s.SRC/'mirofish_native_model.py'),s.sha(s.SRC/'mirofish_native_run.py')),(s.MODEL_SRC_SHA,s.RUN_SRC_SHA))
         for text in ['fc99603','38bce8a','TMF4a','addendum 3',SRC_REVIEW]:self.assertIn(text,s.SRC_REVISION_NOTE)
         self.assertTrue(s.SRC_REVIEW_STATUS.startswith(SRC_REVIEW+'; the TMF5 revisions'))   # TMF5 appends its own open review

@@ -81,7 +81,7 @@ ORIGINAL_SDK_PORT=62298;SERVER_PORT=1235
 # from a selector file written beside the model module. Staging WITHOUT a model copies the W16 bytes as before, with no selector.
 SRC=Path(__file__).absolute().parents[1]/'src'
 MODEL_SRC_SHA='e1cd97e15a990a8418fca22e044520eb19b5bf76edb7b227a4e471e431792115'   # fc99603 (TMF4a) + 38bce8a (TMF4 addendum 3)
-RUN_SRC_SHA='87e25cb380bcd6a44787b41a15b6e12f0d05ce3f0509e13c9232fc33632d93d6'   # TMF5 addendum 2 (was 0426dd5a, TMF4a + addendum 3; f09d4870, TMF5)
+RUN_SRC_SHA='30a068cf82cf967bc3644b82c4518706611756719ac3336056feb2677ad18b79'   # TMF5 check notes (was 0426dd5a, TMF4a + addendum 3; f09d4870, TMF5; 87e25cb3, addendum 2)
 # TMF5 (2026-11-17): staged with a model, the startup and gateway modules are also the pinned src/ revisions (the stop rule's
 # sample fields, the co-resident, the observer identity; the refusal record and the search-query cut), with the same closed
 # integer deltas as the W16 bytes took, and the producer takes the TMF5 patches the staged run script itself lists.
