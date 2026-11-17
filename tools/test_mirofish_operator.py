@@ -577,7 +577,7 @@ class RunRecipe(Base):
 
     def test_decision_instance_wrong_after_the_run_is_said_in_capitals_and_never_reloaded(self):
         def drop(world):
-            if world.launcher is not None and world.launcher.returncode is not None:
+            if world.launcher is not None and world.t >= world.launcher.started + world.run_s:
                 world.models['models'][0]['loaded_instances'] = []
         self.w.on_sleep.append(drop)
         self.main(RUN)
@@ -589,7 +589,7 @@ class RunRecipe(Base):
 
     def test_native_instance_left_loaded_is_said(self):
         def leave(world):
-            if world.launcher is not None and world.launcher.returncode is not None and len(world.models['models']) == 4:
+            if world.launcher is not None and world.t >= world.launcher.started + world.run_s and len(world.models['models']) == 4:
                 world.models['models'].append({'key': 'qwen3-8b', 'type': 'llm', 'loaded_instances': [{'id': 'mf-native-ff', 'config': {}}]})
         self.w.on_sleep.append(leave)
         self.main(RUN)
