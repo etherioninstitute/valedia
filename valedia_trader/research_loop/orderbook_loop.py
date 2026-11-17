@@ -134,11 +134,16 @@ minute makes exactly 4 calls, under the 5 allowed, in that minute and not only o
 after drops a phase holds at most 4, since a new market always takes the least-used phase). Measured on
 2026-11-13 with the final battery (rev 4): about 14,000 input tokens and 3.4 to 3.5 s a call when warm (5.7 s cold),
 so a minute takes about 14 s of reads plus 4 x 3.5 = 14 s of model time; at worst 14 s + 4 x 10 s = 54 s, still inside
-the minute. Each call
-is preceded by two loopback GETs (`/api/tags`, `/api/version`, 2 s limit each) to check the pin.
+the minute. Those measurements were of the Ollama build; since the amendment of 17 November the model is LM
+Studio's instance MODEL_INSTANCE of the GGUF Q8_0 file (six slots, about 2.5 s a call when measured). Each call
+is preceded by one loopback GET (`/api/v1/models`, 2 s limit) to check the pin: the instance is loaded with its
+settings and its entry is the file, whose SHA-256 is verified once in a background thread when collecting starts
+and whose size and modification time are compared on every call. A keeper thread loads the instance when it is
+missing (`ModelKeeper`).
 
 Hosts: Kalshi only at https://api.elections.kalshi.com/trade-api/v2 through `KalshiData` (GET only, no key);
-the model only at http://127.0.0.1:11434 (`ModelClient` refuses any other address). No secrets, no child process.
+the model only at http://127.0.0.1:1235 (`ModelClient` refuses any other address). No secrets. One kind of child
+process: the keeper's `lms load` and `lms unload` of the collector's own instance.
 
 The record is one sqlite file, append-only: triggers refuse every UPDATE and DELETE. Times are kept as UTC ISO
 text and as epoch seconds. Two limits of that guarantee: an `INSERT OR REPLACE` (or `REPLACE`) from another
@@ -156,10 +161,13 @@ import hashlib
 import http.client
 import json
 import math
+import os
 import re
+import shutil
 import signal
 import sqlite3
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -184,8 +192,20 @@ __all__ = ["BATTERY", "BATTERY_ID", "STATE_KEYS", "TABLES", "Selection", "select
 UTC = timezone.utc
 v3 = legacy.load("systemone_v3_candidate")
 KALSHI_BASE = kd.BASE_URL
-MODEL_URL = "http://127.0.0.1:11434"
+MODEL_URL = "http://127.0.0.1:1235"            # LM Studio
 DEFAULT_DB = REPO / "memory" / "orderbook_loop.sqlite"
+# the model's file and the one instance of it the collector calls (the prediction's amendment of 17 November)
+MODEL_KEY_PREFIX = "bespoke-nimble-9b-v3"      # LM Studio's key for the file starts with this
+MODEL_FILE = "~/.lmstudio/models/ggml-org/Bespoke-Nimble-9B-v3-GGUF/Bespoke-Nimble-9B-v3-Q8_0.gguf"   # home expanded at use
+MODEL_FILE_SIZE = 9527503392
+MODEL_FILE_SHA256 = "ad484077ad28c1ba0644509b81e80268f8fd39e9d218415638a988caf3c6e66c"
+MODEL_QUANT = "Q8_0"
+MODEL_INSTANCE = "collector-nimble-9b-v3-q8"   # the name the instance is loaded under and the request names
+MODEL_SLOTS = 6                                # parallel slots: with one, a decision takes over the 10 s limit
+MODEL_CONTEXT = 32768
+KEEPER_EVERY_S = 60.0                          # the keeper runs at most this often,
+KEEPER_TRIES, KEEPER_REST_S = 3, 1800.0        # and after this many replacements in a row rests this long
+LMS_LIMIT_S = 180.0                            # one `lms` command may take this long
 
 # ---- the prediction's settings (do not change: the experiment is locked)
 WATCH_COUNT = 20                  # twenty markets at a time
@@ -201,13 +221,14 @@ ONE_SIDED_MINUTES = 30            # or until its book has been one-sided for 30 
 DEPTH = 10                        # the ten best levels a side, once a minute
 SLOT_S = 300                      # a decision every five minutes per market
 PHASES = 5                        # each market decides on minutes where (minute of the hour) mod 5 == its phase
-TAG = v3.TAG                      # nimble-v3:9b-mxfp8, checked on every call
+TAG = "lmstudio:bespoke-nimble-9b-v3@q8_0"   # stored as model_tag (the amendment of 17 November); the typed
+                                  # contract is still the pinned module's own v3.TAG (nimble-v3:9b-mxfp8)
 
 # ---- the ticket's settings
 WARMUP_S = 1800                   # a market needs 30 minutes of snapshots before its first decision
 STALE_S = 90                      # no call when the newest snapshot is older than this
 MODEL_LIMIT_S = 10.0              # hard limit: an answer not in after this is abandoned (`late`, no answers)
-PIN_TIMEOUT_S = 2.0               # each of the two pin-check GETs
+PIN_TIMEOUT_S = 2.0               # the pin check's one GET
 CALL_RESERVE_S = 2.0              # no call is started with less than MODEL_LIMIT_S + this left in the minute
 FAILS_BEFORE_PAUSE, PAUSE_S = 5, 300
 FIRST_TRADES_S = 60               # a market never read before: its first read goes back one minute
@@ -345,7 +366,7 @@ BATTERY: dict = {
 def _questions_bytes(battery: dict) -> bytes:
     """The questions exactly as they appear in the body sent to the model: the typed request's `questions`,
     compact JSON, in order, nothing sorted."""
-    req = v3.make_request({"x": 1}, battery, tag=TAG)
+    req = v3.make_request({"x": 1}, battery, tag=v3.TAG)
     return json.dumps(req["questions"], separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
@@ -359,8 +380,10 @@ BATTERY_ID = battery_id(BATTERY)
 
 
 def request_bytes(state: dict) -> bytes:
-    """The exact body sent to /v1/systemone: the typed request of the state and the battery, as compact JSON."""
-    req = v3.make_request(state, BATTERY, tag=TAG)
+    """The exact body sent to /v1/systemone: the typed request of the state and the battery, as compact JSON, with
+    the instance's name as its `model`."""
+    req = v3.make_request(state, BATTERY, tag=v3.TAG)
+    req["model"] = MODEL_INSTANCE                    # the same key, so the same order
     return json.dumps(req, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
@@ -996,31 +1019,257 @@ def loopback_http(url: str, data: bytes | None, timeout: float) -> bytes:
 _UNREACHABLE = (ModelUnavailable, OSError, http.client.HTTPException)
 
 
+def _file_sha256(path: str) -> str:
+    """The file's SHA-256, read in 8 MB pieces."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for piece in iter(lambda: f.read(8 << 20), b""):
+            h.update(piece)
+    return h.hexdigest()
+
+
+def _file_stat(path: str):
+    return os.stat(path)
+
+
+def _run_lms(argv: list[str], timeout: float) -> int:
+    """One `lms` command: the fixed argv, no shell, no input, its output discarded. Its exit code."""
+    return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          timeout=timeout, check=False).returncode
+
+
+def _lms_path() -> str:
+    return shutil.which("lms") or os.path.expanduser("~/.lmstudio/bin/lms")
+
+
+def _int_is(x, v: int) -> bool:
+    return type(x) is int and x == v
+
+
+def _instances(listing) -> tuple[list[dict], list[tuple[dict, dict]]]:
+    """The entries of `GET /api/v1/models`, and (entry, instance) for every loaded instance named MODEL_INSTANCE.
+    ValueError for a list that is not of the expected shape."""
+    models = listing.get("models") if isinstance(listing, dict) else None
+    if not isinstance(models, list) or not all(isinstance(e, dict) for e in models):
+        raise ValueError("no list of model entries")
+    found = []
+    for e in models:
+        inst = e.get("loaded_instances", [])
+        if not isinstance(inst, list) or not all(isinstance(i, dict) for i in inst):
+            raise ValueError("loaded_instances of %r is not a list of objects" % e.get("key"))
+        found += [(e, i) for i in inst if i.get("id") == MODEL_INSTANCE]
+    return models, found
+
+
+def _the_file(e: dict) -> str | None:
+    """Why this entry is not the model's file (None when it is): its key starts with the prefix (any suffix: LM
+    Studio may rename it), and its size and quantisation are the file's."""
+    q = e.get("quantization")
+    if not isinstance(e.get("key"), str) or not e["key"].startswith(MODEL_KEY_PREFIX):
+        return "key %r does not start with %s" % (e.get("key"), MODEL_KEY_PREFIX)
+    if not _int_is(e.get("size_bytes"), MODEL_FILE_SIZE):
+        return "size_bytes %r, not %d" % (e.get("size_bytes"), MODEL_FILE_SIZE)
+    if not isinstance(q, dict) or q.get("name") != MODEL_QUANT:
+        return "quantisation %r, not %s" % (q.get("name") if isinstance(q, dict) else q, MODEL_QUANT)
+    return None
+
+
+def _wrong(e: dict, i: dict) -> str | None:
+    """Why this loaded instance is not the one the collector calls (None when it is)."""
+    if e.get("type") != "decision":
+        return "type %r, not 'decision'" % e.get("type")
+    why = _the_file(e)
+    if why:
+        return why
+    cfg = i.get("config") if isinstance(i.get("config"), dict) else {}
+    if not _int_is(cfg.get("context_length"), MODEL_CONTEXT):
+        return "context_length %r, not %d" % (cfg.get("context_length"), MODEL_CONTEXT)
+    if not _int_is(cfg.get("parallel"), MODEL_SLOTS):
+        return "parallel %r, not %d" % (cfg.get("parallel"), MODEL_SLOTS)
+    return None
+
+
+class ModelKeeper:
+    """Loads the collector's instance when it is missing or wrong; nothing else loads it. Asked (`ask`) when
+    collecting starts and whenever the pin finds the instance missing or wrong; each run is a daemon thread, one at
+    a time, at most one every KEEPER_EVERY_S (from the start of the previous one), so it never holds up a cycle or
+    a decision. A run reads the model list; an instance under MODEL_INSTANCE that is right: nothing; one that is
+    wrong (settings, or under another entry): `lms unload MODEL_INSTANCE` first (at most KEEPER_TRIES runs in a
+    row, then KEEPER_REST_S of leaving it alone); then `lms load <key of the entry that is the file> --identifier
+    MODEL_INSTANCE --context-length 32768 --parallel 6 -y`. No entry that is the file: nothing is run. It runs
+    nothing else, never names another instance and never sends a body to the server. Each command run is one row
+    for the `events` table (kind `model_load`), held here until the collecting thread writes it (`pending`,
+    `written`): the store's sqlite connection belongs to that thread. `runner(argv, timeout) -> exit code` and
+    `clock` are for tests."""
+
+    def __init__(self, client: "ModelClient", runner: Callable[[list[str], float], int] | None = None,
+                 clock: Callable[[], float] = time.monotonic, lms: str | None = None):
+        self.client, self.runner, self.clock, self.lms = client, runner, clock, lms
+        self._lock = threading.Lock()
+        self._busy = False
+        self._last: float | None = None              # when the latest run started
+        self._replaced = 0                           # replacements in a row
+        self._rest_from: float | None = None         # when the latest KEEPER_TRIES-th replacement was made
+        self._rows: list[dict] = []
+        self.thread: threading.Thread | None = None
+
+    def ask(self) -> bool:
+        """Start a run unless one is running or one started under KEEPER_EVERY_S ago. Never waits. Whether one
+        was started."""
+        with self._lock:
+            now = self.clock()
+            if self._busy or (self._last is not None and now - self._last < KEEPER_EVERY_S):
+                return False
+            self._busy, self._last = True, now
+            self.thread = threading.Thread(target=self._run, name="model-keeper", daemon=True)
+            self.thread.start()
+        return True
+
+    def _run(self) -> None:
+        try:
+            self._once()
+        except Exception:                            # an unreadable list or a refused command: the next ask
+            pass
+        finally:
+            with self._lock:
+                self._busy = False
+
+    def _once(self) -> None:
+        models, found = _instances(json.loads(self.client.http(self.client.base + "/api/v1/models", None,
+                                                               PIN_TIMEOUT_S)))
+        if found and _wrong(*found[0]) is None:
+            self._replaced = 0
+            return
+        target = next((e for e in models if _the_file(e) is None), None)
+        if target is None:
+            return
+        lms = self.lms or _lms_path()
+        if found:                                    # loaded, but wrong: replaced
+            if self._replaced >= KEEPER_TRIES:
+                if self.clock() - self._rest_from < KEEPER_REST_S:
+                    return
+                self._replaced = 0
+            self._replaced += 1
+            if self._replaced == KEEPER_TRIES:
+                self._rest_from = self.clock()
+            if self._exec([lms, "unload", MODEL_INSTANCE]) != 0:
+                return
+        self._exec([lms, "load", target["key"], "--identifier", MODEL_INSTANCE, "--context-length",
+                    str(MODEL_CONTEXT), "--parallel", str(MODEL_SLOTS), "-y"])
+
+    def _exec(self, argv: list[str]) -> int | None:
+        t0 = self.clock()
+        row: dict = {"argv": argv}
+        try:
+            row["exit_code"] = (self.runner or _run_lms)(argv, LMS_LIMIT_S)
+        except Exception as e:                       # not found, refused, over the limit
+            row.update(exit_code=None, error="%s: %s" % (type(e).__name__, e))
+        row["seconds"] = round(self.clock() - t0, 3)
+        with self._lock:
+            self._rows.append(row)
+        return row["exit_code"]
+
+    def pending(self) -> list[dict]:
+        with self._lock:
+            return list(self._rows)
+
+    def written(self, row: dict) -> None:
+        with self._lock:
+            self._rows = [r for r in self._rows if r is not row]
+
+
 class ModelClient:
-    """Nimble v3's typed endpoint on the local Ollama, called as `SystemOneMember` calls it (the pinned module's
-    `pinned_tag`, `make_request` and `parse_response`). `transport(url, body or None, timeout) -> bytes`."""
+    """Nimble v3's typed endpoint on the local LM Studio, called with the pinned module's `make_request` and
+    `parse_response` (`SystemOneMember`'s contract), on the one instance MODEL_INSTANCE. `transport(url, body or
+    None, timeout) -> bytes`; `hasher`, `stat`, `runner`, `keeper_clock` and `lms` are for tests."""
 
     def __init__(self, transport: Callable[[str, bytes | None, float], bytes] | None = None,
-                 base_url: str = MODEL_URL, clock: Callable[[], float] = time.time):
+                 base_url: str = MODEL_URL, clock: Callable[[], float] = time.time, *,
+                 hasher: Callable[[str], str] | None = None, stat: Callable[[str], Any] | None = None,
+                 runner: Callable[[list[str], float], int] | None = None,
+                 keeper_clock: Callable[[], float] = time.monotonic, lms: str | None = None):
         if not _loopback(base_url):
             raise ValueError("the model is loopback-only")
         self.base, self.http, self.clock = base_url.rstrip("/"), transport or loopback_http, clock
+        self._hasher, self._stat = hasher, stat
+        self._check_lock = threading.Lock()
+        self.checking: threading.Thread | None = None
+        self._checked = threading.Event()            # set when the file's check has ended, well or not
+        self._seen: tuple[int, int] | None = None    # (size, st_mtime_ns) of the file as verified
+        self._failed: str | None = None              # why the check failed
+        self.keeper = ModelKeeper(self, runner, keeper_clock, lms)
+
+    def begin(self) -> None:
+        """When collecting starts: the file's check (once) and one ask of the keeper. Never waits."""
+        self.check_file()
+        self.keeper.ask()
+
+    def check_file(self) -> None:
+        """Start the file's check in a daemon thread, the first time only."""
+        with self._check_lock:
+            if self.checking is None:
+                self.checking = threading.Thread(target=self._check_file, name="model-file-check", daemon=True)
+                self.checking.start()
+
+    def _path(self) -> str:
+        return os.path.expanduser(MODEL_FILE)
+
+    def _now(self) -> tuple[int, int]:
+        st = (self._stat or _file_stat)(self._path())
+        return st.st_size, st.st_mtime_ns
+
+    def _check_file(self) -> None:
+        """The file's SHA-256 (streamed) and size against the constants; its size and modification time as they
+        were, unchanged while it was hashed, kept as verified."""
+        try:
+            before = self._now()
+            digest = (self._hasher or _file_sha256)(self._path())
+            if self._now() != before:
+                self._failed = "the model file changed while it was hashed"
+            elif before[0] != MODEL_FILE_SIZE:
+                self._failed = "the model file's size is %d, not %d" % (before[0], MODEL_FILE_SIZE)
+            elif digest != MODEL_FILE_SHA256:
+                self._failed = "the model file's SHA-256 is %s, not %s" % (digest, MODEL_FILE_SHA256)
+            else:
+                self._seen = before
+        except Exception as e:
+            self._failed = "the model file could not be checked: %s: %s" % (type(e).__name__, e)
+        finally:
+            self._checked.set()
 
     def pin(self) -> tuple[str | None, str | None, str | None]:
-        """(None, digest, None) when the pinned tag is there with the pinned digest; else (status, digest, why)."""
+        """Before every call, one GET of the model list. (None, MODEL_FILE_SHA256, None) when the file is verified
+        and unchanged and the instance is loaded right; else (status, digest, why). The digest is the file's SHA-256
+        whenever the file is verified and unchanged, else None."""
         try:
-            tags = json.loads(self.http(self.base + "/api/tags", None, PIN_TIMEOUT_S))
-            version = json.loads(self.http(self.base + "/api/version", None, PIN_TIMEOUT_S)).get("version")
+            listing = json.loads(self.http(self.base + "/api/v1/models", None, PIN_TIMEOUT_S))
         except _UNREACHABLE as e:
             return "model_unavailable", None, "tag check: %s: %s" % (type(e).__name__, e)
         except Exception as e:                           # anything else still gives the slot its row
             return "error", None, "tag check: %s: %s" % (type(e).__name__, e)
-        digest = next((r.get("digest") for r in (tags.get("models") or []) if isinstance(r, dict)
-                       and r.get("name") == TAG), None) if isinstance(tags, dict) else None
-        if v3.pinned_tag(tags, version) != TAG:
-            return "tag_mismatch", digest, "%s missing, or its digest %s differs from the pin (Ollama %s)" % (
-                TAG, digest, version)
-        return None, digest, None
+        try:
+            _, found = _instances(listing)
+        except ValueError as e:
+            return "error", None, "tag check: an unexpected model list: %s" % e
+        if not self._checked.is_set():
+            return "model_unavailable", None, "model file not yet verified"
+        if self._failed is not None:
+            return "tag_mismatch", None, self._failed
+        try:
+            now = self._now()
+        except Exception as e:
+            return "tag_mismatch", None, "the model file: %s: %s" % (type(e).__name__, e)
+        if now != self._seen:
+            return "tag_mismatch", None, "the model file's size or modification time changed since it was verified"
+        if not found:
+            self.keeper.ask()
+            return "model_unavailable", MODEL_FILE_SHA256, "instance not loaded: no %s in the model list" % (
+                MODEL_INSTANCE)
+        why = _wrong(*found[0])
+        if why:
+            self.keeper.ask()
+            return "tag_mismatch", MODEL_FILE_SHA256, "instance %s: %s" % (MODEL_INSTANCE, why)
+        return None, MODEL_FILE_SHA256, None
 
     def ask(self, body: bytes) -> tuple[bytes, float]:
         """POST the request; the raw answer and the seconds it took. The call runs in its own thread and is
@@ -1392,7 +1641,9 @@ class Collector:
     # ---- start and stop
     def start(self) -> None:
         """Out of sync until the clock is known to be right; then the start is recorded and the record resumed
-        (`_resume`). If it is not right yet, one `clock_off` event, and each cycle checks again."""
+        (`_resume`). If it is not right yet, one `clock_off` event, and each cycle checks again. The model's file
+        check and keeper start here, in their own threads (`ModelClient.begin`)."""
+        self.model.begin()
         self.synced = False
         try:
             if not self._resync():
@@ -1541,10 +1792,18 @@ class Collector:
         elif can_select and due is None and not self.watched() and not self._backing_off(minute):
             due = "off_grid"
             self.event("selection_off_grid", None, why="nothing watched")
+        self._model_loads()
         self._beat()                                     # before the selection, so a long one leaves no hole
         if due:
             self.select(kind=due)
         return made
+
+    def _model_loads(self) -> None:
+        """The keeper's `model_load` rows, written here by the collecting thread, the only one that uses the store's
+        connection; a row the store cannot take now stays with the keeper for the next cycle."""
+        for row in self.model.keeper.pending():
+            self.event("model_load", None, **row)
+            self.model.keeper.written(row)
 
     def _beat(self) -> None:
         self._guard()
@@ -1862,12 +2121,15 @@ class Collector:
             return
         row.update(raw_response=raw.decode("utf-8", errors="replace"), latency_s=latency)
         try:
-            parsed = v3.parse_response(json.loads(raw), BATTERY)
+            reply = json.loads(raw)
+            if not isinstance(reply, dict) or reply.get("model") != MODEL_INSTANCE:
+                raise ValueError("the reply is not from the instance %s" % MODEL_INSTANCE)
+            parsed = v3.parse_response({**reply, "model": v3.TAG}, BATTERY)   # the pinned parser's own name
         except (ValueError, TypeError, AttributeError) as e:      # ContractError is a ValueError
             row.update(status="error", error="unreadable answer: %s" % e)
             return
         row.update(answers_json=json.dumps(parsed["answers"]), input_tokens=parsed["usage"]["input_tokens"],
-                   output_tokens=parsed["usage"]["output_tokens"], model_tag=parsed["model"], status="ok")
+                   output_tokens=parsed["usage"]["output_tokens"], model_tag=TAG, status="ok")
 
     # ---- selection
     def select(self, dry_run: bool = False, max_pages: int | None = None, kind: str = "grid") -> Selection | None:
