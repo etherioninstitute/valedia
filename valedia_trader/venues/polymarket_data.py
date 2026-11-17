@@ -50,12 +50,14 @@ from typing import Any, Callable
 
 __all__ = ["BASE_URL", "USER_AGENT", "HttpError", "PolymarketDataError", "PageCapHit", "Pacer", "urllib_get", "Walk",
            "PolymarketData", "is_number", "validate_board_row", "validate_trade", "validate_position",
-           "validate_resolution", "validate_price_point", "trade_identity", "TS_MIN"]
+           "validate_resolution", "validate_price_point", "trade_identity", "position_identity", "TS_MIN",
+           "BOARD_CATEGORIES"]
 
 BASE_URL = "https://data-api.polymarket.com"
 USER_AGENT = "market-data-reader/1.0"
 DEFAULT_PAGE_CAP = 5000            # pages of a walk; a wallet with more than 5 million trades raises, never truncates
 BOARD_WINDOWS = ("day", "week", "month", "all")
+BOARD_CATEGORIES = ("sports", "crypto")    # T52: a board per category; None is the overall board
 POSITION_STATUSES = (None, "CLOSED")
 MAX_CONDITIONS = 20
 TS_MIN = 1_577_836_800             # 2020-01-01T00:00:00Z: no time of this service is earlier
@@ -264,9 +266,32 @@ POSITION_NUM = ("current_size", "avg_price", "entry_cost_usdc", "total_cost_usdc
                 "realized_pnl", "unrealized_pnl", "total_pnl")
 
 
+TITLE_MAX, OUTCOME_MAX = 500, 200
+_END_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+POSITION_INFO = ("title", "outcome", "end_date", "current_price")
+
+
+def _info_fields(row: dict) -> dict:
+    """The four information fields of a position (T52): title and outcome non-empty strings of at most TITLE_MAX and
+    OUTCOME_MAX characters, end_date a real calendar date YYYY-MM-DD other than the service's 1970-01-01 for none,
+    current_price a number from 0 to 1. A missing or malformed one is None; none of them can reject a row."""
+    title, outcome, end, price = (row.get(k) for k in POSITION_INFO)
+    out = {"title": title if _is_str(title) and len(title) <= TITLE_MAX else None,
+           "outcome": outcome if _is_str(outcome) and len(outcome) <= OUTCOME_MAX else None,
+           "end_date": None, "current_price": float(price) if is_number(price) and 0 <= price <= 1 else None}
+    if isinstance(end, str) and _END_DATE.fullmatch(end) and end != "1970-01-01":
+        try:
+            datetime.strptime(end, "%Y-%m-%d")
+            out["end_date"] = end
+        except ValueError:
+            pass
+    return out
+
+
 def validate_position(row, user: str | None = None) -> tuple[dict | None, str | None]:
-    """A position row (kept for information; the test does not decide on it): wallet, token and condition strings, a
-    status string, the money fields numbers."""
+    """A position row: wallet, token and condition strings, a status string, the money fields numbers (these decide
+    a reject). The information fields (POSITION_INFO, see `_info_fields`) are kept or None, and `unread` names those
+    that were None. A first entry of 0 (the service's "none recorded") is None."""
     if not isinstance(row, dict):
         return None, "not_an_object"
     if not _is_str(row.get("proxy_wallet")):
@@ -284,7 +309,17 @@ def validate_position(row, user: str | None = None) -> tuple[dict | None, str | 
         out[k] = row.get(k) if isinstance(row.get(k), str) else None
     for k in ("first_entry_at", "last_event_at", "outcome_index"):
         out[k] = row.get(k) if _is_int(row.get(k)) else None
+    if out["first_entry_at"] == 0:
+        out["first_entry_at"] = None
+    info = _info_fields(row)
+    out.update(info)
+    out["unread"] = tuple(k for k in POSITION_INFO if info[k] is None)
     return out, None
+
+
+def position_identity(p: dict) -> tuple:
+    """The identity of a validated position row: the wallet folded to lower case and the outcome token."""
+    return (p["proxy_wallet"].lower(), p["token_id"])
 
 
 def validate_resolution(row, ts_max: int | None = None) -> tuple[dict | None, str | None]:
@@ -344,6 +379,7 @@ class Walk:
     rejects: Counter = field(default_factory=Counter)
     pages: int = 0
     read_at: list = field(default_factory=list)
+    unread: Counter = field(default_factory=Counter)      # information fields read as None (positions only)
 
     def reject(self, row, why: str, read_at: str) -> None:
         self.raw.append((row, why))
@@ -545,11 +581,19 @@ class PolymarketData:
         return ans["data"], pg["has_more"], nxt
 
     # ------------------------------------------------------------ routes
-    def leaderboard(self, time_period: str, sort_by: str = "PNL", rows: int = 100, page_cap: int = 50) -> Walk:
-        """The first `rows` rows of a board (`time_period` day, week, month or all; `sort_by` PNL or VOLUME)."""
+    def leaderboard(self, time_period: str, sort_by: str = "PNL", rows: int = 100, page_cap: int = 50,
+                    category: str | None = None) -> Walk:
+        """The first `rows` rows of a board (`time_period` day, week, month or all; `sort_by` PNL or VOLUME;
+        `category` None for the overall board or one of BOARD_CATEGORIES, anything else refused before a request).
+        A category the service does not know answers an empty board, not an error: the caller counts the rows."""
         if time_period not in BOARD_WINDOWS or sort_by not in ("PNL", "VOLUME"):
             raise ValueError("unknown board %r %r" % (time_period, sort_by))
-        params = {"time_period": time_period, "sort_by": sort_by, "limit": min(int(rows), 1000)}
+        if category is not None and not (type(category) is str and category in BOARD_CATEGORIES):
+            raise ValueError("unknown board category %r" % (category,))
+        params = {"time_period": time_period, "sort_by": sort_by}
+        if category is not None:
+            params["category"] = category
+        params["limit"] = min(int(rows), 1000)
         return self.walk("/v2/leaderboard", params, validate_board_row, page_cap=page_cap, max_rows=int(rows),
                          cursor_alone=True)
 
@@ -574,7 +618,16 @@ class PolymarketData:
         if status:
             params["status"] = status
         params["limit"] = 1000
-        return self.walk("/v2/positions", params, lambda r: validate_position(r, user), page_cap=page_cap)
+        w = self.walk("/v2/positions", params, lambda r: validate_position(r, user), page_cap=page_cap,
+                      identity=position_identity, drop_conflicts=True)
+        w.unread = Counter(k for r in w.rows for k in r["unread"])
+        return w
+
+    def position_pages(self, user: str, page_cap: int = DEFAULT_PAGE_CAP, ids=None, conflicted: set | None = None):
+        """A wallet's open positions one page at a time (see walk_pages): repeats are counted per page, identities in
+        conflict are only marked in `conflicted` (the caller drops them); `ids` and `conflicted` span the pages."""
+        return self.walk_pages("/v2/positions", {"user": user, "limit": 1000}, lambda r: validate_position(r, user),
+                               page_cap=page_cap, identity=position_identity, ids=ids, conflicted=conflicted)
 
     def resolutions(self, conditions) -> Walk:
         """The resolution rows of 1 to 20 condition ids in one GET (the route is not paged; a miss is simply absent)."""
