@@ -187,20 +187,19 @@ def test_lottery_and_late_on_create_only():
 
 
 class _Nimble:
-    """VALEDIA_SYSTEMONE=1 with a fake loopback Nimble 2. `post` is the engine fake."""
+    """VALEDIA_SYSTEMONE=1 with a fake shared Elephant-1 instance. `post` is the engine fake on the
+    client's own transport."""
 
     def __init__(self, post):
         self.post = post
 
     def __enter__(self):
         import systemone_hotpath_client as s1
-        from systemone_test_fakes import FULL
+        import systemone_test_fakes as fk
         self.s1, self._saved = s1, (s1._post, s1._get)
         s1._post = self.post
-        s1._get = lambda url, timeout: (
-            {"models": [{"name": "nimble:latest", "digest": FULL}]}
-            if url.endswith("/api/tags") else {"version": "0.35.0"})
-        s1._reset_digest()
+        s1._get = fk.list_get()
+        s1._reset_check()
         nd._WARMED = True
         self._prev = (os.environ.get("VALEDIA_SYSTEMONE"), os.environ.get("VALEDIA_SYSTEMONE_LOG"))
         os.environ["VALEDIA_SYSTEMONE"] = "1"
@@ -209,7 +208,7 @@ class _Nimble:
 
     def __exit__(self, *exc):
         self.s1._post, self.s1._get = self._saved
-        self.s1._reset_digest()
+        self.s1._reset_check()
         for k, v in zip(("VALEDIA_SYSTEMONE", "VALEDIA_SYSTEMONE_LOG"), self._prev):
             if v is None:
                 os.environ.pop(k, None)
@@ -232,11 +231,9 @@ def test_nimble_note_cannot_pass_and_morning_alert(tmp):
     assert failed["create_order"] is False and failed["fv"] == 0.2
 
     def ok_post(_url, payload, _timeout):
-        return {"model": payload["model"], "answers": {
-            "agree": {"choice": "agree", "confidence": 0.4},
-            "confidence": {"noul": 0.4},
-            "status_honesty": {"choice": "honest"},
-        }}
+        import systemone_test_fakes as fk
+        return fk.typed_reply(payload["questions"], {"agree": "agree", "confidence": 0.4,
+                                                     "status_honesty": "honest"}, confidence=0.4)
 
     with _Nimble(ok_post):
         agreed = na.annotate_weather(

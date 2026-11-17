@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Nimble 2 wiring at the five prediction-market decision points. Fakes only.
+"""Decision wiring (named for Nimble) at the five prediction-market decision points, on the
+shared Elephant-1 instance. Fakes only.
 
 Points: master_allocator.execute_allocations (live Kalshi), sports_evidence._admit
 (live sports), weather_live.admit (live weather), poly_loop.evaluate_one (paper),
@@ -33,6 +34,7 @@ import nimble_wiring as nw  # noqa: E402
 import poly_loop  # noqa: E402
 import sports_engine as se  # noqa: E402
 import systemone_hotpath_client as s1  # noqa: E402
+import systemone_test_fakes as fk  # noqa: E402
 import valedia_config as vc  # noqa: E402
 import vaughan_arb_paper as va  # noqa: E402
 import weather_live  # noqa: E402
@@ -47,37 +49,38 @@ from test_poly_us import _restore  # noqa: E402
 vc._MODELS = tempfile.mkdtemp(prefix="nimwire_models_")
 import ere_test_fixture  # ERE v3: valid gate state so phi reads a healthy book
 ere_test_fixture.write_state(vc._MODELS)
-cl._reset_cache(items=[])  # no record: calibration is identity
+cl._reset_cache(items=[])  # no record: calibration is held
 
-PIN = "24e550a16a70"
 VOLATILE = ("nimble", "ts")
+_get = fk.list_get()
+_REAL_CALIBRATE_EX = cl.calibrate_ex
 
 
-def _get(url, timeout):
-    if url.endswith("/api/version"):
-        return {"version": "0.35.0"}
-    if url.endswith("/api/tags"):
-        return {"models": [{"name": "nimble:latest", "digest": PIN + "9" * 52}]}
-    raise AssertionError(url)
+def _as_given(source, p, **kw):
+    """Stand-in for a map fitted under the decision's own key that returns p unchanged."""
+    return {"p_cal": cl._num(p), "calibration": "isotonic", "n": cl.MIN_N}
 
 
 class Nim:
-    """Env + fake engine. choice None → engine down (the POST raises)."""
+    """Env + fake engine (the client's own transport). choice None → engine down (the POST raises).
+    fitted: a fitted map under the decision's own key (stand-in: p as given); else calibration holds."""
 
-    def __init__(self, mode="shadow", enabled=True, choice="skip", conf=0.9, p_buy=0.9):
+    def __init__(self, mode="shadow", enabled=True, choice="skip", conf=0.9, p_buy=0.9, fitted=False):
         self.mode, self.enabled, self.choice, self.conf = mode, enabled, choice, conf
-        self.p_buy = p_buy
+        self.p_buy, self.fitted = p_buy, fitted
         self.posts = []
 
     def _post(self, url, payload, timeout):
         self.posts.append(payload)
         if self.choice is None:
             raise OSError("engine down")
-        return {"model": payload["model"], "answers": {
-            "action": {"choice": self.choice, "confidence": self.conf,
-                       "probabilities": {"buy": self.p_buy, "hold": (1 - self.p_buy) / 2,
-                                         "skip": (1 - self.p_buy) / 2}},
-            "risk": {"choice": "4"}}}
+        if self.choice == "buy":
+            rest = (1 - self.p_buy) / 2
+            probs = {"buy": self.p_buy, "hold": rest, "skip": rest}
+        else:
+            probs = {"buy": 0.1, "hold": 0.1, "skip": 0.1}
+            probs[self.choice] = 0.8
+        return fk.typed_reply(payload["questions"], {"action": probs, "risk": "4"}, confidence=self.conf)
 
     def __enter__(self):
         for k in list(os.environ):
@@ -90,15 +93,17 @@ class Nim:
             os.environ.pop("VALEDIA_SYSTEMONE", None)
         self._orig = (s1._post, s1._get)
         s1._post, s1._get = self._post, _get
-        s1._reset_digest()
+        s1._reset_check()
+        cl.calibrate_ex = _as_given if self.fitted else _REAL_CALIBRATE_EX
         nd._WARMED = True  # warmup has its own test below
         return self
 
     def __exit__(self, *exc):
         s1._post, s1._get = self._orig
+        cl.calibrate_ex = _REAL_CALIBRATE_EX
         os.environ.pop("VALEDIA_SYSTEMONE", None)
         os.environ.pop("VALEDIA_NIMBLE_MODE_PREDICTION", None)
-        s1._reset_digest()
+        s1._reset_check()
 
 
 _ISO = re.compile(r"^\d{4}-\d\d-\d\dT")
@@ -268,20 +273,25 @@ def test_point(name, run, ok, live):
     for choice, conf, pb, why in (("hold", 0.9, 0.9, "veto_model_hold"),
                                   ("buy", 0.01, 0.9, "veto_not_sharp"),
                                   ("buy", 0.9, 0.55, "veto_p_below_required")):
-        with Nim("veto", choice=choice, conf=conf, p_buy=pb):
+        with Nim("veto", choice=choice, conf=conf, p_buy=pb, fitted=True):
             r, orders = run()
         assert orders == 0 and blocked_status(name, r), (name, choice, r)
         assert r["nimble"]["reason"] == why, (name, r["nimble"])
-    # veto + buy, sharp, p_buy over required: proceeds exactly as the code decided
+    # veto + buy with no map under its own key: held, blocked
     with Nim("veto", choice="buy", conf=0.9) as n:
+        r, orders = run()
+    assert orders == 0 and blocked_status(name, r), (name, r)
+    assert r["nimble"]["reason"] == "veto_no_p_buy" and r["nimble"]["calibration"] == "untrained_hold"
+    # veto + buy, sharp, fitted p_buy over required: proceeds exactly as the code decided
+    with Nim("veto", choice="buy", conf=0.9, fitted=True) as n:
         r, orders = run()
     assert ok(r) and orders == base_orders and strip(r) == strip(base), (name, r)
     assert r["nimble"]["allow"] is True and r["nimble"]["reason"] == "veto_model_buy", (name, r["nimble"])
-    assert r["nimble"]["calibration"] == "identity" and r["nimble"]["phi_multiplier"] == 1.0
+    assert r["nimble"]["calibration"] == "isotonic" and r["nimble"]["phi_multiplier"] == 1.0
     assert r["nimble"]["required_p"] >= 0.60, (name, r["nimble"])
     blob = json.dumps(n.posts[0])  # economics are code-only: never in the posted state
     assert "break_even" not in blob and "fee_per" not in blob and "price" not in blob, (name, blob)
-    with Nim("veto", choice="buy", conf=0.05):  # exactly the sharpness floor allows
+    with Nim("veto", choice="buy", conf=0.05, fitted=True):  # exactly the sharpness floor allows
         r, orders = run()
     assert ok(r) and orders == base_orders, (name, r)
     # veto + engine down: blocked (fail closed); veto + VALEDIA_SYSTEMONE unset: blocked, no POST
@@ -396,10 +406,10 @@ def test_warm_once_per_run():
         nd._WARMED, s1._WARM = False, False
         assert nw.warm_for_run([], False) is None and nw.warm_for_run([{"a": 1}], True) is None
         assert n.posts == []
+        assert nw.warm_for_run([{"a": 1}], False) is None
+        assert n.posts == [], n.posts  # no warmup request: the instance is kept by another program
         nw.warm_for_run([{"a": 1}], False)
-        assert len(n.posts) == 1, n.posts
-        nw.warm_for_run([{"a": 1}], False)
-        assert len(n.posts) == 1  # once per process
+        assert n.posts == []
     with Nim("shadow", enabled=False) as n:
         nd._WARMED, s1._WARM = False, False
         nw.warm_for_run([{"a": 1}], False)

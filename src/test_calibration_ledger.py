@@ -300,6 +300,104 @@ def test_calibrate_isotonic_monotone_and_improves_brier():
     assert cl.isotonic_fit([]) == []
 
 
+def _keyed(tag, src, n=40, model=None, start=T):
+    """n well-scored traded decisions under one source key: p_buy .9 when the trade won, .1 when it lost."""
+    decs, ftl = [], []
+    for i in range(n):
+        won = i % 2 == 0
+        ts, tick, eid = start + timedelta(minutes=i), "KX%s%03d" % (tag, i), "%s_%d" % (tag, i)
+        p = 0.9 if won else 0.1
+        row = dec(ts, tick, "yes", {"buy": p, "hold": (1 - p) / 2, "skip": (1 - p) / 2}, src=src)
+        if model is not None:
+            row["model"] = model
+        decs.append(row)
+        ftl += [entry(eid, tick, "yes", ts + timedelta(seconds=60)),
+                sett(eid, tick, "yes" if won else "no", 0.5 if won else -0.5, ts + timedelta(days=1))]
+    return decs, ftl
+
+
+def _store(d, decs, ftl):
+    """Score from files in d and preload the calibration cache with the same items (no default paths)."""
+    paths = dict(decisions_path=write(os.path.join(d, "dec.jsonl"), decs),
+                 ftl_path=write(os.path.join(d, "ftl.jsonl"), ftl),
+                 mirofish_path=write(os.path.join(d, "mf.jsonl"), []), now=NOW)
+    cl._reset_cache(items=cl._all_items(decs, ftl, [], NOW))
+    return cl.score(**paths), paths
+
+
+def test_new_key_held_with_old_rows_exactly_as_empty_store():
+    """Ruling 5 (two-way): rows under old keys never calibrate, weight or enter the new key's fit."""
+    import nimble_decide as nd
+    import systemone_pin as pin
+    import systemone_v3_candidate as v3
+    new = nd._cal_source("pt")
+    assert new == "decide:%s@%s:pt" % (pin.dm.INSTANCE, pin.dm.QUANT.lower()) and new.startswith(pin.SOURCE_PREFIX)
+    old, old_v3 = "nimble_decide:pt", "nimble_decide:v3:%s:pt" % v3.MANIFEST_SHA256
+    try:
+        # empty store: the reference answers
+        res0, paths0 = _store(tmpdir(), [], [])
+        assert res0 == {}
+        held0 = nd._calibrate(new, 0.9)
+        assert held0 == {"p_cal": None, "calibration": "untrained_hold", "n": 0}, held0
+        assert cl.calibrate_ex(new, 0.9) == {"p_cal": 0.9, "calibration": "identity", "n": 0}
+        w0 = cl.earned_weight(new, 0.10, 0.30, **paths0)
+        assert close(w0, 0.05), w0                                      # the unproven fallback
+        # many well-scored rows under the old keys only
+        d_old, f_old = _keyed("O", old)
+        d_v3, f_v3 = _keyed("V", old_v3, model=v3.TAG)
+        res1, paths1 = _store(tmpdir(), d_old + d_v3, f_old + f_v3)
+        assert sorted(res1) == sorted([old, old_v3]), res1             # the new key has no rows
+        assert res1[old]["n_scorable"] == 40 and res1[old_v3]["n_scorable"] == 40, res1
+        # the other side: these rows do fit, and do earn weight, under their own keys
+        assert cl.calibrate_ex(old, 0.9)["calibration"] == "isotonic"
+        assert cl.calibrate_ex(old_v3, 0.9)["calibration"] == "isotonic"
+        assert close(cl.earned_weight(old, 0.10, 0.30, **paths1), 0.30)
+        # ...and the new key is held exactly as with the empty store
+        assert nd._calibrate(new, 0.9) == held0
+        assert nd._calibrate(new, 0.1) == nd._calibrate(new, 0.1) == held0
+        assert cl.calibrate_ex(new, 0.9) == {"p_cal": 0.9, "calibration": "identity", "n": 0}
+        assert cl.earned_weight(new, 0.10, 0.30, **paths1) == w0
+        # new-key rows (model = the instance) are admitted to the new key's fit; old rows are not
+        d_new, f_new = _keyed("N", new, model=pin.dm.INSTANCE)
+        res2, paths2 = _store(tmpdir(), d_old + d_v3 + d_new, f_old + f_v3 + f_new)
+        assert res2[new]["n_scorable"] == 40 and res2[new]["n"] == 40, res2[new]
+        assert res2[old] == res1[old] and res2[old_v3] == res1[old_v3]  # old keys unchanged
+        fit = cl.calibrate_ex(new, 0.9)
+        assert fit["calibration"] == "isotonic" and fit["n"] == 40, fit  # 40, not 120
+        got = nd._calibrate(new, 0.9)
+        assert got["calibration"] == "isotonic" and got["p_cal"] is not None and got["n"] == 40, got
+        assert close(cl.earned_weight(new, 0.10, 0.30, **paths2), 0.30)
+    finally:
+        cl._reset_cache()
+
+
+def test_new_key_admits_only_rows_naming_the_instance():
+    """Ruling 7: the new prefix is admitted only with model == the instance; ruling 8: the v3 gate stays."""
+    import nimble_decide as nd
+    import systemone_pin as pin
+    import systemone_v3_candidate as v3
+    new = nd._cal_source("pt")
+    try:
+        bad = []
+        for tag, model in (("W", v3.TAG), ("X", None), ("Y", pin.dm.INSTANCE.upper()), ("Z", "")):
+            bad += [_keyed(tag, new, model=model)]
+        bad += [_keyed("Q", "decide:other@x:pt", model=pin.dm.INSTANCE),
+                _keyed("R", "decide:%s@%s:pt" % (pin.dm.INSTANCE, "q4_k_m"), model=pin.dm.INSTANCE),
+                _keyed("S", "nimble_decide:v3:%s:pt" % v3.MANIFEST_SHA256, model=None),
+                _keyed("U", "nimble_decide:v3:%s:pt" % ("0" * len(v3.MANIFEST_SHA256)), model=v3.TAG)]
+        decs = [r for ds, _ in bad for r in ds]
+        ftl = [r for _, fs in bad for r in fs]
+        res, _paths = _store(tmpdir(), decs, ftl)
+        assert res == {}, sorted(res)
+        assert nd._calibrate(new, 0.9) == {"p_cal": None, "calibration": "untrained_hold", "n": 0}
+        # the same rows with the right model are admitted
+        ok_decs, ok_ftl = _keyed("W", new, model=pin.dm.INSTANCE)
+        res, _paths = _store(tmpdir(), ok_decs, ok_ftl)
+        assert list(res) == [new] and res[new]["n_scorable"] == 40, res
+    finally:
+        cl._reset_cache()
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

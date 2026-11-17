@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Nimble 2 annotations (nimble_annotate). Replaces test_jev_shadow. Fakes only.
+"""Annotations (nimble_annotate, named for Nimble) on the shared Elephant-1 instance.
+Replaces test_jev_shadow. Fakes only.
 
-No network: the loopback POST and /api/tags GET are fakes. No keys, no orders.
+No network: the typed POST (the client's own transport) and the model-list GET are fakes.
+No keys, no orders.
 Run: python3 test_nimble_annotate.py
 """
 import json
@@ -25,7 +27,7 @@ import nimble_annotate as na  # noqa: E402
 import nimble_decide as nd  # noqa: E402
 import systemone_hotpath_client as s1  # noqa: E402
 from mirofish_signal_extractor import process_mirofish_report  # noqa: E402
-from systemone_test_fakes import FULL  # noqa: E402
+import systemone_test_fakes as fk  # noqa: E402
 
 nd._WARMED = True  # no warmup ping in these tests; warm() is covered by test_nimble_decide
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -48,24 +50,23 @@ REPORT = {
     "markdown_content": ("Bitcoin rally surge accumulate buying pressure near support. "
                          "Institutional traders executed a BUY trade for BTC-USD."),
 }
-ANSWERS = {
-    "action": {"choice": "skip", "confidence": 0.8,
-               "probabilities": {"buy": 0.1, "hold": 0.1, "skip": 0.8}},
-    "stand_down": {"noul": 0.3},
-    "report_usable": {"probability": 0.8},
-    "we_are_the_exit": {"noul": 0.7},
-    "scan_usable": {"noul": 0.6},
-    "agree": {"choice": "agree", "confidence": 0.7,
-              "probabilities": {"agree": 0.7, "disagree": 0.2, "abstain": 0.1}},
-    "confidence": {"noul": 0.6},
-    "status_honesty": {"choice": "honest"},
+PICKS = {  # typed answers per question name (the reply is built for the questions asked)
+    "stand_down": 0.3,
+    "report_usable": 0.8,
+    "we_are_the_exit": 0.7,
+    "scan_usable": 0.6,
+    "agree": {"agree": 0.7, "disagree": 0.2, "abstain": 0.1},
+    "confidence": 0.6,
+    "status_honesty": "honest",
 }
+_get = fk.list_get()
 
 
-def _get(url, timeout):
-    if url.endswith("/api/tags"):
-        return {"models": [{"name": "nimble:latest", "digest": FULL}]}
-    return {"version": "0.35.0"}
+def _answers(questions):
+    picks = dict(PICKS)
+    keys = list(questions.get("action", {}).get("criteria", ()))
+    picks["action"] = {"buy": 0.1, "hold": 0.1, "skip": 0.8} if "skip" in keys else "annotate"
+    return fk.typed_reply(questions, picks, confidence=0.7)
 
 
 class Engine:
@@ -75,17 +76,17 @@ class Engine:
         self.on, self.raise_, self.body, self.posts = on, raise_, body, []
 
     def post(self, url, payload, timeout):
-        assert url == s1.DECIDE_URL and url.startswith("http://127.0.0.1:11434/"), url
+        assert url == s1.DECIDE_URL == s1._pin.dm.URL + "/v1/systemone", url
         self.posts.append(payload)
         if self.raise_:
             raise self.raise_
-        return self.body or {"model": payload["model"], "answers": ANSWERS}
+        return self.body or _answers(payload["questions"])
 
     def __enter__(self):
         self._prev = os.environ.get("VALEDIA_SYSTEMONE")
         self._g, self._p = s1._get, s1._post
         s1._get, s1._post = _get, self.post
-        s1._reset_digest()
+        s1._reset_check()
         if self.on:
             os.environ["VALEDIA_SYSTEMONE"] = "1"
         else:
@@ -94,7 +95,7 @@ class Engine:
 
     def __exit__(self, *exc):
         s1._get, s1._post = self._g, self._p
-        s1._reset_digest()
+        s1._reset_check()
         os.environ.pop("VALEDIA_SYSTEMONE", None)
         if self._prev is not None:
             os.environ["VALEDIA_SYSTEMONE"] = self._prev

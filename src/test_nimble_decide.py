@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""nimble_decide: questions, modes off/shadow/veto, exits, digest, logging, cap.
+"""nimble_decide: questions, modes off/shadow/veto, exits, the instance check, logging, cap.
 
-Fake post/get only. No server, no network. Run: python3 test_nimble_decide.py
+On the shared Elephant-1 instance: the typed call goes through the client's own transport (replaced here
+with a typed fake), the list check through a fake list. Calibration is held until a map fitted on rows under
+the decision's own key exists. No server, no network. Run: python3 test_nimble_decide.py
 """
 import copy
 import json
@@ -22,15 +24,14 @@ os.environ["VALEDIA_SYSTEMONE_LOG"] = LOG
 import calibration_ledger as cl  # noqa: E402
 import nimble_decide as nd  # noqa: E402
 import systemone_hotpath_client as s1  # noqa: E402
+import systemone_test_fakes as fk  # noqa: E402
 import valedia_config as vc  # noqa: E402
 
 vc._MODELS = tempfile.mkdtemp(prefix="nimdec_models_")
 import ere_test_fixture  # ERE v3: healthy BOOK -> phi 0.5 (was neutral 1.0 on missing file)
 ere_test_fixture.write_state(vc._MODELS)
-cl._reset_cache(items=[])  # no record: calibration is identity
+cl._reset_cache(items=[])  # no record: calibration is held
 
-PIN = "24e550a16a70"
-OTHER = "deadbeef0000" + "1" * 52
 INFORMED = {"facts": {"mirofish_fresh": True, "mirofish_agrees": True, "news_present": False},
             "sources": {"mirofish": {"used": True, "age_s": 60}}}
 CAND = {"symbol": "NVDA", "venue": "alpaca", "price": 123.45, "fused": 71.2}
@@ -38,27 +39,50 @@ FACTS = {"fused_strong": True, "filter_passed": True, "fee_ok": True, "already_h
          "raw_fused": 71.2}
 
 
-def _get(digest=PIN + "9" * 52):
-    def fake(url, timeout):
-        if url.endswith("/api/version"):
-            return {"version": "0.35.0"}
-        if url.endswith("/api/tags"):
-            return {"models": [{"name": "nimble:latest", "digest": digest}]}
-        raise AssertionError(url)
-    return fake
+def _get(body=None):
+    return fk.list_get(body)
 
 
-def _post(choice="buy", conf=0.9, risk="3", calls=None, exc=None):
+def _post(choice="buy", conf=0.9, risk="3", calls=None, exc=None, p=0.9):
+    """Typed fake: the chosen action gets probability p; conf None drops confidence; an unknown choice
+    is sent as given (the typed parser refuses it)."""
     def fake(url, payload, timeout):
         if calls is not None:
             calls.append({"url": url, "payload": payload, "timeout": timeout})
         if exc:
             raise exc
-        return {"model": payload["model"], "answers": {
-            "action": {"choice": choice, "confidence": conf,
-                       "probabilities": {"buy": 0.9 if conf is None else conf, "hold": 0.05, "skip": 0.05}},
-            "risk": {"choice": risk}}}
+        body = fk.typed_reply(payload["questions"],
+                              {"action": choice if choice in nd.ACTIONS else "buy", "risk": risk},
+                              confidence=conf, p=p)
+        body["answers"]["action"]["choice"] = choice
+        if conf is None:
+            body["answers"]["action"].pop("confidence")
+        return body
     return fake
+
+
+_REAL_POST = s1._post
+
+try:
+    import pytest
+
+    @pytest.fixture(autouse=True)
+    def _restore_fakes():
+        yield
+        s1._post = _REAL_POST
+        s1._reset_check()
+        cl._reset_cache(items=[])
+except ImportError:  # script mode
+    pass
+
+
+def _train(source="test"):
+    """A fitted map under the decision's own key: p .9 -> .875, p .5 -> .5."""
+    key = nd._cal_source(source)
+    items = [{"source": key, "p": 0.9, "y": 1 if i < 27 else 0} for i in range(30)]
+    items += [{"source": key, "p": 0.5, "y": i % 2} for i in range(30)]
+    cl._reset_cache(items=items)
+    return items
 
 
 def _reset(mode=None, enabled=True, **env):
@@ -71,11 +95,13 @@ def _reset(mode=None, enabled=True, **env):
         os.environ.pop("VALEDIA_SYSTEMONE", None)
     if mode:
         os.environ["VALEDIA_NIMBLE_MODE"] = mode
-    os.environ["VALEDIA_SYSTEMONE_MODEL"] = "nimble:latest"  # historical v2 fixture
+    os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)  # unset: the shared instance
     os.environ["VALEDIA_SYSTEMONE_LOG"] = LOG
     os.environ.update(env)
-    s1._reset_digest()
-    nd._WARMED = True  # warmup has its own test
+    s1._reset_check()
+    s1._post = fk.refuse_post
+    cl._reset_cache(items=[])
+    nd._WARMED = True
     if os.path.exists(LOG):
         os.remove(LOG)
 
@@ -88,6 +114,7 @@ def _lines():
 
 
 def _decide(post, cls="stock", side="buy", cand=None, get=None):
+    s1._post = post  # the client's own transport; an injected post is not honoured
     return nd.decide_candidate(cls, cand or CAND, side=side, code_facts=FACTS, informed=INFORMED,
                                source="test", label="would_buy", post=post, get=get or _get())
 
@@ -146,10 +173,11 @@ def test_shadow_never_blocks():
 
 
 def test_veto_semantics():
-    cases = [(_post("buy", 0.9), True, "veto_model_buy"),
-             (_post("buy", 0.5), False, "veto_p_below_required"),  # p_buy .5 < floor .60
+    # No map under the decision's own key: every buy is held (no calibrated probability).
+    cases = [(_post("buy", 0.9), False, "veto_no_p_buy"),
+             (_post("buy", 0.9, p=0.5), False, "veto_no_p_buy"),
              (_post("buy", 0.01), False, "veto_not_sharp"),
-             (_post("buy", None), True, "veto_model_buy"),  # confidence from probabilities
+             (_post("buy", None), False, "veto_engine_error"),  # typed: confidence is required
              (_post("hold", 0.9), False, "veto_model_hold"),
              (_post("skip", 0.9), False, "veto_model_skip"),
              (_post("banana", 0.9), False, "veto_engine_error"),
@@ -159,14 +187,34 @@ def test_veto_semantics():
         _reset(mode="veto")
         v = _decide(post)
         assert v["allow"] is allow and v["reason"] == reason, (reason, v)
+        if reason == "veto_no_p_buy":
+            assert v["p_cal"] is None and v["calibration"] == "untrained_hold", v
+    # A map fitted on rows under the decision's own key is applied.
+    for p, allow, reason in ((0.9, True, "veto_model_buy"), (0.5, False, "veto_p_below_required")):
+        _reset(mode="veto")
+        _train()
+        v = _decide(_post("buy", 0.9, p=p))
+        assert v["allow"] is allow and v["reason"] == reason and v["calibration"] == "isotonic", v
+    # The same rows under the old keys are never applied: held, as with an empty store.
+    _reset(mode="veto")
+    items = [dict(it, source=src) for it in _train()
+             for src in ("nimble_decide:test", "nimble_decide:v3:%s:test" % ("0" * 64))]
+    cl._reset_cache(items=items)
+    v = _decide(_post("buy", 0.9))
+    assert v["reason"] == "veto_no_p_buy" and v["calibration"] == "untrained_hold", v
+    assert nd._calibrate(nd._cal_source("test"), 0.9) == {"p_cal": None, "calibration": "untrained_hold",
+                                                          "n": 0}
     _reset(mode="veto")
     v = _decide(_post("buy", None))
-    assert v["confidence"] == 0.9 and v["risk"] == 3
+    assert v["confidence"] is None and v["error"] == "ContractError"  # never filled from a probability
     # VALEDIA_NIMBLE_P_FLOOR may only RAISE the 0.60 floor: 0.4 is ignored, 0.7 binds
     _reset(mode="veto", VALEDIA_NIMBLE_P_FLOOR="0.4")
-    assert nd.p_floor() == 0.60 and _decide(_post("buy", 0.5))["allow"] is False
+    _train()
+    assert nd.p_floor() == 0.60 and _decide(_post("buy", 0.9, p=0.5))["allow"] is False
     _reset(mode="veto", VALEDIA_NIMBLE_P_FLOOR="0.7")
-    assert nd.p_floor() == 0.7 and _decide(_post("buy", 0.65))["allow"] is False
+    _train()
+    assert nd.p_floor() == 0.7 and _decide(_post("buy", 0.9, p=0.65))["allow"] is False
+    assert _decide(_post("buy", 0.9, p=0.9))["allow"] is True
     _reset(mode="veto", enabled=False)
     v = _decide(_post())
     assert v["allow"] is False and v["error"] == "engine_disabled"
@@ -186,14 +234,16 @@ def test_exits_never_blocked():
     assert _decide(_post(), side="sell")["allow"] is True
 
 
-def test_digest_mismatch():
-    for mode, allow in (("veto", False), ("shadow", True)):
-        _reset(mode=mode)
-        calls = []
-        v = _decide(_post(calls=calls), get=_get(OTHER))
-        assert v["allow"] is allow and v["error"] == "digest_mismatch" and not calls, v
-        rec = _lines()
-        assert len(rec) == 1 and rec[0]["error"] == "digest_mismatch"
+def test_instance_missing_or_wrong():
+    for body, err in ((fk.listing(fk.entry(publisher="someone")), "instance_wrong"),
+                      (fk.listing(fk.entry(instances=[])), "instance_missing")):
+        for mode, allow in (("veto", False), ("shadow", True)):
+            _reset(mode=mode)
+            calls = []
+            v = _decide(_post(calls=calls), get=_get(body))
+            assert v["allow"] is allow and v["error"] == err and not calls, v
+            rec = _lines()
+            assert len(rec) == 1 and rec[0]["error"] == err
 
 
 def test_logging_and_state():
@@ -202,11 +252,12 @@ def test_logging_and_state():
     cand = copy.deepcopy(CAND)
     v = _decide(_post(calls=calls), cand=cand)
     assert cand == CAND, "candidate must not be mutated"
-    assert v["latency_ms"] is not None and calls[0]["timeout"] == 10.0
+    assert v["latency_ms"] is not None and 9.0 < calls[0]["timeout"] <= 10.0
     rec = _lines()
     assert len(rec) == 1
     r = rec[0]
-    assert r["source"] == "nimble_decide:test" and r["label"]["code"] == "would_buy"
+    assert r["source"] == "decide:elephant-1@q8_0:test" and r["label"]["code"] == "would_buy"
+    assert r["model"] == "elephant-1" and calls[0]["payload"]["model"] == "elephant-1"
     assert r["label"]["mode"] == "shadow" and r["label"]["rule"]["min_sharpness"] == 0.05
     assert r["label"]["rule"]["required_p"] == 0.60 and r["label"]["rule"]["phi_multiplier"] == 0.5
     assert r["label"]["informed_sources"]["mirofish"]["used"] is True
@@ -225,10 +276,10 @@ def test_logging_and_state():
     _reset(VALEDIA_NIMBLE_TIMEOUT_S="2.5")
     calls = []
     _decide(_post(calls=calls))
-    assert calls[0]["timeout"] == 2.5
+    assert 0 < calls[0]["timeout"] <= 2.5
 
 
-def test_warmup_once():
+def test_no_warmup_request():
     _reset()
     nd._WARMED = False
     s1._WARM = False
@@ -236,8 +287,8 @@ def test_warmup_once():
     _decide(_post(calls=calls))
     _decide(_post(calls=calls))
     srcs = [r["source"] for r in _lines()]
-    assert srcs == ["warmup", "nimble_decide:test", "nimble_decide:test"], srcs
-    assert len(calls) == 3
+    assert srcs == ["decide:elephant-1@q8_0:test"] * 2, srcs
+    assert len(calls) == 2
 
 
 def test_informed_none_is_computed_offline():
@@ -248,6 +299,7 @@ def test_informed_none_is_computed_offline():
         "facts": {"news_present": True}, "sources": {"news": {}}}
     try:
         calls = []
+        s1._post = _post(calls=calls)
         nd.decide_candidate("crypto", {"ticker": "BTC-USD"}, side="buy", code_facts={},
                             source="t", post=_post(calls=calls), get=_get())
     finally:
@@ -270,6 +322,7 @@ def test_decide_many_cap():
     items.append({"candidate": {"symbol": "E"}, "side": "sell", "code_facts": {}})
     for mode, rest_allow in (("shadow", True), ("veto", False)):
         _reset(mode=mode)
+        s1._post = post
         out = nd.decide_many("stock", items, source="many", cap_s=2.5, post=post, get=_get(),
                              clock=clock)
         assert len(out) == 5 and len(_lines()) == 3
@@ -306,12 +359,13 @@ def test_fact_builders():
 
 
 def test_confidence_is_not_p_chosen():
-    """Verified on Burton's Mac: confidence = 1 - normalized entropy, NOT P(chosen)."""
-    def post(url, payload, timeout):
-        return {"model": payload["model"], "answers": {
-            "action": {"choice": "skip", "confidence": 0.00159,
-                       "probabilities": {"buy": 0.4765, "skip": 0.5235}},
-            "risk": {"choice": "5"}}}
+    """The typed `confidence` is sharpness, NOT P(chosen): read as given, never replaced."""
+    def typed(probs):
+        def post(url, payload, timeout):
+            return fk.typed_reply(payload["questions"], {"action": probs, "risk": "5"},
+                                  confidence=0.00159)
+        return post
+    post = typed({"buy": 0.4765, "hold": 0.0, "skip": 0.5235})
     _reset(mode="shadow")
     v = _decide(post)
     assert v["action"] == "skip" and v["confidence"] == 0.00159
@@ -324,19 +378,18 @@ def test_confidence_is_not_p_chosen():
     v = _decide(post)
     assert v["allow"] is False and v["reason"] == "veto_model_skip" and v["p_buy"] == 0.4765
 
-    def post_buy(url, payload, timeout):
-        return {"model": payload["model"], "answers": {
-            "action": {"choice": "buy", "confidence": 0.00159,
-                       "probabilities": {"buy": 0.5235, "skip": 0.4765}}, "risk": {"choice": "5"}}}
-    v = _decide(post_buy)
+    v = _decide(typed({"buy": 0.5235, "hold": 0.0, "skip": 0.4765}))
     assert v["allow"] is False and v["reason"] == "veto_not_sharp"
     assert v["p_action"] == 0.5235 == v["p_buy"]
-    # no probabilities: no invented odds
+
+    # no probabilities: the typed parser refuses the reply; no invented odds
     def bare(url, payload, timeout):
-        return {"model": payload["model"], "answers": {"action": {"choice": "buy", "confidence": 0.9}}}
+        body = fk.typed_reply(payload["questions"], {"action": "buy"}, confidence=0.9)
+        body["answers"]["action"].pop("probabilities")
+        return body
     v = _decide(bare)
     assert v["p_action"] is None and v["p_buy"] is None and v["allow"] is False
-    assert v["reason"] == "veto_no_p_buy"  # no odds: the profit rule cannot pass
+    assert v["reason"] == "veto_engine_error" and v["error"] == "ContractError"
     # engine off / exit: keys present, None
     _reset(mode="veto", enabled=False)
     v = _decide(post)
@@ -350,9 +403,9 @@ if __name__ == "__main__":
     test_shadow_never_blocks()
     test_veto_semantics()
     test_exits_never_blocked()
-    test_digest_mismatch()
+    test_instance_missing_or_wrong()
     test_logging_and_state()
-    test_warmup_once()
+    test_no_warmup_request()
     test_informed_none_is_computed_offline()
     test_decide_many_cap()
     test_fact_builders()

@@ -28,8 +28,9 @@ import dynamic_universe as du
 import valedia_config as vc
 import weather_shadow as ws
 
-# Local Ollama is faked, scoped per test (fixture / script main): nimble:latest carries
-# Burton's digest (24e550a16a70...), so it passes the pin. No real /api/tags call.
+# The shared Elephant-1 instance is faked, scoped per test (fixture / script main): the model
+# list shows the one right instance, so it passes the pin. No real list call, no typed call.
+import systemone_test_fakes as fk
 from systemone_test_fakes import Scoped
 _S = Scoped(ak.s1, SLOG)
 _scoped_fakes = _S.fixture()
@@ -204,7 +205,7 @@ def test_systemone_default_off_and_fail_open():
     off = _doc()
     assert off["systemone"]["backend"] == "stub"
     assert off["systemone"]["enabled"] is False
-    assert off["systemone"]["model"] == "nimble:latest"
+    assert off["systemone"]["model"] == ak.s1._pin.dm.INSTANCE
     assert off["fences"]["systemone"] == "stub"
     assert "systemone_shadow" not in off["ranked"][0]
     # The retired decider leaves no key, row field, fence, env read, or print line.
@@ -218,11 +219,11 @@ def test_systemone_default_off_and_fail_open():
         def down(url, payload, timeout):
             seen.append(payload["state"])
             assert payload["state"]["create_order"] is False
-            assert payload["model"] == "nimble:latest"
+            assert payload["model"] == ak.s1._pin.dm.INSTANCE
             raise ConnectionRefusedError("down")
 
-        blown = ak.build(
-            fixture_path=ak.DEFAULT_FIXTURE, annotate=lambda d: d, systemone_post=down)
+        ak.s1._post = down  # the client's own transport (an injected post is not used)
+        blown = ak.build(fixture_path=ak.DEFAULT_FIXTURE, annotate=lambda d: d)
         assert blown["systemone"]["backend"] == "stub"
         assert blown["systemone"]["fail_open"] is True
         assert blown["fences"]["systemone"] == "stub"
@@ -235,7 +236,7 @@ def test_systemone_default_off_and_fail_open():
         assert by["KXHIGHNY"]["label"] == "watch"
         assert all(r["would_have"]["create_order"] is False for r in blown["ranked"])
         states = {s["symbol"]: s for s in seen if s.get("symbol") != "warmup"}
-        # Nimble 2 decides stock/crypto rows only. Weather and oil stay code-labelled watch.
+        # The decision model decides stock/crypto rows only. Weather and oil stay code-labelled watch.
         assert states["PUMP-USD"]["asset_class"] == "crypto"
         assert states["SPY"]["asset_class"] == "stock"
         assert "KXHIGHNY" not in states and "USO" not in states
@@ -245,18 +246,12 @@ def test_systemone_default_off_and_fail_open():
         assert by["PUMP"]["nimble"]["error"] == "ConnectionRefusedError"
 
         def ok(url, payload, timeout):
-            assert payload["model"] == "nimble:latest"
-            return {
-                "model": "nimble2",
-                "answers": {
-                    "action": {"choice": "buy", "confidence": 0.9,
-                               "probabilities": {"buy": 0.9, "hold": 0.05, "skip": 0.05}},
-                    "risk": {"choice": "3"},
-                },
-            }
+            assert payload["model"] == ak.s1._pin.dm.INSTANCE
+            return fk.typed_reply(payload["questions"], {
+                "action": {"buy": 0.9, "hold": 0.05, "skip": 0.05}, "risk": "3"}, confidence=0.9)
 
-        stamped = ak.build(
-            fixture_path=ak.DEFAULT_FIXTURE, annotate=lambda d: d, systemone_post=ok)
+        ak.s1._post = ok
+        stamped = ak.build(fixture_path=ak.DEFAULT_FIXTURE, annotate=lambda d: d)
         assert stamped["systemone"]["backend"] == "systemone_http"
         assert stamped["fences"]["create_order"] is False
         by = {r["symbol"]: r for r in stamped["ranked"]}
@@ -289,21 +284,19 @@ def test_scan_logs_every_decision_with_code_label_and_facts():
 
         def post(url, payload, timeout):
             seen.append(payload)
-            return {"model": "nimble2", "answers": {
-                "action": {"choice": "hold", "confidence": 0.7,
-                           "probabilities": {"buy": 0.2, "hold": 0.7, "skip": 0.1}},
-                "risk": {"choice": "5"}}}
+            return fk.typed_reply(payload["questions"], {
+                "action": {"buy": 0.2, "hold": 0.7, "skip": 0.1}, "risk": "5"}, confidence=0.7)
 
-        doc = ak.build(fixture_path=ak.DEFAULT_FIXTURE, annotate=lambda d: d,
-                       systemone_post=post)
+        ak.s1._post = post
+        doc = ak.build(fixture_path=ak.DEFAULT_FIXTURE, annotate=lambda d: d)
         n = len(doc["ranked"])
         lines = [json.loads(x) for x in open(SLOG).read().splitlines()]
         rows = {r["symbol"]: r for r in doc["ranked"]}
         spot = {k for k, r in rows.items() if r["class"] in ("crypto", "equity", "etf")}
         assert spot and len(spot) < n                   # weather / oil rows get no call
-        assert len(lines) == len(spot) + 1              # warmup + one per stock/crypto row
-        assert lines[0]["source"] == "warmup" and seen[0]["state"]["symbol"] == "warmup"
-        by = {ln["state"]["symbol"].replace("-USD", ""): ln for ln in lines[1:]}
+        assert len(lines) == len(spot)                  # one per stock/crypto row; no warmup request
+        assert all(p["state"]["symbol"] != "warmup" for p in seen) and len(seen) == len(spot)
+        by = {ln["state"]["symbol"].replace("-USD", ""): ln for ln in lines}
         assert set(by) == spot
         for sym, ln in by.items():
             assert ln["source"] == "nimble_decide:movers_scan"

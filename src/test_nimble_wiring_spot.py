@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Nimble 2 wiring at every stock + crypto entry point. Fakes only: no network, no keys.
+"""Decision wiring (named for Nimble) at every stock + crypto entry point, on the shared
+Elephant-1 instance. Fakes only: no network, no keys.
 
 For each point: shadow + a fake 'skip' leaves the decision unchanged (only a stamp is
 added); veto + skip → SKIP_NIMBLE and no cb_buy / alp_buy / paper fill; veto + a sharp buy
-with p_buy over the required probability proceeds; engine down in veto blocks; sells are never blocked; and with
-VALEDIA_SYSTEMONE unset there is no POST and the behavior is identical.
+with a fitted p_buy over the required probability proceeds (with no map under its own key it
+is held); engine down in veto blocks; sells are never blocked; and with VALEDIA_SYSTEMONE
+unset there is no POST and the behavior is identical. The fake engine is the client's own
+transport (s1._post): an injected post is never used for the typed call.
 
 Run: python3 test_nimble_wiring_spot.py
 """
@@ -38,26 +41,44 @@ import systemone_hotpath_client as s1  # noqa: E402
 import tc_auto_paper as tc  # noqa: E402
 import unified_brain as ub  # noqa: E402
 import vibe_shadow_paper as vibe  # noqa: E402
+import systemone_test_fakes as fk  # noqa: E402
 from systemone_test_fakes import Scoped  # noqa: E402
 import valedia_config as vc  # noqa: E402
 
 vc._MODELS = tempfile.mkdtemp(prefix="nimspot_models_")
 import ere_test_fixture  # ERE v3: healthy BOOK -> phi 0.5 (was neutral 1.0 on missing file)
 ere_test_fixture.write_state(vc._MODELS)
-cl._reset_cache(items=[])  # no record: calibration is identity
+cl._reset_cache(items=[])  # no record: calibration is held
 
 _S = Scoped(s1, LOG)
 _scoped_fakes = _S.fixture()
+_REAL_CALIBRATE_EX = cl.calibrate_ex
+
+
+def _as_given(source, p, **kw):
+    """Stand-in for a map fitted under the decision's own key that returns p unchanged."""
+    return {"p_cal": cl._num(p), "calibration": "isotonic", "n": cl.MIN_N}
+
+
+try:
+    import pytest
+
+    @pytest.fixture(autouse=True)
+    def _restore_calibration():
+        yield
+        cl.calibrate_ex = _REAL_CALIBRATE_EX
+except ImportError:  # script mode: main() restores
+    pass
 RULES = os.path.join(ROOT, "data", "crypto-paper", "rules.json")
 BARS = os.path.join(ROOT, "data", "crypto-paper", "bars_safety_pass.json")
 
 
 class Nim:
-    """Fake Nimble transport: records every POST; answers with a fixed verdict."""
+    """Fake engine on the client's own transport: records every POST; answers a typed verdict."""
 
     def __init__(self, choice="skip", conf=0.9, risk="4", exc=None, p_buy=None):
         self.choice, self.conf, self.risk, self.exc, self.all = choice, conf, risk, exc, []
-        self.p_buy = (0.9 if choice == "buy" else 0.5) if p_buy is None else p_buy
+        self.p_buy = 0.9 if p_buy is None else p_buy
 
     calls = property(lambda self: [c for c in self.all if c["state"].get("symbol") != "warmup"])
 
@@ -65,13 +86,16 @@ class Nim:
         self.all.append(payload)
         if self.exc:
             raise self.exc
-        return {"model": payload["model"], "answers": {
-            "action": {"choice": self.choice, "confidence": self.conf,
-                       "probabilities": {"buy": self.p_buy, "hold": (1 - self.p_buy) / 2,
-                                         "skip": (1 - self.p_buy) / 2}},
-            "risk": {"choice": self.risk}}}
+        if self.choice == "buy":
+            rest = (1 - self.p_buy) / 2
+            action = {"buy": self.p_buy, "hold": rest, "skip": rest}
+        else:
+            action = self.choice
+        return fk.typed_reply(payload["questions"], {"action": action, "risk": self.risk},
+                              confidence=self.conf)
 
-def setup(mode=None, on=True, post=None):
+def setup(mode=None, on=True, post=None, fitted=False):
+    """fitted: a map fitted under the decision's own key (stand-in: p as given); else held."""
     for k in [k for k in os.environ if k.startswith("VALEDIA_NIMBLE")]:
         os.environ.pop(k)
     os.environ.pop("VALEDIA_SYSTEMONE", None)
@@ -79,8 +103,10 @@ def setup(mode=None, on=True, post=None):
         os.environ["VALEDIA_SYSTEMONE"] = "1"
     if mode:
         os.environ["VALEDIA_NIMBLE_MODE"] = mode
-    s1._reset_digest()
+    s1._reset_check()
     nd._WARMED = True
+    s1._post = post if post is not None else fk.refuse_post
+    cl.calibrate_ex = _as_given if fitted else _REAL_CALIBRATE_EX
     nws._HOOKS["post"], nws._HOOKS["get"] = post, None
     return post
 
@@ -98,11 +124,14 @@ def test_gate_modes_and_never_raises():
         assert nws.gate("crypto", "BTC-USD", {}, source="t", side="sell") is None
         assert post.all == []
     # veto: sharp buy over required proceeds; not sharp, low p_buy, skip, engine error block
-    post = setup("veto", post=Nim("buy", 0.9))
+    post = setup("veto", post=Nim("buy", 0.9), fitted=True)
     assert nws.blocked(nws.gate("stock", "SPY", {}, source="t")) is False
+    post = setup("veto", post=Nim("buy", 0.9))  # no map under its own key: held, blocked
+    v = nws.gate("stock", "SPY", {}, source="t")
+    assert nws.blocked(v) and v["reason"] == "veto_no_p_buy" and v["calibration"] == "untrained_hold"
     post = setup("veto", post=Nim("buy", 0.01))
     assert nws.blocked(nws.gate("stock", "SPY", {}, source="t"))
-    post = setup("veto", post=Nim("buy", 0.9, p_buy=0.55))
+    post = setup("veto", post=Nim("buy", 0.9, p_buy=0.55), fitted=True)
     v = nws.gate("stock", "SPY", {}, source="t")
     assert nws.blocked(v) and v["reason"] == "veto_p_below_required" and v["required_p"] == 0.60
     post = setup("veto", post=Nim("skip"))
@@ -218,7 +247,7 @@ def test_unified_brain_buy_points():
     assert got["cb_buy"] == [] and got["alp_buy"] == [] and rpt.count("SKIP_NIMBLE") == 2
     assert "NO NEW TRADES" in rpt
     # veto + sharp buy over required proceeds with the same orders; not sharp blocks
-    setup("veto", post=Nim("buy", 0.9))
+    setup("veto", post=Nim("buy", 0.9), fitted=True)
     rpt, got = run_brain(BOTH)
     assert got == base and "SKIP_NIMBLE" not in rpt
     setup("veto", post=Nim("buy", 0.01))
@@ -268,7 +297,7 @@ def test_unified_brain_dca():
     post = setup("veto", post=Nim("skip"))
     rpt, got = run_brain({}, dca_due=True)
     assert got["cb_buy"] == [] and rpt.count("SKIP_NIMBLE") == 4 and "NO NEW TRADES" in rpt
-    setup("veto", post=Nim("buy", 0.9))
+    setup("veto", post=Nim("buy", 0.9), fitted=True)
     assert run_brain({}, dca_due=True)[1] == base
     setup("veto", post=Nim(exc=OSError("down")))
     assert run_brain({}, dca_due=True)[1]["cb_buy"] == []
@@ -323,7 +352,7 @@ def test_dca_module():
     post = setup("veto", post=Nim("skip"))
     out, got = run_dca()
     assert got == {"cb_buy": [], "alp_buy": []} and out.count("SKIP_NIMBLE") == 2
-    setup("veto", post=Nim("buy", 0.9))
+    setup("veto", post=Nim("buy", 0.9), fitted=True)
     assert run_dca()[1] == base
     setup("veto", post=Nim(exc=OSError("down")))
     assert run_dca()[1] == {"cb_buy": [], "alp_buy": []}
@@ -406,13 +435,13 @@ def test_crypto_paper_safety():
     assert dec["pass"] is False and dec["reason"] == "SKIP_NIMBLE" and "SKIP_NIMBLE" in dec["failed_conditions"]
     assert dec["would_have_fill"] is None and not os.path.exists(out)
     assert dec["create_order"] is False and dec["orderPlaced"] is False
-    setup("veto", post=Nim("buy", 0.9))
+    setup("veto", post=Nim("buy", 0.9), fitted=True)
     dec, out = _safety()
     assert dec["pass"] is True and dec["would_have_fill"] and os.path.exists(out)
     setup("veto", post=Nim(exc=OSError("down")))
     assert _safety()[0]["would_have_fill"] is None
     # Ornith refuses: Ornith stays the gate, Nimble is not asked
-    post = setup("veto", post=Nim("buy", 0.9))
+    post = setup("veto", post=Nim("buy", 0.9), fitted=True)
     dec, _ = _safety(post_fn=lambda p: (_ for _ in ()).throw(OSError("ornith down")))
     assert dec["pass"] is False and dec["reason"] == "ornith_down" and post.all == []
 
@@ -473,8 +502,8 @@ def test_movers_scan_label_size_rank_code_owned():
     os.environ.pop("VALEDIA_NIMBLE_MANY_CAP_S", None)
 
 
-def _tc(post_mode, post, action="buy", book=None):
-    setup(post_mode, on=post_mode is not None, post=post)
+def _tc(post_mode, post, action="buy", book=None, fitted=False):
+    setup(post_mode, on=post_mode is not None, post=post, fitted=fitted)
     book = book if book is not None else tc.fresh_book()
     body = {"passphrase": "p", "action": action, "ticker": "COINBASE:BTCUSD", "price": "83360.03",
             "strategy": "supertrend_paper"}
@@ -496,7 +525,7 @@ def test_tc_auto_paper():
     assert code == 200 and resp["filled"] is False and resp["decision"]["reason"] == "SKIP_NIMBLE"
     assert book["cash"] == tc.PAPER_BANKROLL and not book["positions"] and "_fills" not in book
     assert resp["create_order"] is False
-    code, resp, book = _tc("veto", Nim("buy", 0.9))
+    code, resp, book = _tc("veto", Nim("buy", 0.9), fitted=True)
     assert resp["filled"] is True and book["positions"]
     code, resp, book = _tc("veto", Nim(exc=OSError("down")))
     assert resp["filled"] is False and resp["decision"]["reason"] == "SKIP_NIMBLE"
@@ -523,7 +552,7 @@ def test_daviddtech_paper():
     row = _dav()
     assert row["band"] == "review_only" and row["reason"] == "SKIP_NIMBLE"
     assert row["filled"] is False and row["create_order"] is False
-    setup("veto", post=Nim("buy", 0.9))
+    setup("veto", post=Nim("buy", 0.9), fitted=True)
     assert _dav()["band"] == "allowlist"
     setup("veto", post=Nim(exc=OSError("down")))
     assert _dav()["reason"] == "SKIP_NIMBLE"
@@ -550,12 +579,12 @@ def test_vibe_shadow_paper():
     row = vibe.decide(TRADE, st)
     assert row["reason"] == "SKIP_NIMBLE" and row["size_usd"] == 0 and row["would_shadow"] is False
     assert row["create_order"] is False
-    setup("veto", post=Nim("buy", 0.9))
+    setup("veto", post=Nim("buy", 0.9), fitted=True)
     assert vibe.decide(TRADE, st)["reason"] == "shadow_log"
     setup("veto", post=Nim(exc=OSError("down")))
     assert vibe.decide(TRADE, st)["reason"] == "SKIP_NIMBLE"
     # a trade the desk already refuses never reaches Nimble
-    post = setup("veto", post=Nim("buy", 0.9))
+    post = setup("veto", post=Nim("buy", 0.9), fitted=True)
     assert vibe.decide(dict(TRADE, prior_5d_return=0.04), st)["reason"] == "review_only" and post.all == []
 
 def test_etoro_copy_paper_not_wired_by_design():

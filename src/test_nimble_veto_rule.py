@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""nimble_decide profit-consistent veto rule. Fake POST only: no server, no network, no keys.
+"""nimble_decide profit-consistent veto rule. Fake transport only: no server, no network, no keys.
 
 allow iff buy and confidence >= min_sharpness and calibrate(p_buy) >= required_p,
 required_p = max(p_floor, break_even_p + base_margin * phi_multiplier).
+On the shared Elephant-1 instance calibration is held until a map fitted on rows under the decision's own
+key exists, so the rule's arithmetic is driven here through a stand-in fitted map that returns p as given
+(`_fitted_as_given`); the hold itself and real fitted maps are tested beside it.
 Run: python3 test_nimble_veto_rule.py
 """
 import contextlib
@@ -26,9 +29,9 @@ os.environ["VALEDIA_SYSTEMONE_LOG"] = LOG
 import calibration_ledger as cl  # noqa: E402
 import nimble_decide as nd  # noqa: E402
 import systemone_hotpath_client as s1  # noqa: E402
+import systemone_test_fakes as fk  # noqa: E402
 import valedia_config as vc  # noqa: E402
 
-PIN = "24e550a16a70"
 MODELS = tempfile.mkdtemp(prefix="nimrule_models_")
 vc._MODELS = MODELS
 import ere_test_fixture  # ERE v3: healthy BOOK (multiplier 1.0, NORMAL) as the default
@@ -37,12 +40,7 @@ ETH = os.path.join(MODELS, "latest_etherion_risk.json")  # retired file; kept fo
 SECRET_PRICE = 0.7319  # a distinctive number that must never reach the model
 
 
-def _get(url, timeout):
-    if url.endswith("/api/version"):
-        return {"version": "0.35.0"}
-    if url.endswith("/api/tags"):
-        return {"models": [{"name": "nimble:latest", "digest": PIN + "9" * 52}]}
-    raise AssertionError(url)
+_get = fk.list_get()
 
 
 def _post(choice="buy", conf=0.9, p_buy=0.9, calls=None):
@@ -50,11 +48,23 @@ def _post(choice="buy", conf=0.9, p_buy=0.9, calls=None):
         if calls is not None:
             calls.append(payload)
         rest = (1.0 - p_buy) / 2
-        return {"model": payload["model"], "answers": {
-            "action": {"choice": choice, "confidence": conf,
-                       "probabilities": {"buy": p_buy, "hold": rest, "skip": rest}},
-            "risk": {"choice": "3"}}}
+        if choice == "buy":
+            probs = {"buy": p_buy, "hold": rest, "skip": rest}
+        else:  # the chosen action carries the most probability; p_buy stays as given
+            probs = {"buy": p_buy, "hold": 0.0, "skip": 0.0}
+            probs[choice] = 1.0 - p_buy
+        return fk.typed_reply(payload["questions"], {"action": probs, "risk": "3"}, confidence=conf)
     return fake
+
+
+def _fitted_as_given():
+    """Stand-in for a map fitted under the decision's own key that returns p unchanged."""
+    def fake(source, p, **kw):
+        q = cl._num(p)
+        return {"p_cal": q, "calibration": "isotonic", "n": cl.MIN_N}
+    nd_cal = cl.calibrate_ex
+    cl.calibrate_ex = fake
+    return nd_cal
 
 
 def _etherion(level=None, age_h=0.0, raw=None):
@@ -76,16 +86,35 @@ def _reset(mode="veto", **env):
             os.environ.pop(k)
     os.environ["VALEDIA_SYSTEMONE"] = "1"
     os.environ["VALEDIA_NIMBLE_MODE"] = mode
-    os.environ["VALEDIA_SYSTEMONE_MODEL"] = "nimble:latest"  # historical v2 fixture
+    os.environ.pop("VALEDIA_SYSTEMONE_MODEL", None)  # unset: the shared instance
     os.environ["VALEDIA_SYSTEMONE_LOG"] = LOG
     os.environ.update(env)
-    s1._reset_digest()
+    s1._reset_check()
+    s1._post = fk.refuse_post
     nd._WARMED = True
+    cl.calibrate_ex = _REAL_CALIBRATE_EX
     cl._reset_cache(items=[])
     _etherion(None)
 
 
+_REAL_CALIBRATE_EX = cl.calibrate_ex
+_REAL_POST = s1._post
+
+try:
+    import pytest
+
+    @pytest.fixture(autouse=True)
+    def _restore_fakes():
+        yield
+        cl.calibrate_ex = _REAL_CALIBRATE_EX
+        s1._post = _REAL_POST
+        s1._reset_check()
+except ImportError:  # script mode
+    pass
+
+
 def _decide(post, cls="prediction", side="yes", economics=None, source="rule"):
+    s1._post = post  # the client's own transport; an injected post is not honoured
     return nd.decide_candidate(cls, {"ticker": "KXTEST-1", "venue": "kalshi"}, side=side,
                                code_facts={"edge_positive": True}, informed={}, source=source,
                                post=post, get=_get, economics=economics)
@@ -176,38 +205,56 @@ def test_veto_grid():
         ("buy", 0.9, round(req - 0.001, 4), False, "veto_p_below_required"),
         ("buy", 0.05, 0.95, True, "veto_model_buy"),       # exactly the sharpness floor
         ("buy", 0.049, 0.95, False, "veto_not_sharp"),
-        ("hold", 0.9, 0.95, False, "veto_model_hold"),
-        ("skip", 0.9, 0.95, False, "veto_model_skip"),
+        ("hold", 0.9, 0.05, False, "veto_model_hold"),
+        ("skip", 0.9, 0.05, False, "veto_model_skip"),
     ]
     for choice, conf, pb, allow, reason in grid:
         _reset()
+        _fitted_as_given()
         v = _decide(_post(choice, conf, pb), economics=econ)
         assert v["allow"] is allow and v["reason"] == reason, (choice, conf, pb, v)
         assert v["rule_reason"] == reason and abs(v["break_even_p"] - 0.7147) < 1e-9
-        assert v["calibration"] == "identity" and v["p_cal"] == pb
+        assert v["calibration"] == "isotonic" and v["p_cal"] == pb
         assert v["phi_multiplier"] == 0.5 and v["margin"] == 0.01
+    # with no map under its own key the same buys are held, never allowed
+    for choice, conf, pb, allow, reason in grid:
+        _reset()
+        v = _decide(_post(choice, conf, pb), economics=econ)
+        assert v["allow"] is False and v["p_cal"] is None, v
+        assert v["reason"] == (reason if choice != "buy" or reason == "veto_not_sharp"
+                               else "veto_no_p_buy"), v
     # unknown economics → the floor alone
     _reset()
+    _fitted_as_given()
     v = _decide(_post("buy", 0.9, 0.61))
     assert v["allow"] is True and v["required_p"] == 0.60 and v["break_even_p"] is None
     _reset()
+    _fitted_as_given()
     assert _decide(_post("buy", 0.9, 0.59))["reason"] == "veto_p_below_required"
     # a cheap contract still needs the floor; an expensive one needs break-even + margin
     _reset()
+    _fitted_as_given()
     v = _decide(_post("buy", 0.9, 0.62), economics={"side": "yes", "price": 0.10})
     assert v["allow"] is True and v["required_p"] == 0.60
     # no-side buy uses the NO price (margin 0.01 under the healthy book)
     _reset()
+    _fitted_as_given()
     v = _decide(_post("buy", 0.9, 0.82), side="no",  # .82 < .82 + .01 (YES .2 would pass)
                 economics={"side": "no", "yes_price": 0.2, "no_price": 0.82})
     assert v["allow"] is False and abs(v["required_p"] - 0.83) < 1e-9
-    # calibration lowers an overconfident source's p_buy below required
+    # a real map fitted under its own key lowers an overconfident p_buy below required
     _reset()
-    cl._reset_cache(items=[{"source": "nimble_decide:cal", "p": 0.9, "y": i % 2}
-                           for i in range(40)])
+    key = nd._cal_source("cal")
+    assert key == "decide:elephant-1@q8_0:cal"
+    cl._reset_cache(items=[{"source": key, "p": 0.9, "y": i % 2} for i in range(40)])
     v = _decide(_post("buy", 0.9, 0.9), source="cal")
     assert v["calibration"] == "isotonic" and v["p_cal"] == 0.5 and v["allow"] is False
     assert v["reason"] == "veto_p_below_required"
+    # the same rows under an old key are never applied to it: held
+    _reset()
+    cl._reset_cache(items=[{"source": "nimble_decide:cal", "p": 0.9, "y": 1} for i in range(40)])
+    v = _decide(_post("buy", 0.9, 0.9), source="cal")
+    assert v["calibration"] == "untrained_hold" and v["p_cal"] is None and v["reason"] == "veto_no_p_buy"
     cl._reset_cache(items=[])
 
 
@@ -255,6 +302,7 @@ def test_shadow_never_blocks():
                                     ("skip", 0.9, 0.1, "veto_model_skip"),
                                     ("buy", 0.9, 0.99, "veto_model_buy")):
         _reset("shadow")
+        _fitted_as_given()
         v = _decide(_post(choice, conf, pb), economics=econ)
         assert v["allow"] is True and v["reason"] == "shadow_logged", v
         assert v["rule_reason"] == would and v["required_p"] > 0.9, v
@@ -266,6 +314,7 @@ def test_deprecated_min_conf_ignored():
     """An old VALEDIA_NIMBLE_MIN_CONF=0.6 must not become a sharpness floor that blocks all."""
     nd._MIN_CONF_NOTED = False
     _reset(VALEDIA_NIMBLE_MIN_CONF="0.6")
+    _fitted_as_given()
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
         assert nd.min_sharpness() == 0.05 and nd.min_conf() == 0.05
@@ -276,6 +325,7 @@ def test_deprecated_min_conf_ignored():
     assert "deprecated and ignored" in lines[0] and "VALEDIA_NIMBLE_MIN_SHARPNESS" in lines[0]
     assert v["allow"] is True and v["reason"] == "veto_model_buy", v  # 0.3 >= 0.05
     _reset(VALEDIA_NIMBLE_MIN_CONF="0.6", VALEDIA_NIMBLE_MIN_SHARPNESS="0.4")
+    _fitted_as_given()
     with contextlib.redirect_stderr(io.StringIO()):
         assert nd.min_sharpness() == 0.4  # only the new name sets the floor
         assert _decide(_post("buy", 0.3, 0.95))["reason"] == "veto_not_sharp"

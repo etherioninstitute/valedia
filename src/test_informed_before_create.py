@@ -440,7 +440,8 @@ def _roi_conviction():
 
 
 class _Nimble:
-    """VALEDIA_SYSTEMONE=1 with a fake loopback Nimble 2 (no network). raise_ = engine down."""
+    """VALEDIA_SYSTEMONE=1 with a fake shared Elephant-1 instance on the client's own transport
+    (no network). raise_ = engine down."""
 
     def __init__(self, raise_=None):
         self.raise_, self.posts = raise_, []
@@ -449,20 +450,18 @@ class _Nimble:
         self.posts.append(payload)
         if self.raise_:
             raise self.raise_
-        return {"model": payload["model"], "answers": {"action": {
-            "choice": "skip", "confidence": 0.9,
-            "probabilities": {"buy": 0.05, "hold": 0.05, "skip": 0.9}}}}
+        import systemone_test_fakes as fk
+        return fk.typed_reply(payload["questions"], {"action": {"buy": 0.05, "hold": 0.05, "skip": 0.9}},
+                              confidence=0.9)
 
     def __enter__(self):
         import nimble_decide as nd
         import systemone_hotpath_client as s1
-        from systemone_test_fakes import FULL
+        import systemone_test_fakes as fk
         self.s1, self._saved = s1, (s1._post, s1._get)
         s1._post = self._post
-        s1._get = lambda url, timeout: (
-            {"models": [{"name": "nimble:latest", "digest": FULL}]}
-            if url.endswith("/api/tags") else {"version": "0.35.0"})
-        s1._reset_digest()
+        s1._get = fk.list_get()
+        s1._reset_check()
         nd._WARMED = True
         self._env = (_env("VALEDIA_SYSTEMONE", "1"), _env(
             "VALEDIA_SYSTEMONE_LOG", os.path.join(tempfile.mkdtemp(prefix="ibc_nim_"), "d.jsonl")))
@@ -470,7 +469,7 @@ class _Nimble:
 
     def __exit__(self, *exc):
         self.s1._post, self.s1._get = self._saved
-        self.s1._reset_digest()
+        self.s1._reset_check()
         _restore_env("VALEDIA_SYSTEMONE", self._env[0])
         _restore_env("VALEDIA_SYSTEMONE_LOG", self._env[1])
         return False
