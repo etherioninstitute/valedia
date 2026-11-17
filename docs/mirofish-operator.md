@@ -34,8 +34,11 @@ Read-only. It prints, and with `--json-out FILE` (or `--json`) returns as JSON:
   (`elephant-1` under `elephant-1`; `ym-research-embedding` under `google/embedding-gemma-300m`, the key
   `src/mirofish_native_model.py:293` requires). A listing in which a protected id is loaded under another key (the
   embedding's id under the 27B's key, say), a protected key under another id, or any loaded instance has an id or a key that
-  is not a plain string, is refused before any switch-off (`check` prints it as `REFUSED: the model list cannot be judged:
-  ...; the tool does not guess ...`): the tool never decides which instance is meant. A list that cannot be read refuses too.
+  is not a plain string, or a protected pair loaded more than once, is refused before any switch-off (`check` prints it as
+  `REFUSED: the model list cannot be judged: ...; the tool does not guess ...`): the tool never decides which instance is
+  meant. A plain string is a `str`, non-empty, with no leading or trailing space, that encodes as UTF-8. No unload is ever
+  sent with an id or a key that is not a plain string: the switch-off refuses (an `OperatorError`, nothing posted) before
+  it reads or changes anything, and every single unload checks again. A list that cannot be read refuses too.
 - The collector: its launchd job `com.valedia.orderbook-collector` listed; the last 10 decisions' status and latency (shown);
   the decisions of the last 15 minutes (judged by the breach rule below); the age of the last heartbeat. The store is opened read-only (`file:<path>?mode=ro`) and only `decisions.status`,
   `decisions.latency_s`, `decisions.decision_ts` and `heartbeats.ts` are ever read; the three statements are the module's
@@ -90,14 +93,23 @@ For the whole window (the wall clock plus the 120 s cleanup), each named in the 
   just before the gate; for a load test, just before the load call) nothing is launched, everything is restored and the
   row is a refusal naming it (exit 2), since the start check and what the owner was told no longer hold; AFTER the spawn
   (seen at every 30 s check and once more at the end) it is said at once in capitals (`MODEL LOADED AFTER THE
-  ANNOUNCEMENT`), the stop rule governs the run as before, and the run does NOT count, whatever else it shows. A model that
-  appears and goes again between two checks is still named and still keeps the run from counting once one check saw it.
-  A model list that cannot be read at one of these checks is never a pass: BEFORE the spawn (the read after the unloads,
-  the read just before the gate, or before a load test's load call) it is a refusal (`THE MODEL LIST COULD NOT BE READ`,
-  not launched or not loaded, everything restored, `model_list_unread: true` in the row, exit 2); AFTER the spawn it is
-  said in capitals at the first check of each unreadable stretch, every such check's time is kept in
-  `model_list_unread_at`, and the run counts only if the last check, the one at its end, reads the list again (a model
-  that came and went entirely inside the stretch could not be seen by any check). The load test's own `mf-native-<hex>` instance is
+  ANNOUNCEMENT`), the stop rule governs the run as before, and the run does NOT count, whatever else it shows.
+  A model list that cannot be read BEFORE the spawn (the read after the unloads, the read just before the gate, or before
+  a load test's load call) is a refusal (`THE MODEL LIST COULD NOT BE READ`, not launched or not loaded, everything
+  restored, `model_list_unread: true` in the row, exit 2).
+  THE ANNOUNCED SET, AFTER THE SPAWN. At the announcement the row records in `remaining` the exact set of loaded
+  instances (id and key) that stay loaded during the run: the listing with the announced unloads taken out. At every
+  check after the spawn (each 30 s collector check) and once more at the end, the listing must be readable and equal to
+  that set exactly, with the decision instance loaded and right; a run counts only if every such check held
+  (`model_checks`, and `model_check_failures` empty; the one place this is decided is `finish_run_row`, where
+  `counts` is the verdicts and `models_held`). Anything else at a check (an extra instance, a missing one, a protected
+  pair broken, the decision instance not right, a listing that cannot be read even once) is said in capitals at that
+  check (`THE LOADED MODELS DO NOT HOLD AT <utc>: <each problem by name>; THE RUN DOES NOT COUNT`), kept with its time in
+  `model_check_failures`, and the run does not count. The alert is given at the first check of every bad stretch,
+  a second stretch included, and again whenever the problems change. The pipeline's own `mf-native-*` instances are
+  part of the run during the watch; at the end none may be left. The load test's hold is held to the same rule (its own
+  instance allowed during the hold, `models_held` in its result). The remaining limit: a model that appears and is gone
+  again between two checks is not seen by any check. The load test's own `mf-native-<hex>` instance is
   named in the intent file before its load call and is the only instance its unload names
   (`POST /api/v1/models/unload {"instance_id": ...}`) and named in the record. They are NOT reloaded: LM Studio loads each again
   on demand.
@@ -247,10 +259,21 @@ a row nor the intent file. While it exists, `check`, `run` and `load-test` refus
    proposed is not a candidate. Two cases are kept apart: when the proof could NOT be made, nothing is changed, the file is
    kept and it says so in capitals (exit 3): a command that could not be read (the read raised, ps failed, or it answered
    with no string or an empty one, for a pid that is still alive), a start that could not be read (any ps answer other than
-   its own "no such process": exit 1 with nothing on either stream), the job list unreadable, the scan failed. When the
-   proof was made and the answer is no (a command that WAS read does not name this run's folder and script, the start
-   differs from the intent's, or the pid is 1 or less, this tool, an ancestor or a job's pid: a reused pid), the process
-   is reported by its pid only, never signalled, and does not hold the recovery back.
+   its own "no such process": exit 1 with nothing on either stream), the job list unreadable, the scan failed. A command
+   that WAS read and names the staged work folder in any token but fails the proof for both roles (the wrong script, a
+   garbled form, a start that differs from the intent's, a job's pid) is "could not be decided", the same way: nothing is
+   changed for the reader or the intent, it is said in capitals with its pid (`NOT SIGNALLED: THE PROOF COULD NOT BE MADE
+   FOR pid N ...`, ending `could not be decided`), exit 3. (This tool, its ancestors and pids 1 or less are never
+   candidates, whatever their command names.) Only when the proof was made and the command
+   does not mention the folder at all (a reused pid, say), or the pid is one of those never candidates, is the process "not ours": reported by its
+   pid only, never signalled, and it does not hold the recovery back.
+   Every process start is read, recorded and compared in one fixed form: `ps -o lstart=` run with the environment
+   `PATH=/usr/bin:/bin` and nothing else (no `TZ`, no locale variable), so the machine's own time zone and the C locale,
+   whatever the caller's `TZ` or `LC_*` say. That is the same form the pipeline's observer writes in
+   `builder/observer-identity.json` (its observer runs with `HOME` alone), so the two compare. A run started under one
+   caller time zone and recovered under another finds its launcher. What it does not cover: a change of the machine's own
+   time zone between the run and `recover`; the launcher's command still names the folder, so it is then "could not be
+   decided" (exit 3), never "not ours".
 4. Every proven survivor is reported in capitals (`LAUNCHER STILL RUNNING`, `OBSERVER STILL RUNNING`). Only with `--stop`
    is it stopped the documented way, each proven again (start and command) immediately before its own signal, so a pid
    that passed the scan and was replaced by another process is not signalled: TERM to a proven observer, then, if a
@@ -258,7 +281,9 @@ a row nor the intent file. While it exists, `check`, `run` and `load-test` refus
    made counts as still running.
 5. While a proven survivor lives, or while a proof or the scan could not be made, the
    pick reader is NOT put back (the reader beside a live run is what the switch-off exists to prevent) and the intent file
-   is kept. Without `--stop` it then changes nothing at all and writes no row (exit 3).
+   is kept. Without `--stop` it then changes nothing at all and writes no row (exit 3). Under `recover --stop`, when one
+   survivor is proven and another process could not be decided, the proven one is stopped, the reader stays off, the
+   intent is kept and the exit is 3.
 6. Otherwise: the pick reader is bootstrapped from its one constant plist when it was loaded before and is not now (it
    bootstraps, boots out, loads or unloads nothing else); any `mf-native-*` instance still loaded is reported (nothing is
    unloaded) with the decision instance's state; a row `{"command": "recover", "recovered": "recovered after an unfinished
@@ -322,7 +347,9 @@ profile's pinned checkpoint and settings, read back by the staged `check_load_re
 The result (`artifacts/mirofish/load-tests/<utc>-<model>.json`): baseline and after-load median and lowest free reading,
 `setup_cost_points` (baseline median minus the median of the hold's first 60 s), `fall_points` (the hold's first 60 s against
 its last 60 s, medians), highest pressure level, swap change, and the collector's decisions during the test (count, statuses,
-highest latency). These two numbers feed the start threshold's table.
+highest latency). These two numbers feed the start threshold's table. It also holds `remaining` (the announced set),
+`model_checks`, `model_check_failures` and `models_held`: true only when the listing equalled the announced set (its own
+instance allowed during the hold, not after the unload) at every check after the load and at the end.
 
 ## The run record
 
