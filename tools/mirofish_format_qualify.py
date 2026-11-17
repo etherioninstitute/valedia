@@ -19,7 +19,9 @@ import argparse,hashlib,json,shutil,sys,time,uuid
 from pathlib import Path
 CREW=Path('/Volumes/NIMROD_SSD/Qwen-Weight-Space/project/work/sol-foreman-qwen')
 HELPER_ACTIONS={'baseline','load','chat_context','unload'}  # never a generation action
-ENTRY_MODULES=('mirofish_native_model.py','mirofish_native_run.py','mirofish_native_gateway.py')
+# TMF5: the startup module is the fourth: the run module imports it by name when it reads a resource sample, so it is imported
+# from the staged entry and pin-checked like the other three, and nothing needs a hand-set path.
+ENTRY_MODULES=('mirofish_native_model.py','mirofish_native_run.py','mirofish_native_gateway.py','mirofish_native_startup.py')
 SELECTOR='mirofish_model_profile.json'
 # Two real agent requests captured by the gateway of the 2026-11-15 swarm8 run (valedia-native-20261115-swarm8-d), pinned by
 # hash: a 10-message twitter turn with six tools and a 6-message one. Their model field is replaced by this run's identifier.
@@ -27,7 +29,7 @@ RECORDED=[(CREW/'valedia-native-20261115-swarm8-d/run1/calls/09d1cbb2d02e438cbd9
           (CREW/'valedia-native-20261115-swarm8-d/run1/calls/50d7b40c54974b3a8ffa7a26fe3ebd5c/request.json','f73e34965bf9e45bba49d5fffd9dbcebaa65683f2a1378f410b56d36dbf37a2a')]
 LOAD_S,UNLOAD_S,BASELINE_S,ADMISSION_S,WHOLE_S=180,45,15,10,900
 class Modules:
-    def __init__(self,entry,model,run,gateway):self.entry,self.model,self.run,self.gateway=entry,model,run,gateway
+    def __init__(self,entry,model,run,gateway,startup):self.entry,self.model,self.run,self.gateway,self.startup=entry,model,run,gateway,startup
 _LOADED:dict={}
 def require(value,why):
     if not value:raise RuntimeError(why)
@@ -43,10 +45,10 @@ def staged_modules(work):
     sys.path.insert(0,str(entry))
     try:
         import importlib
-        model,run,gateway=(importlib.import_module(name) for name in names)
+        model,run,gateway,startup=(importlib.import_module(name) for name in names)
     finally:sys.path.remove(str(entry))
-    for module in (model,run,gateway):require(Path(module.__file__).absolute().parent==entry,'a native module was not imported from the staged entry: '+module.__name__)
-    _LOADED.update(entry=entry,modules=Modules(entry,model,run,gateway));return _LOADED['modules']
+    for module in (model,run,gateway,startup):require(Path(module.__file__).absolute().parent==entry,'a native module was not imported from the staged entry: '+module.__name__)
+    _LOADED.update(entry=entry,modules=Modules(entry,model,run,gateway,startup));return _LOADED['modules']
 def canned_bodies(identifier):
     tool={'type':'function','function':{'name':'create_post','description':'Create a post.','parameters':{'type':'object','properties':{'content':{'type':'string'}},'required':['content']}}}
     call={'id':'call_1','type':'function','function':{'name':'create_post','arguments':'{"content": "Format check post."}'}}

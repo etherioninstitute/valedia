@@ -81,8 +81,13 @@ ORIGINAL_SDK_PORT=62298;SERVER_PORT=1235
 # from a selector file written beside the model module. Staging WITHOUT a model copies the W16 bytes as before, with no selector.
 SRC=Path(__file__).absolute().parents[1]/'src'
 MODEL_SRC_SHA='e1cd97e15a990a8418fca22e044520eb19b5bf76edb7b227a4e471e431792115'   # fc99603 (TMF4a) + 38bce8a (TMF4 addendum 3)
-RUN_SRC_SHA='0426dd5a52ad363f92d02149258507f80bf5f9d8fe51f4a1fa066733f0816b50'
-SRC_REVIEW_STATUS='blind-checked on 2026-11-15 (V136, pass with notes; the four source repairs of addendum 3 applied afterwards and awaiting their own check)'
+RUN_SRC_SHA='f09d4870835fd0074ab97f4d78bf43b5dca39201051c423a7a778a4cc55707cf'   # TMF5 (was 0426dd5a, TMF4a + addendum 3)
+# TMF5 (2026-11-17): staged with a model, the startup and gateway modules are also the pinned src/ revisions (the stop rule's
+# sample fields, the co-resident, the observer identity; the refusal record and the search-query cut), with the same closed
+# integer deltas as the W16 bytes took, and the producer takes the TMF5 patches the staged run script itself lists.
+STARTUP_SRC_SHA='bd8f952b92b244a7054a064b877b5c2da70c336a62391587151146d62e5c28f7'
+GATEWAY_SRC_SHA='7cdf872efcc9d71260a16501d8594eece32372aa9fb4985af2883e2cf91def11'
+SRC_REVIEW_STATUS='blind-checked on 2026-11-15 (V136, pass with notes; the four source repairs of addendum 3 applied afterwards and awaiting their own check); the TMF5 revisions of the run, startup and gateway modules (2026-11-17) await their own check'
 SRC_REVISION_NOTE=('These two files (mirofish_native_model.py, mirofish_native_run.py) are the src/ revisions of commit fc99603 (TMF4a: '
     'two models by phase, the Bonsai 2 profile, validated helper constants, the hardened registry reader) with the four repairs '
     'of TMF4 addendum 3 (commit 38bce8a), not the W16 bytes. Review status: '+SRC_REVIEW_STATUS+'. History: TMF3 staged the '
@@ -106,7 +111,13 @@ TOKENIZER_PINS={'qwen3-8b':{'config.json':'f7c4eadfbbf522470667b797a3c89be252483
     'model.safetensors.index.json':'f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc'}}
 # The words the pinned run script's prepare_candidate adds to runtime_predicates for a plan; staging writes the same words.
 PLAN_PREDICATE='two pinned models by phase: setup model for preparation and report, turns model for the simulation, swapped at the two boundaries with the gateway idle, the same two probes after each swap'
-START_FRAGMENT='(65 if pre else 30)'  # mirofish_native_run.py:380, the free-memory start rule (30 is the stop floor, unchanged)
+START_FRAGMENT='START_FREE_PERCENT=65'  # mirofish_native_run.py, the start check's one reading (TMF5: the stop rule is sustained, its own)
+# TMF5 (b): the co-resident (the order-book collector's decision model) is declared in the startup source by the same string as
+# FILE in valedia_trader/core/decision_model.py; staging writes FILE into each staged startup copy and refuses a plan whose own
+# serving file resolves to it.
+DECISION_MODEL=SRC.parent/'valedia_trader/core/decision_model.py'
+TMF5_PRODUCER_FILES={'owned-source/producer/backend/app/services/simulation_config_generator.py':3,'owned-source/producer/backend/app/services/oasis_profile_generator.py':1,
+                     'owned-source/producer/backend/app/storage/embedding_service.py':4,'owned-source/producer/backend/app/services/graph_tools.py':1}
 SDK_HELPER_REL='builder/sdk_native.mjs'  # the generated helper script; the launcher refuses unless it equals what the model source generates
 # The SSD's device number, which the launcher checks the prompt-cache target against. The reviewed startup source fixes the value
 # seen on 2026-11-07; macOS numbers a volume when it mounts it, so a reboot or remount can change it. Staging carries the live number
@@ -333,7 +344,7 @@ def closed(edits):
     """A fragment whose derived value equals the reviewed one (for example a wall of exactly 3,600 s against the reviewed one-hour
     freshness cap) is kept as a presence check: it must still occur exactly as often as stated, and it changes nothing."""
     return [(old,new,count,0 if old==new else literals) for old,new,count,literals in edits]
-def swarm_gateway_bytes(raw,profile,model=None):
+def swarm_gateway_bytes(raw,profile,model=None,original_sha=GATEWAY_ORIGINAL_SHA):
     p=swarm_numbers(profile,model);pairs=[('chat_attempts',40,p['chats']),('output_total',60000,p['output']),('embedding_attempts',64,p['embedding_attempts']),('embedding_texts',256,p['embedding_texts']),('embedding_total_bytes',131072,p['embedding_bytes']),('wall_seconds',2400,p['wall'])]
     edits=[(f'{name}: int = {old}',f'{name}: int = {new}',1,1) for name,old,new in pairs]+[(f'"{name}": {old},',f'"{name}": {new},',1,1) for name,old,new in pairs]
     # TMF2: the arrival-to-done and queue limits (default and reviewed maximum each) and the request byte limit follow the derivation.
@@ -341,12 +352,12 @@ def swarm_gateway_bytes(raw,profile,model=None):
     edits+=[('client_seconds: int = 175',f'client_seconds: int = {arrival}',1,1),('"client_seconds": 175,',f'"client_seconds": {arrival},',1,1),
             ('queue_seconds: int = 170',f'queue_seconds: int = {queue}',1,1),('"queue_seconds": 170}',f'"queue_seconds": {queue}}}',1,1),
             ('request_bytes: int = 131072',f'request_bytes: int = {p["request_bytes"]}',1,1)]
-    changed=closed_integer_delta(raw,GATEWAY_ORIGINAL_SHA,closed(edits));nodes=gateway_budget_nodes(ast.parse(changed));require([n.value for n in nodes]==[p['chats'],p['output'],p['chats'],p['output']],'swarm gateway budget mismatch');return changed
+    changed=closed_integer_delta(raw,original_sha,closed(edits));nodes=gateway_budget_nodes(ast.parse(changed));require([n.value for n in nodes]==[p['chats'],p['output'],p['chats'],p['output']],'swarm gateway budget mismatch');return changed
 def swarm_run_bytes(raw,profile,model=None,original_sha=RUN_ORIGINAL_SHA,start_threshold=None):
     """The swarm's closed run-script numbers. Staged with a model, the original is the pinned src/ revision and the free-memory
     start threshold is the chosen model's (TMF3 outcome 5); 65 stays for the 27B, a presence check that changes nothing."""
     p=swarm_numbers(profile,model);wall=p['wall'];caller=p['caller_client_s']
-    threshold=[] if start_threshold is None else [(START_FRAGMENT,f'({start_threshold} if pre else 30)',1,1)]
+    threshold=[] if start_threshold is None else [(START_FRAGMENT,f'START_FREE_PERCENT={start_threshold}',1,1)]
     # TMF2 addendum 1, ruling 1: the two caller timeouts are digit strings in the worker environment; closed_digit_delta proves that
     # only those two strings and the stated integers differ.
     # Addendum 2, R1: the observer's worker event buffer limit, derived from the largest wait event the profile can produce.
@@ -358,9 +369,9 @@ def swarm_run_bytes(raw,profile,model=None,original_sha=RUN_ORIGINAL_SHA,start_t
         ('"max_rounds": 1,',f'"max_rounds": {p["rounds"]},',1,1),("'wall_seconds':2400}",f"'wall_seconds':{wall}}}",1,1),
         ('deadline=start+2400',f'deadline=start+{wall}',1,1),("receipt['wall_seconds']<=2400",f"receipt['wall_seconds']<={wall}",1,1),
         ('research_only=False,max_age_seconds=3600)',f'research_only=False,max_age_seconds={wall})',1,1)]))
-def swarm_startup_bytes(raw,profile,model=None):
+def swarm_startup_bytes(raw,profile,model=None,original_sha=STARTUP_ORIGINAL_SHA):
     p=swarm_numbers(profile,model)
-    return closed_integer_delta(raw,STARTUP_ORIGINAL_SHA,closed([('(30 if preflight else 2400)',f'(30 if preflight else {p["wall"]})',1,1),
+    return closed_integer_delta(raw,original_sha,closed([('(30 if preflight else 2400)',f'(30 if preflight else {p["wall"]})',1,1),
         ('MAX_RECORDS=6001',f'MAX_RECORDS={p["history_records"]}',1,1),('MAX_BYTES=16*1024*1024',f'MAX_BYTES={p["history_mib"]}*1024*1024',1,1)]))
 def swarm_producer_bytes(relative,raw,profile,model=None):
     p=swarm_numbers(profile,model);original,edits=SWARM_PRODUCER[relative]
@@ -475,6 +486,45 @@ def check_selection(name,entry):
     require(type(selection.get('maxContextLength')) is int and selection['maxContextLength']>=LIMITS.WINDOW and selection.get('format')=='gguf','model profile %r does not support the 32,768 window as a GGUF'%name)
     require(selection.get('sizeBytes')==total and selection.get('sourceSha256')==entry['weight_sha256'],'model profile %r selection disagrees with its pinned size or hash'%name)
     return total
+def decision_model_file(path=None):
+    """FILE of valedia_trader/core/decision_model.py, read from its source text (one module-level string assignment)."""
+    tree=ast.parse(snapshot(Path(path) if path is not None else DECISION_MODEL))
+    values=[n.value.value for n in tree.body if isinstance(n,ast.Assign) and [getattr(t,'id',None) for t in n.targets]==['FILE'] and isinstance(n.value,ast.Constant) and type(n.value.value) is str]
+    require(len(values)==1 and values[0],'decision_model.FILE missing or repeated');return values[0]
+def co_resident_declared(path=None):
+    """The declared co-resident file made absolute (home expanded) and resolved with realpath, as the launcher resolves it."""
+    value=os.path.expanduser(decision_model_file(path));require(os.path.isabs(value),'decision_model.FILE cannot be made absolute');return os.path.realpath(value)
+def refuse_co_resident(paths,declared=None):
+    """TMF5 (b): a run never loads the co-resident's own file; every serving file is judged by resolved equality."""
+    declared=co_resident_declared() if declared is None else declared
+    hits=[str(p) for p in paths if os.path.realpath(os.path.expanduser(str(p)))==declared]
+    require(not hits,'a plan cannot load the co-resident\'s file (the order-book collector\'s decision model): '+', '.join(hits));return paths
+def co_resident_bytes(raw,file):
+    """Write `file` into the startup source's one CO_RESIDENT_FILE string constant, the way the port and the device are written,
+    and prove by the syntax tree that nothing else changed. The pinned src/ revision already carries decision_model.FILE, so this
+    changes no byte unless the two strings differ (a src/ test fails if they do)."""
+    require(type(file) is str and file and "'" not in file and '\\' not in file and '\n' not in file,'co-resident file string shape')
+    tree=ast.parse(raw);nodes=[n.value for n in tree.body if isinstance(n,ast.Assign) and [getattr(t,'id',None) for t in n.targets]==['CO_RESIDENT_FILE'] and isinstance(n.value,ast.Constant) and type(n.value.value) is str]
+    require(len(nodes)==1,'startup source declares no single co-resident file')
+    node=nodes[0];lines=raw.splitlines(keepends=True);start=sum(map(len,lines[:node.lineno-1]))+node.col_offset;end=sum(map(len,lines[:node.end_lineno-1]))+node.end_col_offset
+    require(raw[start:end]==("'"+node.value+"'").encode(),'co-resident constant source span changed')
+    changed=raw[:start]+("'"+file+"'").encode()+raw[end:];new=ast.parse(changed)
+    for value in [n.value for n in new.body if isinstance(n,ast.Assign) and [getattr(t,'id',None) for t in n.targets]==['CO_RESIDENT_FILE']]+[node]:value.value='CO_RESIDENT_FILE'
+    require(ast.dump(tree,include_attributes=False)==ast.dump(new,include_attributes=False),'startup source changed outside the co-resident constant');return changed
+def src_producer_patches(work):
+    """The TMF5 producer patches as the staged src/ run script itself lists them, in a fresh interpreter whose only staged modules
+    are the observer entry's (this process holds the W16 modules under the same names)."""
+    import subprocess
+    entry=Path(work)/'owned-source/observer-entry';code='import sys,json;sys.path.insert(0,sys.argv[1]);import mirofish_native_run as r;sys.stdout.write(json.dumps(r.tmf5_producer_patches()))'
+    done=subprocess.run([sys.executable,'-B','-c',code,str(entry)],cwd=str(entry),env={'PATH':'/usr/bin:/bin','TMPDIR':os.environ.get('TMPDIR','/tmp')},capture_output=True,text=True,timeout=120)
+    require(done.returncode==0,'staged src run script could not list its producer patches: '+done.stderr.strip()[-400:]);rows=json.loads(done.stdout)
+    require(type(rows) is list and all(type(r) is list and len(r)==3 and all(type(x) is str for x in r) for r in rows),'producer patch list shape');return [tuple(r) for r in rows]
+def tmf5_producer_bytes(raw,patches):
+    """Apply the patches of one producer file, each to exactly one occurrence, in order; the result must still parse."""
+    text=raw.decode()
+    for old,new in patches:
+        require(text.count(old)==1,'TMF5 producer patch site missing or repeated');text=text.replace(old,new)
+    ast.parse(text);return text.encode()
 def model_choice(name,base_manifest,registry=None):
     """The chosen built-in profile and its pins, derived from the pinned module (names and paths) and the reviewed hashes (the
     base manifest's for the 27B's tokenizer origin, which Bonsai 2 shares; TOKENIZER_PINS otherwise). Refuses, in one line, an
@@ -494,6 +544,7 @@ def model_choice(name,base_manifest,registry=None):
     serving_rows=[{'bytes':entry['weight_bytes'],'path':str(entry['weight_file']),'role':base_rows[-1]['role'] if name==default else 'sole serving GGUF %s weight; %s'%(quant,STAGED_AT),'sha256':entry['weight_sha256']}]
     if entry.get('second_file') is not None:
         serving_rows.append({'bytes':entry['second_bytes'],'path':str(entry['second_file']),'role':'second file LM Studio loads with the weights (vision projector); loaded and unused; '+STAGED_AT,'sha256':entry['second_sha256']})
+    refuse_co_resident([Path(row['path']) for row in serving_rows])  # TMF5 (b)
     threshold=LIMITS.start_threshold(name,serving)
     return {'name':name,'default':name==default,'entry':entry,'entries':{name:entry},'members':[name],'plan':None,'active':name,'limits_key':name,
             'tokenizer_files':files,'model_files':rows+serving_rows,'model_tokenizer':{f:pins[f] for f in files},'tokenizer_by_profile':{name:{f:pins[f] for f in files}},
@@ -592,7 +643,9 @@ def stage(work,data,profile='compact40',sdk_port=ORIGINAL_SDK_PORT,ssd_device=OR
     # model: None (the W16 bytes, no selector) or a verified model_choice() or plan_choice() (the pinned src/ revisions plus the selector).
     require(model is None or (profile in SWARM and isinstance(model,dict) and all(row['bytes'] is not None for row in model['model_files'])),'a model is staged only with a swarm profile and verified pins')
     model_name=model['limits_key'] if model else None  # one profile name, or a plan {'setup','turns'}: what the swarm numbers are derived for
-    if model:src_model,src_run=src_revision('mirofish_native_model.py',MODEL_SRC_SHA),src_revision('mirofish_native_run.py',RUN_SRC_SHA)
+    if model:
+        src_model,src_run=src_revision('mirofish_native_model.py',MODEL_SRC_SHA),src_revision('mirofish_native_run.py',RUN_SRC_SHA)
+        src_startup,src_gateway=src_revision('mirofish_native_startup.py',STARTUP_SRC_SHA),src_revision('mirofish_native_gateway.py',GATEWAY_SRC_SHA);co_file=decision_model_file()
     manifest,base_raw,receipt,receipt_raw,acceptance_raw,controls,observations,helpers=data;work=Path(work).absolute();require(work.parent==CREW and not work.exists() and all(not p.is_symlink() for p in [work,*work.parents]),'fresh direct crew work required');work.mkdir();(work/'builder').mkdir();(work/'tmp').mkdir();ancestry=[];pins=[]
     for row in manifest['files']:
         source=Path(row['path'])
@@ -614,13 +667,15 @@ def stage(work,data,profile='compact40',sdk_port=ORIGINAL_SDK_PORT,ssd_device=OR
                     target=work/relative;mode=target.stat().st_mode&0o777;changed=sdk_port_helper(target.read_text(),sdk_port);target.chmod(0o644);target.write_text(changed);target.chmod(mode);pins[-1]['sha256']=sha(target);ancestry[-1].update(kind='CLOSED_LIVE_SDK_PORT_HELPER_TEXT',source_sha256=row['sha256'],sha256=sha(target))
                 if profile in SWARM:
                     closed=None
-                    if str(relative) in GATEWAY_COPIES:closed=('gateway',lambda raw,p:swarm_gateway_bytes(raw,p,model_name))
+                    if str(relative) in GATEWAY_COPIES:closed=('gateway',lambda raw,p:swarm_gateway_bytes(src_gateway,p,model_name,GATEWAY_SRC_SHA) if model else swarm_gateway_bytes(raw,p,model_name))
                     elif str(relative) in RUN_COPIES:closed=('run',lambda raw,p:swarm_run_bytes(src_run,p,model_name,RUN_SRC_SHA,model['start_threshold']) if model else swarm_run_bytes(raw,p))
-                    elif str(relative) in STARTUP_COPIES:closed=('startup',lambda raw,p:swarm_startup_bytes(raw,p,model_name))
+                    elif str(relative) in STARTUP_COPIES:closed=('startup',lambda raw,p:co_resident_bytes(swarm_startup_bytes(src_startup,p,model_name,STARTUP_SRC_SHA),co_file) if model else swarm_startup_bytes(raw,p,model_name))
                     elif str(relative) in SWARM_PRODUCER:closed=('producer:'+Path(str(relative)).name,lambda raw,p,key=str(relative):swarm_producer_bytes(key,raw,p,model_name))
                     if closed:
                         target=work/relative;changed=closed[1](target.read_bytes(),profile);target.chmod(0o644);target.write_bytes(changed);target.chmod(0o444);pins[-1]['sha256']=sha(target);ancestry[-1].update(kind='REVIEWED_CLOSED_SWARM_INTEGER_DELTA',file=closed[0],source_sha256=row['sha256'],sha256=sha(target))
                         if model and closed[0]=='run':ancestry[-1].update(src_path=str(SRC/'mirofish_native_run.py'),src_sha256=RUN_SRC_SHA,start_threshold=[65,model['start_threshold']])
+                        if model and closed[0]=='gateway':ancestry[-1].update(src_path=str(SRC/'mirofish_native_gateway.py'),src_sha256=GATEWAY_SRC_SHA)
+                        if model and closed[0]=='startup':ancestry[-1].update(src_path=str(SRC/'mirofish_native_startup.py'),src_sha256=STARTUP_SRC_SHA,co_resident_file=co_file,co_resident_source=str(DECISION_MODEL))
                     if str(relative)==MEMORY_REL:
                         target=work/relative;changed=swarm_memory_bytes(target.read_bytes(),profile);target.chmod(0o644);target.write_bytes(changed);target.chmod(0o444);pins[-1]['sha256']=sha(target);ancestry[-1].update(kind='REVIEWED_MEMORY_REPLACEMENT_THEN_CLOSED_INTEGERS',canonical_sha256=MEMORY_CANONICAL_SHA,replacement_path=str(MEMORY_FILE),replacement_sha256=MEMORY_REPLACEMENT_SHA,source_sha256=row['sha256'],sha256=sha(target))
                     if str(relative)==SELECTOR_REL:
@@ -635,6 +690,16 @@ def stage(work,data,profile='compact40',sdk_port=ORIGINAL_SDK_PORT,ssd_device=OR
                     ancestry[-1].update(sha256=sha(target),ssd_device_change=[ORIGINAL_CACHE_DEVICE,ssd_device])
         else:pins.append(copy.deepcopy(row))
     require(sum(row['kind']=='CLOSED_LIVE_SDK_PORT_HELPER_TEXT' for row in ancestry)==(1 if moved and not model else 0),'SDK helper port delta must touch exactly the one helper script')
+    if model:  # TMF5: the producer takes the patches the staged run script lists (no silent fall-back; the search-query cut)
+        listed=src_producer_patches(work);by_file={}
+        for relative,old,new in listed:by_file.setdefault('owned-source/producer/backend/'+relative,[]).append((old,new))
+        require({k:len(v) for k,v in by_file.items()}==TMF5_PRODUCER_FILES,'TMF5 producer patch set changed: '+str({k:len(v) for k,v in by_file.items()}))
+        for relative,patches in sorted(by_file.items()):
+            target=work/relative;before=sha(target);changed=tmf5_producer_bytes(target.read_bytes(),patches);target.chmod(0o644);target.write_bytes(changed);target.chmod(0o444)
+            index=[i for i,row in enumerate(pins) if row['path']==str(target)];rows=[row for row in ancestry if row['target']==str(target)];require(len(index)==1 and len(rows)==1 and rows[0]['sha256']==before,'TMF5 producer patch target pin')
+            pins[index[0]]['sha256']=sha(target)
+            if rows[0]['kind']=='EXACT_ACCEPTED_W16_BYTES':rows[0].update(kind='TMF5_PRODUCER_PATCHES_FROM_THE_STAGED_RUN_SCRIPT',source_sha256=rows[0]['sha256'])
+            rows[0].update(sha256=sha(target),tmf5_patches=len(patches),tmf5_patch_source=str(work/'owned-source/observer-entry/mirofish_native_run.py'))
     selector_pins=[]
     if model:
         reference=model_choice(LIMITS.DEFAULT_MODEL,manifest)
@@ -667,8 +732,12 @@ def stage(work,data,profile='compact40',sdk_port=ORIGINAL_SDK_PORT,ssd_device=OR
     port_rows=[row for row in ancestry if row['kind']=='CLOSED_LIVE_SDK_PORT_ONE_INTEGER'];require(len(port_rows)==(2 if moved and not model else 0),'SDK port delta must touch exactly the two model copies');port_owned=sum(Path(row['source']).is_relative_to(W16/'owned-source') for row in port_rows)
     src_model_rows=[row for row in ancestry if row['kind']=='PINNED_SRC_REVISION_MODEL_MODULE'];require(len(src_model_rows)==(len(MODEL_COPIES) if model else 0),'the src/ model revision must replace exactly the model copies');src_owned=sum(Path(row['source']).is_relative_to(W16/'owned-source') for row in src_model_rows)
     src_run_rows=[row for row in ancestry if 'src_sha256' in row and row['src_sha256']==RUN_SRC_SHA];require(len(src_run_rows)==(len(RUN_COPIES) if model else 0),'the src/ run revision must replace exactly the run copies')
+    for name,pin,copies in [('startup',STARTUP_SRC_SHA,STARTUP_COPIES),('gateway',GATEWAY_SRC_SHA,GATEWAY_COPIES)]:
+        require(sorted(row['target'] for row in ancestry if row.get('src_sha256')==pin)==(sorted(str(work/c) for c in copies) if model else []),'the src/ '+name+' revision must replace exactly the '+name+' copies')
+    tmf5_rows=[row for row in ancestry if 'tmf5_patches' in row];require({str(Path(row['target']).relative_to(work)):row['tmf5_patches'] for row in tmf5_rows}==(TMF5_PRODUCER_FILES if model else {}),'TMF5 producer patches must touch exactly their four files')
+    tmf5_owned=sum(row['kind']=='TMF5_PRODUCER_PATCHES_FROM_THE_STAGED_RUN_SCRIPT' for row in tmf5_rows)
     device_rows=[row for row in ancestry if 'ssd_device_change' in row];require(len(device_rows)==(len(STARTUP_COPIES) if remounted else 0),'SSD device delta must touch exactly the three startup copies');device_owned=sum(row['kind']=='CLOSED_LIVE_SSD_DEVICE_ONE_INTEGER' and Path(row['source']).is_relative_to(W16/'owned-source') for row in device_rows)
-    if profile in SWARM:require(owned_count==72 and exact_owned+port_owned+device_owned+src_owned==55 and sorted(row['file'] for row in swarm_closed)==sorted(['gateway']*3+['run']*3+['startup']*3+['producer:'+Path(k).name for k in SWARM_PRODUCER]) and swarm_selector==1 and memory_rows==1 and swarm_scenario_rows==3 and gateway_deltas==0,'swarm source ancestry changed')
+    if profile in SWARM:require(owned_count==72 and exact_owned+port_owned+device_owned+src_owned+tmf5_owned==55 and sorted(row['file'] for row in swarm_closed)==sorted(['gateway']*3+['run']*3+['startup']*3+['producer:'+Path(k).name for k in SWARM_PRODUCER]) and swarm_selector==1 and memory_rows==1 and swarm_scenario_rows==3 and gateway_deltas==0,'swarm source ancestry changed')
     else:require(owned_count==72 and exact_owned+port_owned+device_owned==({'compact40':70,'report64':68,'report64_coverage':67}[profile]) and owned_gateway==(0 if profile=='compact40' else 2) and gateway_deltas==(0 if profile=='compact40' else 3) and not swarm_closed and not swarm_scenario_rows and not swarm_selector and not memory_rows,'profile source ancestry changed');require(len({sha(work/relative) for relative in GATEWAY_COPIES})==1,'gateway copies inconsistent')
     lineage={'manifest_pinned_owned_source_files':owned_count,'exact_owned_source_files':exact_owned,'reviewed_prompt_only_deltas':1,'profile':profile,'gateway_budget_deltas_total':gateway_deltas,'gateway_budget_deltas_owned':owned_gateway,'qualification_selector_deltas':sum(row['kind']=='EXPLICIT_BOUNDED_NATIVE_COVERAGE_QUALIFICATION_STIMULUS_THREE_RHS' for row in ancestry),'swarm_integer_delta_files':len(swarm_closed),'sdk_port':{'reviewed':ORIGINAL_SDK_PORT,'staged':sdk_port,'model_copies_changed':len(port_rows)+(len(src_model_rows) if moved else 0),'helper_script_changed':moved,'policy_rule_changed':moved,'why':'the local model server chooses a new internal SDK port each time its app restarts; a candidate is usable only while the server that was running at staging keeps running'},'ssd_device':{'reviewed':ORIGINAL_CACHE_DEVICE,'staged':ssd_device,'startup_copies_changed':len(device_rows),'route_record_changed':False,'why':'macOS numbers a volume when it mounts it, so a reboot or remount can change the SSD device number the launcher checks the prompt-cache target against; staging read the live number of the mounted SSD itself. builder/shared-cache-storage-route.json is the dated record of the 2026-11-07 routing and nothing reads it, so it keeps its 2026-11-07 number'},'swarm_selector_deltas':swarm_selector,'swarm_scenario_files_replaced':swarm_scenario_rows,'runtime_scaffolds':EMPTY_SCAFFOLDS,'historical_runtime_log_excluded':'owned-source/producer/backend/logs/2026-11-07.log (not manifest-pinned source)','base_manifest_sha256':BASE_SHA,'metadata_receipt_sha256':METADATA_SHA,'source_copies':ancestry,'canonical_revision_witness':canonical_revision_witness(EXTRACTOR_CANONICAL,EXTRACTOR_PARENT_SHA),'historical_proof_policy':'Copied old manifests remain exact historical proof, not new target claims. Operational file paths in this derived manifest and all four generated policies/configs point at new work.','original713_and318':'713 selected pins unchanged; the one canonical extractor row in318 uses the exact closed witness; '+str(len(ACKNOWLEDGED_WITNESSES))+' other original files carry an owner-acknowledged later revision that is NOT copied into this candidate (the reviewed W16 bytes are); the remaining original pins are unchanged','owner_acknowledged_canonical_revisions':{'list_sha256':ACKNOWLEDGED_SHA,'count':len(ACKNOWLEDGED_WITNESSES),'copied_into_candidate':False,'witnesses':list(ACKNOWLEDGED_WITNESSES)},'no_model_graph_worker_paper_or_broker_actions':True}
     if model:lineage['model_profile']={'name':model['name'],'plan':model['plan'],'src_revisions':SRC_REVISION_NOTE,'src_revisions_review':SRC_REVIEW_STATUS,'model_copies_from_src':len(src_model_rows),'run_copies_from_src':len(src_run_rows),'selector_files':selector_pins}
@@ -723,8 +792,9 @@ def model_manifest(derived,model,p,selector_pins):
     predicates=list(derived.get('runtime_predicates') or []);rows=[i for i,x in enumerate(predicates) if x.startswith('65pre/30floor/40GiB owned caps')];require(len(rows)==1,'start threshold predicate missing or repeated')
     predicates[rows[0]]=str(threshold)+predicates[rows[0]][2:]
     if model['plan'] is not None:predicates.append(PLAN_PREDICATE)
+    predicates.append('TMF5 stop rule: kernel pressure level 4 on any sample, level 2 or more on every sample for 10 s, free below 30 on every sample for 10 s, or no fresh valid reading for 3 s; the co-resident (decision_model.FILE served by llama-server) outside the owned figure and recorded beside it; two such processes stop the run')
     derived['runtime_predicates']=predicates
-    derived['startup_recovery']=dict(derived.get('startup_recovery') or {},start_threshold_staged={'percent_free':threshold,'note':'caps above is the W16 record, where the reviewed start threshold was 65; this candidate\'s run script starts at '+str(threshold)+'% free (TMF4 addendum 1, ruling c). The 30% stop floor and the 40 GiB resident-memory bound are unchanged.'})
+    derived['startup_recovery']=dict(derived.get('startup_recovery') or {},start_threshold_staged={'percent_free':threshold,'note':'caps above is the W16 record, where the reviewed start threshold was 65; this candidate\'s run script starts at '+str(threshold)+'% free (TMF5 addendum 1, ruling e: '+LIMITS.start_terms()['arithmetic']+'). The 30% stop floor and the 40 GiB resident-memory bound are unchanged.'})
     if others:
         for block in ('GGUF_qualification','mlx_profile_recovery'):
             if isinstance(derived.get(block),dict):derived[block]=dict(derived[block],applies_to='qwen3.8-27b only: this block is the evidence of the 27B checkpoint (W16); it is not evidence for '+' or '.join(others))
@@ -746,16 +816,19 @@ def model_manifest(derived,model,p,selector_pins):
                 'correct_source':{'tokenizer_origin':str(source_txt),'tokenizer_origin_text':source_txt.read_text() if source_txt.is_file() else None,'gguf':str(entry['weight_file']),'gguf_bytes':entry['weight_bytes'],'gguf_sha256':entry['weight_sha256']}}
         member_rows[name]=row
     probes=p.get('probe_chats',2);swaps=p.get('swap_chats',0)
-    arithmetic={name:'30 + ceil(100 x (%d + %d + %d) / %d) + 5 = %d'%(model['serving_by_member'][name],LIMITS.kv_cache_bytes(name),LIMITS.GRAPH_AND_WORKERS_BYTES,LIMITS.INSTALLED_MEMORY_BYTES,model['members_threshold'][name]) for name in members}
+    terms=LIMITS.start_terms();arithmetic={name:terms['arithmetic'] for name in members}
     derived['model_profile']={'name':model['name'],'plan':model['plan'],'members':member_rows,'source_files':SRC_REVISION_NOTE,'src_revisions_review':SRC_REVIEW_STATUS,
-        'src_revisions':{'mirofish_native_model.py':{'path':str(SRC/'mirofish_native_model.py'),'sha256':MODEL_SRC_SHA,'copies':sorted(MODEL_COPIES)},'mirofish_native_run.py':{'path':str(SRC/'mirofish_native_run.py'),'sha256':RUN_SRC_SHA,'copies':sorted(RUN_COPIES)}},
+        'src_revisions':{'mirofish_native_model.py':{'path':str(SRC/'mirofish_native_model.py'),'sha256':MODEL_SRC_SHA,'copies':sorted(MODEL_COPIES)},'mirofish_native_run.py':{'path':str(SRC/'mirofish_native_run.py'),'sha256':RUN_SRC_SHA,'copies':sorted(RUN_COPIES)},
+            'mirofish_native_startup.py':{'path':str(SRC/'mirofish_native_startup.py'),'sha256':STARTUP_SRC_SHA,'copies':sorted(STARTUP_COPIES)},'mirofish_native_gateway.py':{'path':str(SRC/'mirofish_native_gateway.py'),'sha256':GATEWAY_SRC_SHA,'copies':sorted(GATEWAY_COPIES)}},
+        'co_resident':{'file':decision_model_file(),'source':str(DECISION_MODEL),'startup_copies':sorted(STARTUP_COPIES),'rule':'a llama-server process whose --model, made absolute and resolved, equals this file resolved the same way; left out of the owned figure and recorded beside it; two such processes stop the run; a plan whose own serving file resolves to it is refused at staging'},
+        'producer_patches':{'files':dict(TMF5_PRODUCER_FILES),'source':'tmf5_producer_patches() of the staged run script','what':'four re-raising patches where the producer fell back to default or rule-based settings; the search query cut to the gateway text limit at a character boundary and the cut recorded on the call; a refused graph search raises instead of degrading to local search'},
         'selector':{'content':model['selector'].decode(),'files':selector_pins,'registry_carried':False,'why_no_registry':'only the built-in profiles of the pinned module are staged; without the registry beside it the staged module knows exactly those'},
         'model_files':'derived from MODEL_PROFILES of the pinned module text, in load order: each member\'s five tokenizer-origin files (listed once when shared) and its serving files (the GGUF weights and any second file); tokenizer hashes from '+('the base manifest' if all(model['entries'][m]['tokenizer_root']==profiles[default]['tokenizer_root'] for m in members) else 'the base manifest for the 27B\'s origin and TOKENIZER_PINS in this tool otherwise')+'; every size and hash checked at staging',
         'sdk_helper':('the reviewed helper with its checkpoint selection, selection size and weight hash naming this model (each exactly once)' if model['plan'] is None else 'the reviewed helper with the pinned module\'s three closed plan fragments, the first carrying both members\' validated constants as one JSON table')+', equal to what the staged model module generates',
         'observer_policy':'the reviewed policy with its tokenizer-origin folder rule and GGUF file rule replaced in place by the rules for the staged tokenizer origins and serving files, equal to what the staged src/ run script generates',
         'start_threshold':{'percent_free':threshold,'by_member':dict(model['members_threshold']),'reviewed':65,'stop_floor':30,'rss_bound_gib':40,'arithmetic':arithmetic,
-            'rule':'30 + ceil(100 x (serving files + context cache at 32,768 in 16-bit floats + 4 GiB) / installed memory %d) + 5; for a plan the larger member\'s (TMF4 addendum 1, ruling c)'%LIMITS.INSTALLED_MEMORY_BYTES,
-            'why':'Whenever a model is named the formula is used, the 27B included (72); the default path without a model keeps the reviewed 65. The 30% stop floor and the 40 GiB resident-memory bound are unchanged.'},
+            'terms':{k:dict(v) for k,v in terms.items() if k in LIMITS.START_ORDER},'rule':'floor + margin + setup_cost + fall, each a named value of the start table in tools/mirofish_swarm_limits.py with its source (TMF5 addendum 1, ruling e)',
+            'why':'Whenever a model is named the table is used; the default path without a model keeps the reviewed 65. The start check is one reading; the running phase stops on the sustained rule (30% free on every sample for 10 s, among others); the 40 GiB resident-memory bound is unchanged.'},
         'budgets':{'post_swap_probe_chats':swaps,'post_swap_probe_output':swaps*LIMITS.NATIVE_PROBE_OUTPUT,'chats':p['chats'],'output_total':p['output'],
             'output':'(%d + %d) x 512 + (%d - %d) x 4096 = %d, rounded up to 100,000 = %d'%(LIMITS.START_PROBES,swaps,p['chats'],probes,p['reserve_need'],p['output'])},
         'expected_by_phase':{'setup_model':p.get('setup_model',p['model'])+' ('+LIMITS.MODELS[p.get('setup_model',members[0])]['speed_source']+')','turns_model':p.get('turns_model',p['model'])+' ('+LIMITS.MODELS[p.get('turns_model',members[-1])]['speed_source']+')',

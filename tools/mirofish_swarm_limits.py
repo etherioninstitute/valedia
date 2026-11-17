@@ -63,13 +63,19 @@ MODELS = {
 # The 8B's real prompt tokens per 27B real token for the same 44 request bodies (its reported usage.prompt_tokens against the
 # 27B admission's count): reddit median 0.939, largest 0.950; twitter median 0.918, largest 0.931. The largest is used.
 INSTALLED_MEMORY_BYTES = 68719476736   # this Mac (sysctl hw.memsize, 64 GiB)
-# The free-memory start threshold (TMF4 addendum 1, ruling c): 30 + ceil(100 x (the serving files LM Studio loads, weights and
-# any second file + the context cache at 32,768 in 16-bit floats + 4 GiB for the graph store and workers) / installed memory)
-# + 5 points of margin; for a plan, the larger member's. It replaces TMF3's weights + 6 GiB, which left the 8B at the floor.
-STOP_FLOOR_PERCENT = 30                # the run stops under this much free memory (mirofish_native_run.py:380); unchanged
+# The free-memory start threshold (TMF5 addendum 1, ruling e): start = floor + margin + setup_cost + fall, each a NAMED value
+# with the source of its number beside it (file and date). It replaces TMF4's per-model formula. The lead replaces setup_cost and
+# fall with figures measured by a load-only test beside the new collector before the first run: that is a change to this table
+# and its source strings only; staging and its tests follow the table.
+STOP_FLOOR_PERCENT = 30                # the run stops when free memory stays under this for 10 s (mirofish_native_run.py STOP_FREE_PERCENT)
 KV_VALUE_BYTES = 2                     # 16-bit floats
-GRAPH_AND_WORKERS_BYTES = 4 * 2**30    # the graph store and the worker processes besides the model
-START_MARGIN_POINTS = 5
+START_ORDER = ('floor', 'margin', 'setup_cost', 'fall')
+START_TERMS = {
+    'floor': {'value': 30, 'source': 'the reviewed stop floor: mirofish_native_run.py STOP_FREE_PERCENT (W16 review, 2026-11-06), kept as the sustained floor by TMF5 addendum 1 ruling d (2026-11-17)'},
+    'margin': {'value': 10, 'source': 'TMF5 addendum 1 ruling e (.foreman/tickets/TMF5-addendum-1.md, 2026-11-17)'},
+    'setup_cost': {'value': 24, 'source': 'TMF5 Step 0 (2026-11-16): loading Bonsai 2 (7.7 GiB) cost 17 to 24 points of free memory in the recorded runs valedia-native-20261115-swarm8-b2q8-b/c/d and swarm48-b2q8-a (host-resource samples.jsonl); the largest is used'},
+    'fall': {'value': 10, 'source': 'TMF5 Step 0 (2026-11-16): beside the collector the reading fell another 10 points over eight minutes after the load, same recorded runs'},
+}
 REVIEWED_START_THRESHOLD = 65          # the reviewed start rule (mirofish_native_run.py:380). The default path (no model named)
                                        # keeps it and its bytes; whenever a model is named the formula is used (72 for the 27B)
 
@@ -82,12 +88,26 @@ def kv_cache_bytes(model):
     return 2 * m['attention_layers'] * m['kv_heads'] * m['head_dim'] * WINDOW * KV_VALUE_BYTES
 
 
-def start_threshold(model, serving_bytes):
-    """Free memory, percent, a run needs before it starts with this checkpoint: ruling (c). serving_bytes is what LM Studio
-    loads: the weights and any second file (Bonsai 2's vision projector). The 30% stop floor and the 40 GiB resident-memory
-    bound are not derived here and do not change."""
-    need = serving_bytes + kv_cache_bytes(model) + GRAPH_AND_WORKERS_BYTES
-    return STOP_FLOOR_PERCENT + math.ceil(100 * need / INSTALLED_MEMORY_BYTES - 1e-12) + START_MARGIN_POINTS
+def start_threshold(model, serving_bytes=None):
+    """Free memory, percent, a run needs before it starts: the sum of START_TERMS (ruling e), the same for every model named
+    (the measured setup cost covers the load). serving_bytes is accepted and not used. The sustained 30% stop floor and the
+    40 GiB resident-memory bound are not derived here and do not change."""
+    require_model(model)
+    return start_terms()['total']
+
+
+def start_terms():
+    """The table checked (every named term an integer of at least 0 with a source string) and its total."""
+    if tuple(START_TERMS) != START_ORDER or any(type(START_TERMS[k].get('value')) is not int or START_TERMS[k]['value'] < 0
+                                                or type(START_TERMS[k].get('source')) is not str or not START_TERMS[k]['source'] for k in START_ORDER):
+        raise ValueError('the start table must name floor, margin, setup_cost and fall, each an integer with a source')
+    if START_TERMS['floor']['value'] != STOP_FLOOR_PERCENT:
+        raise ValueError('the start table floor must be the stop floor')
+    total = sum(START_TERMS[k]['value'] for k in START_ORDER)
+    if not STOP_FLOOR_PERCENT < total <= 100:
+        raise ValueError('the start threshold must lie above the stop floor and at most 100')
+    return dict({k: dict(START_TERMS[k]) for k in START_ORDER}, total=total,
+                arithmetic=' + '.join('%s %d' % (k, START_TERMS[k]['value']) for k in START_ORDER) + ' = %d' % total)
 
 
 def plan_start_threshold(members):
