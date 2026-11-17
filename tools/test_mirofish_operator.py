@@ -1,0 +1,709 @@
+"""TMF6: the MiroFish operator command, against fakes only. Nothing here runs launchctl, lms, ps, memory_pressure, sysctl,
+the stager or the launcher, sends a request to LM Studio, opens the collector's real store, loads a model or signals a real
+process: a World object stands in for all of them (an injected command runner, spawn, HTTP function, clock and sleeper, signal
+sender and model load path) and a scratch SQLite file stands in for the collector's store."""
+import ast, copy, hashlib, importlib.util, json, os, signal, sqlite3, tempfile, types, unittest
+from pathlib import Path
+
+HERE = Path(__file__).absolute().parent
+
+
+def load(name):
+    spec = importlib.util.spec_from_file_location(name + '_under_test', HERE / (name + '.py'))
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); return module
+
+
+OP = load('mirofish_operator')
+T0 = 1794830400.0                      # 2026-11-16 12:00 UTC
+SCHEMA = """CREATE TABLE decisions (id INTEGER PRIMARY KEY, watch_id INTEGER, ticker TEXT, slot_iso TEXT, slot_ts REAL,
+    decision_iso TEXT, decision_ts REAL, status TEXT, forced INTEGER, battery_id TEXT, state_json TEXT, request_sha256 TEXT,
+    model_tag TEXT, model_digest TEXT, latency_s REAL, raw_response TEXT, answers_json TEXT, input_tokens INTEGER,
+    output_tokens INTEGER, error TEXT);
+CREATE TABLE heartbeats (id INTEGER PRIMARY KEY, iso TEXT, ts REAL, watched INTEGER, kalshi_requests INTEGER,
+    kalshi_failures INTEGER, model_calls INTEGER, paused INTEGER);"""
+PICKS_PLIST = '/fake/LaunchAgents/com.valedia.picks.hourly.plist'
+OBSERVER_PID, OBSERVER_START = 5151, 'Mon Nov 16 12:00:05 2026'
+
+
+def decision_entry():
+    return {'key': 'elephant-1', 'type': 'decision', 'decision_type': 'openjev', 'publisher': 'debackerl',
+            'quantization': {'name': 'Q8_0'}, 'size_bytes': 10151733984,
+            'loaded_instances': [{'id': 'elephant-1', 'config': {'context_length': 8192, 'parallel': 1,
+                                                                'physical_batch_size': 2048, 'eval_batch_size': 2048}}]}
+
+
+def listing():
+    return {'models': [decision_entry(),
+                       {'key': 'google/embedding-gemma-300m', 'type': 'embedding',
+                        'loaded_instances': [{'id': 'ym-research-embedding', 'config': {'context_length': 2048}}]},
+                       {'key': 'qwen/qwen3.8-27b', 'type': 'llm', 'loaded_instances': [{'id': 'qwen3.8-27b-chat', 'config': {}}]},
+                       {'key': 'qwen3-8b', 'type': 'llm', 'loaded_instances': []}]}
+
+
+def done(rc=0, out='', err=''):
+    return types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
+
+
+class FakeLauncher:
+    def __init__(self, world, work):
+        self.world, self.work, self.pid, self.returncode = world, Path(work), 4242, None
+        self.started = world.t
+
+    def poll(self):
+        w = self.world
+        if self.returncode is not None:
+            return self.returncode
+        termed = w.procs.get(OBSERVER_PID, {}).get('termed_at')
+        if (termed is not None and w.t >= termed + w.cleanup_s) or (termed is None and w.t >= self.started + w.run_s):
+            receipt = copy.deepcopy(w.receipt)
+            if termed is not None:
+                receipt.update(complete=False, failure={'type': 'NativeRefused', 'reason': 'supervisor interrupted'})
+            (self.work / 'builder/native-run-receipt.json').write_text(json.dumps(receipt))
+            (self.work / 'builder/gateway-ledger.json').write_text(json.dumps(w.ledger))
+            w.procs.pop(OBSERVER_PID, None); self.returncode = 0 if receipt.get('complete') else 1
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.poll()
+
+
+class FakeLoadPath:
+    def __init__(self, world, work, out, profile):
+        self.world, self.work, self.out, self.profile = world, work, out, profile
+        self.identifier = 'mf-native-' + 'a' * 32
+
+    def baseline(self):
+        return {'embedding': {'instanceReference': 'emb'}}
+
+    def load(self):
+        w = self.world; w.loads.append(self.profile)
+        if w.load_error:
+            raise RuntimeError(w.load_error)
+        w.models['models'].append({'key': self.profile, 'type': 'llm', 'loaded_instances': [{'id': self.identifier, 'config': {}}]})
+        w.free = w.free_after_load; w.load_t = w.t
+        return {'identifier': self.identifier}
+
+    def unload(self):
+        w = self.world; w.unloads_via_pipeline.append(self.identifier)
+        w.models['models'] = [e for e in w.models['models'] if not any(i['id'] == self.identifier for i in e['loaded_instances'])]
+        w.free = 80
+        return True, {'unloaded': self.identifier}
+
+    def close(self):
+        return None
+
+
+class World:
+    def __init__(self, tmp):
+        self.tmp = Path(tmp); self.t = T0
+        self.store = self.tmp / 'orderbook_loop.sqlite'
+        with sqlite3.connect(self.store) as db:
+            db.executescript(SCHEMA)
+        self.crew = self.tmp / 'crew'; self.crew.mkdir()
+        self.collector_listed = True; self.beating = True
+        self.latency = lambda t: 1.2; self.status = lambda t: 'ok'
+        self.picks_loaded = True; self.bootout_rc = 0; self.bootstrap_rc = 0
+        self.link_text = 'LM Link: disabled\n'
+        self.free, self.free_after_load, self.pressure, self.swap_mb = 80, 60, 1, 100.0
+        self.models = listing(); self.unload_status = 200
+        self.procs = {}; self.calls = []; self.http_calls = []; self.signals = []; self.out = []
+        self.spawned = []; self.spawn_error = None; self.stage_rc = 0; self.preflight_rc = 0; self.threshold = 56
+        self.on_sleep = []; self.run_s = 180; self.cleanup_s = 5; self.identity_start = OBSERVER_START
+        self.loads = []; self.unloads_via_pipeline = []; self.load_error = None; self.load_t = None
+        self.receipt = {'complete': True, 'cleanup_proven': True, 'paper_handoff': True, 'resource_failures': [],
+                        'events': [{'event': 'pre_resource'}],
+                        'resource': {'lowest_sustained_free_percent_10s': 47, 'max_pressure_level': 1,
+                                     'co_resident_rss_bytes_max': 21 * 2**30}}
+        self.ledger = {'calls': [{'id': 'c1', 'kind': 'chat', 'state': 'complete'}, {'id': 'c2', 'kind': 'embedding', 'state': 'complete'}]}
+        self.last_minute = int((T0 - 600) // 60)
+        self.collector_step()
+
+    # ---- the collector writing its store, once a minute
+    def collector_step(self):
+        with sqlite3.connect(self.store) as db:
+            while (self.last_minute + 1) * 60 <= self.t:
+                self.last_minute += 1; ts = self.last_minute * 60.0
+                if self.beating:
+                    db.execute('INSERT INTO heartbeats (ts, paused) VALUES (?, 0)', (ts,))
+                for k in range(2):
+                    db.execute('INSERT INTO decisions (decision_ts, status, latency_s, answers_json, raw_response, state_json) '
+                               'VALUES (?, ?, ?, ?, ?, ?)', (ts + 1 + k, self.status(ts), self.latency(ts), '{"a":1}', 'x', '{}'))
+
+    def now(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.t += seconds; self.collector_step()
+        for callback in list(self.on_sleep):
+            callback(self)
+
+    # ---- commands
+    def run(self, argv, cwd=None, env=None, timeout=None):
+        argv = [str(a) for a in argv]; self.calls.append(argv)
+        if argv[0].endswith('lms') and argv[1:] == ['link', 'status']:
+            return done(0, self.link_text)
+        if argv[:2] == ['/bin/launchctl', 'print']:
+            label = argv[2].rsplit('/', 1)[1]
+            if label == OP.COLLECTOR_LABEL:
+                return done(0 if self.collector_listed else 113, '\tprogram = /x\n\targuments = {\n\t\tcollector --key=SECRETKEY\n\t}\n')
+            if label == OP.PICKS_LABEL:
+                if not self.picks_loaded:
+                    return done(113, '', 'Could not find service')
+                return done(0, 'gui/501/com.valedia.picks.hourly = {\n\tpath = %s\n\tstate = not running\n\targuments = {\n'
+                               '\t\tpicks --token=SECRETKEY\n\t}\n\tstdout path = /x/out.log\n}\n' % PICKS_PLIST)
+        if argv[:2] == ['/bin/launchctl', 'bootout']:
+            if self.bootout_rc == 0:
+                self.picks_loaded = False
+            return done(self.bootout_rc)
+        if argv[:2] == ['/bin/launchctl', 'bootstrap']:
+            if self.bootstrap_rc == 0 and argv[3] == PICKS_PLIST:
+                self.picks_loaded = True
+            return done(self.bootstrap_rc)
+        if argv == ['/usr/bin/memory_pressure']:
+            return done(0, 'The system has 68719476736 (4194304 pages with a page size of 16384).\n'
+                           'System-wide memory free percentage: %d%%\n' % self.free)
+        if argv == ['/usr/sbin/sysctl', '-n', 'kern.memorystatus_vm_pressure_level']:
+            return done(0, '%d\n' % self.pressure)
+        if argv == ['/usr/sbin/sysctl', '-n', 'vm.swapusage']:
+            return done(0, 'total = 2048.00M  used = %.2fM  free = 1000.00M  (encrypted)\n' % self.swap_mb)
+        if argv[:2] == ['/bin/ps', '-p']:
+            proc = self.procs.get(int(argv[2]))
+            if proc is None:
+                return done(1, '')
+            return done(0, '%d %d %s\n' % (int(argv[2]), proc['pgid'], proc['start']))
+        if any(a.endswith('mirofish_native_stage.py') for a in argv):
+            work = Path(argv[argv.index('--work') + 1])
+            if self.stage_rc:
+                return done(self.stage_rc, '', 'refused: fake')
+            (work / 'builder').mkdir(parents=True); (work / 'owned-source/observer-entry').mkdir(parents=True)
+            manifest = {'launch_authorized': False, 'model_profile': {'start_threshold': {'percent_free': self.threshold}}}
+            (work / 'builder/candidate-manifest.json').write_text(json.dumps(manifest))
+            digest = hashlib.sha256((work / 'builder/candidate-manifest.json').read_bytes()).hexdigest()
+            return done(0, json.dumps({'status': 'STAGED_NOT_AUTHORIZED_NO_SERVICES', 'work': str(work), 'candidate_sha256': digest}) + '\n')
+        if any(a.endswith('mirofish_native_startup.py') for a in argv) and '--preflight' in argv:
+            work = Path(argv[argv.index('--work') + 1])
+            (work / 'builder/startup-preflight.json').write_text('{}')
+            return done(self.preflight_rc, json.dumps({'exit': self.preflight_rc, 'preflight': True}))
+        raise AssertionError('unexpected command: %r' % argv)
+
+    def spawn(self, argv, cwd=None, env=None):
+        argv = [str(a) for a in argv]; self.spawned.append(argv)
+        if self.spawn_error:
+            raise self.spawn_error
+        work = Path(argv[argv.index('--work') + 1])
+        self.procs[OBSERVER_PID] = {'start': OBSERVER_START, 'pgid': OBSERVER_PID}
+        (work / 'builder/observer-identity.json').write_text(json.dumps(
+            {'pid': OBSERVER_PID, 'start': self.identity_start, 'pgid': OBSERVER_PID, 'written_utc': '2026-11-16T12:00:05+00:00'}))
+        self.launcher = FakeLauncher(self, work); return self.launcher
+
+    def send_signal(self, pid, sig):
+        self.signals.append((pid, sig))
+        if pid in self.procs:
+            self.procs[pid].setdefault('termed_at', self.t)
+
+    def http(self, method, url, body=None, timeout=None):
+        self.http_calls.append((method, url, copy.deepcopy(body)))
+        if method == 'GET' and url.endswith('/api/v1/models'):
+            return 200, copy.deepcopy(self.models)
+        if method == 'POST' and url.endswith('/api/v1/models/unload'):
+            if self.unload_status != 200:
+                return self.unload_status, {'error': 'fake failure'}
+            for e in self.models['models']:
+                e['loaded_instances'] = [i for i in e['loaded_instances'] if i['id'] != body['instance_id']]
+            return 200, {'instance_id': body['instance_id']}
+        raise AssertionError('unexpected request: %s %s' % (method, url))
+
+    def host(self, **overrides):
+        values = dict(run=self.run, spawn=self.spawn, http=self.http, now=self.now, sleep=self.sleep,
+                      send_signal=self.send_signal, disk_free=lambda path: 400 * 10**9, uid=501, store=self.store,
+                      crew=self.crew, record=self.tmp / 'artifacts/runs.jsonl', load_tests=self.tmp / 'artifacts/load-tests',
+                      load_path=lambda work, out, profile, hold_s: FakeLoadPath(self, work, out, profile),
+                      out=self.out.append, lms='/fake/bin/lms')
+        values.update(overrides)
+        return OP.Host(**values)
+
+    # ---- what happened
+    def bootouts(self):
+        return [c for c in self.calls if c[:2] == ['/bin/launchctl', 'bootout']]
+
+    def posts(self):
+        return [c for c in self.http_calls if c[0] == 'POST']
+
+    def stages(self):
+        return [c for c in self.calls if any(a.endswith('mirofish_native_stage.py') for a in c)]
+
+    def rows(self, path=None):
+        path = path or self.tmp / 'artifacts/runs.jsonl'
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.is_file() else []
+
+    def text(self):
+        return '\n'.join(str(x) for x in self.out)
+
+
+RUN = ['run', '--profile', 'swarm8', '--model', 'qwen3-8b', '--announced', 'Owner told 11:55 UTC: swarm8 on the 8B, picks off']
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory(); self.w = World(self.dir.name)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def main(self, argv, **overrides):
+        return OP.main(argv, host=self.w.host(**overrides))
+
+
+class StoreRules(Base):
+    def test_no_issuable_sql_names_a_locked_column(self):
+        self.assertTrue(OP.SQL)
+        for sql in OP.SQL:
+            for word in ('answers_json', 'raw_response', 'state_json'):
+                self.assertNotIn(word, sql)
+
+    def test_every_sql_literal_in_the_module_is_in_the_allowed_tuple(self):
+        tree = ast.parse((HERE / 'mirofish_operator.py').read_text())
+        literals = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                    and ('SELECT' in n.value.upper() or 'INSERT' in n.value.upper() or 'UPDATE ' in n.value.upper())}
+        self.assertTrue(literals)
+        self.assertEqual(literals - set(OP.SQL), set())
+
+    def test_a_query_outside_the_tuple_is_refused(self):
+        with self.assertRaises(OP.OperatorError):
+            OP.query(self.w.host(), 'SELECT answers_json FROM decisions')
+        rows = OP.query(self.w.host(), OP.SQL_LAST_HEARTBEAT)
+        self.assertEqual(len(rows), 1)
+
+    def test_the_store_is_opened_read_only(self):
+        db = OP.open_store(self.w.store)
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                db.execute('INSERT INTO heartbeats (ts) VALUES (1)')
+        finally:
+            db.close()
+
+    def test_model_failure_statuses_are_collector_statuses(self):
+        source = (HERE.parent / 'valedia_trader/research_loop/orderbook_loop.py').read_text()
+        statuses = next(ast.literal_eval(n.value) for n in ast.walk(ast.parse(source))
+                        if isinstance(n, ast.Assign) and any(getattr(t, 'id', None) == 'STATUSES' for t in n.targets))
+        self.assertTrue(set(OP.MODEL_FAILURE_STATUSES) <= set(statuses))
+        self.assertNotIn('ok', OP.MODEL_FAILURE_STATUSES); self.assertNotIn('stale_data', OP.MODEL_FAILURE_STATUSES)
+        self.assertEqual(set(OP.MODEL_FAILURE_STATUSES), {'model_unavailable', 'tag_mismatch', 'late', 'error'})
+
+
+class Pure(unittest.TestCase):
+    def test_lm_link_parse_both_ways(self):
+        self.assertTrue(OP.link_disabled('LM Link: disabled\n'))
+        self.assertTrue(OP.link_disabled('Status: Disabled'))
+        for text in ('LM Link: enabled', 'LM Link is not enabled', '', 'connected to 2 devices', 'disabled? enabled'):
+            self.assertFalse(OP.link_disabled(text), text)
+
+    def test_breach_rules_both_ways(self):
+        ok = [{'status': 'ok', 'latency_s': 1.0, 'decision_ts': i} for i in range(5)]
+        self.assertIsNone(OP.breach_of(ok, 10, True))
+        self.assertIn('not listed', OP.breach_of(ok, 10, False))
+        self.assertIn('heartbeat', OP.breach_of(ok, 91, True)); self.assertIsNone(OP.breach_of(ok, 90, True))
+        self.assertIn('heartbeat', OP.breach_of(ok, None, True))
+        one_slow = ok[:2] + [{'status': 'ok', 'latency_s': 9.0, 'decision_ts': 2}] + ok[3:]
+        self.assertIsNone(OP.breach_of(one_slow, 10, True))
+        two_slow = ok[:2] + [{'status': 'ok', 'latency_s': 9.0, 'decision_ts': 2}, {'status': 'ok', 'latency_s': 8.5, 'decision_ts': 3}]
+        self.assertIn('in a row', OP.breach_of(two_slow, 10, True))
+        self.assertIsNone(OP.breach_of(ok[:2] + [{'status': 'ok', 'latency_s': 8.0, 'decision_ts': 2}] * 2, 10, True))
+        for status in OP.MODEL_FAILURE_STATUSES:
+            self.assertIn(status, OP.breach_of(ok + [{'status': status, 'latency_s': None, 'decision_ts': 9}], 10, True))
+        self.assertIsNone(OP.breach_of(ok + [{'status': 'stale_data', 'latency_s': None, 'decision_ts': 9}], 10, True))
+
+    def test_streaks(self):
+        def row(profile, counts, launched=True):
+            return {'command': 'run', 'profile': profile, 'launched': launched, 'counts': counts}
+        rows = [row('swarm8', True), row('swarm8', False), row('swarm8', True), row('swarm48', True), row('swarm8', True),
+                row('swarm8', False, launched=False)]
+        s = OP.streaks(rows)
+        self.assertEqual(s['9']['streak'], 2); self.assertEqual(s['9']['target'], 10)
+        self.assertEqual(s['48']['streak'], 1); self.assertEqual(s['48']['target'], 3)
+        self.assertEqual(OP.streaks(rows + [row('swarm8', False)])['9']['streak'], 0)
+
+    def test_verdicts(self):
+        base = dict(collector={'breach': None, 'over_8s': 0, 'model_failures': 0},
+                    pipeline={'failed_calls': 0, 'refused_calls': 0, 'memory_stop': False, 'swaps_clean': True,
+                              'cleanup_proven': True, 'failure': None, 'report_usable': True},
+                    memory={'lowest_sustained_free_percent_10s': 40})
+        v = OP.verdicts(**copy.deepcopy(base))
+        self.assertEqual(v, {'collector_unharmed': True, 'pipeline_clean': True, 'room_to_spare': True})
+        self.assertFalse(OP.verdicts(**dict(copy.deepcopy(base), memory={'lowest_sustained_free_percent_10s': 39}))['room_to_spare'])
+        self.assertIsNone(OP.verdicts(**dict(copy.deepcopy(base), memory={'lowest_sustained_free_percent_10s': None}))['room_to_spare'])
+        b = copy.deepcopy(base); b['collector']['over_8s'] = 1
+        self.assertFalse(OP.verdicts(**b)['collector_unharmed'])
+        b = copy.deepcopy(base); b['pipeline']['failed_calls'] = 1
+        self.assertFalse(OP.verdicts(**b)['pipeline_clean'])
+        b = copy.deepcopy(base); b['pipeline']['report_usable'] = False   # a near-neutral report is not a pipeline fault
+        self.assertTrue(OP.verdicts(**b)['pipeline_clean'])
+        b = copy.deepcopy(base); b['pipeline']['memory_stop'] = True
+        self.assertFalse(OP.verdicts(**b)['pipeline_clean'])
+
+
+class Check(Base):
+    def test_check_reports_every_field_and_names_what_a_run_switches_off(self):
+        out = self.dir.name + '/check.json'
+        rc = self.main(['check', '--profile', 'swarm8', '--model', 'qwen3-8b', '--json-out', out])
+        self.assertEqual(rc, 0)
+        s = json.loads(Path(out).read_text())
+        self.assertTrue(s['lm_link']['disabled'])
+        self.assertTrue(s['models']['decision_instance']['loaded_and_right'])
+        self.assertTrue(s['models']['embedding_loaded'])
+        self.assertEqual([o['instance_id'] for o in s['models']['others']], ['qwen3.8-27b-chat'])
+        self.assertTrue(s['collector']['job_listed']); self.assertEqual(len(s['collector']['last_decisions']), 10)
+        self.assertLessEqual(s['collector']['heartbeat_age_s'], 60); self.assertIsNone(s['collector']['breach'])
+        self.assertEqual(s['memory'], {'free_percent': 80, 'pressure_level': 1, 'swap_used_bytes': 100 * 2**20})
+        self.assertEqual(s['pick_reader']['listed'], True); self.assertEqual(s['pick_reader']['plist'], PICKS_PLIST)
+        self.assertEqual(s['disk']['free_bytes'], 400 * 10**9)
+        self.assertEqual(s['durations'], {'expected_s': 2346, 'wall_s': 3600})
+        a = s['announcement']
+        for part in ('2026-11-16', '39 min', '60 min', 'com.valedia.picks.hourly', 'qwen3.8-27b-chat', 'NOT reloaded'):
+            self.assertIn(part, a)
+        self.assertEqual(s['refusals'], [])
+        self.assertNotIn('SECRETKEY', self.w.text() + Path(out).read_text())   # no command line is ever kept
+        self.assertEqual(self.w.posts(), []); self.assertEqual(self.w.bootouts(), [])
+
+    def test_check_dry_run_reads_nothing(self):
+        self.assertEqual(self.main(['check', '--dry-run']), 0)
+        self.assertEqual(self.w.calls, []); self.assertEqual(self.w.http_calls, [])
+
+
+class Refusals(Base):
+    """Each refusal both ways: the condition refuses (exit 2, nothing switched off, nothing staged or launched), and the healthy
+    world launches."""
+
+    def assertRefused(self, why, *, switched=False):
+        rc = self.main(RUN)
+        self.assertEqual(rc, 2, self.w.text())
+        self.assertIn(why, self.w.text())
+        self.assertEqual(self.w.spawned, [])
+        if not switched:
+            self.assertEqual(self.w.bootouts(), []); self.assertEqual(self.w.posts(), []); self.assertEqual(self.w.stages(), [])
+        self.assertTrue(self.w.picks_loaded)
+        row = self.w.rows()[-1]
+        self.assertFalse(row['launched']); self.assertIn(why, row['refused'])
+
+    def test_healthy_world_launches(self):
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+        self.assertEqual(len(self.w.spawned), 1)
+
+    def test_announced_is_required(self):
+        for argv in (RUN[:-2], RUN[:-1] + ['  ']):
+            self.assertEqual(self.main(argv), 2)
+        self.assertIn('--announced', self.w.text()); self.assertEqual(self.w.calls, []); self.assertEqual(self.w.rows(), [])
+
+    def test_lm_link_enabled(self):
+        self.w.link_text = 'LM Link: enabled'; self.assertRefused('LM Link')
+
+    def test_decision_instance_missing(self):
+        self.w.models['models'][0]['loaded_instances'] = []; self.assertRefused('decision instance')
+
+    def test_decision_instance_wrong(self):
+        self.w.models['models'][0]['loaded_instances'][0]['config']['context_length'] = 4096; self.assertRefused('context_length')
+
+    def test_collector_slow(self):
+        self.w.latency = lambda t: 9.0; self.w.collector_step(); self.w.sleep(120); self.assertRefused('in a row')
+
+    def test_collector_model_failure(self):
+        self.w.status = lambda t: 'model_unavailable'; self.w.sleep(60); self.assertRefused('model_unavailable')
+
+    def test_collector_no_heartbeat(self):
+        self.w.beating = False; self.w.sleep(120); self.assertRefused('heartbeat')
+
+    def test_collector_job_not_listed(self):
+        self.w.collector_listed = False; self.assertRefused('not listed')
+
+    def test_pressure_not_one(self):
+        self.w.pressure = 2; self.assertRefused('pressure level 2')
+
+    def test_unexpired_gate_of_an_earlier_run(self):
+        old = self.w.crew / 'valedia-native-old'; old.mkdir()
+        (old / 'root-one-native-attempt.json').write_text(json.dumps({'expires_at_utc': '2026-11-16T12:30:00+00:00'}))
+        self.assertRefused('gate')
+
+    def test_expired_gate_does_not_refuse(self):
+        old = self.w.crew / 'valedia-native-old'; old.mkdir()
+        (old / 'root-one-native-attempt.json').write_text(json.dumps({'expires_at_utc': '2026-11-16T11:30:00+00:00'}))
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+
+    def test_live_observer_of_an_earlier_run(self):
+        old = self.w.crew / 'valedia-native-old/builder'; old.mkdir(parents=True)
+        self.w.procs[777] = {'start': 'Sun Nov 15 09:00:00 2026', 'pgid': 777}
+        (old / 'observer-identity.json').write_text(json.dumps({'pid': 777, 'start': 'Sun Nov 15 09:00:00 2026', 'pgid': 777}))
+        self.assertRefused('observer')
+
+    def test_dead_observer_of_an_earlier_run_does_not_refuse(self):
+        old = self.w.crew / 'valedia-native-old/builder'; old.mkdir(parents=True)
+        self.w.procs[777] = {'start': 'Mon Nov 16 08:00:00 2026', 'pgid': 777}     # the pid now belongs to another process
+        (old / 'observer-identity.json').write_text(json.dumps({'pid': 777, 'start': 'Sun Nov 15 09:00:00 2026', 'pgid': 777}))
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+
+    def test_native_instance_already_loaded(self):
+        self.w.models['models'][2]['loaded_instances'].append({'id': 'mf-native-0123', 'config': {}}); self.assertRefused('mf-native-0123')
+
+    def test_free_under_the_staged_threshold(self):
+        self.w.free = 55
+        self.assertRefused('55% free is under the staged start threshold 56%', switched=True)
+        self.assertEqual(len(self.w.stages()), 2)          # the threshold is the staged folder's own
+        self.assertTrue(self.w.picks_loaded)                 # and what was switched off is back
+
+    def test_free_at_the_staged_threshold_runs(self):
+        self.w.free = 56; self.assertEqual(self.main(RUN), 0, self.w.text())
+
+
+class Restore(Base):
+    def assertRestored(self):
+        self.assertTrue(self.w.picks_loaded)
+        self.assertEqual([c for c in self.w.calls if c[:2] == ['/bin/launchctl', 'bootstrap']],
+                         [['/bin/launchctl', 'bootstrap', 'gui/501', PICKS_PLIST]])
+
+    def test_failing_launcher_restores(self):
+        self.w.spawn_error = OSError('launcher would not start')
+        rc = self.main(RUN)
+        self.assertEqual(rc, 1); self.assertRestored()
+        row = self.w.rows()[-1]
+        self.assertIn('launcher would not start', row['error']); self.assertTrue(row['switch_offs']['pick_reader']['restored'])
+
+    def test_failing_unload_restores_and_stops_before_staging(self):
+        self.w.unload_status = 500
+        rc = self.main(RUN)
+        self.assertEqual(rc, 1); self.assertRestored(); self.assertEqual(self.w.stages(), []); self.assertEqual(self.w.spawned, [])
+        self.assertIn('qwen3.8-27b-chat', self.w.rows()[-1]['error'])
+
+    def test_ctrl_c_in_the_watch_loop_stops_once_and_restores(self):
+        fired = []
+
+        def interrupt(world):
+            if world.launcher is not None and world.t >= world.launcher.started + 60 and not fired:
+                fired.append(world.t); raise KeyboardInterrupt
+        self.w.on_sleep.append(interrupt)
+        rc = self.main(RUN)
+        self.assertEqual(rc, 1); self.assertRestored()
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)])
+        row = self.w.rows()[-1]
+        self.assertIn('interrupted', row['stopped']); self.assertTrue(row['pipeline']['receipt_found'])
+
+    def test_exception_in_the_record_write_still_restores(self):
+        (self.w.tmp / 'artifacts/runs.jsonl').mkdir(parents=True)      # a folder where the record file should be
+        rc = self.main(RUN)
+        self.assertEqual(rc, 3); self.assertRestored(); self.assertIn('RECORD NOT WRITTEN', self.w.text())
+
+    def test_failed_restore_is_an_error_exit_in_capitals_and_in_the_record(self):
+        self.w.bootstrap_rc = 5
+        rc = self.main(RUN)
+        self.assertEqual(rc, 3); self.assertFalse(self.w.picks_loaded)
+        self.assertIn('PICK READER NOT RESTORED', self.w.text())
+        row = self.w.rows()[-1]
+        self.assertFalse(row['switch_offs']['pick_reader']['restored'])
+        self.assertTrue(any('PICK READER NOT RESTORED' in a for a in row['alerts']))
+
+    def test_pick_reader_not_loaded_before_is_left_alone(self):
+        self.w.picks_loaded = False
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+        self.assertEqual(self.w.bootouts(), []); self.assertFalse(self.w.picks_loaded)
+        self.assertTrue(self.w.rows()[-1]['switch_offs']['pick_reader']['restored'])
+
+
+class RunRecipe(Base):
+    def test_clean_run_end_to_end(self):
+        rc = self.main(RUN)
+        self.assertEqual(rc, 0, self.w.text())
+        stages = self.w.stages()
+        self.assertEqual(len(stages), 2)
+        self.assertIn('--model', stages[0]); self.assertIn('qwen3-8b', stages[0])
+        work = Path(stages[0][stages[0].index('--work') + 1]); twin = Path(stages[1][stages[1].index('--work') + 1])
+        self.assertTrue((twin / 'builder/startup-preflight.json').is_file())
+        self.assertFalse((work / 'builder/startup-preflight.json').exists())
+        gate = json.loads((work / 'root-one-native-attempt.json').read_text())
+        self.assertEqual(gate['outcome'], 'VALEDIA-MIROFISH-FRESH-1'); self.assertEqual(gate['action'], 'one-native-attempt')
+        self.assertEqual(gate['candidate_sha256'], hashlib.sha256((work / 'builder/candidate-manifest.json').read_bytes()).hexdigest())
+        self.assertNotIn('--preflight', self.w.spawned[0]); self.assertIn('--gate', self.w.spawned[0])
+        self.assertEqual(self.w.posts(), [('POST', OP.LMSTUDIO + '/api/v1/models/unload', {'instance_id': 'qwen3.8-27b-chat'})])
+        self.assertEqual(self.w.signals, [])
+        row = self.w.rows()[-1]
+        self.assertEqual(row['announced'], RUN[-1]); self.assertTrue(row['launched']); self.assertIsNone(row['stopped'])
+        self.assertEqual(row['staged_folder'], str(work)); self.assertEqual(row['plan'], {'model': 'qwen3-8b'})
+        self.assertEqual(row['switch_offs']['pick_reader']['before']['listed'], True)
+        self.assertEqual(row['switch_offs']['pick_reader']['after']['listed'], True)
+        self.assertEqual([m['instance_id'] for m in row['switch_offs']['models_unloaded']], ['qwen3.8-27b-chat'])
+        self.assertEqual(row['pipeline']['calls'], 2); self.assertEqual(row['pipeline']['failed_calls'], 0)
+        self.assertTrue(row['pipeline']['complete']); self.assertTrue(row['pipeline']['cleanup_proven'])
+        self.assertEqual(row['memory']['lowest_sustained_free_percent_10s'], 47)
+        self.assertEqual(row['memory']['swap_start_bytes'], 100 * 2**20)
+        self.assertGreater(row['collector']['decisions'], 0); self.assertIsNone(row['collector']['breach'])
+        self.assertEqual(row['verdicts'], {'collector_unharmed': True, 'pipeline_clean': True, 'room_to_spare': True})
+        self.assertTrue(row['counts'])
+        self.assertTrue(row['post']['decision_instance_right']); self.assertEqual(row['post']['native_loaded'], [])
+        summary = [line for line in self.w.out if isinstance(line, str) and line.startswith('  ')]
+        self.assertEqual(len(summary), 10, '\n'.join(summary))
+        self.assertIn('LM Studio loads', self.w.text())
+        self.assertNotIn('SECRETKEY', json.dumps(row) + self.w.text())
+
+    def test_never_a_request_to_the_decision_instance_and_never_a_load(self):
+        self.main(RUN)
+        for method, url, body in self.w.http_calls:
+            self.assertNotIn('elephant-1', json.dumps(body))
+            self.assertFalse(url.endswith('/load'))
+        self.assertNotIn('ym-research-embedding', json.dumps(self.w.posts()))
+
+    def test_breach_stops_the_run_exactly_once(self):
+        self.w.cleanup_s = 120                                   # the observer takes a while to clean up
+        def slow(world):
+            if world.launcher is not None and world.t >= world.launcher.started + 30:
+                world.latency = lambda t: 9.5
+        self.w.on_sleep.append(slow)
+        rc = self.main(RUN)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)])
+        row = self.w.rows()[-1]
+        self.assertEqual(row['stopped'], 'collector breach'); self.assertIn('in a row', row['collector']['breach'])
+        self.assertGreaterEqual(row['collector']['highest_latency_s'], 9.5)
+        self.assertFalse(row['verdicts']['collector_unharmed']); self.assertFalse(row['counts'])
+        self.assertTrue(self.w.picks_loaded)
+
+    def test_a_pid_whose_start_differs_is_never_signalled(self):
+        self.w.identity_start = 'Sun Nov 15 01:02:03 2026'
+        def slow(world):
+            if world.launcher is not None and world.t >= world.launcher.started + 30:
+                world.latency = lambda t: 9.5
+        self.w.on_sleep.append(slow)
+        self.main(RUN)
+        self.assertEqual(self.w.signals, [])
+        row = self.w.rows()[-1]
+        self.assertIn('start', row['stop']['not_signalled'])
+        self.assertTrue(any('NOT SIGNALLED' in a for a in row['alerts']))
+
+    def test_decision_instance_wrong_after_the_run_is_said_in_capitals_and_never_reloaded(self):
+        def drop(world):
+            if world.launcher is not None and world.launcher.returncode is not None:
+                world.models['models'][0]['loaded_instances'] = []
+        self.w.on_sleep.append(drop)
+        self.main(RUN)
+        self.assertIn('DECISION INSTANCE NOT LOADED AND RIGHT', self.w.text())
+        row = self.w.rows()[-1]
+        self.assertFalse(row['post']['decision_instance_right'])
+        self.assertTrue(any('DECISION INSTANCE NOT LOADED AND RIGHT' in a for a in row['alerts']))
+        self.assertEqual(len(self.w.posts()), 1)
+
+    def test_native_instance_left_loaded_is_said(self):
+        def leave(world):
+            if world.launcher is not None and world.launcher.returncode is not None and len(world.models['models']) == 4:
+                world.models['models'].append({'key': 'qwen3-8b', 'type': 'llm', 'loaded_instances': [{'id': 'mf-native-ff', 'config': {}}]})
+        self.w.on_sleep.append(leave)
+        self.main(RUN)
+        self.assertEqual(self.w.rows()[-1]['post']['native_loaded'], ['mf-native-ff'])
+        self.assertIn('MF-NATIVE INSTANCE STILL LOADED', self.w.text())
+
+    def test_neutral_report_is_recorded_unusable_and_still_counts(self):
+        self.w.receipt['paper_handoff'] = False
+        self.main(RUN)
+        row = self.w.rows()[-1]
+        self.assertFalse(row['pipeline']['report_usable']); self.assertTrue(row['verdicts']['pipeline_clean'])
+
+    def test_missing_receipt_memory_fields_are_null_with_a_note(self):
+        del self.w.receipt['resource']
+        self.main(RUN)
+        row = self.w.rows()[-1]
+        self.assertIsNone(row['memory']['lowest_sustained_free_percent_10s']); self.assertTrue(row['memory']['notes'])
+        self.assertIsNone(row['verdicts']['room_to_spare']); self.assertFalse(row['counts'])
+
+    def test_plan_swaps_are_judged(self):
+        self.w.receipt['events'] += [{'event': 'model_swap', 'boundary': 'B1'}, {'event': 'post_swap_compatibility_probes_passed', 'boundary': 'B1'}]
+        argv = ['run', '--profile', 'swarm8', '--setup-model', 'ternary-bonsai-2-27b', '--turns-model', 'qwen3-8b', '--announced', 'told']
+        self.main(argv)
+        row = self.w.rows()[-1]
+        self.assertEqual(row['plan'], {'setup': 'ternary-bonsai-2-27b', 'turns': 'qwen3-8b'})
+        self.assertFalse(row['pipeline']['swaps_clean']); self.assertFalse(row['verdicts']['pipeline_clean'])
+
+    def test_dry_run_changes_nothing(self):
+        rc = self.main(RUN + ['--dry-run'])
+        self.assertEqual(rc, 0, self.w.text())
+        self.assertEqual(self.w.bootouts(), []); self.assertEqual(self.w.posts(), []); self.assertEqual(self.w.stages(), [])
+        self.assertEqual(self.w.spawned, []); self.assertEqual(self.w.rows(), [])
+        self.assertIn('would', self.w.text())
+
+    def test_record_prints_rows_and_streaks(self):
+        self.main(RUN); self.w.out.clear()
+        self.assertEqual(self.main(['record']), 0)
+        text = self.w.text()
+        self.assertIn('9 participants: 1 in a row (target 10)', text); self.assertIn('48 participants: 0 in a row (target 3)', text)
+
+
+class LoadTest(Base):
+    LT = ['load-test', '--model', 'qwen3-8b', '--hold-minutes', '2', '--announced', 'Owner told: 8B load test, 5 min']
+
+    def result(self):
+        files = sorted((self.w.tmp / 'artifacts/load-tests').glob('*.json'))
+        self.assertEqual(len(files), 1)
+        return json.loads(files[0].read_text())
+
+    def test_load_test_measures_and_restores(self):
+        def fall(world):
+            if world.load_t is not None and world.t >= world.load_t + 60 and world.free == 60:
+                world.free = 55
+        self.w.on_sleep.append(fall)
+        rc = self.main(self.LT)
+        self.assertEqual(rc, 0, self.w.text())
+        r = self.result()
+        self.assertEqual(r['announced'], self.LT[-1])
+        self.assertEqual(r['baseline']['median'], 80); self.assertEqual(r['baseline']['lowest'], 80)
+        self.assertEqual(r['baseline']['samples'], 120)
+        self.assertEqual(r['after_load']['lowest'], 55)
+        self.assertEqual(r['setup_cost_points'], 20); self.assertEqual(r['fall_points'], 5)
+        self.assertEqual(r['highest_pressure_level'], 1); self.assertEqual(r['swap_change_bytes'], 0)
+        self.assertIsNone(r['collector']['breach']); self.assertGreater(r['collector']['decisions'], 0)
+        self.assertTrue(r['unload']['proven']); self.assertEqual(r['post']['native_loaded'], [])
+        self.assertEqual(self.w.loads, ['qwen3-8b']); self.assertEqual(len(self.w.unloads_via_pipeline), 1)
+        self.assertTrue(self.w.picks_loaded)
+        stage = self.w.stages()
+        self.assertEqual(len(stage), 1); self.assertIn('qwen3-8b', stage[0])
+        self.assertEqual(self.w.spawned, [])
+
+    def test_breach_during_the_hold_unloads_early(self):
+        def slow(world):
+            if world.load_t is not None and world.t >= world.load_t + 20:
+                world.latency = lambda t: 9.5
+        self.w.on_sleep.append(slow)
+        rc = self.main(self.LT)
+        self.assertEqual(rc, 1)
+        r = self.result()
+        self.assertEqual(r['stopped'], 'collector breach'); self.assertTrue(r['unload']['proven'])
+        self.assertLess(r['after_load']['samples'], 240); self.assertTrue(self.w.picks_loaded)
+
+    def test_ctrl_c_during_the_hold_unloads_and_restores(self):
+        def interrupt(world):
+            if world.load_t is not None and world.t >= world.load_t + 10:
+                world.on_sleep.clear(); raise KeyboardInterrupt
+        self.w.on_sleep.append(interrupt)
+        rc = self.main(self.LT)
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(self.w.unloads_via_pipeline), 1); self.assertTrue(self.w.picks_loaded)
+        self.assertIn('interrupted', self.result()['stopped'])
+
+    def test_failed_load_still_unloads_and_restores(self):
+        self.w.load_error = 'load refused by the helper'
+        rc = self.main(self.LT)
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(self.w.unloads_via_pipeline), 1); self.assertTrue(self.w.picks_loaded)
+        self.assertIn('load refused', self.result()['load']['refusal'])
+
+    def test_load_test_needs_announced_and_two_minutes(self):
+        self.assertEqual(self.main(self.LT[:-2]), 2)
+        self.assertEqual(self.main(['load-test', '--model', 'qwen3-8b', '--hold-minutes', '1', '--announced', 'x']), 2)
+        self.assertEqual(self.w.calls, [])
+
+    def test_load_test_refuses_like_a_run(self):
+        self.w.pressure = 4
+        self.assertEqual(self.main(self.LT), 2)
+        self.assertEqual(self.w.loads, []); self.assertEqual(self.w.bootouts(), [])
+
+    def test_load_test_dry_run_changes_nothing(self):
+        self.assertEqual(self.main(self.LT + ['--dry-run']), 0, self.w.text())
+        self.assertEqual(self.w.loads, []); self.assertEqual(self.w.bootouts(), []); self.assertEqual(self.w.stages(), [])
+        self.assertFalse((self.w.tmp / 'artifacts/load-tests').exists())
+
+
+if __name__ == '__main__':
+    unittest.main()
