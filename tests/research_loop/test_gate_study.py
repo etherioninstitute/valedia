@@ -323,11 +323,46 @@ def test_the_listed_figures_decide_the_listed_rules_only_and_unavailable_fails_c
     assert gs.develops("R3_gate", material(strict_p={1: 0.001}), [], CRITERIA)
 
 
+def test_a_missing_or_non_finite_figure_never_passes_whatever_the_thresholds(monkeypatch):
+    """Every figure R1 to R4 read, in both versions, set to None and to NaN in turn, under thresholds at zero and
+    below (min_dsr 0 and -1) and the re-timing threshold at 0.05 and at 1: the rule never passes; with the figures
+    present and good it passes (two-way). R0 is the gate's own verdict and is outside this ruling."""
+    good = {"sharpe": 0.05, "n_obs": 2000, "skew": 0.0, "kurt": 3.0}
+    reads = {"R1": ("moments", "p"), "R2": ("moments", "p"), "R3": ("moments", "strict"), "R4": ("active",)}
+    names = {"gate": {"p": "timing_p", "strict": "strict_p", "active": "active_moments"},
+             "listed": {"p": "timing_p_listed", "strict": "strict_p_listed", "active": "active_moments_listed"}}
+    bad_values = {"moments": (None, dict(good, sharpe=float("nan"))), "active": (None, dict(good, kurt=float("nan"))),
+                  "p": (None, float("nan")), "strict": ({1: None}, {1: float("nan")})}
+    cases = goods = 0
+    for alpha in (0.05, 1.0):
+        monkeypatch.setattr(gs, "ALPHA", alpha)
+        for min_dsr in (0.0, -1.0):
+            c = gt.Criteria(min_dsr=min_dsr)
+            for base, figures in reads.items():
+                for version in gs.TIMED:
+                    rule = f"{base}_{version}"
+                    ok = material(**STRICT)
+                    assert gs.develops(rule, ok, [], c) and gs.passes(rule, ok, [], c), (rule, alpha, min_dsr)
+                    goods += 1
+                    for fig in figures:
+                        key = "moments" if fig == "moments" else names[version][fig]
+                        for value in bad_values[fig]:
+                            m = material(**{**STRICT, key: value})
+                            assert not gs.develops(rule, m, [], c) and not gs.passes(rule, m, [], c), \
+                                (rule, key, value, alpha, min_dsr)
+                            cases += 1
+    assert (cases, goods) == (2 * 2 * 2 * 7 * 2, 2 * 2 * 8)               # 112 failing cases, 32 passing
+
+
 def test_a_cell_counts_the_books_whose_re_timing_test_was_unavailable():
     v = [{1: dict.fromkeys(gs.RULES, False)} for _ in range(3)]
     cell = gs._cell_report("N1", 0.5, v, [1], [0.1, 0.2, 0.3], 0, [None] * 3,
-                           timing=[(True, False, 0.4), (True, True, 1.0), (False, False, None)])
+                           timing=[(True, False, 0.4, 400), (True, True, 1.0, 1000), (False, False, None, None)])
     assert cell["timing_unavailable"] == {"gate": 1, "listed": 2} and cell["median_listed_share"] == 0.7
+    # each book's listed window, in book order (both None for a book that holds nothing out of sample)
+    assert cell["listed_window"] == [{"listed_bars": 400, "listed_share": 0.4},
+                                     {"listed_bars": 1000, "listed_share": 1.0},
+                                     {"listed_bars": None, "listed_share": None}]
     assert list(cell["by_attempts"]["1"]) == list(gs.RULES)
 
 
@@ -674,7 +709,7 @@ def test_the_listed_window_starts_where_every_held_symbol_is_priced(market):
     # the same test as timing_null on the stretch, its average book from the stretch only
     same = gt.timing_null(w.iloc[s0:], r.iloc[s0:])
     assert {k: t[k] for k in same} == same and t["listed_start"] == s0
-    assert t["listed_share"] == (len(w) - s0) / len(w)
+    assert t["listed_share"] == (len(w) - s0) / len(w) and t["listed_bars"] == len(w) - s0
     assert t["average_book_held_throughout_sharpe"] == _held_sharpe(gs.held_average_book(w.iloc[s0:], r.iloc[s0:]))
     # a book holding only the funds: its listed window is the whole window, and the test is the gate's own
     funds = w.copy()
@@ -688,7 +723,10 @@ def test_the_listed_window_starts_where_every_held_symbol_is_priced(market):
     never["BTC-USD"] = np.nan
     gone = gs.timing_listed(w, r, never)
     assert "unavailable" in gone and gone["listed_start"] is None and gs.listed_start(w, never) is None
+    assert (gone["listed_bars"], gone["listed_share"]) == (0, 0.0)        # no bar inside a listed window
     assert gs.listed_start(w * 0.0, px) == 0                              # holds nothing
+    empty = gs.timing_listed(w * 0.0, r, px)                              # no listed window to speak of: both None
+    assert "unavailable" in empty and (empty["listed_bars"], empty["listed_share"]) == (None, None)
 
 
 def _p_values(prices, dollar, cost, n):
@@ -714,6 +752,9 @@ def test_p_listed_is_near_uniform_on_no_skill_books_where_the_gate_s_p_is_not(ma
     # 100 (median p 0.226), p_listed on 7 of 100 (median 0.535); median share of the window inside the listed window
     # 0.479. Marks: p_listed's share within 0.065 of 0.05 (three binomial sds at n = 100: at most 0.115) and its median
     # within 0.15 of 0.5; the gate's share at least 0.12 and its median at most 0.35.
+    # The gate's 16% is THIS fixture's figure, not the size of the bias: its size and its direction depend on the
+    # universe (how the late symbols drifted before and after they listed). A second checker measured 5.0%, 13.0% and
+    # 6.0% on three universes, and below 5% where the late symbols fall. The marks are marks on this fixture only.
     assert share["listed"] <= 0.115 and abs(float(np.median(listed)) - 0.5) <= 0.15, share
     assert share["gate"] >= 0.12 and float(np.median(gate)) <= 0.35, share
     assert 0.3 <= float(np.median(shares)) <= 0.7
@@ -780,6 +821,27 @@ def test_two_specs_with_the_same_whole_history_book_are_counted_once(market, mon
     out = gs._surrogate_books(prices, False, 3, 0, 3)
     assert out["duplicate_specs_dropped"] == 0 and out["duplicate_books_dropped"] == 1
     assert [s.to_spec()["entry"]["rule"] for _, s in out["books"]] == ["momentum", "hold"]     # the first kept
+
+
+def test_two_books_equal_on_the_first_half_and_different_on_the_second_are_both_kept(market, monkeypatch):
+    prices = market[0]
+    mid = prices.index[len(prices) // 2]
+    full = pd.DataFrame(1.0 / len(prices.columns), index=prices.index, columns=prices.columns)
+    flat = full * 0.0
+    # spec k is a different drawn spec; its book: 0 held throughout, 1 the same on the first half then flat, 2 again 0
+    made = {0: (full, full), 1: (full, flat), 2: (full, full)}
+    specs = [{"name": f"study_rule_{k}", "entry": {"rule": "hold", "k": k}} for k in range(3)]
+    monkeypatch.setattr(gs, "draw_rule_spec", lambda cols, rng, k: specs[k])
+    monkeypatch.setattr(gs, "RuleStrategy", type("Fake", (), {"from_spec": staticmethod(
+        lambda spec: Spliced(prices, *made[spec["entry"]["k"]], mid, spec["name"]))}))
+    one, two = (run_rules(Spliced(prices, *made[k], mid, "study_half_check"), prices)[0] for k in (0, 1))
+    half = len(prices) // 2
+    assert one.iloc[:half].equals(two.iloc[:half]) and not one.iloc[half:].equals(two.iloc[half:])
+    out = gs._surrogate_books(prices, False, 3, 0, 3)
+    # the two books that differ only on the second half are both kept and counted as two; the third, the same
+    # whole-history book as the first, is dropped (two-way)
+    assert [s.name for _, s in out["books"]] == ["study_rule_0", "study_rule_1"]
+    assert out["duplicate_books_dropped"] == 1 and out["duplicate_specs_dropped"] == 0
 
 
 # ---- the study end to end
@@ -851,6 +913,9 @@ def test_the_report_is_strict_json_with_every_family_rule_and_attempt_count(smal
                 assert c["runs"] == want and set(c["by_attempts"]) == {"1", "31"}
                 # no late listing here: every book's re-timing tests ran and the listed window is the whole window
                 assert c["timing_unavailable"] == {"gate": 0, "listed": 0} and c["median_listed_share"] == 1.0
+                per_book = c["listed_window"]                            # per book: the whole window, every bar
+                assert len(per_book) == c["runs"] and all(b["listed_share"] == 1.0 for b in per_book)
+                assert all(isinstance(b["listed_bars"], int) and b["listed_bars"] > 0 for b in per_book)
                 for n, row in c["by_attempts"].items():
                     assert list(row) == list(gs.RULES)
                     for rule, r in row.items():
@@ -888,6 +953,18 @@ def test_the_reading_says_it_in_words(small):
     assert sum(s.startswith(("Rules whose false-pass interval", "No rule has a false-pass")) for s in reading) == 1
     assert sum("short-range dependence of the data kept: a rule that lives inside 20 bars keeps its edge here" in s
                for s in reading) == 1
+    # which window each figure of the _listed rules comes from, and that the gate's bias is not a constant
+    windows = [s for s in reading if s.startswith("Which window each figure of the _listed rules comes from")]
+    assert len(windows) == 1 and all(w in windows[0] for w in (
+        "the re-timing p-value", "R4's active return and its number of observations", "listed window",
+        "the gate's own verdict and Sharpe test in R1 to R3", "the spread of the earlier attempts' Sharpes",
+        "whole out-of-sample window", "shorter stretch for timing than for return", "listed_bars"))
+    doc = " ".join(gs.__doc__.split())                                    # the module docstring says it too
+    assert all(w in doc for w in ("R4's active return and its number of observations", "whole out-of-sample window",
+                                  "shorter stretch for timing than for return", "listed_bars",
+                                  "size and its direction depend on the universe"))
+    bias = [s for s in reading if s.startswith("The gate's own re-timing bias where symbols list late")]
+    assert len(bias) == 1 and "size and its direction depend on the universe" in bias[0]
     assert reading[-1].startswith(f"Anchor: R0 judged from the kept material agreed with the real gate on {rep['books']} books")
     side = rep["results"]["detrended"]["N2"][0]
     g, li = side["by_attempts"]["31"]["R3_gate"], side["by_attempts"]["31"]["R3_listed"]
