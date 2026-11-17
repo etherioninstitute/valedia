@@ -16,27 +16,42 @@ report's Deflated Sharpe, re-timing p-value and headline Sharpe exactly, and, wh
 the first book of every cell through the real gate in a ledger seeded with them. `report["anchor"]` counts every
 disagreement; the study is void unless they are all zero.
 
-BOOK FAMILIES (no skill: N1 to N4; real, known skill: E1 to E3)
+BOOK FAMILIES (no skill: N1 to N4b; real, known skill: E1 to E3)
 * N1: the long-only oracle (`controls.OracleCheat`) at hit rate 0.50, 5-bar blocks: random timing.
 * N2: the same, 20-bar blocks.
 * N3: the long-short no-edge book (`controls.NoEdgeBook`).
-* N4: rule strategies on SURROGATE prices: `n_surrogates` joint stationary-bootstrap resamples of the frame
-  (`surrogate_prices`), and on each `specs_per_surrogate` long-only rule strategies drawn from the rule library
-  (`draw_rule_spec`, ranges in `DRAW_RANGES`). Identical books on one surrogate count once (`_surrogate_books`:
-  a repeated spec, or a different spec with the same whole-history book, is dropped and counted). Books on one
-  surrogate share its path and are not independent, so N4 also reports each surrogate's own pass share and a 95%
-  interval from a bootstrap over whole surrogates (`surrogate_bootstrap`, seeded, 2,000 resamples); the reading judges
-  N4 by that interval, not the Wilson one.
+* N4a and N4b: rule strategies on SURROGATE prices: `n_surrogates` joint resamples of the frame's simple returns
+  (`surrogate_prices`: rows resampled together, within listing regimes), and on each `specs_per_surrogate` long-only
+  rule strategies drawn from the rule library (`draw_rule_spec`, ranges in `DRAW_RANGES`; the same draws for N4a and
+  N4b). N4a resamples rows INDEPENDENTLY (block length 1): the cross-section and each symbol's distribution are kept
+  and every dependence across time is gone, so nothing in time can be learned. N4b uses stationary-bootstrap blocks of
+  mean length 20: the data's short-range dependence is kept, so a rule that lives inside 20 bars keeps its edge there
+  (labelled so in the report). Identical books on one surrogate count once (`_surrogate_books`: a repeated spec, or a
+  different spec with the same whole-history book, is dropped and counted). Books on one surrogate share its path and
+  are not independent, so N4a and N4b also report each surrogate's own pass share and a 95% interval from a bootstrap
+  over whole surrogates (`surrogate_bootstrap`, seeded, 2,000 resamples); the reading judges them by that interval.
 * E1: the long-only oracle at hit rates 0.52, 0.55, 0.60, 5-bar blocks. E2: the same, 20-bar blocks.
 * E3: a market-neutral oracle (`NeutralOracle`) at the same hit rates, 5-bar blocks.
 
 DATA VERSIONS. "given": the prices as handed in. "detrended": `controls.detrend` applied to the frame each book runs
-on (for N4: to each surrogate drawn from the detrended prices, so its drift is exactly zero as well).
+on (for N4a and N4b: to each surrogate drawn from the detrended prices, so its drift is exactly zero as well).
+
+TWO RE-TIMING TESTS. The gate's `timing_null` slides the whole out-of-sample book along the calendar; where a symbol
+lists late, a slid copy "holds" it on bars before it existed, where its return is zero, so the real book beats its
+copies with no skill at all. The study therefore computes, beside the gate's own figures, the same test on the LISTED
+WINDOW (`timing_listed`): from the first out-of-sample bar on which every symbol the book ever holds there has a
+price, to the end; the same statistic, common shift and minimum shift (it calls `timing_null` on that stretch), and
+the "same average book, held throughout" built from that stretch only. Where that stretch is too short for the test,
+the listed-window figures are unavailable and every rule that needs them fails for that book (counted). With no late
+listing the stretch is the whole window and the two are the same number. Every rule that uses a re-timing p (R1, R2,
+R3) and R4's active return are judged twice: `_gate` (the gate's figures; the anchor concerns only these and R0) and
+`_listed`.
 
 CANDIDATE RULES. Each is "passes development under these conditions AND passes the sealed checks as today"; the
 development checks it does not name stay as the gate has them. N is the number of attempts counted on the market,
 this one included (1 on a fresh ledger, len(prior_attempt_sharpes) + 1 at the prior attempts).
 * R0: the gate as it is today.
+Each of R1 to R4 below comes as `Rk_gate` and `Rk_listed` (see TWO RE-TIMING TESTS).
 * R1: R0 and the re-timing p-value (the report's `timing_null`, 300 shifts) at most 0.05.
 * R2: R1, with the Deflated Sharpe's variance of attempt Sharpes taken from the OTHER attempts only (the idea's own
   left out; fewer than 3 others: 1 / n_obs, what the gate does today for fewer than 3).
@@ -44,9 +59,10 @@ this one included (1 on a fresh ledger, len(prior_attempt_sharpes) + 1 at the pr
   the re-timing p-value at most 0.05 / N, from `gauntlet.timing_null` re-run with 400 N shifts (20 times the
   reciprocal of the threshold), same seed, on the same out-of-sample book and returns.
 * R4: the Deflated Sharpe computed on ACTIVE returns: the out-of-sample net return minus the return of the same
-  average book, held throughout (exactly `timing_null`'s definition: |w| averaged over the out-of-sample bars, times
-  the sign of the summed weight, per symbol with any position), over the same bars; N counted as today, the idea's own
-  attempt left out of the variance (as R2). No re-timing condition (the rule does not name one).
+  average book, held throughout (exactly `timing_null`'s definition and alignment: |w| averaged over the window, times
+  the sign of the summed weight, per symbol with any position; the book earns the returns of the window's bars after
+  its first, as `timing_null`'s `book[:-1] * r[1:]` does), over those bars; N counted as today, the idea's own attempt
+  left out of the variance (as R2). No re-timing condition (the rule does not name one).
 
 Everything runs in a `tempfile.TemporaryDirectory()`; each book's folder is deleted when it is done. The study takes
 no path, so it cannot write the real ledger; the command line reads prior Sharpes from a ledger opened read-only.
@@ -76,10 +92,14 @@ from valedia_trader.research_loop.ledger import HypothesisLedger
 from valedia_trader.research_loop.strategy import CRYPTO, SCORES, RuleStrategy, Strategy, StrategyRisk, run_rules
 
 __all__ = ["study", "develops", "passes", "deflated_value", "wilson", "surrogate_bootstrap", "surrogate_prices",
-           "stationary_bootstrap_rows",
+           "stationary_bootstrap_rows", "listing_regimes", "listed_start", "timing_listed", "held_average_book",
+           "active_returns", "TIMED", "SURROGATE_BLOCK",
            "draw_rule_spec", "NeutralOracle", "RULES", "FAMILIES", "DRAW_RANGES", "main"]
 
-RULES = ("R0", "R1", "R2", "R3", "R4")
+RULES = ("R0", "R1_gate", "R1_listed", "R2_gate", "R2_listed", "R3_gate", "R3_listed", "R4_gate", "R4_listed")
+TIMED = ("gate", "listed")            # whose re-timing figures a rule uses
+_KEYS = {"gate": ("timing_p", "strict_p", "active_moments"),
+         "listed": ("timing_p_listed", "strict_p_listed", "active_moments_listed")}
 ALPHA = 0.05                          # the re-timing threshold of R1 and R2; R3 divides it by N
 R3_SHIFTS_PER_RECIPROCAL = 20         # R3 re-runs timing_null with this many times 1 / threshold shifts
 GATE_SHIFTS = 300                     # timing_null's own default, used by develop
@@ -90,7 +110,9 @@ EDGE_HIT_RATES = (0.52, 0.55, 0.60)
 _Z95 = 1.959963984540054
 _SEALED_CHECKS = ("made_money", "prediction_failure_terms")
 _VERSIONS = ("given", "detrended")
-_CODES = {"N1": 1, "N2": 2, "N3": 3, "N4": 4, "E1": 5, "E2": 6, "E3": 7, "surrogate": 8, "spec": 9, "cluster": 10}
+_CODES = {"N1": 1, "N2": 2, "N3": 3, "E1": 5, "E2": 6, "E3": 7, "surrogate": 8, "spec": 9, "cluster": 10,
+          "N4a": 11, "N4b": 12}
+SURROGATE_BLOCK = {"N4a": 1, "N4b": MEAN_BLOCK}   # mean block length of each surrogate family's resampling
 N_BOOT = 2000                         # resamples of whole surrogates for N4's interval
 
 # family: (kind, hit rates, horizon, plain description)
@@ -98,12 +120,16 @@ FAMILIES: dict[str, tuple[str, tuple[float, ...], int | None, str]] = {
     "N1": ("oracle", (0.50,), 5, "long-only random timing, 5-bar blocks (the oracle at hit rate 0.50)"),
     "N2": ("oracle", (0.50,), 20, "long-only random timing, 20-bar blocks (the oracle at hit rate 0.50)"),
     "N3": ("no_edge", (), None, "the long-short no-edge book"),
-    "N4": ("surrogate_rules", (), None, "long-only rule strategies on stationary-bootstrap surrogate prices"),
+    "N4a": ("surrogate_rules", (), None, ("long-only rule strategies on surrogate prices with rows resampled "
+                                          "independently (block length 1): nothing in time can be learned")),
+    "N4b": ("surrogate_rules", (), None, ("long-only rule strategies on surrogate prices in blocks of mean length 20: "
+                                          "short-range dependence of the data kept: a rule that lives inside 20 bars "
+                                          "keeps its edge here")),
     "E1": ("oracle", EDGE_HIT_RATES, 5, "the long-only oracle, 5-bar blocks"),
     "E2": ("oracle", EDGE_HIT_RATES, 20, "the long-only oracle, 20-bar blocks"),
     "E3": ("neutral", EDGE_HIT_RATES, 5, "the market-neutral oracle, 5-bar blocks"),
 }
-NO_SKILL = ("N1", "N2", "N3", "N4")
+NO_SKILL = ("N1", "N2", "N3", "N4a", "N4b")
 EDGE = ("E1", "E2", "E3")
 
 # The ranges N4 draws from. Score parameters: integers drawn uniformly from the library's documented ranges
@@ -201,27 +227,31 @@ def _r3_rest(material: dict, criteria: gt.Criteria) -> bool:
 
 def develops(rule: str, material: dict, others: Sequence[float], criteria: gt.Criteria | None = None) -> bool:
     """Does the book pass development under `rule`, with `others` the other attempts counted on the market?
-    Pure: everything comes from `material` (see `_book`). R3 reads `material["strict_p"][N]`, which must be there
-    whenever the rest of R3 passes (KeyError otherwise)."""
+    Pure: everything comes from `material` (see `_Book`). `Rk_gate` reads the gate's re-timing figures (`timing_p`,
+    `strict_p`, `active_moments`), `Rk_listed` the listed window's (the same names with `_listed`); a figure that is
+    None (unavailable) fails the rule. R3 reads `strict_p...[N]`, which must be there whenever the rest of R3 passes
+    (KeyError otherwise)."""
     c = criteria or gt.Criteria()
+    if rule not in RULES:
+        raise ValueError(f"unknown rule {rule!r}")
     if material.get("refused"):
         return False
     own, m = material["own"], material["moments"]
     if rule == "R0":
         return _gate_checks_ok(material) and deflated_value(m, own, others) >= c.min_dsr
-    if rule == "R1":
-        return develops("R0", material, others, c) and _p_ok(material["timing_p"], ALPHA)
-    if rule == "R2":
+    base, version = rule.split("_")
+    p_key, strict_key, active_key = _KEYS[version]
+    if base == "R1":
+        return develops("R0", material, others, c) and _p_ok(material[p_key], ALPHA)
+    if base == "R2":
         return (_gate_checks_ok(material) and deflated_value(m, own, others, leave_own_out=True) >= c.min_dsr
-                and _p_ok(material["timing_p"], ALPHA))
-    if rule == "R3":
+                and _p_ok(material[p_key], ALPHA))
+    if base == "R3":
         if not _r3_rest(material, c):
             return False
         n = attempts_counted(material, others)
-        return _p_ok(material["strict_p"][n], ALPHA / n)
-    if rule == "R4":
-        return _gate_checks_ok(material) and deflated_value(material["active_moments"], own, others, leave_own_out=True) >= c.min_dsr
-    raise ValueError(f"unknown rule {rule!r}")
+        return _p_ok(material[strict_key][n], ALPHA / n)
+    return _gate_checks_ok(material) and deflated_value(material[active_key], own, others, leave_own_out=True) >= c.min_dsr
 
 
 def sealed_ok(material: dict) -> bool:
@@ -252,25 +282,44 @@ def stationary_bootstrap_rows(n: int, pool: int, mean_block: float, rng: np.rand
     return out
 
 
-def surrogate_prices(prices: pd.DataFrame, rng: np.random.Generator, mean_block: float = MEAN_BLOCK) -> pd.DataFrame:
-    """A joint stationary-bootstrap resample of the frame's simple returns, rebuilt into prices.
+def listing_regimes(prices: pd.DataFrame) -> list[tuple[int, int]]:
+    """The frame's LISTING REGIMES as [start, end) row ranges, in order: maximal stretches of bars with the same set of
+    listed symbols, a symbol being listed from its first price to its last (a gap inside that span does not end it)."""
+    px = prices.to_numpy(dtype=float)
+    ok = np.isfinite(px) & (px > 0)
+    n = len(px)
+    rows = np.arange(n)[:, None]
+    first = np.where(ok.any(axis=0), ok.argmax(axis=0), n)
+    last = np.where(ok.any(axis=0), n - 1 - ok[::-1].argmax(axis=0), -1)
+    listed = (rows >= first[None, :]) & (rows <= last[None, :])
+    cuts = [0] + [t for t in range(1, n) if (listed[t] != listed[t - 1]).any()] + [n]
+    return [(a, b) for a, b in zip(cuts[:-1], cuts[1:])]
 
-    Rows are resampled together, so the cross-section of each bar is kept. Only COMPLETE rows are resampled: bars on
-    which every symbol has a simple return (both prices present and positive). Each bar after the first gets one
-    resampled complete row; each symbol's prices are rebuilt by compounding from its own first price, at its own
-    first row, and the frame's missing prices stay missing (a symbol listed later is still missing before its
-    listing; a gap stays a gap, and the compounding runs through it). Fewer than 252 complete rows: ValueError."""
+
+def surrogate_prices(prices: pd.DataFrame, rng: np.random.Generator, mean_block: float = MEAN_BLOCK) -> pd.DataFrame:
+    """A joint resample of the frame's simple returns, rebuilt into prices, that respects listing.
+
+    Rows are resampled together, so the cross-section of each bar is kept, and WITHIN LISTING REGIMES
+    (`listing_regimes`): every bar of a regime gets the return row of a bar drawn from the same regime (its bars after
+    its first, whose returns are between two bars of the regime), by the stationary bootstrap with `mean_block`
+    (1: rows drawn independently). The regimes keep their order and lengths, so a symbol still starts where it started
+    and the early years keep the early years' behaviour. A symbol's missing return in a drawn row (a gap in its prices
+    inside the regime) counts as no move; a regime with a single bar has no row to draw from and gets no move. Each
+    symbol's prices are rebuilt by compounding from its own first price, at its own first row, and the frame's missing
+    prices stay missing (the compounding runs through a gap)."""
     px = prices.to_numpy(dtype=float)
     ok = np.isfinite(px) & (px > 0)
     r = np.full(px.shape, np.nan)
     both = ok[1:] & ok[:-1]
     r[1:][both] = px[1:][both] / px[:-1][both] - 1.0
-    complete = np.flatnonzero(np.isfinite(r).all(axis=1))
-    if len(complete) < 252:
-        raise ValueError(f"only {len(complete)} bars have a return for every symbol; the surrogate needs at least 252")
     n, m = px.shape
-    rows = complete[stationary_bootstrap_rows(n - 1, len(complete), mean_block, rng)]
-    sim = np.vstack([np.zeros((1, m)), r[rows]])
+    sim = np.zeros((n, m))
+    for a, b in listing_regimes(prices):
+        pool = np.arange(max(a + 1, 1), b)
+        bars = np.arange(max(a, 1), b)
+        if len(pool) and len(bars):
+            sim[bars] = r[pool[stationary_bootstrap_rows(len(bars), len(pool), mean_block, rng)]]
+    sim = np.nan_to_num(sim, nan=0.0)
     out = np.full(px.shape, np.nan)
     for j in range(m):
         first = np.flatnonzero(ok[:, j])
@@ -364,6 +413,56 @@ class NeutralOracle(Strategy):
         return self.walk(prices)[0].abs()
 
 
+# ---- the re-timing test on the listed window, and the average book held throughout
+
+def _held_cols(weights: pd.DataFrame, other: pd.DataFrame) -> list[str]:
+    """The symbols a book holds at some time in the window: `timing_null`'s own choice of columns."""
+    return [c for c in weights.columns if c in other.columns and float(weights[c].abs().sum()) > 0]
+
+
+def listed_start(weights: pd.DataFrame, prices: pd.DataFrame) -> int | None:
+    """The first row of the LISTED WINDOW: the first bar on which every symbol the book ever holds in `weights` has a
+    price in `prices` (the same rows). 0 for a book that holds nothing; None if there is no such bar."""
+    cols = _held_cols(weights, prices)
+    if not cols:
+        return 0
+    px = prices[cols].to_numpy(dtype=float)
+    hit = np.flatnonzero((np.isfinite(px) & (px > 0)).all(axis=1))
+    return int(hit[0]) if len(hit) else None
+
+
+def timing_listed(weights: pd.DataFrame, asset_returns: pd.DataFrame, prices: pd.DataFrame, n: int = GATE_SHIFTS) -> dict:
+    """`gauntlet.timing_null` run on the listed window only (same statistic, common shift, minimum shift and seed),
+    plus `listed_start` and `listed_share` (the share of the window's bars inside it). Unavailable as timing_null is
+    (too short a stretch, no positions), or when no bar has every held symbol priced."""
+    s = listed_start(weights, prices)
+    if s is None:
+        return {"unavailable": "no bar has a price for every symbol the book holds", "listed_start": None,
+                "listed_share": 0.0}
+    out = gt.timing_null(weights.iloc[s:], asset_returns.iloc[s:], n=n)
+    return {**out, "listed_start": s, "listed_share": (len(weights) - s) / len(weights) if len(weights) else 0.0}
+
+
+def held_average_book(weights: pd.DataFrame, asset_returns: pd.DataFrame) -> pd.Series | None:
+    """The return of `timing_null`'s "same average book, held throughout", computed exactly as it does: |w| averaged
+    over the window times the sign of the summed weight, per held symbol; earning `book[:-1] * r[1:]`, so the series
+    covers the window's bars after its first. None when the book holds nothing."""
+    cols = _held_cols(weights, asset_returns)
+    if not cols:
+        return None
+    w = weights[cols].to_numpy(float)
+    r = asset_returns[cols].fillna(0.0).to_numpy(float)
+    book = np.tile(np.abs(w).mean(axis=0) * np.sign(w.sum(axis=0)), (len(w), 1))
+    return pd.Series((book[:-1] * r[1:]).sum(axis=1), index=weights.index[1:])
+
+
+def active_returns(net: pd.Series, weights: pd.DataFrame, asset_returns: pd.DataFrame) -> pd.Series:
+    """Net return minus the held average book's return, on the bars that book earns (the window's after its first)."""
+    held = held_average_book(weights, asset_returns)
+    bars = net.reindex(weights.index).iloc[1:]
+    return (bars if held is None else bars - held).dropna()
+
+
 # ---- one book through the real gate
 
 def _moments(x: np.ndarray) -> dict | None:
@@ -407,12 +506,13 @@ class _Book:
         self.frame, self.dollar, self.cost, self.criteria, self.strategy = frame, dollar, cost, criteria, strategy
         self.cut = int(len(frame) * (1.0 - criteria.sealed_fraction))
         self.gate = _gate_run(frame, dollar, cost, criteria, folder, strategy, ())
-        self.material: dict = {"refused": self.gate["refused"], "strict_p": {}, "sealed": None}
+        self.material: dict = {"refused": self.gate["refused"], "strict_p": {}, "strict_p_listed": {}, "sealed": None}
         self.mismatches: list[str] = []
         self.r3_seconds: dict[int, float] = {}
         if self.gate["refused"]:
             self.material.update(error=self.gate["error"], checks={}, own=[], moments=None, active_moments=None,
-                                 timing_p=None, development_sharpe=None)
+                                 active_moments_listed=None, timing_p=None, timing_p_listed=None, listed_share=None,
+                                 development_sharpe=None)
             return
         rep = self.gate["report"]
         timing = rep["breaker"].get("timing_null") or {}
@@ -422,20 +522,17 @@ class _Book:
 
     def _rebuild(self, rep: dict) -> None:
         """The out-of-sample net returns and book, with the calls `develop` makes for one candidate."""
-        c = self.criteria
-        dev = self.frame.iloc[: self.cut]
-        dollar = None if self.dollar is None else self.dollar.iloc[: self.cut]
-        w, _ = run_rules(self.strategy, dev)
-        windows = [idx for idx in np.array_split(np.arange(c.warmup_days, len(dev)), c.walk_forward_windows) if len(idx)]
-        stitched = pd.DataFrame(0.0, index=dev.index, columns=dev.columns)
-        for idx in windows:
-            stitched.iloc[idx] = w.iloc[idx].to_numpy()
-        oos = slice(windows[0][0], None)
-        base = run_backtest(dev, stitched, self.cost, dollar)
-        net = base.net.iloc[oos]
-        self._w, self._r = base.weights.iloc[oos], dev.pct_change().iloc[oos]
+        oos = oos_run(self.frame, self.dollar, self.cost, self.criteria, self.strategy)
+        net, self._w, self._r, px = oos["net"], oos["weights"], oos["returns"], oos["prices"]
         self.material["moments"] = _moments(net.dropna().to_numpy(dtype=float))
-        self.material["active_moments"] = _moments(self._active(net).to_numpy(dtype=float))
+        self.material["active_moments"] = _moments(active_returns(net, self._w, self._r).to_numpy(dtype=float))
+        listed = timing_listed(self._w, self._r, px)
+        self._start = listed["listed_start"] if listed.get("p_value") is not None else None
+        self.material.update(timing_p_listed=listed.get("p_value"), listed_share=listed["listed_share"])
+        self.material["active_moments_listed"] = None if self._start is None else _moments(active_returns(
+            net.iloc[self._start:], self._w.iloc[self._start:], self._r.iloc[self._start:]).to_numpy(dtype=float))
+        if listed.get("listed_start") == 0 and listed.get("p_value") != self.material["timing_p"]:
+            self.mismatches.append("listed_window_without_late_listing")
         # the rebuilt material must give back the report's own numbers, exactly
         if deflated_value(self.material["moments"], self.material["own"], ()) != rep["deflated_sharpe"]["value"]:
             self.mismatches.append("deflated_sharpe")
@@ -445,24 +542,22 @@ class _Book:
         if gt.timing_null(self._w, self._r).get("p_value") != self.material["timing_p"]:
             self.mismatches.append("timing_p_value")
 
-    def _active(self, net: pd.Series) -> pd.Series:
-        """Net return minus the return of the same average book held throughout (timing_null's definition)."""
-        w, r = self._w, self._r
-        cols = [x for x in w.columns if x in r.columns and float(w[x].abs().sum()) > 0]
-        net = net.dropna()
-        if not cols:
-            return net
-        book = np.abs(w[cols].to_numpy(float)).mean(axis=0) * np.sign(w[cols].to_numpy(float).sum(axis=0))
-        held = r[cols].fillna(0.0).to_numpy(float) @ book
-        return net - pd.Series(held, index=r.index).reindex(net.index)
-
-    def strict_p(self, n_attempts: int) -> float | None:
-        if n_attempts not in self.material["strict_p"]:
+    def strict_p(self, n_attempts: int, version: str = "gate") -> float | None:
+        """R3's re-timing p at N attempts (400 N shifts), on the whole window (gate) or the listed window."""
+        key = _KEYS[version][1]
+        if n_attempts not in self.material[key]:
             t = time.time()
-            out = gt.timing_null(self._w, self._r, n=r3_shifts(n_attempts))
-            self.material["strict_p"][n_attempts] = out.get("p_value")
-            self.r3_seconds[n_attempts] = time.time() - t
-        return self.material["strict_p"][n_attempts]
+            if version == "gate":
+                p = gt.timing_null(self._w, self._r, n=r3_shifts(n_attempts)).get("p_value")
+            elif self._start is None:
+                p = None                                              # no listed-window test: fails closed
+            else:
+                s = self._start
+                p = gt.timing_null(self._w.iloc[s:], self._r.iloc[s:], n=r3_shifts(n_attempts)).get("p_value")
+            self.material[key][n_attempts] = p
+            if version == "gate":
+                self.r3_seconds[n_attempts] = time.time() - t
+        return self.material[key][n_attempts]
 
     def sealed(self) -> dict:
         """The sealed checks, with the calls `seal` makes (all prices, then the sealed slice)."""
@@ -484,11 +579,31 @@ class _Book:
         if m["refused"]:
             return dict.fromkeys(RULES, False)
         if _r3_rest(m, c):
-            self.strict_p(attempts_counted(m, others))
+            for version in TIMED:
+                self.strict_p(attempts_counted(m, others), version)
         dev = {rule: develops(rule, m, others, c) for rule in RULES}
         if any(dev.values()):
             self.sealed()
         return {rule: dev[rule] and sealed_ok(m) for rule in RULES}
+
+
+def oos_run(frame: pd.DataFrame, dollar, cost: CostModel, criteria: gt.Criteria, strategy: Strategy) -> dict:
+    """The out-of-sample net returns, held weights, asset returns and prices of one candidate's development run,
+    with the calls `develop` makes (run_rules on the development rows, the walk-forward windows stitched, the
+    backtest, the out-of-sample slice)."""
+    c = criteria
+    cut = int(len(frame) * (1.0 - c.sealed_fraction))
+    dev = frame.iloc[:cut]
+    dollar = None if dollar is None else dollar.iloc[:cut]
+    w, _ = run_rules(strategy, dev)
+    windows = [idx for idx in np.array_split(np.arange(c.warmup_days, len(dev)), c.walk_forward_windows) if len(idx)]
+    stitched = pd.DataFrame(0.0, index=dev.index, columns=dev.columns)
+    for idx in windows:
+        stitched.iloc[idx] = w.iloc[idx].to_numpy()
+    oos = slice(windows[0][0], None)
+    base = run_backtest(dev, stitched, cost, dollar)
+    return {"net": base.net.iloc[oos], "weights": base.weights.iloc[oos], "returns": dev.pct_change().iloc[oos],
+            "prices": dev.iloc[oos]}
 
 
 def _nan(x) -> bool:
@@ -501,11 +616,13 @@ def _rng(seed: int, *parts) -> np.random.Generator:
     return np.random.default_rng([int(seed), *[_CODES[p] if isinstance(p, str) else int(p) for p in parts]])
 
 
-def _surrogate_books(base: pd.DataFrame, flat: bool, seed: int, j: int, specs_per_surrogate: int) -> dict:
-    """Surrogate `j` of `base` (detrended again when `flat`) and its drawn rule strategies, identical books counted
-    once: a spec drawn again (the same rule and numbers; the hold rule has none) is dropped, and so is a different
-    spec whose whole-history book is the same as one kept (`controls._fingerprint_weights`). The first draw is kept."""
-    frame = surrogate_prices(base, _rng(seed, "surrogate", j))
+def _surrogate_books(base: pd.DataFrame, flat: bool, seed: int, j: int, specs_per_surrogate: int,
+                     fam: str = "N4b") -> dict:
+    """Surrogate `j` of family `fam` (its block length, `SURROGATE_BLOCK`) of `base` (detrended again when `flat`) and
+    its drawn rule strategies, identical books counted once: a spec drawn again (the same rule and numbers; the hold
+    rule has none) is dropped, and so is a different spec whose whole-history book is the same as one kept
+    (`controls._fingerprint_weights`). The first draw is kept. The specs drawn depend on `j` only, not on `fam`."""
+    frame = surrogate_prices(base, _rng(seed, "surrogate", fam, j), SURROGATE_BLOCK[fam])
     if flat:
         frame = controls.detrend(frame)
     spec_rng = _rng(seed, "spec", j)
@@ -531,7 +648,7 @@ def _surrogate_books(base: pd.DataFrame, flat: bool, seed: int, j: int, specs_pe
 def _books(fam: str, base: pd.DataFrame, version: str, seed: int, n_null: int, n_edge: int, n_surrogates: int,
            specs_per_surrogate: int, dropped: dict | None = None):
     """(cell key, book number, frame, strategy, surrogate number) for every book of a family on one data version.
-    For N4 the duplicates dropped are added up in `dropped`."""
+    For N4a and N4b the duplicates dropped are added up in `dropped`."""
     kind, rates, horizon, _ = FAMILIES[fam]
     flat = version == "detrended"
     if kind == "oracle" or kind == "neutral":
@@ -547,7 +664,7 @@ def _books(fam: str, base: pd.DataFrame, version: str, seed: int, n_null: int, n
             yield None, k, base, controls.NoEdgeBook(base, _rng(seed, fam, k), name="study_no_edge"), None
     else:
         for j in range(n_surrogates):
-            sur = _surrogate_books(base, flat, seed, j, specs_per_surrogate)
+            sur = _surrogate_books(base, flat, seed, j, specs_per_surrogate, fam)
             if dropped is not None:
                 for key in ("duplicate_specs_dropped", "duplicate_books_dropped"):
                     dropped[key] = dropped.get(key, 0) + sur[key]
@@ -556,13 +673,18 @@ def _books(fam: str, base: pd.DataFrame, version: str, seed: int, n_null: int, n
 
 
 def _cell_report(fam: str, h, verdicts: list[dict], counts: list[int], sharpes: list, refused: int,
-                 surrogate_of: list, *, dropped: dict | None = None, seed: int = 0, version: str = "given") -> dict:
-    """One cell's counts. For N4 also, per rule and count: the surrogates with a pass, each surrogate's own pass share
+                 surrogate_of: list, *, dropped: dict | None = None, seed: int = 0, version: str = "given",
+                 timing: list | None = None) -> dict:
+    """One cell's counts, the books whose re-timing figures were unavailable (each kind; refused books count) and
+    the median share of out-of-sample bars inside the listed window. For N4a and N4b also, per rule and count: the surrogates with a pass, each surrogate's own pass share
     (minimum, median, maximum), and `surrogate_bootstrap`'s interval (the same seeded resamples for every rule and
     count of the cell); and the cell's surrogates and dropped duplicates."""
     kind, _, horizon, _ = FAMILIES[fam]
     out: dict = {"hit_rate": h, "horizon": horizon, "runs": len(verdicts), "refused": refused,
                  "median_development_sharpe": _median(sharpes), "by_attempts": {}}
+    if timing is not None:                       # per book: (gate p available, listed p available, listed share)
+        out["timing_unavailable"] = {"gate": sum(not g for g, _, _ in timing), "listed": sum(not li for _, li, _ in timing)}
+        out["median_listed_share"] = _median([x for _, _, x in timing])
     clusters = sorted({s for s in surrogate_of if s is not None})
     if kind == "surrogate_rules":
         out.update(surrogates=len(clusters), **{k: int((dropped or {}).get(k, 0))
@@ -592,9 +714,11 @@ def _median(xs):
 
 def study(prices: pd.DataFrame, dollar_volume: pd.DataFrame | None, cost: CostModel, *,
           prior_attempt_sharpes: Sequence[float] = (), n_null: int = 400, n_edge: int = 100, n_surrogates: int = 50,
-          specs_per_surrogate: int = 20, seed: int = 20261116, criteria: gt.Criteria | None = None) -> dict:
+          specs_per_surrogate: int = 20, seed: int = 20261116, criteria: gt.Criteria | None = None,
+          anchor_all: bool = False) -> dict:
     """Run every book family through the real gate, on the data as given and detrended, judge every candidate rule at
-    one attempt and at len(prior_attempt_sharpes) + 1, and return the report (strict JSON)."""
+    one attempt and at len(prior_attempt_sharpes) + 1, and return the report (strict JSON). `anchor_all`: re-run EVERY
+    book through the real gate at the prior attempts for the anchor (default: the first book of every cell)."""
     if min(n_null, n_edge, n_surrogates, specs_per_surrogate) < 1:
         raise ValueError("n_null, n_edge, n_surrogates and specs_per_surrogate must be at least 1")
     priors = [float(s) for s in prior_attempt_sharpes]
@@ -626,10 +750,13 @@ def study(prices: pd.DataFrame, dollar_volume: pd.DataFrame | None, cost: CostMo
                     for n, secs in book.r3_seconds.items():
                         r3_seconds.setdefault(n, []).append(secs)
                     _anchor_book(anchor, book, verdicts)
-                    if priors and k == 0:
+                    if priors and (anchor_all or k == 0):
                         _anchor_priors(anchor, book, frame, dollar_volume, cost, c, root / f"prior{done:06d}", priors,
                                        verdicts[counts[-1]])
-                    cell = cells.setdefault(h, {"verdicts": [], "sharpes": [], "refused": 0, "surrogate": []})
+                    cell = cells.setdefault(h, {"verdicts": [], "sharpes": [], "refused": 0, "surrogate": [],
+                                                "timing": []})
+                    cell["timing"].append((book.material["timing_p"] is not None,
+                                           book.material["timing_p_listed"] is not None, book.material["listed_share"]))
                     cell["verdicts"].append(verdicts)
                     cell["sharpes"].append(book.material.get("development_sharpe"))
                     cell["refused"] += int(book.material["refused"])
@@ -639,7 +766,8 @@ def study(prices: pd.DataFrame, dollar_volume: pd.DataFrame | None, cost: CostMo
                     if done % PROGRESS_EVERY == 0:
                         print(f"gate_study: {done} books in {time.time() - t0:.0f} s", file=sys.stderr, flush=True)
                 results[version][fam] = [_cell_report(fam, h, v["verdicts"], counts, v["sharpes"], v["refused"],
-                                                      v["surrogate"], dropped=dropped, seed=seed, version=version)
+                                                      v["surrogate"], dropped=dropped, seed=seed, version=version,
+                                                      timing=v["timing"])
                                          for h, v in cells.items()]
     elapsed = time.time() - t0
     timed = ", ".join(f"{_median(v):.2f} s at N = {n} ({r3_shifts(n)} shifts, {len(v)} books)"
@@ -651,10 +779,14 @@ def study(prices: pd.DataFrame, dollar_volume: pd.DataFrame | None, cost: CostMo
         "attempt_counts": counts, "prior_attempts": len(priors),
         "sizes": {"n_null": n_null, "n_edge": n_edge, "n_surrogates": n_surrogates,
                   "specs_per_surrogate": specs_per_surrogate, "seed": int(seed)},
-        "results": results, "anchor": anchor,
+        "results": results, "anchor": {**anchor, "at_prior_attempts_scope": (
+            "every book" if anchor_all else "the first book of every cell") if priors else "no prior attempts"},
         "r3_re_timing": {"shifts": {str(n): r3_shifts(n) for n in counts},
                          "books_re_timed": {str(n): len(v) for n, v in sorted(r3_seconds.items())}},
-        "surrogates": {"mean_block": MEAN_BLOCK, "complete_rows_in_pool": int(_complete_rows(prices)),
+        "surrogates": {"mean_block": SURROGATE_BLOCK,
+                       "listing_regimes": [{"from": str(prices.index[a].date()), "to": str(prices.index[b - 1].date()),
+                                            "bars": b - a, "listed_symbols": int(_listed_count(prices, a))}
+                                           for a, b in listing_regimes(prices)],
                        "draw_ranges": DRAW_RANGES, "sizing": SIZING, "risk": "the default StrategyRisk()"},
         "books": done,
         "data": {"symbols": int(prices.shape[1]), "first": str(prices.index[0].date()),
@@ -664,10 +796,11 @@ def study(prices: pd.DataFrame, dollar_volume: pd.DataFrame | None, cost: CostMo
     return gt._clean(report)                                    # timings go to stderr only: the report is deterministic
 
 
-def _complete_rows(prices: pd.DataFrame) -> int:
-    px = prices.to_numpy(dtype=float)
-    ok = np.isfinite(px) & (px > 0)
-    return int((ok[1:] & ok[:-1]).all(axis=1).sum())
+def _listed_count(prices: pd.DataFrame, row: int) -> int:
+    ok = prices.notna() & (prices > 0)
+    first, last = ok.idxmax(), ok[::-1].idxmax()
+    t = prices.index[row]
+    return int(sum(bool(ok[c].any()) and first[c] <= t <= last[c] for c in prices.columns))
 
 
 def _anchor_book(anchor: dict, book: _Book, verdicts: dict) -> None:
@@ -705,6 +838,9 @@ _RULE_TEXT = {
     "R3": "the Sharpe test for one trial, and the re-timing p-value at most 0.05 / N from 400 N shifts",
     "R4": "the Deflated Sharpe on active returns (net minus the same average book held throughout), N as today, "
           "the idea's own attempt left out of the variance",
+    "_gate": "R1 to R4 with the gate's re-timing test and average book, on the whole out-of-sample window",
+    "_listed": "R1 to R4 with the same test and average book on the listed window only (from the first bar on which "
+               "every symbol the book holds has a price); unavailable there: the rule fails",
 }
 
 
@@ -721,6 +857,10 @@ def _fmt_clustered(r: dict, surrogates: int) -> str:
     lo, hi = r["surrogate_bootstrap_95"]
     return head + (f"95% interval {lo:.3f} to {hi:.3f} from a bootstrap over {surrogates} whole surrogates, "
                    "not the Wilson interval)")
+
+
+def _rule_words(base: str) -> str:
+    return "average book" if base == "R4" else "re-timing p-value"
 
 
 def _lower(r: dict, fam: str) -> float | None:
@@ -740,7 +880,8 @@ def _reading(report: dict) -> list[str]:
                 for fam in NO_SKILL:
                     cell = report["results"][version][fam][0]
                     r = cell["by_attempts"][str(n)][rule]
-                    text = _fmt_clustered(r, cell["surrogates"]) if fam == "N4" else _fmt_share(r)
+                    clustered = FAMILIES[fam][0] == "surrogate_rules"
+                    text = _fmt_clustered(r, cell["surrogates"]) if clustered else _fmt_share(r)
                     out.append(f"{rule} false-pass share on {fam} ({words[version]}, {att}): {text}.")
                     lower = _lower(r, fam)
                     if lower is not None and lower > ALPHA:
@@ -753,9 +894,23 @@ def _reading(report: dict) -> list[str]:
                     out.append(f"{rule} on {fam} ({words[version]}, {att}): smallest hit rate passing at least 80% of "
                                "books: " + (f"{min(ok):.2f}." if ok else "none of " + ", ".join(
                                    "{:.2f}".format(c["hit_rate"]) for c in cells) + "."))
+    for base in ("R1", "R2", "R3", "R4"):                      # the two re-timing figures, side by side
+        for version in _VERSIONS:
+            for n in report["attempt_counts"]:
+                att = "1 attempt" if n == 1 else f"{n} attempts"
+                for fam in NO_SKILL:
+                    cell = report["results"][version][fam][0]
+                    g, li = (cell["by_attempts"][str(n)][f"{base}_{t}"] for t in TIMED)
+                    un = cell.get("timing_unavailable") or {"gate": 0, "listed": 0}
+                    out.append(f"{base} on {fam} ({words[version]}, {att}): {g['passes']} of {g['runs']} pass with the "
+                               f"gate's {_rule_words(base)}, {li['passes']} of {li['runs']} with the listed window's "
+                               f"(re-timing test unavailable: {un['gate']} and {un['listed']} books).")
+    out.append("N4b (resampled in blocks of mean length 20): short-range dependence of the data kept: a rule that lives "
+               "inside 20 bars keeps its edge here, so N4b is no-skill only for slower rules; N4a resamples rows "
+               "independently, so nothing in time can be learned from it.")
     if above:
-        out.append("Rules whose false-pass interval (for N4 the bootstrap over whole surrogates) lies wholly above 0.05 "
-                   "on at least one no-skill family: "
+        out.append("Rules whose false-pass interval (for N4a and N4b the bootstrap over whole surrogates) lies wholly "
+                   "above 0.05 on at least one no-skill family: "
                    + "; ".join(f"{rule} ({', '.join(v)})" for rule, v in above.items()) + ".")
     else:
         out.append("No rule has a false-pass interval lying wholly above 0.05 on any no-skill family.")
@@ -781,13 +936,16 @@ def main(argv=None) -> int:
     ap.add_argument("--n-surrogates", type=int, default=50)
     ap.add_argument("--specs-per-surrogate", type=int, default=20)
     ap.add_argument("--seed", type=int, default=20261116)
+    ap.add_argument("--anchor-all", action="store_true",
+                    help="re-run every book through the real gate at the prior attempts (default: the first of each cell)")
     args = ap.parse_args(argv)
     from valedia_trader.research_loop import cli
     prices, dollar, cost = cli._market(argparse.Namespace(data=args.data))        # the research command's cost model
     priors = (controls.read_prior_attempt_sharpes(args.prior_from_ledger, args.market or cli.MARKET)
               if args.prior_from_ledger else ())
     rep = study(prices, dollar, cost, prior_attempt_sharpes=priors, n_null=args.n_null, n_edge=args.n_edge,
-                n_surrogates=args.n_surrogates, specs_per_surrogate=args.specs_per_surrogate, seed=args.seed)
+                n_surrogates=args.n_surrogates, specs_per_surrogate=args.specs_per_surrogate, seed=args.seed,
+                anchor_all=args.anchor_all)
     print(json.dumps(rep, indent=2, allow_nan=False))
     return 0
 
