@@ -2,7 +2,7 @@
 the stager or the launcher, sends a request to LM Studio, opens the collector's real store, loads a model or signals a real
 process: a World object stands in for all of them (an injected command runner, spawn, HTTP function, clock and sleeper, signal
 sender and model load path) and a scratch SQLite file stands in for the collector's store."""
-import ast, copy, fcntl, hashlib, importlib.util, json, os, signal, sqlite3, tempfile, time, types, unittest
+import ast, copy, fcntl, hashlib, importlib.util, json, os, random, signal, sqlite3, subprocess, sys, tempfile, time, types, unittest
 from pathlib import Path
 
 HERE = Path(__file__).absolute().parent
@@ -28,6 +28,30 @@ LAUNCHER_PID, LAUNCHER_START = 4242, 'Mon Nov 16 12:00:04 2026'
 LINK_OFF = 'You have disabled LM Link. To re-enable it, run lms link enable.\n'
 TOOL_PID, TOOL_PARENT, TOOL_START = 3131, 3030, 'Mon Nov 16 11:59:00 2026'      # the operator tool itself and its parent
 NEAR_NEUTRAL = 'derived report not usable evidence'          # src/mirofish_provenance.py:437, via mirofish_native_run.py:806
+COLLECTOR_PID, COLLECTOR_START = 7171, 'Mon Nov 16 08:00:00 2026'
+PICKS_PID = 6161
+SECRET = 'SECRETKEY'                     # in every fake command line: it must never reach an output, a row or a file
+# Addendum 4, part B: real child processes for the kill tests. A launcher that starts an observer and stops it on SIGINT;
+# an observer that ends on TERM; both end by themselves within 60 s. The stager writes them in place of the staged scripts.
+REAL_LAUNCHER = '''import os, subprocess, sys, time
+preflight = False
+deadline=time.monotonic()+(30 if preflight else WALL);stop=None
+work = sys.argv[sys.argv.index('--work') + 1]
+entry = os.path.join(work, 'owned-source', 'observer-entry')
+observer = subprocess.Popen([sys.executable, '-B', os.path.join(entry, 'mirofish_native_run.py')], cwd=work,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+with open(os.path.join(os.path.dirname(os.path.dirname(work)), 'real-pids'), 'a') as f:
+    f.write(str(observer.pid) + chr(10))
+end = time.monotonic() + 60
+try:
+    while observer.poll() is None and time.monotonic() < end:
+        time.sleep(0.02)
+except KeyboardInterrupt:
+    observer.terminate(); observer.wait()
+if observer.poll() is None:
+    observer.kill(); observer.wait()
+'''
+REAL_OBSERVER = '# a stand-in that writes builder/observer-identity.json in the real pipeline\nimport time\ntime.sleep(60)\n'
 
 
 def decision_entry():
@@ -128,6 +152,8 @@ class World:
         self.fsyncs = []; self.timed = []
         self.handle_signals = []; self.launcher_end_t = None; self.handlers = {}; self.installs = []
         self.ps_unreadable = set(); self.ps_raises = {}; self.fsync_raises = None; self.staged_wall = None
+        self.commands = {}; self.collector_pid = None; self.scan_raises = None; self.command_raises = None
+        self.real = False; self.kill_at = None; self.term_in_spawn = False; self.on_bootstrap = None; self.on_fsync = None
         self.staged_manifest_wall = None; self.staged_startup = True; self.intent_at_bootout = 'unseen'
         self.free, self.free_after_load, self.pressure, self.swap_mb = 80, 60, 1, 100.0
         self.models = listing(); self.unload_status = 200
@@ -160,6 +186,10 @@ class World:
         return self.t
 
     def sleep(self, seconds):
+        if self.real:
+            if self.kill_at == 'sleep' and self.spawned:
+                os.kill(os.getpid(), signal.SIGKILL)
+            time.sleep(0.1)
         self.t += seconds; self.collector_step()
         for callback in list(self.on_sleep):
             callback(self)
@@ -172,11 +202,12 @@ class World:
         if argv[:2] == ['/bin/launchctl', 'print']:
             label = argv[2].rsplit('/', 1)[1]
             if label == OP.COLLECTOR_LABEL:
-                return done(0 if self.collector_listed else 113, '\tprogram = /x\n\targuments = {\n\t\tcollector --key=SECRETKEY\n\t}\n')
+                return done(0 if self.collector_listed else 113, '\tprogram = /x\n%s\targuments = {\n\t\tcollector --key=SECRETKEY\n\t}\n' % (
+                    '\tpid = %d\n' % self.collector_pid if self.collector_pid else ''))
             if label == OP.PICKS_LABEL:
                 if not self.picks_loaded:
                     return done(113, '', 'Could not find service')
-                state = 'running\n\tpid = 6161' if self.picks_running else 'not running'
+                state = 'running\n\tpid = %d' % PICKS_PID if self.picks_running else 'not running'
                 trigger = '' if self.picks_minute is None else (
                     '\tevent triggers = {\n\t\tcom.valedia.picks.hourly.1 => {\n\t\t\tdescriptor = {\n'
                     '\t\t\t\t"Minute" => %d\n\t\t\t}\n\t\t}\n\t}\n' % self.picks_minute)
@@ -191,6 +222,8 @@ class World:
                 raise self.bootout_raises_after()                  # Ctrl-C right after the bootout took effect
             return done(self.bootout_rc)
         if argv[:2] == ['/bin/launchctl', 'bootstrap']:
+            if self.on_bootstrap:
+                self.on_bootstrap(self)
             if self.bootstrap_raises:
                 raise self.bootstrap_raises()                      # before it took effect
             if self.bootstrap_rc == 0 and argv[3] == PICKS_PLIST:
@@ -205,6 +238,11 @@ class World:
             return done(0, '%d\n' % self.pressure)
         if argv == ['/usr/sbin/sysctl', '-n', 'vm.swapusage']:
             return done(0, 'total = 2048.00M  used = %.2fM  free = 1000.00M  (encrypted)\n' % self.swap_mb)
+        if argv[:2] == ['/bin/ps', '-p'] and self.real and int(argv[2]) in self.real_set():
+            if self.kill_at == 'ps':
+                os.kill(os.getpid(), signal.SIGKILL)
+            r = subprocess.run(argv, capture_output=True, text=True)          # read-only: pid, ppid, pgid and start only
+            return done(r.returncode, r.stdout, '')
         if argv[:2] == ['/bin/ps', '-p'] and int(argv[2]) in self.ps_raises:
             raise self.ps_raises.pop(int(argv[2]))()              # once
         if argv[:2] == ['/bin/ps', '-p'] and int(argv[2]) in self.ps_unreadable:
@@ -225,7 +263,10 @@ class World:
             wall = self.staged_wall or OP.run_durations('swarm8', {'model': 'qwen3-8b'})['wall_s']
             if self.staged_startup:
                 (work / 'owned-source/observer-entry/mirofish_native_startup.py').write_text(
+                    REAL_LAUNCHER.replace('WALL', str(wall)) if self.real else
                     "    deadline=time.monotonic()+(30 if preflight else %d);stop=threading.Event();errors=[]\n" % wall)
+            if self.real:
+                (work / 'owned-source/observer-entry/mirofish_native_run.py').write_text(REAL_OBSERVER)
             manifest = {'launch_authorized': False, 'model_profile': {'start_threshold': {'percent_free': self.threshold}},
                         'uniform_policy': {'wall_seconds': self.staged_manifest_wall or wall}}
             (work / 'builder/candidate-manifest.json').write_text(json.dumps(manifest))
@@ -237,11 +278,57 @@ class World:
             return done(self.preflight_rc, json.dumps({'exit': self.preflight_rc, 'preflight': True}))
         raise AssertionError('unexpected command: %r' % argv)
 
+    # ---- addendum 4: real children (part B), process commands (part A)
+    @property
+    def real_file(self):
+        return self.tmp / 'real-pids'
+
+    def real_set(self):
+        try:
+            return {int(x) for x in self.real_file.read_text().split()}
+        except (OSError, ValueError):
+            return set()
+
+    def ours(self, pid):
+        """The command of a real child this test started, still running (its command names this test's folder), else
+        None: a pid that ended and was reused is never read further nor signalled."""
+        if pid not in self.real_set():
+            return None
+        r = subprocess.run(['/bin/ps', '-ww', '-p', str(pid), '-o', 'command='], capture_output=True, text=True)
+        text = r.stdout.strip() if r.returncode == 0 else ''
+        return text if str(self.tmp) in text else None
+
+    def proc_command(self, pid):
+        if self.command_raises:
+            raise self.command_raises('%s fake failure' % SECRET)
+        if self.real and pid in self.real_set():
+            return self.ours(pid)
+        return self.commands.get(pid) if pid in self.procs else None
+
+    def proc_scan(self):
+        if self.scan_raises:
+            raise self.scan_raises('fake scan failure')
+        return sorted(set(self.procs) | self.real_set())
+
     def spawn(self, argv, cwd=None, env=None):
         argv = [str(a) for a in argv]; self.spawned.append(argv)
         if self.spawn_error:
             raise self.spawn_error
         work = Path(argv[argv.index('--work') + 1])
+        if self.real:
+            if self.term_in_spawn:
+                self.fire(signal.SIGTERM)
+            p = subprocess.Popen([sys.executable, '-B', 'mirofish_native_startup.py', '--work', str(work), '--gate', argv[-1]],
+                                 cwd=str(work / 'owned-source/observer-entry'), stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            with open(self.real_file, 'a') as f:
+                f.write('%d\n' % p.pid)
+            if self.kill_at == 'spawn':
+                os.kill(os.getpid(), signal.SIGKILL)
+            return p
+        self.commands[LAUNCHER_PID] = ' '.join(argv) + ' --note=%s-L' % SECRET
+        self.commands[OBSERVER_PID] = ('/usr/bin/sandbox-exec -f %s/builder/observer.sb /x/bin/python3.11 -B '
+                                       '%s/owned-source/observer-entry/mirofish_native_run.py --token=%s-O' % (work, work, SECRET))
         self.procs[LAUNCHER_PID] = {'start': LAUNCHER_START, 'pgid': self.launcher_pgid, 'ppid': TOOL_PID}
         self.procs[OBSERVER_PID] = {'start': OBSERVER_START, 'pgid': OBSERVER_PID, 'ppid': LAUNCHER_PID}
         if self.identity is not None:
@@ -254,10 +341,18 @@ class World:
 
     def send_signal(self, pid, sig):
         self.signals.append((pid, sig))
+        if self.real and pid in self.real_set():
+            if self.ours(pid):                                    # a process this test started, still running
+                os.kill(pid, sig)
+            return
         if pid in self.procs:
             self.procs[pid].setdefault('termed_at', self.t)
 
     def fsync(self, fd):
+        if self.real and self.kill_at == 'fsync' and self.spawned:
+            os.kill(os.getpid(), signal.SIGKILL)
+        if self.on_fsync:
+            self.on_fsync(self, fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).rstrip(b'\0').decode())
         if self.fsync_raises:
             exc, self.fsync_raises = self.fsync_raises, None
             raise exc()
@@ -290,7 +385,9 @@ class World:
                       crew=self.crew, record=self.tmp / 'artifacts/runs.jsonl', load_tests=self.tmp / 'artifacts/load-tests',
                       load_path=lambda work, out, profile, hold_s: FakeLoadPath(self, work, out, profile),
                       out=self.out.append, lms='/fake/bin/lms', self_pid=TOOL_PID, parent_pid=TOOL_PARENT, fsync=self.fsync,
-                      install_signal=self.install_signal, intent=self.tmp / 'artifacts/mirofish/operator-intent.json')
+                      install_signal=self.install_signal, intent=self.tmp / 'artifacts/mirofish/operator-intent.json',
+                      proc_command=self.proc_command, proc_scan=self.proc_scan, picks_plist=PICKS_PLIST,
+                      lock=self.tmp / 'artifacts/mirofish/operator.lock')
         values.update(overrides)
         return OP.Host(**values)
 
@@ -326,6 +423,12 @@ class Base(unittest.TestCase):
         self.dir = tempfile.TemporaryDirectory(); self.w = World(self.dir.name)
 
     def tearDown(self):
+        for pid in self.w.real_set():          # only the children this test started, while they still run
+            if self.w.ours(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
         self.dir.cleanup()
 
     def main(self, argv, **overrides):
@@ -1487,14 +1590,13 @@ class Addendum3(Base):
         self.w.out.clear(); self.w.calls.clear(); self.w.signals.clear(); self.w.http_calls.clear(); self.w.timed.clear()
         self.rows_before = len(self.w.rows())
 
-    def test_2_recover_puts_the_reader_back_reports_the_run_writes_a_row_and_removes_the_intent(self):
+    def test_2_recover_reports_a_live_run_and_changes_nothing(self):
+        # addendum 4, part B: beside a proven survivor the reader is not put back and the intent is kept
         self.killed_run()
         self.assertEqual(self.main(['recover']), 3)
-        self.assertTrue(self.w.picks_loaded); self.assertEqual(self.w.signals, [])
+        self.assertFalse(self.w.picks_loaded); self.assertEqual(self.w.signals, [])
         self.assertIn('LAUNCHER STILL RUNNING', self.w.text()); self.assertIn('OBSERVER STILL RUNNING', self.w.text())
-        row = self.w.rows()[-1]
-        self.assertEqual(row['command'], 'recover'); self.assertEqual(row['recovered'], 'recovered after an unfinished run')
-        self.assertTrue(row['launcher_alive']); self.assertFalse(self.intent.exists())
+        self.assertEqual(len(self.w.rows()), self.rows_before); self.assertTrue(self.intent.exists())
 
     def test_2_recover_stop_stops_the_surviving_run_the_documented_way(self):
         self.killed_run()
@@ -1551,7 +1653,7 @@ class Addendum3(Base):
                              ('resource_failure_samples', {})):
             with self.subTest(field=field, value=value):
                 self.fresh(); self.w.receipt[field] = value
-                self.assertIn(self.main(RUN), (0, 3), self.w.text())
+                self.assertIn(self.main(RUN), (1, 3), self.w.text())      # addendum 4, F: a run that does not count is not 0
                 row = self.w.rows()[-1]
                 self.assertFalse(row['pipeline']['receipt_readable']); self.assertFalse(row['verdicts']['pipeline_clean'])
                 self.assertIsNone(row['error'])
@@ -1580,6 +1682,347 @@ class Addendum3(Base):
         self.main(['check', '--profile', 'swarm8', '--model', 'qwen3-8b'])
         d = OP.run_durations('swarm8', {'model': 'qwen3-8b'})
         self.assertIn('expected %d s, wall %d s' % (d['expected_s'], d['wall_s']), self.w.text())
+
+
+class Addendum4(Base):
+    """The repair after the blind check of dde513d."""
+    LT = LoadTest.LT
+    intent = Addendum3.intent
+    at = Addendum3.at
+    fresh = Addendum3.fresh
+    killed_run = Addendum3.killed_run
+    slow_after = Addendum3.slow_after
+
+    def edit_intent(self, **paths):
+        data = json.loads(self.intent.read_text())
+        for path, value in paths.items():
+            node = data; keys = path.split('__')
+            for k in keys[:-1]:
+                node = node[k]
+            node[keys[-1]] = value
+        self.intent.write_text(json.dumps(data))
+
+    def identity_names(self, pid, start, pgid):
+        work = Path(json.loads(self.intent.read_text())['work'])
+        (work / 'builder/observer-identity.json').write_text(json.dumps({'pid': pid, 'start': start, 'pgid': pgid}))
+
+    def only_hostile(self):
+        """A killed run whose launcher and observer are gone; the collector runs (with a command line that carries a key)."""
+        self.killed_run()
+        self.w.procs.pop(OBSERVER_PID); self.w.procs.pop(LAUNCHER_PID)
+        self.w.collector_pid = COLLECTOR_PID
+        self.w.procs[COLLECTOR_PID] = {'start': COLLECTOR_START, 'pgid': COLLECTOR_PID, 'ppid': 1}
+        self.w.commands[COLLECTOR_PID] = '/x/bin/python -m valedia_trader.collector --key=%s-C' % SECRET
+
+    def assertNoSecret(self):
+        texts = [self.w.text(), (self.w.tmp / 'artifacts/runs.jsonl').read_text() if (self.w.tmp / 'artifacts/runs.jsonl').exists() else '',
+                 self.intent.read_text() if self.intent.exists() else '']
+        for t in texts:
+            self.assertNotIn(SECRET, t)
+
+    def assertNothingSignalledAndKept(self, rc):
+        self.assertNotEqual(rc, 0); self.assertEqual(self.w.signals, []); self.assertTrue(self.intent.exists()); self.assertNoSecret()
+
+    # ---- A: a signal only to a process proven to belong to this run
+    def test_A_a_launcher_written_as_the_collector_is_never_signalled(self):
+        self.only_hostile()
+        self.edit_intent(launcher={'pid': COLLECTOR_PID, 'start': COLLECTOR_START, 'pgid': COLLECTOR_PID})
+        self.assertNothingSignalledAndKept(self.main(['recover', '--stop']))
+        self.assertIn('NOT SIGNALLED', self.w.text()); self.assertIn('COLLECTOR', self.w.text())
+
+    def test_A_launcher_pid_1_and_an_identity_naming_the_collector_send_nothing(self):
+        self.only_hostile()
+        self.edit_intent(launcher={'pid': 1, 'start': None, 'pgid': None})
+        self.identity_names(COLLECTOR_PID, COLLECTOR_START, COLLECTOR_PID)
+        self.assertNothingSignalledAndKept(self.main(['recover', '--stop']))
+
+    def test_A_the_collector_and_the_pick_reader_proposed_every_way_with_a_matching_command_are_never_signalled(self):
+        for who in ('collector', 'picks'):
+            for how in ('launcher', 'identity', 'scan'):
+                with self.subTest(who=who, how=how):
+                    self.fresh(); self.only_hostile()
+                    work = json.loads(self.intent.read_text())['work']
+                    pid = COLLECTOR_PID if who == 'collector' else PICKS_PID
+                    if who == 'picks':
+                        self.w.picks_running = True; self.w.picks_loaded = True
+                        self.w.procs[PICKS_PID] = {'start': 'Mon Nov 16 12:00:01 2026', 'pgid': PICKS_PID, 'ppid': 1}
+                    start = self.w.procs[pid]['start']
+                    # the command names the staged folder and the script: only the job-pid rule stops it
+                    self.w.commands[pid] = ('/x/python -B mirofish_native_startup.py --work %s --gate g --k=%s' % (work, SECRET)
+                                            if how != 'identity' else
+                                            '/x/python -B %s/owned-source/observer-entry/mirofish_native_run.py %s' % (work, SECRET))
+                    if how == 'launcher':
+                        self.edit_intent(launcher={'pid': pid, 'start': start, 'pgid': pid})
+                    if how == 'identity':
+                        self.identity_names(pid, start, pid)
+                    self.assertNothingSignalledAndKept(self.main(['recover', '--stop']))
+                    self.assertIn('JOB', self.w.text())
+
+    def test_A_pids_not_above_1_never_signalled_and_mistyped_pids_refused_whole(self):
+        for pid in (1, 0, -5):
+            with self.subTest(pid=pid):
+                self.fresh(); self.only_hostile(); self.edit_intent(launcher={'pid': pid, 'start': None, 'pgid': None})
+                self.assertNothingSignalledAndKept(self.main(['recover', '--stop']))
+        for pid in (True, '4242', 4242.0):
+            with self.subTest(pid=pid):
+                self.fresh(); self.killed_run(); self.edit_intent(launcher={'pid': pid, 'start': LAUNCHER_START, 'pgid': LAUNCHER_PID})
+                self.assertEqual(self.main(['recover', '--stop']), 2)
+                self.assertNothingSignalledAndKept(2); self.assertIn('launcher.pid', self.w.text()); self.assertFalse(self.w.picks_loaded)
+
+    def test_A_the_tool_or_an_ancestor_is_never_signalled(self):
+        for pid in (TOOL_PID, TOOL_PARENT):
+            with self.subTest(pid=pid):
+                self.fresh(); self.only_hostile()
+                work = json.loads(self.intent.read_text())['work']
+                self.w.commands[pid] = '/x/python -B mirofish_native_startup.py --work %s --gate g' % work
+                self.edit_intent(launcher={'pid': pid, 'start': self.w.procs[pid]['start'], 'pgid': self.w.procs[pid]['pgid']})
+                self.assertNothingSignalledAndKept(self.main(['recover', '--stop'])); self.assertIn('ANCESTOR', self.w.text())
+
+    def test_A_right_pid_and_start_with_the_wrong_command_is_never_signalled(self):
+        self.killed_run()
+        self.w.commands[LAUNCHER_PID] = '/usr/bin/vim notes.txt %s' % SECRET
+        self.w.commands[OBSERVER_PID] = '/usr/bin/less %s/owned-source/observer-entry/mirofish_native_run.py' % (
+            json.loads(self.intent.read_text())['work'])
+        self.assertNothingSignalledAndKept(self.main(['recover', '--stop'])); self.assertIn('COMMAND', self.w.text())
+        self.assertFalse(self.w.picks_loaded)
+
+    def test_A_the_right_command_with_a_wrong_start_is_never_signalled(self):
+        self.killed_run()
+        self.w.procs[LAUNCHER_PID]['start'] = 'Mon Nov 16 13:33:33 2026'
+        self.w.procs[OBSERVER_PID]['start'] = 'Mon Nov 16 13:33:34 2026'
+        self.assertNothingSignalledAndKept(self.main(['recover', '--stop'])); self.assertIn('START', self.w.text())
+
+    def test_A_a_command_that_cannot_be_read_sends_nothing_and_says_nothing_of_it(self):
+        self.killed_run(); self.w.command_raises = RuntimeError
+        self.assertNothingSignalledAndKept(self.main(['recover', '--stop']))
+
+    def test_A_a_proven_run_is_signalled_once_the_documented_way_and_no_command_line_reaches_anything(self):
+        self.killed_run()
+        def reap(world):
+            if world.procs.get(OBSERVER_PID, {}).get('termed_at') is not None:
+                world.procs.pop(OBSERVER_PID, None); world.procs.pop(LAUNCHER_PID, None)
+        self.w.on_sleep.append(reap)
+        self.assertEqual(self.main(['recover', '--stop']), 0, self.w.text())
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)]); self.assertNoSecret()
+
+    # ---- B: a KILL between the spawn and the launcher's entry, with real children
+    def forked_kill(self, kill_at, held=False):
+        self.w.real = True; self.w.kill_at = kill_at; self.w.term_in_spawn = held
+        child = os.fork()
+        if child == 0:
+            try:
+                OP.main(RUN, host=self.w.host())
+            finally:
+                os._exit(99)
+        _, status = os.waitpid(child, 0)
+        self.assertTrue(os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL, (kill_at, status))
+        end = time.time() + 10
+        while time.time() < end and len([p for p in self.w.real_set() if self.w.ours(p)]) < 2:
+            time.sleep(0.05)
+        self.assertEqual(len([p for p in self.w.real_set() if self.w.ours(p)]), 2, kill_at)
+        self.w.kill_at = None; self.w.picks_loaded = False          # the killed tool had booted the reader out
+        self.w.out.clear(); self.w.calls.clear(); self.w.signals.clear(); self.w.timed.clear()
+
+    def test_B_a_kill_anywhere_between_the_spawn_and_the_entry_never_orphans_the_run(self):
+        for point, held in (('spawn', False), ('fsync', False), ('ps', False), ('sleep', True)):
+            with self.subTest(point=point, held=held):
+                self.fresh(); self.forked_kill(point, held)
+                self.assertTrue(self.intent.exists()); rows = len(self.w.rows())
+                self.assertEqual(self.main(['recover']), 3, self.w.text())           # reports, changes nothing
+                self.assertIn('LAUNCHER STILL RUNNING', self.w.text()); self.assertIn('OBSERVER STILL RUNNING', self.w.text())
+                self.assertFalse(self.w.picks_loaded); self.assertTrue(self.intent.exists()); self.assertEqual(self.w.signals, [])
+                self.assertEqual(len(self.w.rows()), rows)
+                self.w.out.clear()
+                self.assertEqual(self.main(['recover', '--stop']), 0, self.w.text())   # stops both, reader back, row, file gone
+                self.assertEqual([p for p in self.w.real_set() if self.w.ours(p)], [])
+                self.assertTrue(self.w.picks_loaded); self.assertFalse(self.intent.exists())
+                self.assertEqual(self.w.rows()[-1]['command'], 'recover'); self.assertNoSecret()
+                self.w.out.clear()
+                self.assertEqual(self.main(['recover']), 0); self.assertIn('no intent file', self.w.text())
+
+    def test_B_a_failed_scan_keeps_the_file_and_the_reader_off(self):
+        self.killed_run(); self.w.procs.pop(OBSERVER_PID); self.w.procs.pop(LAUNCHER_PID); self.w.scan_raises = RuntimeError
+        self.assertEqual(self.main(['recover', '--stop']), 3)
+        self.assertIn('SCAN', self.w.text()); self.assertTrue(self.intent.exists()); self.assertFalse(self.w.picks_loaded)
+
+    def test_B_the_intent_is_synced_before_the_spawn_with_the_proof(self):
+        seen = {}
+        orig = self.w.spawn
+        def spawn(argv, cwd=None, env=None):
+            seen.update(json.loads(self.intent.read_text())); return orig(argv, cwd, env)
+        self.assertEqual(self.main(RUN, spawn=spawn), 0, self.w.text())
+        self.assertEqual(seen['scripts'], {'launcher': 'mirofish_native_startup.py', 'observer': 'mirofish_native_run.py'})
+        self.assertIsNotNone(seen['launch']['spawning_utc']); self.assertEqual(seen['work'], self.w.rows()[-1]['staged_folder'])
+
+    # ---- C: recover bootstraps the pick reader's own plist only
+    def test_C_an_intent_naming_another_label_or_plist_is_refused_whole(self):
+        for change in ({'pick_reader__label': OP.COLLECTOR_LABEL},
+                       {'pick_reader__before__plist': '/fake/LaunchAgents/com.valedia.orderbook-collector.plist'}):
+            with self.subTest(change=change):
+                self.fresh(); self.killed_run(); self.w.procs.pop(OBSERVER_PID); self.w.procs.pop(LAUNCHER_PID)
+                self.edit_intent(**change)
+                self.assertEqual(self.main(['recover', '--stop']), 2)
+                self.assertFalse(self.w.picks_loaded); self.assertTrue(self.intent.exists())
+                self.assertEqual([c for c in self.w.calls if c[:2] == ['/bin/launchctl', 'bootstrap']], [])
+                self.assertIn('MISMATCH', self.w.text())
+
+    # ---- D: the writer's liveness by an exclusive lock the kernel drops
+    def lock_holder(self):
+        path = self.w.tmp / 'artifacts/mirofish/operator.lock'; path.parent.mkdir(parents=True, exist_ok=True)
+        code = ('import fcntl, os, sys, time\nfd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)\n'
+                'fcntl.flock(fd, fcntl.LOCK_EX)\nprint("locked", flush=True)\ntime.sleep(60)\n')
+        child = subprocess.Popen([sys.executable, '-c', code, str(path), str(self.w.tmp)], stdout=subprocess.PIPE, text=True)
+        self.assertEqual(child.stdout.readline().strip(), 'locked')
+        return child
+
+    def test_D_run_load_test_and_recover_refuse_while_a_live_tool_holds_the_lock_and_go_once_it_is_killed(self):
+        self.killed_run(); self.w.procs.pop(OBSERVER_PID); self.w.procs.pop(LAUNCHER_PID)
+        child = self.lock_holder()
+        try:
+            self.assertEqual(self.main(['recover', '--stop']), 2); self.assertIn('LOCK', self.w.text())
+            self.assertFalse(self.w.picks_loaded); self.assertTrue(self.intent.exists())
+            self.intent.rename(self.intent.with_name('kept.json'))
+            self.assertEqual(self.main(RUN), 2); self.assertIn('LOCK', self.w.rows()[-1]['refused'])
+            self.assertEqual(self.main(self.LT), 2); self.assertEqual(self.w.bootouts(), [])
+            self.intent.with_name('kept.json').rename(self.intent)
+        finally:
+            child.kill(); child.wait()
+        self.w.out.clear()
+        self.assertEqual(self.main(['recover', '--stop']), 0, self.w.text())
+        self.assertTrue(self.w.picks_loaded); self.assertFalse(self.intent.exists())
+
+    # ---- E: nothing read from a file can raise
+    def test_E_mistyped_boundaries_and_ledger_states_are_not_clean_and_the_checks_still_run(self):
+        for events, calls in (([{'event': 'model_swap', 'boundary': ['B1']}], None), ([{'event': 'model_swap', 'boundary': {'b': 1}}], None),
+                              ([{'event': 'model_swap', 'boundary': 'B1'}, {'event': 'model_swap', 'boundary': 2}], None),
+                              (None, [{'id': 'c1', 'state': ['complete']}])):
+            with self.subTest(events=events, calls=calls):
+                self.fresh()
+                if events is not None:
+                    self.w.receipt['events'] = events
+                if calls is not None:
+                    self.w.ledger = {'calls': calls}
+                self.main(['run', '--profile', 'swarm8', '--setup-model', 'qwen3-8b', '--turns-model', 'qwen3-8b',
+                           '--announced', 'told'])
+                row = self.w.rows()[-1]
+                self.assertIsNone(row['error']); self.assertFalse(row['verdicts']['pipeline_clean'])
+                for key in ('pipeline', 'collector', 'memory', 'post'):
+                    self.assertIsNotNone(row[key], key)
+
+    def test_E_an_intent_of_the_wrong_shape_is_refused_and_kept(self):
+        self.killed_run(); self.edit_intent(pick_reader__before='listed')
+        self.assertEqual(self.main(['recover']), 2); self.assertIn('pick_reader.before', self.w.text())
+        self.assertTrue(self.intent.exists()); self.assertFalse(self.w.picks_loaded)
+
+    POOL = (None, True, False, 0, -1, 7, 1.5, '', 'x', 'B1', [], [1], [None], ['B1', 2], {}, {'a': 1}, [[1]], [{'boundary': [1]}],
+            [{'event': 'model_swap', 'boundary': {'x': 1}}], {'calls': 'x'})
+
+    def test_E_property_random_mistyped_receipts_never_raise(self):
+        rng = random.Random(4); work = self.w.tmp / 'prop'; (work / 'builder').mkdir(parents=True)
+        fields = ('complete', 'cleanup_proven', 'paper_handoff', 'failure', 'events', 'resource_failures',
+                  'resource_failure_samples', 'resource', 'extra')
+        n = 0
+        for i in range(3000):
+            receipt = copy.deepcopy(self.w.receipt)
+            for _ in range(rng.randint(1, 3)):
+                target = rng.choice(fields + ('events.0', 'resource.lowest_sustained_free_percent_10s', 'failure.reason'))
+                if '.' in target:
+                    head, key = target.split('.')
+                    node = receipt.get(head)
+                    if isinstance(node, list) and node:
+                        node[0] = {'event': rng.choice(self.POOL), 'boundary': rng.choice(self.POOL)}
+                    elif isinstance(node, dict):
+                        node[key] = rng.choice(self.POOL)
+                else:
+                    receipt[target] = rng.choice(self.POOL)
+            (work / 'builder/native-run-receipt.json').write_text(json.dumps(receipt))
+            (work / 'builder/gateway-ledger.json').write_text(json.dumps(rng.choice(
+                [self.w.ledger, {'calls': [{'state': rng.choice(self.POOL)}]}, rng.choice(self.POOL)])))
+            plan = rng.choice([None, {'model': 'm'}, {'setup': 'a', 'turns': 'b'}])
+            p, r = OP.pipeline_outcome(work, plan, rng.choice([0, 1, None]))
+            m = OP.memory_outcome(r, 1, 2, {'lowest': None, 'max_pressure': None})
+            OP.verdicts({'breach': None, 'over_8s': 0, 'statuses': {}}, p, m); n += 1
+        self.assertEqual(n, 3000)
+
+    def test_E_property_random_mistyped_intents_never_raise(self):
+        self.killed_run(); good = json.loads(self.intent.read_text()); self.w.procs.pop(OBSERVER_PID); self.w.procs.pop(LAUNCHER_PID)
+        rng = random.Random(5); paths = []
+        def walk(node, prefix):
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    paths.append(prefix + (k,)); walk(v, prefix + (k,))
+        walk(good, ())
+        n = 0
+        for i in range(1500):
+            bad = copy.deepcopy(good)
+            for _ in range(rng.randint(1, 2)):
+                path = rng.choice(paths); node = bad
+                try:
+                    for k in path[:-1]:
+                        node = node[k]
+                    node[path[-1]] = rng.choice(self.POOL)
+                except (KeyError, TypeError):
+                    pass
+            self.intent.write_text(json.dumps(bad) if rng.random() < 0.97 else rng.choice(['', '[', '[1]', '"x"']))
+            rc = self.main(['recover', rng.choice(['--dry-run', '--stop'])]); n += 1
+            self.assertIn(rc, (0, 2, 3))
+            if rc == 0 and not self.intent.exists():
+                self.intent.write_text(json.dumps(good))
+        self.assertEqual(n, 1500)
+
+    # ---- F: what the row records
+    def test_F_a_signal_during_the_restore_is_in_the_row_and_a_counting_run_exits_0(self):
+        self.w.on_bootstrap = lambda world: world.fire(signal.SIGTERM)
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+        row = self.w.rows()[-1]
+        self.assertTrue(row['counts']); self.assertEqual(row['signals_received'][0]['signal'], 'SIGTERM')
+        self.assertEqual(row['signals_received'][0]['during'], 'the restore')
+
+    def test_F_a_signal_during_the_row_is_recorded_on_disk(self):
+        fired = []
+        def hook(world, path):
+            if path.endswith('runs.jsonl') and not fired:
+                fired.append(1); world.fire(signal.SIGHUP)
+        self.w.on_fsync = hook
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+        notes = [r for r in self.w.rows() if r.get('command') == 'signal-note']
+        self.assertEqual(notes[-1]['signals_received'][0]['during'], 'the row')
+
+    def test_F_exit_0_exactly_when_the_run_counts_and_the_restore_succeeded(self):
+        self.w.receipt['cleanup_proven'] = False
+        self.assertEqual(self.main(RUN), 1); self.assertFalse(self.w.rows()[-1]['counts'])
+        self.fresh(); self.w.bootstrap_rc = 1
+        self.assertEqual(self.main(RUN), 3)
+
+    def test_F_a_recover_row_for_a_launched_run_resets_the_streak(self):
+        self.killed_run()
+        self.assertEqual(OP.streaks(self.w.rows())['9']['streak'], 1)
+        self.w.procs.pop(OBSERVER_PID); self.w.procs.pop(LAUNCHER_PID)
+        self.main(['recover'])
+        self.assertTrue(self.w.rows()[-1]['launched']); self.assertEqual(OP.streaks(self.w.rows())['9']['streak'], 0)
+
+    def test_F_the_intent_is_kept_when_the_stop_could_not_be_sent(self):
+        self.w.run_s = 50000; self.w.write_identity = False
+        def recycle(world):
+            if world.launcher is not None and LAUNCHER_PID in world.procs and world.t >= world.launcher.started + 10:
+                world.procs[LAUNCHER_PID]['start'] = 'Mon Nov 16 12:30:00 2026'
+        self.w.on_sleep.append(recycle)
+        self.assertEqual(self.main(RUN), 3); self.assertTrue(self.intent.exists())
+
+    def test_F_the_announcement_states_the_staged_wall(self):
+        self.w.staged_wall = 5100
+        self.main(RUN)
+        line = next(x for x in self.w.out if str(x).startswith('check passed and staged'))
+        self.assertIn('wall clock of 85 min', line); self.assertNotIn('wall clock of 60 min', line)
+
+    # ---- H: the tests the surviving mutants showed missing
+    def test_H_the_intent_is_kept_when_the_restore_failed(self):
+        self.w.bootstrap_rc = 1
+        self.assertEqual(self.main(RUN), 3); self.assertTrue(self.intent.exists())
+
+    def test_H_recover_keeps_the_intent_while_the_reader_is_still_off(self):
+        self.killed_run(); self.w.procs.pop(OBSERVER_PID); self.w.procs.pop(LAUNCHER_PID); self.w.bootstrap_rc = 1
+        self.assertEqual(self.main(['recover']), 3); self.assertTrue(self.intent.exists()); self.assertFalse(self.w.picks_loaded)
 
 
 if __name__ == '__main__':
