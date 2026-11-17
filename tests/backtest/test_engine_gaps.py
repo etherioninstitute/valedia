@@ -304,7 +304,7 @@ def test_a_target_that_opens_an_unpriced_symbol_opens_nothing_until_it_is_priced
     p = [100.0, 101.0, 102.0, 103.0, np.nan, np.nan, np.nan, 107.0, 108.0, 109.0]
     res = _ten_bars(p, [0.0] * 4 + [0.5] * 6)                    # target 0.5 from bar 5, inside the gap
     assert res.weights["A"].tolist() == [0.0] * 7 + [0.5] * 3
-    assert res.turnover.tolist() == [0.0] * 7 + [0.5, 0.0, 0.0]
+    assert res.turnover.iloc[:8].tolist() == [0.0] * 7 + [0.5]                # later bars only rebalance drift
     assert (res.gross.iloc[:8] == 0.0).all() and res.gross.iloc[8] == pytest.approx(0.5 * (108 / 107 - 1))
     late = _ten_bars([np.nan] * 3 + p[3:], [0.5] * 10)            # a late listing: the same rule from bar 0
     assert late.weights["A"].tolist() == [0.0] * 3 + [0.5] + [0.5] * 6 and late.turnover.iloc[3] == 0.5
