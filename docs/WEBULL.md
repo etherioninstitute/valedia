@@ -177,14 +177,18 @@ Live mode exists only as attended commands, run by you at a terminal, from the r
 account the venue would trade. `--propose` writes a ticket and sends nothing; `--approve NUMBER` sends only that
 ticket's orders, each after fresh checks. Whole shares only (`--fractional` is refused).
 
-**The live key pair** lives in a file of its own, `~/.hermes/secrets/webull-live.env` (beside `trading.env`; the
-place is fixed in code from your user record, and no environment variable moves it), holding exactly two lines:
+**The live key pair** lives in a file of its own, `~/.hermes/secrets/webull-live.env`, beside `trading.env`. The code
+computes the place exactly as `<home>/.hermes/secrets/webull-live.env`, where `<home>` is your home folder as the
+system's user record gives it (not `$HOME`), so no environment variable moves it. It holds exactly two lines:
 
     WEBULL_LIVE_APP_KEY=...
     WEBULL_LIVE_APP_SECRET=...
 
-It must be a regular file (not a link, no link in a folder above it, one name on disk), yours, mode 600 (not readable
-or writable by your group or others), in a folder only you can write. Any other line, a repeated name, an empty value
+It must be a regular file (not a link, no link in a folder above it, one name on disk) and yours. It must not be
+readable or writable by your group or others: mode 600 or 400 passes, 644 is refused (stricter than the owner's JSON
+files, which may be 644, because this file holds a key). The folder that holds it, `~/.hermes/secrets/`, must be yours
+and writable by you alone; that is the one folder checked (the folders above it are checked for links only). Any other
+line, a repeated name, an empty value
 or wrong permissions is a refusal that names the fault and shows no value. Only the live commands read it. They never
 take a key from the process environment or from `trading.env`, fix the environment to production and the host to
 `api.webull.com` in code, pass no account id (the account is chosen by the class in your confirmation, and its last 4
