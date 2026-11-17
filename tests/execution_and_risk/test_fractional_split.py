@@ -37,7 +37,7 @@ def oracle(difference: float, quote: float, held: float, move: float) -> dict:
 
 def _oracle(d: Decimal, q: Decimal, h: Decimal, move: Decimal) -> dict:
     rounded = _steps(max(d, -h))
-    zeroed = (d + h) * q < Decimal(5)
+    zeroed = d + h < 1 and (d + h) * q < Decimal(5)               # addendum 3: only a target under one share
     effective = -_steps(h) if zeroed else rounded
     sign = 1 if effective > 0 else -1
     whole, rem = divmod(abs(effective), STEPS)
@@ -58,8 +58,10 @@ def _as_steps(units: Decimal) -> int:
 
 def _quote(rng: random.Random) -> float:
     kind = rng.random()
+    if kind < 0.07:
+        return round(rng.uniform(0.05, 1.0), 4)                 # under a dollar
     if kind < 0.15:
-        return round(rng.uniform(0.5, 5.0), 2)                  # cheap: a whole share is worth less than the minimum
+        return round(rng.uniform(1.0, 5.0), 2)                  # cheap: a whole share is worth less than the minimum
     if kind < 0.85:
         return round(rng.uniform(5.0, 700.0), 2)
     if kind < 0.95:
@@ -166,8 +168,8 @@ def test_a_target_worth_less_than_the_minimum_is_a_target_of_zero():
     met = 0
     for difference, quote, side, held in _all_worlds():
         split = split_difference(difference, quote, side, held)
-        worth = (_d(difference) + _d(held)) * _d(quote)
-        assert split.target_zeroed is (worth < FRACTIONAL_MIN_VALUE)
+        target = _d(difference) + _d(held)
+        assert split.target_zeroed is (target < 1 and target * _d(quote) < FRACTIONAL_MIN_VALUE)
         if not split.target_zeroed:
             continue
         met += 1
@@ -310,7 +312,7 @@ def test_a_target_worth_exactly_the_minimum_is_kept_and_a_step_less_is_zero():
         for _ in range(20):
             held_steps = rng.randint(0, 2 * n)
             held = held_steps / STEPS
-            for steps, zeroed in ((n, False), (n - 1, True)):
+            for steps, zeroed in ((n, False), (n - 1, n - 1 < STEPS)):        # one share or more: never zeroed
                 difference = (steps - held_steps) / STEPS
                 if difference == 0:
                     continue
@@ -319,3 +321,78 @@ def test_a_target_worth_exactly_the_minimum_is_kept_and_a_step_less_is_zero():
                 assert split.target_zeroed is zeroed, (target, quote, held, steps)
                 if zeroed:
                     assert all(leg.units < 0 for leg in split.legs)
+
+
+# ---- addendum 3: only a target of less than one share is taken as zero
+
+
+def test_the_case_found_a_purchase_at_a_price_under_five_dollars_sells_nothing():
+    s = split_difference(0.4, 2.0, "buy", 2.0)                  # target 2.4 shares worth 4.80: one share or more
+    assert s.legs == () and not s.target_zeroed and s.residual == Decimal("0.4")
+    s = split_difference(0.5, 0.8, "buy", 3.0)                  # under a dollar: target 3.5 worth 2.80
+    assert s.legs == () and not s.target_zeroed
+    s = split_difference(-0.3, 4.0, "sell", 3.0)                # a sale to 2.7 shares worth 10.80: left as it is
+    assert [x.units for x in s.legs] == [] and s.residual == Decimal("-0.3") and not s.target_zeroed
+    s = split_difference(0.2, 4.0, "buy", 0.5)                  # target 0.7 worth 2.80: zero; 0.5 held worth 2.00
+    assert s.target_zeroed and s.legs == ()                     # ... is dust, not a sale leg
+
+
+def test_a_purchase_never_yields_a_sale_leg_and_a_sale_never_a_purchase_leg():
+    cheap = 0
+    for difference, quote, side, held in _all_worlds():
+        split = split_difference(difference, quote, side, held)
+        if side == "buy":
+            assert all(leg.units > 0 for leg in split.legs), (difference, quote, held)
+        else:
+            assert all(leg.units < 0 for leg in split.legs), (difference, quote, held)
+        cheap += quote < 5
+    rng = random.Random(5)
+    for _ in range(4000):                                        # and over prices under 5 dollars and under 1
+        quote = round(rng.uniform(0.01, 5.0), rng.choice([2, 4]))
+        held, target = _units(rng, quote), _units(rng, quote)
+        if target == held:
+            continue
+        side = "buy" if target > held else "sell"
+        split = split_difference(target - held, quote, side, held)
+        assert all((leg.units > 0) is (side == "buy") for leg in split.legs), (target, held, quote)
+        cheap += 1
+    assert cheap > 4500
+
+
+@pytest.fixture(scope="module")
+def first_build():
+    """order_step.py as the first build of R1 had it (commit 3b83cd9), loaded under a name of its own."""
+    import importlib.util
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    src = subprocess.run(["git", "-C", str(root), "show", "3b83cd9:valedia_trader/execution_and_risk/order_step.py"],
+                         capture_output=True, check=True, timeout=60).stdout
+    import tempfile
+    folder = Path(tempfile.mkdtemp(prefix="t51-first-build-"))
+    (folder / "order_step_t51_first.py").write_bytes(src)
+    spec = importlib.util.spec_from_file_location("order_step_t51_first", folder / "order_step_t51_first.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["order_step_t51_first"] = mod
+    spec.loader.exec_module(mod)
+    yield mod
+    sys.modules.pop("order_step_t51_first", None)
+    import shutil
+    shutil.rmtree(folder, ignore_errors=True)
+
+
+def test_for_every_price_of_five_dollars_or_more_the_result_is_the_first_builds(first_build):
+    compared = differ_below = 0
+    for difference, quote, side, held in _all_worlds():
+        new = split_difference(difference, quote, side, held)
+        old = first_build.split_difference(difference, quote, side, held)
+        same = ([(x.leg, x.order_type, x.units) for x in new.legs] == [(x.leg, x.order_type, x.units) for x in old.legs]
+                and (new.difference, new.residual, new.residual_value, new.target_zeroed) ==
+                (old.difference, old.residual, old.residual_value, old.target_zeroed))
+        if quote >= 5:
+            assert same, (difference, quote, side, held)
+            compared += 1
+        else:
+            differ_below += not same
+    assert compared >= 5000 and differ_below > 0                 # the rule changed only below 5 dollars
