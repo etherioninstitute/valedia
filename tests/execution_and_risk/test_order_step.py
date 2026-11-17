@@ -8746,6 +8746,21 @@ def t34b3_base(tmp_path_factory):
     return base
 
 
+def test_t51_the_base_refuses_a_layout4_ledger_in_words_and_changes_nothing(tmp_path, t34b3_base):
+    """Ruling D: ed4d96f's order step, handed a ledger this revision wrote (layout 4), refuses it in words, so a
+    roll-back never misreads a ledger; the file is left as it was. (The comparisons above give the base its own.)"""
+    w = ticket_world(tmp_path / "w")
+    w.paper = paper({"a": {"SPY": 2.0}})
+    _run_with(osx, w)
+    assert _dump(w.ledger_path)["version"] == 4
+    raw = w.ledger_path.read_bytes()
+    w.later(5)
+    with pytest.raises(sys.modules["orders_t34b3_base"].OrderError,
+                       match=r"different version of this module \(layout 4, this module writes layout 3\); it is not opened"):
+        _run_with(t34b3_base, w)
+    assert w.ledger_path.read_bytes() == raw
+
+
 def _t34b3_ledger(dump, counts=None):
     """A ledger dump with the entry kinds T34b-3 adds to each stored reconcile record taken out (ruling 3), counted."""
     if dump is None:
