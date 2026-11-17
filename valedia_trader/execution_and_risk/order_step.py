@@ -763,8 +763,8 @@ class Split:
     in that order, all on one side. `residual`: `difference` less what the legs send, so the legs and the residual
     always sum to `difference` exactly; it is a remainder held back (worth less than the minimum with its margin),
     or, when the target was taken as zero, the part of the difference that zeroing changed. `residual_value`: its
-    size at the judged quote. `target_zeroed`: the target was worth less than FRACTIONAL_MIN_VALUE and was taken as
-    zero. `why`: words for a residual that is not zero, else None."""
+    size at the judged quote. `target_zeroed`: the target, of less than one share, was worth less than
+    FRACTIONAL_MIN_VALUE and was taken as zero. `why`: words for a residual that is not zero, else None."""
     difference: Decimal
     legs: tuple
     residual: Decimal
@@ -798,8 +798,10 @@ def split_difference(difference, quote, side: str, held) -> Split:
     `difference` is target less `held` (signed, not zero); `side` is "buy" or "sell" and must agree with its sign;
     `held` is the LEDGER'S OWN holding (never the baseline, never the venue's). The rule, exact in Decimal:
       (i)   a sale is capped at `held`, and the difference is rounded toward zero to FRACTIONAL_DECIMALS decimals;
-      (ii)  a target (held + difference) worth less than FRACTIONAL_MIN_VALUE at the quote is a target of zero: the
-            whole holding is sold, as far as the legs allow (so the legs may sell when `side` says buy);
+      (ii)  a target (held + difference) of LESS THAN ONE SHARE worth less than FRACTIONAL_MIN_VALUE at the quote is
+            a target of zero: the holding (itself under one share) is sold as far as the minimum allows; a target of
+            one share or more is never changed by this rule (T51 addendum 3), so a purchase never yields a sale leg
+            and a sale never a purchase leg;
       (iii) a = |rounded difference|, W = floor(a), r = a - W;
       (iv)  a LIMIT leg of W when W >= 1; a MARKET leg of r when r > 0 and r x quote x (1 - TICKET_QUOTE_MOVE) is at
             least FRACTIONAL_MIN_VALUE (a margin so a move the ticket allows still clears the minimum); otherwise r
@@ -822,13 +824,14 @@ def split_difference(difference, quote, side: str, held) -> Split:
         step = Decimal(1).scaleb(-FRACTIONAL_DECIMALS)
         rounded = max(d, -h).quantize(step, rounding=ROUND_DOWN)
         why = []
-        target_value = (h + d) * q
-        zeroed = target_value < FRACTIONAL_MIN_VALUE
+        target = h + d
+        target_value = target * q
+        zeroed = target < 1 and target_value < FRACTIONAL_MIN_VALUE   # T51 addendum 3: one share or more never zeroed
         effective = rounded
         if zeroed:
             effective = (-h).quantize(step, rounding=ROUND_DOWN)
-            why.append(f"the target is worth {target_value.quantize(CENT, rounding=ROUND_DOWN)}, less than the "
-                       f"minimum of {FRACTIONAL_MIN_VALUE}, and is taken as zero")
+            why.append(f"the target of less than one share is worth {target_value.quantize(CENT, rounding=ROUND_DOWN)}, "
+                       f"less than the minimum of {FRACTIONAL_MIN_VALUE}, and is taken as zero")
         size = abs(effective)
         sign = 1 if effective > 0 else -1
         whole = size.to_integral_value(rounding=ROUND_FLOOR)
