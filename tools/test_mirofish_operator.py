@@ -161,6 +161,9 @@ class World:
         # unreadable model list, the plist the reader is loaded from
         self.commands_unreadable = {}; self.ps_garbled = set(); self.models_unreadable = False; self.picks_plist_path = PICKS_PLIST
         self.ps_failing = set()
+        # addendum 8, B: process starts are kept in the machine's own zone; a ps that inherits the caller's environment
+        # renders them in the caller's TZ (caller_tz, None = the machine's), one run with a fixed environment does not
+        self.caller_tz = None; self.system_tz = 'UTC'
         self.free, self.free_after_load, self.pressure, self.swap_mb = 80, 60, 1, 100.0
         self.models = listing(); self.unload_status = 200
         self.procs = {TOOL_PID: {'start': TOOL_START, 'pgid': TOOL_PARENT, 'ppid': TOOL_PARENT},
@@ -253,7 +256,7 @@ class World:
         if argv[:2] == ['/bin/ps', '-p'] and self.real and int(argv[2]) in self.real_set():
             if self.kill_at == 'ps':
                 os.kill(os.getpid(), signal.SIGKILL)
-            r = subprocess.run(argv, capture_output=True, text=True)          # read-only: pid, ppid, pgid and start only
+            r = subprocess.run(argv, capture_output=True, text=True, env=env)  # read-only: pid, ppid, pgid and start only
             return done(r.returncode, r.stdout, '')
         if argv[:2] == ['/bin/ps', '-p'] and int(argv[2]) in self.ps_garbled:
             return done(0, 'garbled\n')
@@ -268,7 +271,7 @@ class World:
             if proc is None:
                 return done(1, '')
             assert argv[3:] == ['-o', 'pid=,ppid=,pgid=,lstart='], argv          # never a command line
-            return done(0, '%d %d %d %s\n' % (int(argv[2]), proc.get('ppid', 1), proc['pgid'], proc['start']))
+            return done(0, '%d %d %d %s\n' % (int(argv[2]), proc.get('ppid', 1), proc['pgid'], self.render_start(proc['start'], env)))
         if any(a.endswith('mirofish_native_stage.py') for a in argv):
             work = Path(argv[argv.index('--work') + 1])
             if self.stage_rc:
@@ -293,6 +296,15 @@ class World:
             (work / 'builder/startup-preflight.json').write_text('{}')
             return done(self.preflight_rc, json.dumps({'exit': self.preflight_rc, 'preflight': True}))
         raise AssertionError('unexpected command: %r' % argv)
+
+    def render_start(self, start, env):
+        """lstart as ps prints it: in the TZ of the environment it runs in (the caller's when it inherits it)."""
+        zone = (env.get('TZ') if env is not None else self.caller_tz) or self.system_tz
+        if zone == self.system_tz:
+            return start
+        import datetime, zoneinfo
+        t = datetime.datetime.strptime(start, '%a %b %d %H:%M:%S %Y').replace(tzinfo=zoneinfo.ZoneInfo(self.system_tz))
+        return t.astimezone(zoneinfo.ZoneInfo(zone)).strftime('%a %b %d %H:%M:%S %Y')
 
     # ---- addendum 4: real children (part B), process commands (part A)
     @property
@@ -1790,7 +1802,8 @@ class Addendum4(Base):
                         self.edit_intent(launcher={'pid': pid, 'start': start, 'pgid': pid})
                     if how == 'identity':
                         self.identity_names(pid, start, pid)
-                    self.assertNotOursAndRecovered(self.main(['recover', '--stop']))
+                    # addendum 8, D: its command names the staged folder, so it is "could not be decided": held back
+                    self.assertNothingSignalledAndKept(self.main(['recover', '--stop'])); self.assertFalse(self.w.picks_loaded)
                     self.assertIn('JOB', self.w.text())
 
     def test_A_pids_not_above_1_never_signalled_and_mistyped_pids_refused_whole(self):
@@ -1816,8 +1829,7 @@ class Addendum4(Base):
     def test_A_right_pid_and_start_with_the_wrong_command_is_never_signalled(self):
         self.killed_run()
         self.w.commands[LAUNCHER_PID] = '/usr/bin/vim notes.txt %s' % SECRET
-        self.w.commands[OBSERVER_PID] = '/usr/bin/less %s/owned-source/observer-entry/mirofish_native_run.py' % (
-            json.loads(self.intent.read_text())['work'])
+        self.w.commands[OBSERVER_PID] = '/usr/bin/less /elsewhere/owned-source/observer-entry/mirofish_native_run.py'
         self.assertNotOursAndRecovered(self.main(['recover', '--stop'])); self.assertIn('COMMAND', self.w.text())
         self.assertTrue(self.w.picks_loaded)        # addendum 5: definitely not ours does not hold the reader off
 
@@ -1830,10 +1842,13 @@ class Addendum4(Base):
 
     def test_A_the_right_command_with_a_wrong_start_is_never_signalled(self):
         # addendum 7, A: only the start the intent holds for its launcher is compared; the identity file's is a hint
+        # addendum 8, D: its command still names the staged folder, so it is "could not be decided": held back
         self.killed_run()
         self.w.procs[LAUNCHER_PID]['start'] = 'Mon Nov 16 13:33:33 2026'
         self.w.procs.pop(OBSERVER_PID)
-        self.assertNotOursAndRecovered(self.main(['recover', '--stop'])); self.assertIn('START', self.w.text())
+        rc = self.main(['recover', '--stop'])
+        self.assertNothingSignalledAndKept(rc); self.assertEqual(rc, 3); self.assertIn('START', self.w.text())
+        self.assertFalse(self.w.picks_loaded)
 
     def test_A_an_observer_whose_start_differs_from_the_identity_file_is_still_found_by_its_command(self):
         self.killed_run(); self.w.procs[OBSERVER_PID]['start'] = 'Mon Nov 16 13:33:34 2026'
@@ -2466,12 +2481,13 @@ class Addendum7(Base):
         self.assertEqual(rc, 2); self.assertEqual(self.w.loads, []); self.assertIn('MODEL LIST COULD NOT BE READ', r['refused'])
         self.assertTrue(self.w.picks_loaded); self.assertFalse(self.intent.exists())
 
-    def test_C_after_the_spawn_an_unreadable_list_is_an_alert_and_the_run_counts_only_once_it_is_read_again(self):
+    def test_C_after_the_spawn_an_unreadable_list_is_an_alert_and_the_run_does_not_count(self):
+        # addendum 8, A: unreadable even once, and read again later, the run does not count
         self.at(30, lambda world: setattr(world, 'models_unreadable', True))
         self.at(60, lambda world: setattr(world, 'models_unreadable', False))
-        self.assertEqual(self.main(RUN), 0, self.w.text())
+        self.assertNotEqual(self.main(RUN), 0, self.w.text())
         row = self.w.rows()[-1]
-        self.assertTrue(row['counts']); self.assertTrue(any('MODEL LIST COULD NOT BE READ' in a for a in row['alerts']), row['alerts'])
+        self.assertFalse(row['counts']); self.assertTrue(any('MODEL LIST COULD NOT BE READ' in a for a in row['alerts']), row['alerts'])
         self.fresh()
         self.at(30, lambda world: setattr(world, 'models_unreadable', True))
         self.assertNotEqual(self.main(RUN), 0)
@@ -2622,6 +2638,186 @@ class Addendum7(Base):
         self.assertEqual(self.main(RUN, run=run), 2)
         self.assertEqual(self.w.bootouts(), []); self.assertEqual(self.w.posts(), []); self.assertEqual(self.w.spawned, [])
         self.assertIn('elsewhere.plist', self.w.rows()[-1]['refused'])
+
+
+class Addendum8(Base):
+    """The repair after the blind check of e582ff3."""
+    LT = LoadTest.LT
+    intent = Addendum3.intent
+    killed_run = Addendum3.killed_run
+    at = Addendum3.at
+    fresh = Addendum3.fresh
+    changing = Addendum3.changing
+    edit_intent = Addendum4.edit_intent
+    assertNoSecret = Addendum4.assertNoSecret
+    lt_result = Addendum6.lt_result
+    reap_on_term = Addendum7.reap_on_term
+    assertHeldBack = Addendum7.assertHeldBack
+
+    # ---- A: the exact announced set, with the decision instance right, at every check after the spawn and at the end
+    @staticmethod
+    def breakers():
+        def emb_id_under_the_27b(m):
+            m[2]['loaded_instances'].append({'id': 'ym-research-embedding', 'config': {}})
+        def second_under_the_emb_key(m):
+            m[1]['loaded_instances'].append({'id': 'emb-2', 'config': {}})
+        def decision_id_other_key(m):
+            m.append({'key': 'other/key', 'type': 'llm', 'loaded_instances': [{'id': 'elephant-1', 'config': {}}]})
+        def numeric_id(m):
+            m.append({'key': 'x/y', 'type': 'llm', 'loaded_instances': [{'id': 5, 'config': {}}]})
+        def plain_extra(m):
+            m.append({'key': 'late/model', 'type': 'llm', 'loaded_instances': [{'id': 'late-1', 'config': {}}]})
+        def embedding_gone(m):
+            m[1]['loaded_instances'] = []
+        def decision_wrong(m):
+            m[0]['loaded_instances'][0]['config']['context_length'] = 4096
+        return {'the 27B under the embedding id': emb_id_under_the_27b, 'a second instance under the embedding key':
+                second_under_the_emb_key, 'a model under the decision id with another key': decision_id_other_key,
+                'a numeric id': numeric_id, 'an unannounced model': plain_extra, 'an announced instance gone': embedding_gone,
+                'the decision instance not right': decision_wrong}
+
+    def assertDidNotCount(self, rc, row, word=''):
+        self.assertTrue(row['launched']); self.assertFalse(row['counts']); self.assertNotEqual(rc, 0)
+        self.assertTrue(row['verdicts']['pipeline_clean'] and row['verdicts']['collector_unharmed'])   # it would have counted
+        self.assertTrue(row['model_check_failures'], row)
+        self.assertTrue(any(word in a for a in row['alerts'] if a.upper() == a), row['alerts'])
+
+    def test_A_a_listing_that_leaves_the_announced_set_after_the_spawn_and_stays_never_counts(self):
+        for name, edit in self.breakers().items():
+            with self.subTest(case=name):
+                self.fresh(); self.at(30, lambda world, edit=edit: edit(world.models['models']))
+                rc = self.main(RUN)
+                self.assertDidNotCount(rc, self.w.rows()[-1]); self.assertEqual(self.w.signals, [])
+
+    def test_A_a_listing_that_leaves_the_set_and_comes_back_never_counts(self):
+        for name, edit in self.breakers().items():
+            with self.subTest(case=name):
+                self.fresh(); before = []
+                self.at(30, lambda world, edit=edit: (before.append(copy.deepcopy(world.models)), edit(world.models['models'])))
+                self.at(60, lambda world: world.models.update(before[0]))
+                self.assertDidNotCount(self.main(RUN), self.w.rows()[-1])
+
+    def test_A_the_announced_set_is_recorded_and_a_clean_run_counts(self):
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+        row = self.w.rows()[-1]
+        self.assertEqual(row['remaining'], [['elephant-1', 'elephant-1'], ['ym-research-embedding', 'google/embedding-gemma-300m']])
+        self.assertTrue(row['counts']); self.assertEqual(row['model_check_failures'], []); self.assertGreater(row['model_checks'], 1)
+
+    def test_A_the_pipelines_own_native_instance_during_the_run_is_part_of_it_but_not_at_the_end(self):
+        native = {'key': 'qwen3-8b', 'type': 'llm', 'loaded_instances': [{'id': 'mf-native-' + 'c' * 32, 'config': {}}]}
+        self.at(30, lambda world: world.models['models'].append(copy.deepcopy(native)))
+        self.at(120, lambda world: world.models.update(models=[e for e in world.models['models'] if e is not None and
+                                                                not any(i['id'].startswith('mf-native-') for i in e['loaded_instances'] if isinstance(i.get('id'), str))]))
+        self.assertEqual(self.main(RUN), 0, self.w.text()); self.assertTrue(self.w.rows()[-1]['counts'])
+        self.fresh(); self.at(30, lambda world: world.models['models'].append(copy.deepcopy(native)))   # left at the end
+        rc = self.main(RUN); self.assertDidNotCount(rc, self.w.rows()[-1])
+
+    def test_A_the_load_tests_hold_is_held_to_the_same_rule(self):
+        for name, edit in self.breakers().items():
+            with self.subTest(case=name):
+                self.fresh(); done_ = []
+                def hook(world, edit=edit):
+                    if world.load_t is not None and world.t >= world.load_t + 30 and not done_:
+                        done_.append(1); edit(world.models['models'])
+                self.w.on_sleep.append(hook)
+                rc = self.main(self.LT); r = self.lt_result()
+                self.assertNotEqual(rc, 0); self.assertTrue(r['model_check_failures']); self.assertFalse(r['models_held'])
+                self.assertTrue(r['unload']['proven'])
+        self.fresh(); self.assertEqual(self.main(self.LT), 0, self.w.text())
+        r = self.lt_result(); self.assertTrue(r['models_held']); self.assertEqual(r['model_check_failures'], [])
+
+    # ---- F: an alert at the first check of every bad stretch, a second one included
+    def test_F_a_second_bad_stretch_is_alerted_at_its_first_check(self):
+        LATE = Addendum6.LATE
+        self.at(30, lambda world: world.models['models'].append(copy.deepcopy(LATE)))
+        self.at(60, lambda world: world.models.update(models=[e for e in world.models['models'] if e.get('key') != 'late/model']))
+        self.at(90, lambda world: world.models['models'].append(copy.deepcopy(LATE)))
+        self.at(120, lambda world: world.models.update(models=[e for e in world.models['models'] if e.get('key') != 'late/model']))
+        self.main(RUN)
+        row = self.w.rows()[-1]
+        self.assertEqual(len([a for a in row['alerts'] if 'late-1' in a and 'NOT IN THE ANNOUNCED SET' in a]), 2, row['alerts'])
+        self.assertEqual(len(row['model_check_failures']), 2)
+
+    # ---- B: one fixed form for every process start
+    def test_B_the_same_live_process_read_under_two_time_zones_gives_the_same_start(self):
+        host = OP.Host(record=self.w.tmp / 'r.jsonl', intent=self.w.tmp / 'i.json', lock=self.w.tmp / 'l.lock')
+        seen = []
+        for zone in ('Asia/Tokyo', 'America/Los_Angeles'):
+            with unittest.mock.patch.dict(os.environ, {'TZ': zone, 'LC_ALL': 'C'}):
+                seen.append(OP.read_identity(host, os.getpid()))           # this test process itself, read only
+        self.assertEqual(seen[0][1], 'ok'); self.assertEqual(seen[0], seen[1])
+
+    def test_B_a_run_under_one_time_zone_and_a_recover_under_another_find_the_launcher(self):
+        self.w.caller_tz = 'America/Los_Angeles'
+        self.killed_run()
+        self.w.caller_tz = 'Asia/Tokyo'
+        self.assertHeldBack(self.main(['recover']))
+        self.assertIn('LAUNCHER STILL RUNNING', self.w.text()); self.assertIn('OBSERVER STILL RUNNING', self.w.text())
+        self.w.out.clear(); self.reap_on_term()
+        self.assertEqual(self.main(['recover', '--stop']), 0, self.w.text())
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)])
+
+    def test_B_the_observer_is_stopped_by_its_identity_under_any_caller_time_zone(self):
+        self.w.caller_tz = 'Asia/Tokyo'; self.w.cleanup_s = 60
+        def slow(world):
+            if world.launcher is not None and world.t >= world.launcher.started + 30:
+                world.latency = lambda t: 9.5
+        self.w.on_sleep.append(slow)
+        self.main(RUN)
+        self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)]); self.assertEqual(self.w.rows()[-1]['stop']['by'], 'observer')
+
+    # ---- C: a plain string is non-empty with no outer space; each protected pair at most once
+    @staticmethod
+    def bad_listings():
+        def add(key, iid):
+            return lambda m: m.append({'key': key, 'type': 'llm', 'loaded_instances': [{'id': iid, 'config': {}}]})
+        def two_embeddings(m):
+            m.append({'key': 'google/embedding-gemma-300m', 'type': 'embedding',
+                      'loaded_instances': [{'id': 'ym-research-embedding', 'config': {}}]})
+        return {'empty id': add('x/y', ''), 'empty key': add('', 'z-1'), 'id with a leading space': add('x/y', ' z-1'),
+                'id with a trailing space': add('x/y', 'z-1 '), 'key with an outer space': add(' x/y', 'z-1'),
+                'a blank id': add('x/y', '   '), 'the embedding pair twice': two_embeddings}
+
+    def test_C_ids_and_keys_that_are_not_plain_and_a_repeated_pair_refuse_check_run_and_load_test(self):
+        for name, edit in self.bad_listings().items():
+            for argv in (['check'], RUN, self.LT):
+                with self.subTest(case=name, command=argv[0]):
+                    self.fresh(); edit(self.w.models['models'])
+                    rc = self.main(argv)
+                    self.assertEqual(self.w.posts(), []); self.assertEqual(self.changing(), [])
+                    if argv[0] == 'check':
+                        self.assertTrue(any(str(x).startswith('REFUSED') and 'does not guess' in str(x) for x in self.w.out), self.w.text())
+                    else:
+                        self.assertEqual(rc, 2, self.w.text())
+
+    def test_C_no_unload_is_ever_sent_with_an_id_that_is_not_a_plain_string(self):
+        host = self.w.host()
+        s = OP.do_check(host, 'swarm8', {'model': 'qwen3-8b'})
+        for iid in ('', ' x', 5, None):
+            with self.subTest(iid=iid):
+                s['models']['others'] = [{'instance_id': iid, 'key': 'x/y'}]
+                row = OP.new_row('run', types.SimpleNamespace(announced='x', profile='swarm8'), None, self.w.t)
+                with self.assertRaises(OP.OperatorError):
+                    OP.SwitchOffs(host, row).apply(s)
+                self.assertEqual(self.w.posts(), [])
+                self.w.picks_loaded = True
+
+    # ---- D: a process whose command names the staged folder but fails both proofs could not be decided
+    def test_D_a_garbled_command_naming_the_staged_folder_holds_everything_back(self):
+        for target in (LAUNCHER_PID, OBSERVER_PID):
+            with self.subTest(pid=target):
+                self.fresh(); self.killed_run(); self.reap_on_term()
+                work = json.loads(self.intent.read_text())['work']
+                self.w.commands[target] = '/x/python3 -X%s/owned-source/observer-entry/mirofish_native_run.py --k=%s' % (work, SECRET)
+                self.assertHeldBack(self.main(['recover', '--stop']))
+                self.assertNotIn(target, {p for p, _ in self.w.signals}); self.assertIn(str(target), self.w.text())
+                self.assertIn('COULD NOT BE', self.w.text())
+
+    def test_D_a_command_that_does_not_mention_the_folder_is_not_ours(self):
+        self.killed_run(); self.w.procs.pop(OBSERVER_PID)
+        self.w.commands[LAUNCHER_PID] = '/usr/bin/vim notes.txt'
+        self.assertEqual(self.main(['recover', '--stop']), 0, self.w.text())
+        self.assertEqual(self.w.signals, []); self.assertTrue(self.w.picks_loaded)
 
 
 if __name__ == '__main__':
