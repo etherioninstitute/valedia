@@ -82,8 +82,9 @@ script's server check; mentions in MiroFish's model table, the doctor and older 
 name Ollama providers.
 
 **Target.** One server (LM Studio) and at most two resident models:
-1. the Nimble 9B decision model (LM Studio lists `bespoke-nimble-9b-v3` at two quantisations and serves the same
-   typed `/v1/systemone` endpoint) for the collector, the forecast job and the panel's Nimble seats;
+1. the Nimble 9B decision model (LM Studio's `bespoke-nimble-9b-v3@q8_0`, served on the same typed
+   `/v1/systemone` endpoint; the smaller Q4 file was removed on the owner's instruction the same evening) for the
+   collector, the forecast job and the panel's Nimble seats;
 2. one general model for everything else local: MiroFish (all phases) and the local bots. First candidate: Bonsai 2
    (a 27B-class model in an 8.3 GB file, already qualified for MiroFish setup, report and agent turns).
 Whether ONE model can do both jobs is a measured question, not a preference: it needs a test of the general model
@@ -99,6 +100,25 @@ on the collector's task, which cannot be judged before the collector's own locke
 - On one general model for every phase, a 48-actor run takes about five hours, not 1 h 43 (the fast agent turns
   came from a third, small model). Whether the decision model can take the agent turns is to be tested.
 - The 27B is no longer resident; local bots and the hourly pick reader move to the general model.
+
+## Measured the same evening: the decision model on LM Studio (two test loads, invented states)
+
+- **Slots decide the speed.** One decision is six passes of about 2,370 tokens. With one slot they run one after
+  another: 13.7 s a decision, over the collector's 10 s limit. With six slots (context 32,768) they run together:
+  2.5 s, against 3.6 s on Ollama. The smaller Q4 file was no faster (2.7 s).
+- **Memory.** The Q8 file with six slots holds about 10.4 GiB in its server process and costs about 20 points of
+  the free-memory reading; Ollama's copy costs more (16.4 GiB as Ollama reports it).
+- **It stays loaded.** A model loaded by name with no idle time-out was not unloaded when another model was
+  loaded on demand. With the instance gone, a call that names it fails at once and loads nothing by itself.
+- **One caller at a time.** Two decisions sent together took 2.5 s and 7.6 s: the second waits. Whoever shares the
+  collector's instance must send one call at a time, or the instance needs more slots.
+- **Any second model working on this Mac slows the collector's calls.** During the test loads the collector's own
+  calls took 6.1 s at the median and 7.96 s at the worst (3.6 and 5.3 before); none was late. The same happened
+  when another session used the model file for its own work. So target 1 above ("never slowed") is to be read as
+  a limit to hold (no call over 8 s, none late), measured in every run, since some slowing is physical.
+- **The collector's move is feasible** and is declared in its prediction document (amendment of 17 November
+  00:35 UTC), with a deadline: the new revision takes over before 18 November 12:00 UTC or the move waits until
+  the collector's test has ended.
 
 ## Rules that do not change
 
