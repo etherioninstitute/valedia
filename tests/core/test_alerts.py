@@ -2347,3 +2347,113 @@ def test_t50_a4_an_ordinary_file_naming_a_live_name_registers_none_of_its_values
     assert clean and "WEBULL_LIVE_APP_KEY" in why and "nothing was done" in why
     assert "trading_values" not in env._cache and al._registered["longest"] == longest
     assert al.clean(f"a {TRADING['BROKER_API_KEY']} b") == f"a {TRADING['BROKER_API_KEY']} b"   # none of its values known
+
+
+# ---- T51 A1 (addendum 3, ruling 2): a layout-3 ledger and a layout-4 one, each made by the code that writes it, read alike
+
+@pytest.fixture(scope="module")
+def ledger_module_at_33ace6f(tmp_path_factory):
+    """The ledger module as 33ace6f had it (it writes layout 3), from git, under a name of its own. Module-scoped, so
+    git runs before `no_real_launch` refuses every program for the test itself."""
+    import importlib.util
+    where = tmp_path_factory.mktemp("at-33ace6f")
+    import io
+    import tarfile
+    rel = "valedia_trader/execution_and_risk/orders.py"
+    root = Path(__file__).resolve().parents[2]
+    got = subprocess.run(["git", "-C", str(root), "archive", "--format=tar", "33ace6f", rel], capture_output=True, timeout=60)
+    assert got.returncode == 0, got.stderr.decode(errors="replace")[:300]
+    with tarfile.open(fileobj=io.BytesIO(got.stdout)) as tar:
+        tar.extractall(where, filter="data")
+    spec = importlib.util.spec_from_file_location("orders_at_33ace6f_alerts", where / rel)
+    old = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(old)
+    assert old.LAYOUT_VERSION == 3
+    return old
+
+
+def _filled_ledger(module, path: Path, unknown: bool) -> None:
+    """With the given ledger module: a clean reconcile, an order filled and applied, another open, and (with
+    `unknown`) one whose submit raised, which blocks the ledger."""
+    clock = [NOW - 600]
+    led = module.OrderLedger(path, not_sent=(), clock=lambda: clock[0])
+    v = _Booked()
+    led.reconcile(v, {})
+    led.intend("paper-XLE-1", "XLE", 5.0, 60.0, limit_price=60.6)
+    led.submit_once(v, "paper-XLE-1")
+    v.book["paper-XLE-1"].update(state="filled", filled_units=5.0, avg_price=60.1, fee=0.05)
+    clock[0] += 60
+    led.reconcile(v, {})
+    led.mark_applied([f["id"] for f in led.unapplied_fills()])
+    v.held = {"XLE": 5.0}
+    clock[0] += 60
+    led.reconcile(v, {"XLE": 5.0})
+    led.intend("paper-SPY-2", "SPY", 2.0, 600.0, limit_price=606.0)
+    led.submit_once(v, "paper-SPY-2")
+    if unknown:
+        led.intend("paper-QQQ-3", "QQQ", 1.0, 500.0, limit_price=505.0)
+        led.submit_once(_Venue(raises=True), "paper-QQQ-3")
+    led.close()
+
+
+class _Booked:
+    name = "fake"
+
+    def __init__(self):
+        self.book, self.held = {}, {}
+
+    def submit(self, symbol, units, tag, price=None, limit_price=None):
+        self.book[tag] = {"state": "open", "filled_units": 0.0, "avg_price": None, "fee": None,
+                          "venue_order_id": f"V-{tag}", "raw_status": "NEW"}
+        return {"status": "accepted", "venue_order_id": f"V-{tag}"}
+
+    def order_status(self, tag):
+        got = self.book.get(tag)
+        return dict(got) if got is not None else None
+
+    def positions(self):
+        return dict(self.held)
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_every_ledger_reader_reads_layout_3_and_layout_4_alike_and_writes_neither(world, ledger_module_at_33ace6f,
+                                                                                  unknown):
+    from valedia_trader.research_loop import owner_page as op
+    from valedia_trader.execution_and_risk import orders as new_orders
+    old = ledger_module_at_33ace6f
+    seen = {}
+    for layout, module in ((3, old), (4, new_orders)):
+        world.ledger_path.unlink()
+        _filled_ledger(module, world.ledger_path, unknown)
+        raw = sqlite3.connect(world.ledger_path)
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == layout
+        raw.close()
+        before = {p.name: p.read_bytes() for p in (world.root / "memory").glob("orders-*")}
+        r = watch(world)
+        led = al.open_order_ledger(world.ledger_path, lambda: NOW)
+        try:
+            records = led.orders()
+            reasons = led.blocked(al.LEDGER_MAX_AGE_SECONDS)
+        finally:
+            led.close()
+        times, body = op.broker_part(world.ledger_path, world.env(), op.Context(world.env()))
+        assert {p.name: p.read_bytes() for p in (world.root / "memory").glob("orders-*")} == before   # nothing written
+        assert not any("orders" in f or "layout" in f for f in r.failures), (layout, r.failures)
+        assert ("orders:orders-webull-sandbox" in keys(r)) is unknown, (layout, keys(r))
+        assert all((o["order_type"], o["collar_price"]) == ("LIMIT", None) for o in records)
+        seen[layout] = ([{k: v for k, v in o.items() if k not in ("order_type", "collar_price")} for o in records],
+                        reasons, body, times)
+    assert seen[3] == seen[4]                                       # the same orders, gate, page and times either way
+
+
+def test_a_ledger_of_layout_3_with_a_schema_not_layout_3s_is_a_failure_in_words(world):
+    world.ledger_path.unlink()
+    db = sqlite3.connect(world.ledger_path)
+    db.execute("CREATE TABLE orders (tag TEXT)")
+    db.execute("PRAGMA user_version = 3")
+    db.commit()
+    db.close()
+    before = world.ledger_path.read_bytes()
+    r = watch(world)
+    assert r.raised == [] and any("layout 3" in f for f in r.failures), r.failures
+    assert world.ledger_path.read_bytes() == before

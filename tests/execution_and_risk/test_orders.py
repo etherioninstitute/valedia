@@ -3629,3 +3629,16 @@ def test_a_read_only_open_never_rolls_back_a_dead_writers_journal(tmp_path, old_
         orders.open_read_only(path)
     assert {p.name: p.read_bytes() for p in folder.iterdir()} == files
     assert _look(path) == before                               # an ordinary open rolls it back: layout 3 as it was
+
+
+def test_the_order_paths_open_upgrades_a_layout3_file_and_opens_a_layout4_one_as_it_is(tmp_path, old_orders):
+    """`order_step.open_ledger` (the order step's and the event practice's write-open, cli.py and event_practice.py)
+    is the only opener that upgrades: a layout-3 file to layout 4, a layout-4 file unchanged."""
+    from valedia_trader.execution_and_risk.order_step import open_ledger
+    path = _old_ledger_file(old_orders, tmp_path / "orders-webull-sandbox.sqlite")
+    before = _look(path)
+    open_ledger(path, clock=Clock(1_000_300.0)).close()
+    assert _look(path) == _as_layout4(before, _fresh_master(tmp_path))
+    raw = path.read_bytes()
+    open_ledger(path, clock=Clock(1_000_300.0)).close()
+    assert _look(path) == _as_layout4(before, _fresh_master(tmp_path)) and path.read_bytes() == raw
