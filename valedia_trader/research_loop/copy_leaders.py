@@ -48,8 +48,11 @@ Rules the code holds:
   holdings and cost by token, realized profit, resolved positions, shares and sells by calendar month, the new
   positions found), and read a price window's points only when it is used. Each prints one flushed line a wallet
   (its number of the total, its first ten characters, rows read, seconds, memory); --max-memory-mb (1,500 by
-  default) is checked at each wallet and stops the step with nothing written. `sealed` checks it while it
-  recomputes the development result, BEFORE its claim; once the period is claimed it says so and does not stop.
+  default) is checked at each wallet and stops the step with nothing written. `sealed` stops for memory only
+  BEFORE its claim (while it recomputes the development result), with the period not spent; after the claim it
+  never stops for memory (stopping there would spend the period without a result): it prints an alert in capitals
+  at the wallet where the limit was passed and goes on to its result. Right before the claim it prints the peak
+  memory the development recomputation needed, so the figure is seen before the period is spent.
 * While a pull runs, nothing else reads the store. The pull holds an exclusive advisory lock (flock) on the file
   STORE.lock beside the store for its whole life (the kernel releases it if the process dies); a second pull,
   `develop` and `sealed` take it without waiting and refuse in words: "a pull is running on this store". The pull's
@@ -1458,7 +1461,7 @@ _READING: dict = {"label": "load", "say": None, "limit": None, "claimed": False}
 def _reading(label: str, say, limit, claimed: bool = False):
     """What `load` prints and checks while develop or sealed runs it (load's own arguments stay the period's)."""
     before = dict(_READING)
-    _READING.update(label=label, say=say, limit=limit, claimed=claimed)
+    _READING.update(label=label, say=say, limit=limit, claimed=claimed, peak=0)
     try:
         yield
     finally:
@@ -1471,18 +1474,27 @@ def _reading_guard():
     said = []
 
     def guard(mb, i, n):
+        _READING["peak"] = max(_READING.get("peak") or 0, mb)
         if limit is None or mb <= limit:
             return
         if claimed:                                # the period is spent: stopping now would lose it, so say it
             if not said and say is not None:
                 said.append(True)
-                say("%s: resident memory %d MB is above the limit of %d MB (--max-memory-mb) at wallet %d of %d; not "
-                    "stopped: the sealed period is claimed" % (label, mb, limit, i, n))
+                say(("%s: resident memory %d MB is above the limit of %d MB (--max-memory-mb) at wallet %d of %d; not "
+                     "stopped: the sealed period is claimed and a stop now would spend it without a result"
+                     % (label, mb, limit, i, n)).upper())
             return
         raise MemoryStopped("stopped: resident memory %d MB is above the limit of %d MB (--max-memory-mb) at wallet "
                             "%d of %d of %s; nothing written%s" % (mb, limit, i, n, label, "; the sealed period is not "
                                                                    "claimed" if label.startswith("sealed") else ""))
     return guard
+
+
+def _peak_mb() -> float:
+    """This process's peak resident memory so far (ru_maxrss: bytes on macOS, kilobytes elsewhere)."""
+    import resource
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / (2 ** 20 if sys.platform == "darwin" else 2 ** 10)
 
 
 def _say_err(msg: str) -> None:
@@ -1753,7 +1765,16 @@ def _store_lock(path: Path, exclusive: bool):
     """The advisory lock on STORE.lock: exclusive for the pull's whole life, shared while develop or sealed read;
     taken without waiting, refused in words; the kernel releases it when the process ends, however it ends."""
     lock = Path(str(path) + ".lock")
-    fd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as first:
+        try:                                       # a reader may lock a lock file it can only read
+            if exclusive:
+                raise first
+            fd = os.open(str(lock), os.O_RDONLY)
+        except OSError as e:
+            raise Refused("cannot create or open the lock file %s (%s): whether a pull is running on this store "
+                          "cannot be known, so nothing is read (nothing written)" % (lock, e.strerror or e)) from None
     try:
         try:
             fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
@@ -2062,10 +2083,13 @@ def load(store, period: str, leave_out=()) -> Data:
         windows.update(ten_minute_windows(targets, points, resolutions))
         points = _StoredPoints(path, s.finished_among("prices", windows))
         _count_bad_points(s.db, points.keys, counts)
+        not_pulled = Counter()                     # counted by wallet: no token, market or time is printed
         for k, wd in windows.items():
             if k not in points:
                 for w in targets[wd.target].wallets:
-                    implicated.setdefault(w, []).append("price window %s not pulled" % k)
+                    not_pulled[w] += 1
+        for w, n in not_pulled.items():
+            implicated.setdefault(w, []).append("%d price windows not pulled (pull them with: pull --phase 2)" % n)
         missing = sorted(w for w in implicated if w not in leave)
         if missing:
             raise Refused("the pull is unfinished for wallets %s (%s); to run without them use: --leave-out %s"
@@ -2303,9 +2327,14 @@ def _readable(path: Path):
     end), and it passes PRAGMA quick_check."""
     if not path.is_file():
         raise Refused("the store %s is missing (nothing written)" % path)
+    lock = Path(str(path) + ".lock")
     with _store_lock(path, exclusive=False):
-        check_integrity(path)
-        yield
+        try:
+            check_integrity(path)
+            yield
+        except Refused as e:
+            raise Refused("%s; the lock file %s is the one thing a refused run may leave beside the store"
+                          % (e, lock)) from None
 
 
 def run_develop(*, store=None, out_dir=None, leave_out=(), max_memory_mb: float | None = MAX_MEMORY_MB,
@@ -2378,7 +2407,7 @@ def sealed_bookkeeping_problems(s: Store, leave: list) -> list:
         "LEFT JOIN walks k ON k.kind = 'prices' AND k.key = w.key AND k.status = 'finished' "
         "WHERE p.month IN (%s)" % ",".join("?" * len(months)), months).fetchone()
     if missing:
-        out.append("%d of %d sealed price windows not pulled" % (missing, total))
+        out.append("%d of %d sealed price windows not pulled (pull them with: pull --phase 2)" % (missing, total))
     return out
 
 
@@ -2446,6 +2475,12 @@ def _run_sealed(path: Path, out_dir, leave_out, develop_file) -> dict:
             "wallets_left_out": leave, "store_id": sid, "store": str(path.resolve())}
     if _BEFORE_CLAIM is not None:
         _BEFORE_CLAIM()
+    if _READING["say"] is not None:                # the figure, seen before the period is spent
+        _READING["say"]("sealed: the development recomputation needed at most %d MB resident (read at each wallet; "
+                        "this process's peak so far %d MB); the limit is %s; claiming the sealed period now: after the "
+                        "claim it never stops for memory" % (_READING.get("peak") or 0, _peak_mb(),
+                                                             "%d MB" % _READING["limit"] if _READING["limit"] else
+                                                             "none"))
     _claim(path, sid, note)                        # the store's own marker, committed BEFORE any sealed row is read
     marker.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -2526,8 +2561,14 @@ def main(argv=None) -> int:
     p.add_argument("--store", default=None)
     p.add_argument("--leave-out", nargs="*", default=[])
     p.add_argument("--max-memory-mb", type=int, default=MAX_MEMORY_MB)
+    sealed_help = ("the sealed run, once per store. Before its claim it stops for memory (--max-memory-mb) with the "
+                   "period not spent; after the claim it never stops for memory (stopping there would spend the "
+                   "period without a result): it prints an alert in capitals at the wallet where the limit was passed "
+                   "and goes on to its result. Right before the claim it prints the peak memory the development "
+                   "recomputation needed.")
     for name in ("develop", "sealed"):
-        p = sub.add_parser(name)
+        p = sub.add_parser(name, help=sealed_help if name == "sealed" else "the development run",
+                           description=sealed_help if name == "sealed" else None)
         p.add_argument("--store", default=None)
         p.add_argument("--out-dir", default=None)
         p.add_argument("--leave-out", nargs="*", default=[])

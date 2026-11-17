@@ -149,6 +149,20 @@ def is_number(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
+TOO_LARGE = "number_too_large_for_store"      # a whole number outside SQLite's 64-bit integers (2**63 or more)
+
+
+def _fits_store(values) -> bool:
+    """Every whole number among `values` (and inside lists among them) fits SQLite's 64-bit integer; a row with one
+    that does not is malformed (writing it would end the pull with an OverflowError)."""
+    for v in values:
+        if isinstance(v, list) and not _fits_store(v):
+            return False
+        if isinstance(v, int) and not isinstance(v, bool) and not -2 ** 63 <= v < 2 ** 63:
+            return False
+    return True
+
+
 def _is_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
@@ -194,6 +208,8 @@ def validate_board_row(row) -> tuple[dict | None, str | None]:
     for k in ("pnl", "volume"):
         if not is_number(row.get(k)):
             return None, "bad_" + k
+    if not _fits_store((row["rank"], row["pnl"], row["volume"])):
+        return None, TOO_LARGE
     return {"rank": row["rank"], "user_id": row["user_id"], "pnl": float(row["pnl"]), "volume": float(row["volume"])}, None
 
 
@@ -233,6 +249,8 @@ def validate_trade(row, user: str | None = None, ts_max: int | None = None) -> t
                                "event_slug", "outcome_index", "transaction_hash")}
     for k in ("slug", "title", "outcome"):
         out[k] = row.get(k) if isinstance(row.get(k), str) else None
+    if not _fits_store(out.values()):
+        return None, TOO_LARGE
     return out, None
 
 
@@ -290,6 +308,8 @@ def validate_resolution(row, ts_max: int | None = None) -> tuple[dict | None, st
             return None, "bad_resolved_at"
         if _ts_why(ts, ts_max):
             return None, "resolved_at_out_of_span"
+    if pay is not None and not _fits_store(pay):
+        return None, TOO_LARGE
     return {"condition_id": row["condition_id"], "status": row["status"], "payouts": list(pay) if pay else None,
             "resolved_at": ra, "resolved_ts": ts}, None
 
@@ -307,6 +327,8 @@ def validate_price_point(row, ts_max: int | None = None) -> tuple[dict | None, s
     why = _ts_why(ts, ts_max)
     if why:
         return None, why
+    if not _fits_store((p, res, ts)):
+        return None, TOO_LARGE
     return {"price": p, "resolution_seconds": res, "timestamp": ts}, None
 
 

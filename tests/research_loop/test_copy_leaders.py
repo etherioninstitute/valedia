@@ -2328,7 +2328,7 @@ def _outcome(fn):
     except Exception as e:                            # either module's own Refused
         if type(e).__name__ != "Refused":
             raise
-        return "refused", str(e)
+        return "refused", str(e).split("; the lock file ")[0]          # the note addendum 8 added
 
 
 def test_t47c_planning_develop_and_sealed_equal_the_code_before_on_40_seeded_stores(tmp_path, monkeypatch):
@@ -2711,8 +2711,8 @@ def test_the_wallet_fold_equals_wallet_book_and_new_positions_at_the_edges(tmp_p
 # ------------------------------------------------------------------ T47 addendum 8
 def test_a_stored_number_too_large_for_the_store_is_counted_and_the_pull_goes_on(tmp_path, monkeypatch):
     monkeypatch.setattr(cl, "_now", lambda: FIXED)
-    w = _small_world(3)
-    svc = PagedWorld(w, 3, size=50)
+    w = World(11, edge=0.3, move=0.0, pros=5, per_month=11, months=SMALL_MONTHS)    # a world phase 2 reads
+    svc = PagedWorld(w, 11, size=50)
     wallet = sorted(svc.feeds)[0]
     svc.feeds[wallet][1]["size"] = 2 ** 63                     # a trade
     cond = sorted(w.res)[0]
@@ -2750,7 +2750,7 @@ def test_a_reader_that_cannot_make_the_lock_file_refuses_in_words(tmp_path):
     try:
         for run in (lambda: cl.run_develop(store=store, out_dir=tmp_path / "o", say=lambda m: None),
                     lambda: cl.run_sealed(store=store, out_dir=tmp_path / "o", flag=True, say=lambda m: None)):
-            with pytest.raises(cl.Refused, match="cannot (create|open) the lock file .*whether a pull is running"):
+            with pytest.raises(cl.Refused, match="cannot create or open the lock file .*whether a pull is running"):
                 run()
     finally:
         os.chmod(d, 0o755)
@@ -2776,7 +2776,7 @@ def test_the_refusal_for_windows_not_pulled_prints_their_count_and_the_command(t
     with pytest.raises(cl.Refused) as e:
         cl.run_develop(store=store, out_dir=tmp_path / "o", say=lambda m: None)
     text = str(e.value)
-    assert re.search(r"\b4 price windows not pulled \(pull them with: pull --phase 2\)", text), text
+    assert re.search(r"\b3 price windows not pulled \(pull them with: pull --phase 2\)", text), text   # the 3 base windows
     assert not re.search(r"tok\d+|cond\d+|@\d+|\b1[5-9]\d{8}\b", text), text
 
 
