@@ -75,7 +75,9 @@ For the whole window (the wall clock plus the 120 s cleanup), each named in the 
   is read idle again the start goes ahead; an idle reader never seen running refuses until :03:00. The plist in this repo
   (`tools/launchd/com.valedia.picks.hourly.plist`) schedules it at minute 7, so the window there is :05:00 to :10:00 unless it
   is seen running and then idle sooner.
-- every loaded model that is neither the decision instance nor the embedding instance: unloaded by REST
+- every loaded model that is neither the decision instance nor the embedding instance (exactly: every loaded instance
+  whose id is not `elephant-1`, `ym-research-embedding`, an `mf-native-*` id or an id beginning `elephant-1`, and whose
+  model key is not `elephant-1`; anything else, a model under another key with an id such as `copy` included): unloaded by REST
   (`POST /api/v1/models/unload {"instance_id": ...}`) and named in the record. They are NOT reloaded: LM Studio loads each again
   on demand.
 
@@ -171,29 +173,61 @@ the launch the run is stopped the same way and the record says `stopped: wall ex
 `run` and `load-test` install handlers for TERM, HUP and INT before the first switch-off. A TERM or a hang-up (a closed
 terminal, an ended session, a caller's timeout) takes the same controlled path as a Ctrl-C: stop the run, restore, record
 `stopped: operator signalled (SIGTERM)` (or `SIGHUP`), exit 1. At most one signal ever raises: one that arrives during the
-stop, the restore or the recording is only listed in the row's `signals_received`, and never aborts that path. A hang-up
-that is already ignored when the tool starts (it was started under `nohup`) stays ignored, and the row says
+stop, the restore or the recording is only listed in the row's `signals_received` with the stage it came in (`the stop`,
+`the restore`, `finishing the row`, `the row`, ...), and never aborts that path; one that arrives while the row itself is
+being written is recorded in a following `{"command": "signal-note", ...}` line. A run that had counted keeps its `counts`.
+A hang-up that is already ignored when the tool starts (it was started under `nohup`) stays ignored, and the row says
 `hup_ignored: true`. The old handlers are put back at the end.
 
-What no handler can catch (a KILL, a crash, a power cut) is caught by the intent file
-`artifacts/mirofish/operator-intent.json`, written and synced (a temporary file synced, renamed into place, the folder synced)
-before the first switch-off. It holds: the command; the time; this tool's own pid and start; the pick reader's label and
-before-state (`listed`, `plist`, `state`); the instance ids about to be unloaded (and that they are not reloaded); the staged
-folder and its twin; the record path; and, rewritten as soon as they are known, the launcher's pid, start and group (for a
-load test, its `mf-native-*` identifier). It is removed only after the restore and the row are done; if either did not
-complete it stays, with a capitals line saying so and exit 3, so that no path ends with neither a row nor the intent file
-(an interrupt while the minimal row is being synced included). While it exists, `check`, `run` and `load-test` refuse in
-capitals.
+**The lock.** `run` and `load-test` hold an exclusive advisory lock (`flock`) on `artifacts/mirofish/operator.lock` from
+before their first changing action until after their row; `recover` holds it while it works. Each takes it without
+waiting and refuses in capitals (`ANOTHER OPERATOR COMMAND HOLDS THE LOCK`) when it is held. The kernel drops the lock when
+its holder ends, however it ends (a KILL included), so whether the tool that wrote an intent file is still alive is asked
+of the kernel, never read from a pid. The launcher does not inherit it. The lock file is never removed.
 
-`recover` is for after such an end. It reads the intent file (none: "no intent file", exit 0); refuses if the tool that wrote
-it is still running (its pid and start match); bootstraps the pick reader from the recorded plist when it was loaded before
-and is not now; reports whether the recorded launcher and its observer are alive (pid and start match) as `LAUNCHER STILL
-RUNNING` / `OBSERVER STILL RUNNING`, and only with `--stop` stops the run the documented way (TERM to the observer when its
-identity is usable and it is the recorded launcher's child, else SIGINT to the launcher when its pid and start match;
-nothing on a pid alone) and waits up to 180 s for it to end; reports any `mf-native-*` instance still loaded (it unloads
-nothing) and the decision instance's state; appends a row `{"command": "recover", "recovered": "recovered after an unfinished
-run", ...}`; and removes the intent file (kept if the reader could not be restored or the row not written). Exit 0 with no
-alert, else 3. `recover --dry-run` reads and prints, and changes nothing.
+**The intent file.** What no handler can catch (a KILL, a crash, a power cut) is caught by
+`artifacts/mirofish/operator-intent.json`, written and synced (a temporary file synced, renamed into place, the folder
+synced) before the first switch-off. It holds: the command and the profile; the time; this tool's own pid and start; the
+pick reader's label and before-state (`listed`, `plist`, `state`); the instance ids about to be unloaded (and that they are
+not reloaded); the staged folder and its twin; the record path; the two scripts that prove a survivor
+(`{"launcher": "mirofish_native_startup.py", "observer": "mirofish_native_run.py"}`); `launch.spawning_utc`, written and
+synced just BEFORE the spawn; the launcher's pid, written inside the statement that binds its handle, then its start and
+group once read (for a load test, its `mf-native-*` identifier). It is removed only after the restore and the row are done
+and the launcher has ended; otherwise it stays, with a capitals line saying so and exit 3, so that no path ends with neither
+a row nor the intent file. While it exists, `check`, `run` and `load-test` refuse in capitals.
+
+**`recover`** is for after such an end. In order:
+
+1. It takes the lock (a live writer holds it: refused, exit 2). No intent file: "no intent file", exit 0.
+2. The intent is parsed against its one typed shape (every field and its type, nothing else); a field that fails is named
+   and nothing is done, the file kept (exit 2). Then it is checked against the tool's constants: the pick reader's label
+   `com.valedia.picks.hourly`, its one plist `~/Library/LaunchAgents/com.valedia.picks.hourly.plist`, and a work folder that
+   is a staged `valedia-native-*` folder of the crew folder; a `MISMATCH` is printed and nothing is done (exit 2). (The run
+   path, for its part, refuses to boot out a reader loaded from any other plist.)
+3. Survivors are looked for: the intent's launcher entry, the observer identity file in the staged folder, and a scan of
+   this user's processes (pids only) for the two commands. Each proposed pid is put to the proof, and only a pid that
+   passes ALL of it is a survivor: above 1; not this process or any ancestor; not the job pid of
+   `com.valedia.orderbook-collector` or of `com.valedia.picks.hourly` (read from launchd by those fixed labels); its start
+   equal to the one held for it, when one is held; and its own command naming BOTH the staged folder and the script of its
+   role: the launcher `... -B mirofish_native_startup.py --work <staged folder> ...`, the observer
+   `... -B <staged folder>/owned-source/observer-entry/mirofish_native_run.py`. The command is read (`ps -ww -p PID -o
+   command=`) for that test alone and dropped at once: it is never printed, logged, stored, put in a row or in an exception
+   text; only "it names them" or "it does not" leaves the test. An identity file never suffices by itself: it only proposes
+   a pid. A proposed process that is alive but fails a test is never signalled; a capitals line says which test failed.
+4. Every proven survivor is reported in capitals (`LAUNCHER STILL RUNNING`, `OBSERVER STILL RUNNING`). Only with `--stop`
+   is it stopped the documented way, each proven again just before its signal: TERM to a proven observer, then, if a
+   proven launcher still runs, SIGINT to it; it waits up to 180 s for them to end.
+5. While a proven survivor lives, while the scan could not be made, or while a proposed process is alive but unproven, the
+   pick reader is NOT put back (the reader beside a live run is what the switch-off exists to prevent) and the intent file
+   is kept. Without `--stop` it then changes nothing at all and writes no row (exit 3).
+6. Otherwise: the pick reader is bootstrapped from its one constant plist when it was loaded before and is not now (it
+   bootstraps, boots out, loads or unloads nothing else); any `mf-native-*` instance still loaded is reported (nothing is
+   unloaded) with the decision instance's state; a row `{"command": "recover", "recovered": "recovered after an unfinished
+   run", "launched": ..., "profile": ...}` is appended; and the intent file is removed if the reader is back. A recover row
+   of a run that was launched (or was being spawned) is a run that does not count: it resets that profile's streak.
+
+Exit 0 when the recovery is complete with no alert, else 3. `recover --dry-run` reads, proves and prints, and changes
+nothing.
 
 A long run should not depend on the terminal that started it. Start it detached from the terminal, so that closing the
 window or ending the session neither hangs it up nor kills it, and read its output from the log:
@@ -222,8 +256,10 @@ check; the signal handlers; stage (`tools/mirofish_native_stage.py --stage --pro
 the staged threshold; preflight the twin
 (`mirofish_native_startup.py --preflight`, which loads no model); the gate (`root-one-native-attempt.json`: outcome, action,
 candidate hash, an expiry 30 minutes ahead, and the announcement); launch from the observer entry; watch; restore; append the
-record row; remove the intent file; a ten-line summary. Exit 0 ran to its end with no alert, 1 stopped or failed, 2 refused, 3 a restore failed, the
-record was not written, or an alert in capitals. A Ctrl-C or SystemExit inside the restore or the recording is raised again
+record row; remove the intent file; a ten-line summary. Exit 0 exactly when the run counts (its row written) and the
+restore succeeded, whatever else was alerted or signalled during the cleanup; 2 refused; 3 a restore failed, the record was
+not written, the intent file was left, or the run did not count with an alert in capitals; 1 otherwise (stopped, failed,
+or ran to its end without counting). The announcement printed at the start, after staging, states the STAGED wall. A Ctrl-C or SystemExit inside the restore or the recording is raised again
 after the row and the summary are written (the shell then shows it).
 
 ## load-test
@@ -274,5 +310,6 @@ swap at the start and end; the tool's own 30 s readings), the collector during t
 
 A run COUNTS only when all three are true. `record` prints the rows and the current streak of counted runs at 9 participants
 (`swarm8`, target 10 in a row) and at 48 (`swarm48`, target 3 in a row); one launched run that does not count resets its
-streak; refusals do not touch it. `recover` rows are listed apart and never touch a streak. The word "reliable" waits for
+streak; refusals do not touch it. A `recover` row of a launched run is such a run: it resets the streak; `signal-note`
+lines are never runs. The word "reliable" waits for
 those targets.
