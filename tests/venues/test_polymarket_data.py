@@ -424,16 +424,16 @@ def test_prices_history_window_walk_and_point_shapes():
     def h(p, q):
         assert p == "/v2/prices-history"
         if "cursor" not in q:
-            assert q == {"token_id": "111", "start": "100", "end": "200"}
-            return page([{"price": 0.4, "resolution_seconds": 300, "timestamp": 100},
-                         {"price": True, "resolution_seconds": 300, "timestamp": 400}], True, "p1")
-        assert q == {"token_id": "111", "start": "100", "end": "200", "cursor": "p1"}
-        return page([{"price": 0.45, "resolution_seconds": 0, "timestamp": 150},
-                     {"price": 0.5, "resolution_seconds": -1, "timestamp": 160},
-                     {"price": float("nan"), "resolution_seconds": 0, "timestamp": 170}])
+            assert q == {"token_id": "111", "start": "1700000100", "end": "1700000200"}
+            return page([{"price": 0.4, "resolution_seconds": 300, "timestamp": 1700000100},
+                         {"price": True, "resolution_seconds": 300, "timestamp": 1700000400}], True, "p1")
+        assert q == {"token_id": "111", "start": "1700000100", "end": "1700000200", "cursor": "p1"}
+        return page([{"price": 0.45, "resolution_seconds": 0, "timestamp": 1700000150},
+                     {"price": 0.5, "resolution_seconds": -1, "timestamp": 1700000160},
+                     {"price": float("nan"), "resolution_seconds": 0, "timestamp": 1700000170}])
     c, t, clock = client(h)
-    w = c.prices_history("111", 100, 200)
-    assert [(r["timestamp"], r["price"], r["resolution_seconds"]) for r in w.rows] == [(100, 0.4, 300), (150, 0.45, 0)]
+    w = c.prices_history("111", 1_700_000_100, 1_700_000_200)
+    assert [(r["timestamp"], r["price"], r["resolution_seconds"]) for r in w.rows] == [(1_700_000_100, 0.4, 300), (1_700_000_150, 0.45, 0)]
     assert dict(w.rejects) == {"bad_price": 2, "bad_resolution_seconds": 1}
     for start, end in ((200, 100), (0, 100), (True, 100)):
         with pytest.raises(ValueError):
@@ -488,11 +488,11 @@ def test_a_trade_identity_is_wallet_hash_token_condition_side_size_price_time_an
 
 
 def test_a_price_point_repeated_is_kept_once_and_counted():
-    pts = [{"price": 0.4, "resolution_seconds": 300, "timestamp": 100},
-           {"price": 0.4, "resolution_seconds": 300, "timestamp": 100},
-           {"price": 0.41, "resolution_seconds": 0, "timestamp": 100}]
+    pts = [{"price": 0.4, "resolution_seconds": 300, "timestamp": 1700000100},
+           {"price": 0.4, "resolution_seconds": 300, "timestamp": 1700000100},
+           {"price": 0.41, "resolution_seconds": 0, "timestamp": 1700000100}]
     c, t, clock = client(lambda p, q: page(pts))
-    w = c.prices_history("111", 50, 200)
+    w = c.prices_history("111", 1_700_000_050, 1_700_000_200)
     assert len(w.rows) == 2 and dict(w.rejects) == {"repeated_row": 1}
 
 

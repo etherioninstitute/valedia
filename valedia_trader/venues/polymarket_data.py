@@ -3,7 +3,10 @@
 No key and no account: every request is a plain GET with a generic client name, to that one host and only under
 /v2/; this module has no way to send anything else and no knob to point it elsewhere. Manners copied from
 kalshi_data: at most three requests a second; a 429 or a server error is retried after a growing wait (1, 2, 4, 8 s,
-or the server's Retry-After), five tries in all, then a clear error. Any other non-200 answer is raised at once.
+or the server's Retry-After), five tries in all, then a clear error; a timeout, a reset or a dropped connection is
+retried the same way. Any other non-200 answer is raised at once. A redirect is NEVER followed: a 3xx answer is an
+error naming its status, after exactly one request, and is not retried. The address must be https on that host with
+no user, no port and a path under /v2/ with no `..` or `//`, after percent-decoding.
 
 Routes (field names from the service's published specification, /v2/openapi.json, read 2026-11-17):
 
@@ -20,12 +23,20 @@ Routes (field names from the service's published specification, /v2/openapi.json
   timestamp is the start of the span it was observed in, and a terminal point has resolution_seconds 0. It is
   paged like the list routes. `prices_history` asks for one window; an empty window is a finished walk.
 * every row is validated; a row of the wrong shape is a counted reject (reason in `Walk.rejects`), never a guess.
-  A bool, None, NaN, infinity or a string where a number belongs is wrong.
+  A bool, None, NaN, infinity or a string where a number belongs is wrong. A time must be whole epoch seconds from
+  2020-01-01 to one day after the client was made (a time in milliseconds is out of that span).
+* one identity per row within a walk; a repeat is dropped and counted ("repeated_row"). A trade: wallet (case
+  folded), transaction hash, token, condition, side, size, price, time and outcome index (the feed has no fill id,
+  so two fills of one transaction alike in all of these are one row). A price point: token, time and grain. A
+  resolution row: the whole row (two different rows for one condition are left to `resolution_batches`, which does
+  not trust them).
 """
 from __future__ import annotations
 
+import http.client
 import json
 import math
+import posixpath
 import time
 import urllib.error
 import urllib.parse
@@ -37,7 +48,7 @@ from typing import Any, Callable
 
 __all__ = ["BASE_URL", "USER_AGENT", "HttpError", "PolymarketDataError", "PageCapHit", "Pacer", "urllib_get", "Walk",
            "PolymarketData", "is_number", "validate_board_row", "validate_trade", "validate_position",
-           "validate_resolution", "validate_price_point"]
+           "validate_resolution", "validate_price_point", "trade_identity", "TS_MIN"]
 
 BASE_URL = "https://data-api.polymarket.com"
 USER_AGENT = "market-data-reader/1.0"
@@ -45,12 +56,16 @@ DEFAULT_PAGE_CAP = 5000            # pages of a walk; a wallet with more than 5 
 BOARD_WINDOWS = ("day", "week", "month", "all")
 POSITION_STATUSES = (None, "CLOSED")
 MAX_CONDITIONS = 20
+TS_MIN = 1_577_836_800             # 2020-01-01T00:00:00Z: no time of this service is earlier
+TS_AFTER_START = 86_400            # a time may be at most one day after the client was made
+HOST = "data-api.polymarket.com"
 
 
 class HttpError(Exception):
     """A non-200 answer. Transports raise this so the retry rules see the status code."""
     def __init__(self, status: int, url: str, retry_after: float | None = None):
-        super().__init__("HTTP %s for %s" % (status, url))
+        super().__init__("HTTP %s for %s%s" % (status, url, " (a redirect: never followed)" if 300 <= status < 400
+                                               else ""))
         self.status, self.url, self.retry_after = status, url, retry_after
 
 
@@ -77,17 +92,42 @@ class Pacer:
 
 
 def _allowed(url: str) -> bool:
-    return url.startswith(BASE_URL + "/v2/")
+    """https, exactly the service's host (no user, no port), a path under /v2/ with no `..` segment and no `//`,
+    judged after percent-decoding and again after normalising."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    path = urllib.parse.unquote(parts.path)
+    return (parts.scheme == "https" and parts.netloc == HOST and path.startswith("/v2/") and "//" not in path
+            and ".." not in path.split("/") and "\\" not in path and posixpath.normpath(path).startswith("/v2/")
+            and not parts.fragment)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follows a redirect: the 3xx answer falls through to urllib's error for it."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_HANDLERS: tuple = ()              # further urllib handlers (tests put a stand-in for the network here)
+
+
+def _opener():
+    return urllib.request.build_opener(_NoRedirect(), *_HANDLERS)
 
 
 def urllib_get(url: str, timeout: float = 60.0) -> tuple[bytes, str | None]:
-    """GET one URL of the service: (body, the answer's Date header or None). Refuses any other address. A non-200
-    answer raises HttpError with its status (and Retry-After when sent)."""
+    """GET one URL of the service: (body, the answer's Date header or None). Refuses any other address. Any answer
+    but a 200 raises HttpError with its status (and Retry-After when sent); a redirect is never followed."""
     if not _allowed(url):
         raise PolymarketDataError("refused: %s is not under %s/v2/" % (url, BASE_URL))
     req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": USER_AGENT}, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _opener().open(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", None) or resp.getcode()
+            if status != 200:
+                raise HttpError(status, url)
             headers = getattr(resp, "headers", None)
             return resp.read(), (headers.get("Date") if headers is not None else None)
     except urllib.error.HTTPError as e:
@@ -111,6 +151,19 @@ def _is_int(v) -> bool:
 
 def _is_str(v, nonempty: bool = True) -> bool:
     return isinstance(v, str) and (bool(v) or not nonempty)
+
+
+def _ts_max(ts_max: int | None) -> int:
+    return ts_max if ts_max is not None else int(time.time()) + TS_AFTER_START
+
+
+def _ts_why(ts, ts_max: int | None) -> str | None:
+    """None for whole epoch seconds from 2020-01-01 to `ts_max`; else the reason."""
+    if not _is_int(ts):
+        return "bad_timestamp"
+    if not TS_MIN <= ts <= _ts_max(ts_max):
+        return "timestamp_out_of_span"
+    return None
 
 
 def rfc3339_to_ts(v) -> int | None:
@@ -143,10 +196,11 @@ def validate_board_row(row) -> tuple[dict | None, str | None]:
 TRADE_STR = ("token_id", "condition_id")
 
 
-def validate_trade(row, user: str | None = None) -> tuple[dict | None, str | None]:
+def validate_trade(row, user: str | None = None, ts_max: int | None = None) -> tuple[dict | None, str | None]:
     """A trade row: side BUY or SELL; token and condition non-empty strings; size a number above 0; price a number from
-    0 to 1; timestamp an int above 0; outcome_index 0 or 1; event_slug and transaction_hash strings (may be empty).
-    With `user`, the row's proxy_wallet must be that wallet (case folded)."""
+    0 to 1; timestamp whole seconds from 2020-01-01 to `ts_max` (default: a day from now); outcome_index 0 or 1;
+    event_slug and transaction_hash strings (may be empty). With `user`, the row's proxy_wallet must be that wallet
+    (case folded)."""
     if not isinstance(row, dict):
         return None, "not_an_object"
     if not _is_str(row.get("proxy_wallet")):
@@ -163,8 +217,9 @@ def validate_trade(row, user: str | None = None) -> tuple[dict | None, str | Non
         return None, "bad_size"
     if not is_number(price) or not 0 <= price <= 1:
         return None, "bad_price"
-    if not _is_int(ts) or ts <= 0:
-        return None, "bad_timestamp"
+    why = _ts_why(ts, ts_max)
+    if why:
+        return None, why
     if not _is_int(oi) or oi not in (0, 1):
         return None, "bad_outcome_index"
     for k in ("event_slug", "transaction_hash"):
@@ -175,6 +230,12 @@ def validate_trade(row, user: str | None = None) -> tuple[dict | None, str | Non
     for k in ("slug", "title", "outcome"):
         out[k] = row.get(k) if isinstance(row.get(k), str) else None
     return out, None
+
+
+def trade_identity(t: dict) -> tuple:
+    """The identity of a validated trade row (the feed has no fill id)."""
+    return (t["proxy_wallet"].lower(), t["transaction_hash"], t["token_id"], t["condition_id"], t["side"], t["size"],
+            t["price"], t["timestamp"], t["outcome_index"])
 
 
 POSITION_NUM = ("current_size", "avg_price", "entry_cost_usdc", "total_cost_usdc", "current_value", "total_size",
@@ -204,9 +265,10 @@ def validate_position(row, user: str | None = None) -> tuple[dict | None, str | 
     return out, None
 
 
-def validate_resolution(row) -> tuple[dict | None, str | None]:
+def validate_resolution(row, ts_max: int | None = None) -> tuple[dict | None, str | None]:
     """A condition-keyed resolution row: condition_id and status strings; payouts None or exactly two integers
-    (micro-USDC a share) not below 0; resolved_at None or an RFC3339 time with its zone, also given as `resolved_ts`."""
+    (micro-USDC a share) not below 0; resolved_at None or an RFC3339 time with its zone from 2020-01-01 to `ts_max`,
+    also given as `resolved_ts`."""
     if not isinstance(row, dict):
         return None, "not_an_object"
     if not _is_str(row.get("condition_id")):
@@ -222,13 +284,15 @@ def validate_resolution(row) -> tuple[dict | None, str | None]:
         ts = rfc3339_to_ts(ra)
         if ts is None:
             return None, "bad_resolved_at"
+        if _ts_why(ts, ts_max):
+            return None, "resolved_at_out_of_span"
     return {"condition_id": row["condition_id"], "status": row["status"], "payouts": list(pay) if pay else None,
             "resolved_at": ra, "resolved_ts": ts}, None
 
 
-def validate_price_point(row) -> tuple[dict | None, str | None]:
-    """A price-history point: price a number from 0 to 1, resolution_seconds an int not below 0, timestamp an int
-    above 0 (the start of the span the point was observed in)."""
+def validate_price_point(row, ts_max: int | None = None) -> tuple[dict | None, str | None]:
+    """A price-history point: price a number from 0 to 1, resolution_seconds an int not below 0, timestamp whole
+    seconds from 2020-01-01 to `ts_max` (the start of the span the point was observed in)."""
     if not isinstance(row, dict):
         return None, "not_an_object"
     p, res, ts = row.get("price"), row.get("resolution_seconds"), row.get("timestamp")
@@ -236,8 +300,9 @@ def validate_price_point(row) -> tuple[dict | None, str | None]:
         return None, "bad_price"
     if not _is_int(res) or res < 0:
         return None, "bad_resolution_seconds"
-    if not _is_int(ts) or ts <= 0:
-        return None, "bad_timestamp"
+    why = _ts_why(ts, ts_max)
+    if why:
+        return None, why
     return {"price": p, "resolution_seconds": res, "timestamp": ts}, None
 
 
@@ -265,8 +330,14 @@ class Walk:
         self.rows.append(good)
         self.row_read_at.append(read_at)
 
-    def add(self, row, validator, read_at: str) -> None:
+    def add(self, row, validator, read_at: str, identity=None, ids: set | None = None) -> None:
         good, why = validator(row)
+        if why is None and identity is not None:
+            k = identity(good)
+            if k in ids:
+                why = "repeated_row"
+            else:
+                ids.add(k)
         self.raw.append((row, why))
         self.raw_read_at.append(read_at)
         if why is None:
@@ -294,19 +365,21 @@ class PolymarketData:
 
     def __init__(self, fetch: Callable[[str], Any] = urllib_get, *, max_per_second: float = 3.0, tries: int = 5,
                  sleep: Callable[[float], Any] = time.sleep, clock: Callable[[], float] = time.monotonic,
-                 now: Callable[[], str] = _now):
+                 now: Callable[[], str] = _now, wall: Callable[[], float] = time.time):
         self.fetch, self.tries, self.sleep, self.now = fetch, tries, sleep, now
+        self.ts_max = int(wall()) + TS_AFTER_START        # the latest time a row may carry
         self.pacer = Pacer(1.0 / max_per_second + 0.01, sleep, clock)    # a hair over 1/3 s: never 4 in a second
         self.last_date: str | None = None
         self.requests = 0
 
     def get_json(self, path: str, params: dict | None = None):
-        """GET base + path (a /v2/ path) with the query `params`; retries 429 and 5xx with waits of 1, 2, 4, 8 s (or
-        Retry-After, at most 60 s)."""
+        """GET base + path (a /v2/ path) with the query `params`; retries 429, 5xx and transport errors (a timeout, a
+        reset, a dropped connection) with waits of 1, 2, 4, 8 s (or Retry-After, at most 60 s)."""
         if not (isinstance(path, str) and path.startswith("/v2/") and ".." not in path and "//" not in path):
             raise PolymarketDataError("refused path %r" % (path,))
         url = BASE_URL + path + ("?" + urllib.parse.urlencode(params) if params else "")
         last: HttpError | None = None
+        last_err: str | None = None
         for attempt in range(self.tries):
             if attempt:
                 wait = last.retry_after if last is not None and last.retry_after else float(2 ** (attempt - 1))
@@ -319,21 +392,25 @@ class PolymarketData:
                     body, self.last_date = body
             except HttpError as e:
                 if e.status == 429 or e.status >= 500:
-                    last = e
+                    last, last_err = e, "HTTP %s" % e.status
                     continue
                 raise
+            except (OSError, http.client.HTTPException) as e:          # timeouts, resets, dropped connections
+                last, last_err = None, "%s: %s" % (type(e).__name__, e)
+                continue
             try:
                 return json.loads(body)
             except ValueError as e:
                 raise PolymarketDataError("not JSON from %s: %s" % (url, e)) from None
-        raise PolymarketDataError("gave up after %d tries: HTTP %s at %s" % (self.tries, last.status if last else "?", url))
+        raise PolymarketDataError("gave up after %d tries: %s at %s" % (self.tries, last_err or "?", url))
 
     def walk(self, path: str, params: dict, validator, *, page_cap: int = DEFAULT_PAGE_CAP, max_rows: int | None = None,
-             cursor_alone: bool = False) -> Walk:
-        """Every row of a cursor-paged list route, validated. Stops when has_more is false (or, with `max_rows`, once
-        that many rows were served). Raises on a wrong envelope, has_more without a cursor, a repeated cursor, or a
-        `page_cap`-th page that still promises more."""
-        w, seen, cursor = Walk(), set(), None
+             cursor_alone: bool = False, identity=None) -> Walk:
+        """Every row of a cursor-paged list route, validated, each identity once (`identity(row)`; a repeat is a
+        counted "repeated_row"). Stops when has_more is false (or, with `max_rows`, once that many rows were served).
+        Raises on a wrong envelope, has_more without a cursor, a repeated cursor, or a `page_cap`-th page that still
+        promises more."""
+        w, seen, cursor, ids = Walk(), set(), None, set()
         resend = {k: v for k, v in params.items() if k != "limit"}
         while True:
             if w.pages >= page_cap:
@@ -347,7 +424,7 @@ class PolymarketData:
             for row in rows:
                 if max_rows is not None and len(w.raw) >= max_rows:
                     return w
-                w.add(row, validator, read_at)
+                w.add(row, validator, read_at, identity, ids)
             if max_rows is not None and len(w.raw) >= max_rows:
                 return w
             if not more:
@@ -384,7 +461,8 @@ class PolymarketData:
         """A wallet's trades, both its taker and maker fills (`taker_only=false`), from `start` (1: the full history),
         newest first as served."""
         params = {"user": user, "start": int(start), "limit": 1000, "taker_only": "false"}
-        return self.walk("/v2/trades", params, lambda r: validate_trade(r, user), page_cap=page_cap)
+        return self.walk("/v2/trades", params, lambda r: validate_trade(r, user, self.ts_max), page_cap=page_cap,
+                         identity=trade_identity)
 
     def positions(self, user: str, status: str | None = None, page_cap: int = DEFAULT_PAGE_CAP) -> Walk:
         """A wallet's positions: open (the default, `status` None) or closed (`status` "CLOSED")."""
@@ -408,9 +486,10 @@ class PolymarketData:
         pg = ans.get("pagination")
         if pg is not None and (not isinstance(pg, dict) or pg.get("has_more") is not False):
             raise PolymarketDataError("/v2/resolutions answered a paged list; this reader cannot page it")
-        w = Walk(pages=1, read_at=[read_at])
+        w, ids = Walk(pages=1, read_at=[read_at]), set()
         for row in ans["data"]:
-            w.add(row, validate_resolution, read_at)
+            w.add(row, lambda r: validate_resolution(r, self.ts_max), read_at,
+                  lambda good: json.dumps(good, sort_keys=True), ids)
         return w
 
     def resolution_batches(self, conditions):
@@ -422,7 +501,8 @@ class PolymarketData:
             batch = conds[i:i + MAX_CONDITIONS]
             w = self.resolutions(batch)
             good: Counter = Counter(r["condition_id"] for r in w.rows)
-            bad: Counter = Counter(raw.get("condition_id") for raw, why in w.raw if why and isinstance(raw, dict))
+            bad: Counter = Counter(raw.get("condition_id") for raw, why in w.raw
+                                   if why and why != "repeated_row" and isinstance(raw, dict))
             answers = {}
             for c in batch:
                 if good[c] > 1:
@@ -440,4 +520,5 @@ class PolymarketData:
         if not _is_str(token_id) or not (_is_int(start) and _is_int(end)) or not 0 < start < end:
             raise ValueError("a token id and 0 < start < end, whole seconds")
         params = {"token_id": token_id, "start": start, "end": end}
-        return self.walk("/v2/prices-history", params, validate_price_point, page_cap=page_cap)
+        return self.walk("/v2/prices-history", params, lambda r: validate_price_point(r, self.ts_max),
+                         page_cap=page_cap, identity=lambda p: (token_id, p["timestamp"], p["resolution_seconds"]))

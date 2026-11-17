@@ -76,7 +76,7 @@ def test_a_wrong_number_in_a_stored_trade_is_a_counted_reject(bad):
 
 
 def test_cash_is_exact_micro_dollars():
-    t = T("w", 100, price=0.1, size=3.0)
+    t = T("w", MS(2026, 3), price=0.1, size=3.0)
     assert t.cash_micro == 300_000 and t.size_micro == 3_000_000
 
 

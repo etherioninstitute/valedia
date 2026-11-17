@@ -31,7 +31,10 @@ Rules the code holds:
   conditions so read, and the price windows of development positions only. A leader's standing for month M uses only
   trades and resolutions before M began. `sealed` needs the flag and the development file with its hash; before
   its marker it checks from bookkeeping tables alone that phase 1 finished and that every sealed window of the plan
-  was pulled; it writes the marker BEFORE any sealed row is read, and runs once.
+  was pulled, then recomputes the development result from THIS store and goes on only when that recomputed result
+  passed and the given file equals it byte for byte. The sealed period is spent once per store: the store carries
+  its own id and its own sealed marker, written and committed in the store BEFORE any sealed row is read (the
+  output folder's marker is a second sign). Output folders default to one named for the store's id.
 * Money is whole cents decided on integers: trade cash is exact micro-dollars, a standing and a 24-hour sum are
   rounded to cents half up, a follower's price is rounded to the cent half up; means are computed at the end.
 * The event (Polymarket's event slug) is the unit of the resampling. Every left-out wallet, month, position, price
@@ -42,10 +45,12 @@ from __future__ import annotations
 import argparse
 import calendar
 import hashlib
+import http.client
 import json
 import os
 import sqlite3
 import sys
+import uuid
 from bisect import bisect_left
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -82,7 +87,7 @@ MAX_SHARES_PER_DOLLAR = 20                # fewer than this many shares traded p
 TOP_N, MIN_LEADERS = 10, 3
 NEW_WINDOW = 30 * DAY                     # no holding of the token or its opposite in the 30 days before
 BUY_WINDOW = DAY                          # purchases of the token within 24 hours of the first, inclusive
-MIN_BUY_CENTS = 100_000                   # 1,000 dollars
+MIN_BUY_MICRO = 1_000 * 1_000_000         # 1,000 dollars, compared exactly
 FIRST_LO, FIRST_HI = Decimal("0.10"), Decimal("0.90")
 RESOLVE_WITHIN = 45 * DAY
 DELAY = HOUR
@@ -302,7 +307,7 @@ def position_skip(pos: NewPosition, resolutions: dict) -> str | None:
     """Why a leader's new position is not copied (rules in this order), or None. The follower's price is judged later."""
     if not FIRST_LO <= pos.price <= FIRST_HI:
         return "first_price_outside_0.10_0.90"
-    if micro_to_cents(pos.cash24_micro) < MIN_BUY_CENTS:
+    if pos.cash24_micro < MIN_BUY_MICRO:
         return "under_1000_in_24h"
     r = resolutions.get(pos.condition)
     if r is None or r.state == "unresolved":
@@ -451,7 +456,7 @@ def wallet_book(trades, resolutions: dict) -> Book:
 
 
 class Standing(NamedTuple):
-    profit_cents: int
+    profit_micro: int
     resolved_positions: int
     shares_micro: int
 
@@ -469,20 +474,20 @@ def _count_in(times, lo, hi) -> int:
 
 
 def standing(book: Book, month) -> Standing:
-    """Realized profit (cents), resolved positions and shares traded over the three calendar months before `month`,
-    from events before the month began."""
+    """Realized profit (exact micro-dollars), resolved positions and shares traded over the three calendar months
+    before `month`, from events before the month began."""
     lo, hi = _bounds(month)
-    profit = micro_to_cents(_window_sum(book.realized_ts, book.realized_cum, lo, hi))
+    profit = _window_sum(book.realized_ts, book.realized_cum, lo, hi)
     return Standing(profit, _count_in(book.resolved_ts, lo, hi), _window_sum(book.shares_ts, book.shares_cum, lo, hi))
 
 
 def qualifies(st: Standing) -> str | None:
     if st.resolved_positions < MIN_RESOLVED:
         return "fewer_than_30_resolved"
-    if st.profit_cents <= 0:
+    if st.profit_micro <= 0:
         return "profit_not_above_zero"
-    # shares / dollars < 20  <=>  shares_micro / 1e6 < 20 * profit_cents / 100
-    if st.shares_micro >= MAX_SHARES_PER_DOLLAR * 10_000 * st.profit_cents:
+    # shares / dollars < 20  <=>  shares_micro / 1e6 < 20 * profit_micro / 1e6, compared exactly
+    if st.shares_micro >= MAX_SHARES_PER_DOLLAR * st.profit_micro:
         return "20_or_more_shares_per_dollar"
     return None
 
@@ -496,7 +501,7 @@ def pick_leaders(standings: dict) -> tuple[list, Counter]:
         if why:
             skips[why] += 1
         else:
-            qual.append((-st.profit_cents, w))
+            qual.append((-st.profit_micro, w))
     qual.sort()
     top = [w for _, w in qual[:TOP_N]]
     if len(qual) > TOP_N:
@@ -700,6 +705,9 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(self.path))
         self.db.executescript(SCHEMA)
+        if self.meta("store_id") is None:          # the store's own identity, written once when it is made
+            self.set_meta("store_id", uuid.uuid4().hex)
+            self.db.commit()
 
     def __enter__(self):
         return self
@@ -964,14 +972,18 @@ def pull(store_path, client: pd.PolymarketData, phase: int = 1, leave_out=(), sa
             _pull_phase2(s, client, leave_out, say, errors)
         s.set_meta("last_pull_phase_%d_ended_at" % phase, _now())
     if errors:
+        say("phase %d ended with %d walks unfinished (a re-run reads only those): %s"
+            % (phase, len(errors), "; ".join(e.split(": ", 1)[0] for e in errors)))
         raise PullIncomplete("%d walks did not finish (they stay unfinished): %s" % (len(errors), "; ".join(errors[:20])))
     return {"requests": client.requests}
 
 
 def _guarded(errors, label, fn) -> None:
+    """Run one walk; a failure of the service or of the connection (after the reader's bounded tries) leaves it
+    unfinished and the pull goes on."""
     try:
         fn()
-    except (pd.HttpError, pd.PolymarketDataError) as e:
+    except (pd.HttpError, pd.PolymarketDataError, OSError, http.client.HTTPException) as e:
         errors.append("%s: %s" % (label, e))
 
 
@@ -998,11 +1010,14 @@ def _pull_phase1(s: Store, client, say, errors) -> None:
         s.start_walk("resolutions", c)
     s.commit()
 
-    def batches():
-        for batch, w, answers in client.resolution_batches(conds):
-            s.finish_resolutions(batch, w, answers)
-            s.commit()
-    _guarded(errors, "resolutions", batches)
+    for i in range(0, len(conds), pd.MAX_CONDITIONS):
+        part = conds[i:i + pd.MAX_CONDITIONS]
+
+        def one(part=part):
+            for batch, w, answers in client.resolution_batches(part):
+                s.finish_resolutions(batch, w, answers)
+        _guarded(errors, "resolutions from %s" % part[0], one)
+        s.commit()
 
 
 def add_ten_minute_windows(s: Store) -> dict:
@@ -1247,35 +1262,85 @@ def _write_bytes(path: Path, raw: bytes) -> None:
     os.replace(tmp, path)
 
 
+# The readings the program takes where the prediction document is silent (printed with every result).
+READINGS = (
+    "A wallet's cost of a token is its average cost; a sale removes cost in proportion to the shares sold.",
+    "Profit counts when it is realised inside the three-month window: at a sale, or at the market's resolution.",
+    "A resolved position is a token the wallet still held when its market resolved.",
+    "A profit of zero or less does not qualify.",
+    "Ties in profit are broken by wallet name.",
+    "Shares sold beyond what the wallet's trades show it held earn nothing (counted); every trade, such a sale "
+    "included, starts the 30-day count of the new-position test again.",
+    "A wallet's trades at or after its market's resolution are ignored (counted).",
+    "Development starts three months after the earliest trade read and ends with June 2026.",
+    "A position whose event slug is empty is left out (counted).",
+    "One copied trade per leader per new position: two leaders in the same position give two copied trades.",
+    "The figure for first purchases over 10,000 dollars uses the first fill only.",
+    "Sports are decided by the event or market slug's prefix (a fixed list of league prefixes).",
+    "The 0.05 to 0.95 guard is applied to the recorded price before rounding to the cent.",
+    "More than one resolution row for a condition, when they differ, is not trusted: the condition is taken as "
+    "unresolved.",
+    "A trade row's identity is wallet, transaction hash, token, condition, side, size, price, time and outcome "
+    "index; a price point's is token, time and grain; a resolution row's is the whole row; a repeat is dropped and "
+    "counted.",
+    "Times are whole epoch seconds from 2020-01-01 to one day after the pull started; others are counted rejects.",
+    "A price point at or after the market's resolution time (resolved_at) is never a price; a tie on time takes "
+    "the finer grain.",
+    "The 10-minute figure is read only where the main window's first usable point has a grain of five minutes or "
+    "finer, and counts only trades priced at that grain.",
+    "The delay table's median and 90th percentile are nearest-rank.",
+    "Both thresholds are compared exactly in micro-dollars: fewer than 20 shares per dollar of profit, and at least "
+    "1,000 dollars within 24 hours.",
+)
+
+
+def store_id(store) -> str:
+    with Store(store) as s:
+        return s.meta("store_id")
+
+
+def store_sealed_marker(store):
+    """The sealed marker written in the store, or None."""
+    with Store(store) as s:
+        return s.meta("sealed_marker")
+
+
 def _provenance(store: Path) -> dict:
     with Store(store) as s:
-        boards = s.board_read_at()
+        boards, sid = s.board_read_at(), s.meta("store_id")
     return {"prediction_commit": PREDICTION_COMMIT, "time_correction_commit": TIME_CORRECTION_COMMIT,
             "amendment_commit": AMENDMENT_COMMIT, "second_amendment_commit": SECOND_AMENDMENT_COMMIT,
             "prediction_doc": PREDICTION_DOC, "code_sha256": code_sha256(),
-            "store": str(store), "boards_read_at": boards}
+            "store": str(Path(store).resolve()), "store_id": sid, "boards_read_at": boards,
+            "readings": list(READINGS)}
 
 
 def _store_path(store) -> Path:
     return Path(store) if store is not None else REPO / STORE
 
 
-def _out_dir(out_dir) -> Path:
-    return Path(out_dir) if out_dir is not None else REPO / OUT_DIR
+def _out_dir(out_dir, sid: str) -> Path:
+    """The given folder, or one named for the store's id: two stores never share a default folder."""
+    return Path(out_dir) if out_dir is not None else REPO / OUT_DIR / sid
+
+
+def _development_doc(path: Path, leave_out) -> dict:
+    """The development document of this store (development months only; deterministic for one store and code)."""
+    data = load(path, "development", leave_out)
+    return {"provenance": _provenance(path), "result": development_result(data)}
 
 
 def run_develop(*, store=None, out_dir=None, leave_out=()) -> dict:
     path = _store_path(store)
-    data = load(path, "development", leave_out)
-    doc = {"provenance": _provenance(path), "result": development_result(data)}
-    out = _out_dir(out_dir) / "develop.json"
+    doc = _development_doc(path, leave_out)
+    out = _out_dir(out_dir, doc["provenance"]["store_id"]) / "develop.json"
     raw = _dump(doc)
     _write_bytes(out, raw)
     _write_bytes(out.with_name(out.name + ".sha256"), (hashlib.sha256(raw).hexdigest() + "\n").encode())
     return doc
 
 
-def _check_development_file(dev: Path, leave_out: list) -> str:
+def _read_development_file(dev: Path) -> tuple[bytes, str]:
     side = dev.with_name(dev.name + ".sha256")
     if not dev.is_file():
         raise Refused("the development file %s is missing: run develop first" % dev)
@@ -1285,22 +1350,24 @@ def _check_development_file(dev: Path, leave_out: list) -> str:
     got = hashlib.sha256(raw).hexdigest()
     if side.read_text().strip() != got:
         raise Refused("the development file's hash differs from the one written with it")
+    return raw, got
+
+
+def _why_differs(raw: bytes, recomputed: dict, leave: list) -> str:
+    """Why a development file is not the result recomputed from this store (the first reason found)."""
     try:
         doc = json.loads(raw)
         prov, res = doc["provenance"], doc["result"]
-        step = res["step_1"]
     except (ValueError, KeyError, TypeError):
-        raise Refused("the development file is not a development file of this program") from None
+        return "the development file is not a development file of this program"
+    if prov.get("store_id") != recomputed["provenance"]["store_id"]:
+        return "the development file belongs to another store (%s, not %s)" % (
+            prov.get("store_id"), recomputed["provenance"]["store_id"])
+    if res.get("wallets_left_out") != leave:
+        return "the wallets left out %s differ from those development left out %s" % (leave, res.get("wallets_left_out"))
     if prov.get("code_sha256") != code_sha256():
-        raise Refused("the development file was made by different code")
-    if prov.get("prediction_commit") != PREDICTION_COMMIT or res.get("period") != "development":
-        raise Refused("the development file implements another prediction or period")
-    if step.get("verdict") != "PROCEED":
-        raise Refused("development failed step 1: the sealed period is not opened")
-    if res.get("wallets_left_out") != leave_out:
-        raise Refused("the wallets left out %s differ from those development left out %s"
-                      % (leave_out, res.get("wallets_left_out")))
-    return got
+        return "the development file was made by different code"
+    return "the development file differs from the development result recomputed from this store"
 
 
 def sealed_bookkeeping_problems(s: Store, leave: list) -> list:
@@ -1328,27 +1395,49 @@ def sealed_bookkeeping_problems(s: Store, leave: list) -> list:
 
 
 def run_sealed(*, store=None, out_dir=None, flag: bool = False, leave_out=(), develop_file=None) -> dict:
+    """The sealed run, once per store. In order: the flag; the store's own marker; the folder's marker; the
+    development file and its hash; the bookkeeping; the development result recomputed from this store (it must pass,
+    and the file must equal it byte for byte); the store's marker (committed), the folder's marker; only then the
+    sealed rows."""
     if not flag:
         raise Refused("the sealed period is opened only with --i-am-opening-the-sealed-period")
     path = _store_path(store)
-    od = _out_dir(out_dir)
-    dev = Path(develop_file) if develop_file is not None else od / "develop.json"
+    if not path.is_file():
+        raise Refused("the store %s is missing (nothing written)" % path)
     leave = sorted(set(leave_out))
-    dev_sha = _check_development_file(dev, leave)
+    with Store(path) as s:
+        sid, spent = s.meta("store_id"), s.meta("sealed_marker")
+    if spent is not None:
+        raise Refused("the sealed period of store %s was already run (its marker in the store is dated %s): it is "
+                      "spent. If its result is missing it must be recomputed by hand from the store by the lead, never "
+                      "run again" % (sid, spent.get("time")))
+    od = _out_dir(out_dir, sid)
     marker = od / "sealed.used"
     if marker.exists():
         raise Refused("the sealed period was already run (%s exists)" % marker)
-    if not path.is_file():
-        raise Refused("the store %s is missing (nothing was marked used)" % path)
+    dev = Path(develop_file) if develop_file is not None else od / "develop.json"
+    dev_raw, dev_sha = _read_development_file(dev)
     with Store(path) as s:                         # bookkeeping only: no sealed row is read before the marker
         problems = sealed_bookkeeping_problems(s, leave)
     if problems:
         raise Refused("the sealed run is not started (nothing written): %s" % "; ".join(problems))
+    recomputed = _development_doc(path, leave)     # development months only
+    step = recomputed["result"]["step_1"]
+    if step["verdict"] != "PROCEED":
+        raise Refused("development, recomputed from this store, failed step 1 (%s): the sealed period is not opened "
+                      "(nothing written)" % step["failed"])
+    if dev_raw != _dump(recomputed):
+        raise Refused("%s (nothing written)" % _why_differs(dev_raw, recomputed, leave))
     note = {"time": datetime.now(UTC).isoformat(), "development_sha256": dev_sha, "development_file": str(dev),
-            "wallets_left_out": leave}
+            "wallets_left_out": leave, "store_id": sid, "store": str(path.resolve())}
+    with Store(path) as s:                         # the store's own marker, committed BEFORE any sealed row is read
+        if s.meta("sealed_marker") is not None:
+            raise Refused("the sealed period of store %s was already run" % sid)
+        s.set_meta("sealed_marker", note)
+        s.commit()
     marker.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with open(marker, "x") as f:               # written BEFORE any sealed row is read
+        with open(marker, "x") as f:               # the folder's marker: a second sign
             f.write(json.dumps(note, sort_keys=True, indent=1) + "\n")
             f.flush()
             os.fsync(f.fileno())
@@ -1371,8 +1460,9 @@ def format_table(doc: dict) -> str:
     r = doc["result"]
     sb = r["sells_beyond_holding"]
     share = sb["share_of_leader_sells"]
-    lines = ["copying the leaders, %s period (prediction %s, amended %s and %s)" % (
-                 r["period"], PREDICTION_COMMIT, AMENDMENT_COMMIT, SECOND_AMENDMENT_COMMIT),
+    prov = doc.get("provenance", {})
+    lines = ["copying the leaders, %s period (prediction %s, amended %s and %s), store %s" % (
+                 r["period"], PREDICTION_COMMIT, AMENDMENT_COMMIT, SECOND_AMENDMENT_COMMIT, prov.get("store_id")),
              "candidates %d; wallets left out: %s%s" % (
                  r["candidates"], r["wallets_left_out"] or "none",
                  " (unfinished in the pull: %s)" % r["unfinished_left_out"] if r["unfinished_left_out"] else ""),
@@ -1407,6 +1497,8 @@ def format_table(doc: dict) -> str:
                          "90th percentile %s s; points passed over %s" % (
                              NOTE, k, v["grain_seconds"], v["delay_seconds"]["median"], v["delay_seconds"]["p90"],
                              v["points_passed_over"]))
+    lines.append("readings where the document is silent (%d, also in the provenance):" % len(prov.get("readings", [])))
+    lines += ["  - " + x for x in prov.get("readings", [])]
     return "\n".join(lines)
 
 
