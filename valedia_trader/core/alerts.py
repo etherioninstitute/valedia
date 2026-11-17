@@ -85,7 +85,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Protocol
 from zoneinfo import ZoneInfo
 
-from valedia_trader.core.secrets import child_env, env_file_path, load_env, redact
+from valedia_trader.core.secrets import LiveNameInReach, child_env, env_file_path, is_live_file, load_env, redact
 
 __all__ = ["Alert", "Env", "Sender", "MacNotifier", "WatchResult", "watch", "open_alerts", "alerts_file", "main", "clean",
            "open_readonly", "describe", "SourceMissing", "CHECKS", "last_trading_day", "exchange_sessions", "launchctl_text",
@@ -649,6 +649,9 @@ def register_trading_file(env: Env | None = None) -> dict[str, str]:
     done = "nothing was done"
     values: dict[str, str] = {}
     try:
+        if is_live_file(path):                         # T50: judged from names and metadata, before the file is opened
+            raise TradingFileError("the file named as the trading file is the live key file (webull-live.env); it was not "
+                                   f"opened and nothing was registered; {done}")
         if path.is_file():
             if path.stat().st_mode & 0o077:
                 raise TradingFileError(f"the trading file is readable by others; it must be readable by its owner only (chmod 600); {done}")
@@ -664,7 +667,10 @@ def register_trading_file(env: Env | None = None) -> dict[str, str]:
                 raise TradingFileError(f"the trading file is not valid UTF-8 text; {done}") from None
             if sum(1 for ln in text.splitlines() if "=" in ln and not ln.lstrip().startswith("#")) > TRADING_FILE_MAX_SETTINGS:
                 raise TradingFileError(f"the trading file holds more than 200 settings, so it is not a trading file; {done}")
-            load_env(path, environ=values)
+            try:
+                load_env(path, environ=values)
+            except LiveNameInReach as exc:             # T50: the loader refused the file; none of its values is registered
+                raise TradingFileError(f"the trading file was refused: {exc}; nothing was registered; {done}") from None
             _registered["longest"] = max([_registered["longest"]] + [len(v) for v in values.values() if isinstance(v, str)])
     except TradingFileError:
         raise

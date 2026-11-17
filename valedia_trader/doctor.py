@@ -582,11 +582,13 @@ def check_jobs(paths: LoopPaths, launchd_dir: str | Path | None = None, agents_d
     raw text), and the files each of those property lists runs (_named_by), one level down (binaries are skipped). A
     file holding --live as a whole word or either live key name fails the check, named; so does anything the check
     could not read or find (a folder, a job file, a property list it cannot parse, a file a job runs), named, and a
-    folder that does not exist on this machine is said to be so. Nothing a file holds is printed."""
+    folder that does not exist on this machine is said to be so. In LaunchAgents, a file that cannot be read or parsed
+    fails the check only when its file name starts with com.valedia.; any other is listed as not examined (the
+    folder holds other programs' files). Nothing a file holds is printed."""
     launchd = Path(launchd_dir) if launchd_dir is not None else paths.root / "tools" / "launchd"
     agents = Path(agents_dir) if agents_dir is not None else LAUNCH_AGENTS
     scanned: set[Path] = set()
-    hits, unread, missing = [], [], []
+    hits, unread, missing, not_examined = [], [], [], []
     named: list[tuple[Path, str]] = []
 
     def listing(folder: Path) -> list[Path]:
@@ -629,11 +631,15 @@ def check_jobs(paths: LoopPaths, launchd_dir: str | Path | None = None, agents_d
     for p in listing(agents):
         if p.suffix != ".plist":
             continue
+        ours_by_name = p.name.startswith(OUR_LABEL)
         raw, why = _read_job_bytes(p, False)
-        if raw is None:
-            unread.append(f"{p.name} ({why})")             # whose it is cannot be told
+        if raw is None:                                    # whose it is: its file name says, the only thing left to go by
+            (unread if ours_by_name else not_examined).append(f"{p.name} ({why})")
             continue
         data = _job_plist(raw)
+        if data is None and not ours_by_name:
+            not_examined.append(f"{p.name} (not a property list launchd can read)")
+            continue
         label = data.get("Label") if data else None
         if data is None or (isinstance(label, str) and label.startswith(OUR_LABEL)):
             data = scan(p, p.name, True)
@@ -651,10 +657,18 @@ def check_jobs(paths: LoopPaths, launchd_dir: str | Path | None = None, agents_d
         if unread:
             parts.append("could not be read: " + "; ".join(unread))
         parts += missing
+        if not_examined:
+            parts.append(_not_examined(not_examined))
         return FAIL, "; ".join(parts)
+    tail = f"; {_not_examined(not_examined)}" if not_examined else ""
     if not scanned:
-        return ATTENTION, f"no job files found (looked in {launchd} and {agents})"
-    return OK, f"{len(scanned)} job files scanned; none names --live or a live key name"
+        return ATTENTION, f"no job files found (looked in {launchd} and {agents}){tail}"
+    return OK, f"{len(scanned)} job files scanned; none names --live or a live key name{tail}"
+
+
+def _not_examined(names: list[str]) -> str:
+    return ("not examined (other programs' files in LaunchAgents that could not be read or parsed): "
+            + "; ".join(names))
 
 
 def check_mirofish(paths: LoopPaths) -> tuple[str, str]:

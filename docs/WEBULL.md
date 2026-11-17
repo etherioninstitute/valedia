@@ -203,10 +203,9 @@ shows no value.
 Only the live commands read it. The ordinary loader (the one every other command uses for `trading.env`) refuses the
 live file however it is named (through `VALEDIA_ENV_FILE`, a link, another spelling of the path or a second name on
 disk: it compares the real paths and the file's device and inode before reading anything), and refuses any file that
-names either live name anywhere, setting nothing from it; the refusal names the fault and no value. One exception
-remains, outside this change: the alerts commands (`python -m valedia_trader.core.alerts`) read the trading file's
-bytes themselves before handing it to the loader, so pointed at the live file they read it into memory (never into
-the environment or any output) before they refuse.
+names either live name anywhere, setting nothing from it; the refusal names the fault and no value. The alerts
+commands and the owner page make the same identity test before they open the trading file, and register nothing
+from a file that names a live name.
 
 The live commands never take a key from the process environment or from `trading.env`, fix the environment to production and the host to
 `api.webull.com` in code, pass no account id (the account is chosen by the class in your confirmation, and its last 4
@@ -222,7 +221,9 @@ program given as a path, the first argument after an interpreter such as `bash` 
 `.sh`, `.zsh`, `.bash`, `.py` or `.command`) holds `--live` or either live name. A property list is read as launchd
 reads it, text or binary, and every string in it is tested as well as its raw text. Anything the check cannot read or
 find (a folder, a job file, a property list it cannot parse, a script a job runs) fails the check, named, and a
-folder that does not exist on this machine is said to be so.
+folder that does not exist on this machine is said to be so. In your LaunchAgents folder, which holds other programs'
+files too, a file that cannot be read or parsed fails the check only when its name starts with `com.valedia.`; any
+other is listed in the check's line as not examined.
 
 **Practice runs never reach production.** The order step without `--live` (the 06:55 and 07:10 jobs), the events
 probe (`python -m valedia_trader.venues.webull_events probe`) and the connection check
