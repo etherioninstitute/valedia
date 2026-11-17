@@ -418,3 +418,55 @@ at the usual rate are not expected before about 05:48 UTC; in the first ten minu
 were made (slots 05:19 and 05:24), both ok. The stop of 22 minutes earlier the same day did not have this cost
 (decisions resumed in the first minute). A later declaration of a long stop counts the half hour after it as well.
 A later run of this kind is declared here before it happens.
+
+## Amendment: the model's server and file change (declared at 00:40 UTC on 17 November, 16:40 PST on 16 November, before any restart; no answer has been scored)
+
+Under note 4 above, and on the owner's instruction of 16 November that every local model on this Mac runs through
+one server, LM Studio, and none through Ollama.
+
+**What changes.**
+- The server: from Ollama (`127.0.0.1:11434`) to LM Studio (`127.0.0.1:1235`). The typed endpoint
+  (`/v1/systemone`), the shape of the request and the reply's strict checks are the same.
+- The model file: from Ollama's build `nimble-v3:9b-mxfp8` (8-bit, run by MLX) to the publisher's GGUF build of
+  the same model, `Bespoke-Nimble-9B-v3-Q8_0.gguf` (8-bit, run by llama.cpp; 9,527,503,392 bytes; SHA-256
+  `ad484077ad28c1ba0644509b81e80268f8fd39e9d218415638a988caf3c6e66c`). Both are packaged from Nimble v3 9B.
+  Whether the two builds give the same answers is not known and is not assumed.
+- How it is loaded: one instance under a fixed name, six slots, context 32,768, never unloaded when idle.
+- The check before every call: that this instance is loaded with those settings and that its file is the one
+  named above (size and quantisation as the server reports them; the file's SHA-256 verified when the collector
+  starts and its size and modification time on every call). A failed check is a row with its status, as now.
+- What is stored: `model_tag` becomes `lmstudio:bespoke-nimble-9b-v3@q8_0` and `model_digest` the file's
+  SHA-256. The request names the instance, so `request_sha256` differs from before for the same state.
+
+**What does not change.** The markets, the snapshots, the slots, the state, the battery and its hash, the 10 second
+limit on a call, the three quoting rules, the periods, the yardsticks, the pass rule and the evaluation code. That
+code selects decisions by status and battery, never by the model's tag (read in its source; it has still never
+opened the real record).
+
+**Why the test is not touched.** The pass rule uses the test period only, which begins at 00:00 UTC on
+19 November and will run wholly on the new build. Nothing scored uses a model answer from the development period:
+the yardsticks are fitted on outcomes. The development days before and after the restart are not pooled or
+compared for any statement about the model. What is tested is now "Nimble v3 9B, GGUF Q8_0, under LM Studio". The
+section "What I expect" was written about the Ollama build and from probes of it; it stands as written and is
+judged against the new build's test period.
+
+**A deadline, fixed now.** The test period runs on one revision (note 4) and its first day is fixed by the first
+start of collection. The new revision takes over only if it has passed a blind check and been restarted before
+12:00 UTC on 18 November, which leaves at least half a development day as its shakedown. If it has not, this
+amendment lapses: the collector stays exactly as it is until the test period has ended, and that is said here.
+
+**Measured before this was written** (17 November, 00:12 to 00:30 UTC; the states sent were invented numbers
+under the collector's own state keys, never a stored state; nothing was sent to the collector's own model): with
+six slots LM Studio's build answers the battery in 2.5 seconds (13.7 with one slot, where the six questions run
+one after another); the replies pass the collector's strict parser once the model's name is put back; one request
+sent three times gave identical answers; an instance loaded by name was not unloaded when another model was
+loaded on demand; with the instance gone a call fails at once and nothing is loaded in its place.
+
+**What those measurements cost the collector, which had not been declared.** The loads shared the Mac's graphics
+memory and processor with the collector's own model. From 00:12 to 00:30 UTC the collector's calls took 6.1
+seconds at the median and 7.96 at the worst (3.56 and 5.31 in the hour before); its 42 decisions in that window
+were all ok and none was late. From about 00:30 UTC another session on this Mac has been using the same model
+file in LM Studio for work of its own, and the collector's calls have stayed near 6.5 seconds since; that is
+not part of this test and is watched.
+
+The restart is declared here, with its time and the revision's commit, before it happens.
