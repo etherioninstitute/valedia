@@ -378,6 +378,8 @@ records every refused request; after preparation, the simulation and the report 
 or cancelled call. The format check (`tools/mirofish_format_qualify.py`) imports `mirofish_native_startup` from the staged
 entry as its fourth pinned module, so it runs with no hand-set path.
 
+**The preflight (addendum 2).** A twin's `--preflight` now runs `mirofish_startup_preflight.py` (staged with a model beside the observer's run script) under the observer's sandbox: with the run's own code it proves the observer is confined, every pinned file matches, a plan's manifest binds the selector's plan, and the host's signed capsule verifies with its latest sample passing the run's START rule (free against the staged threshold, pressure level 1, fresh and valid); it prints one JSON line, exits 0 only when all hold (else 3), and the launcher's `builder/startup-preflight.json` carries that exit and line under `observer`. It still cannot show anything that needs a model: no model is loaded, so the SDK helper, the load readback and the model's own template admission are not tested, nor the gate, which only a launch claims.
+
 ### Where an agent turn's time goes (recorded, 2026-11-15)
 
 The "fixed overhead" of about 6 s a turn was model time and queueing, not admission or dispatch. From the gateway ledgers and
