@@ -1164,3 +1164,86 @@ def test_s_reader_agrees_with_normalize_candle_on_well_formed_rows(tmp_path):
         norm = kd.normalize_candle(raw)
         assert cand["end_ts"] == norm["end_ts"]
         assert cand["yes_bid"]["close"] == norm["yes_bid"]["close"] and cand["yes_ask"]["close"] == norm["yes_ask"]["close"]
+
+
+# ---------------------------------------------------------------- addendum 4: one ticker shape, no case games
+@pytest.mark.parametrize("t", ["KXHIGHNY-26NOV12-T65", "A", "A" * 80, "A.B-C9", "KXNBAGAME-26JAN05TORPHI-TOR"])
+def test_ticker_shape_accepts_kalshi_tickers(t):
+    assert ab.ticker_ok(t)
+
+
+@pytest.mark.parametrize("t", ["", "a", "kxhighny-x", "KXHIGHNY-x", "9ABC", "-A", ".A", "A" * 81, "A" * 500, "A B",
+                               "A\n", "KXHIGHNY-X\n", "KX_Y", "ÉA", "A/B", "../x", None, 5, True, ["A"], {"a": 1}])
+def test_ticker_shape_refuses_everything_else(t):
+    assert not ab.ticker_ok(t)
+
+
+def test_w_tickers_of_the_wrong_shape_are_counted_bad_ticker(tmp_path):
+    specs = [one_market(ev="KXHIGHNY-B%d" % i, close=datetime(2023, 6, 1 + i, 5, 0, tzinfo=UTC)) for i in range(4)]
+    write_w(tmp_path, specs + [one_market()])
+    ok = {"KXHIGHNY-Z1-M"}
+
+    def edit(ms):
+        for m, bad in zip(ms[:4], ["kxhighny-lower", "A" * 500, "A" * 81, "Kx"]):
+            m["ticker"] = bad
+    _rewrite_w_markets(tmp_path, edit)
+    col = ab.collect("W", "development", root=tmp_path)
+    assert col.labels["24h"].market_skips == {"bad_ticker": 4} and len(col.labels["24h"].trades) == 2
+
+
+def _case_root(root, poison):
+    """A listing with KXHIGHNY-X in a sealed event and kxhighny-x in a development event; on a case-insensitive volume
+    both names are the same candle file."""
+    dev_spec = Spec("KXHIGHNY-EVD", "kxhighny-x", datetime(2023, 6, 1, 5, 0, tzinfo=UTC), "yes", 50, 52)
+    sealed_spec = Spec("KXHIGHNY-EVS", "KXHIGHNY-X", datetime(2025, 6, 1, 5, 0, tzinfo=UTC), "yes", 50, 52)
+    base = gen(9, 100, 3, sealed=False, tag="D")
+    write_w(root, base + [dev_spec, sealed_spec], corrupt={"KXHIGHNY-X"} if poison else ())
+
+
+def test_a_lower_case_twin_of_a_sealed_ticker_cannot_reach_its_candle_file(tmp_path):
+    clean, poisoned = tmp_path / "clean", tmp_path / "poisoned"
+    _case_root(clean, False)
+    _case_root(poisoned, True)
+    assert canon(develop(clean)["result"]) == canon(develop(poisoned)["result"])
+    col = ab.collect("W", "development", root=poisoned)
+    assert "KXHIGHNY-EVD" not in {t[0] for t in col.labels["24h"].trades}
+
+
+def test_a_lower_case_twin_is_left_out_even_when_the_shape_rule_is_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(ab, "ticker_ok", lambda t: type(t) is str and bool(t))
+    clean, poisoned = tmp_path / "clean", tmp_path / "poisoned"
+    _case_root(clean, False)
+    _case_root(poisoned, True)
+    assert canon(develop(clean)["result"]) == canon(develop(poisoned)["result"])
+    assert ab.collect("W", "development", root=clean).unassignable == {"duplicate_ticker": 2}      # folded repeat
+
+
+def test_a_candle_file_named_in_another_case_is_no_candle_and_is_not_read(tmp_path):
+    write_w(tmp_path, [one_market(ev="KXHIGHNY-C1")], skip_files={"KXHIGHNY-Z1-M"})
+    (Path(tmp_path) / "artifacts" / "kalshi_weather" / "candles" / "kxhighny-z1-m.json").write_text("{{ not json")
+    lab = ab.collect("W", "development", root=tmp_path).labels["24h"]
+    assert lab.market_skips == {"no_candle": 1}                       # not bad_candle_record: the file was not opened
+
+
+def test_candle_file_lookup_is_exact_even_if_the_shape_rule_is_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(ab, "ticker_ok", lambda t: type(t) is str and bool(t))
+    write_w(tmp_path, [one_market()])
+    base = Path(tmp_path) / "artifacts" / "kalshi_weather"
+    d = json.loads((base / "markets.json").read_text())
+    d["markets"][0]["ticker"] = "kxhighny-z1-m"                       # the file on disk is KXHIGHNY-Z1-M.json
+    (base / "markets.json").write_text(json.dumps(d))
+    lab = ab.collect("W", "development", root=tmp_path).labels["24h"]
+    assert lab.market_skips == {"no_candle": 1} and lab.trades == []
+
+
+def test_s_ticker_shape_and_empty_tickers(tmp_path):
+    d1 = datetime(2026, 1, 10, 18, 0, tzinfo=UTC)
+    write_s(tmp_path, [Spec("KXNBAGAME-G", "KXNBAGAME-G-X", d1, "yes", 50, 52)])
+    for pk, t in (("P1", "kxnbagame-lower"), ("P2", "A" * 500), ("P3", "Kx")):
+        s_add_market(tmp_path, pk, {"ticker": t, "event_ticker": "KXNBAGAME-E" + pk, "result": "yes"})
+    s_add_market(tmp_path, "P4", {"ticker": "", "event_ticker": "KXNBAGAME-EP4", "result": "yes"})   # one empty ticker
+    col = ab.collect("S", "development", root=tmp_path)
+    assert col.unassignable == {"bad_ticker": 4} and {t[0] for t in col.labels["last"].trades} == {"KXNBAGAME-G"}
+    s_add_market(tmp_path, "P5", {"ticker": "", "event_ticker": "KXNBAGAME-EP5", "result": "yes"})   # a repeated one
+    col = ab.collect("S", "development", root=tmp_path)
+    assert col.unassignable == {"bad_ticker": 3, "duplicate_ticker": 2}        # each copy counted once, one reason
