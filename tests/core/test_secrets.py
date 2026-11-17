@@ -1384,6 +1384,7 @@ KEY_LINE, SECRET_LINE = f"WEBULL_LIVE_APP_KEY={LIVE_KEY}", f"WEBULL_LIVE_APP_SEC
     (f"{KEY_LINE}\n{SECRET_LINE}\r", "carriage return"),
     (b"\xef\xbb\xbf" + GOOD_LIVE.encode(), "begins with a byte-order mark"),
     (f"WEBULL_LIVE_APP_KEY=Zq7Rt\x014Kw9PmXv\n{SECRET_LINE}\n", "line 1 holds a byte that is not printable ASCII"),
+    (f"WEBULL_LIVE_APP_KEY=Zq7Rt\x7f4Kw9PmXv\n{SECRET_LINE}\n", "line 1 holds a byte that is not printable ASCII"),
     (f"WEBULL_LIVE_APP_KEY={'é' * 10}\n{SECRET_LINE}\n", "line 1 holds a byte that is not printable ASCII"),
     (b"WEBULL_LIVE_APP_KEY=\xff\xfeZq7Rt4Kw9\n" + SECRET_LINE.encode() + b"\n", "line 1 holds a byte that is not printable ASCII"),
     (f"WEBULL_LIVE_APP_KEY=Zq7Rt4K\n{SECRET_LINE}\n", "WEBULL_LIVE_APP_KEY is shorter than 8 characters"),
@@ -1675,3 +1676,15 @@ def test_t50_a3_every_practice_entry_pointed_at_the_live_file_refuses_and_no_liv
     assert clean and refused, (entry, way)
     assert watch.looks >= 1                                           # the last look; a refusal before any call is the aim
     assert _OPENS == [] or way == "copy", (entry, way, len(_OPENS))  # the live file itself is never opened
+
+
+def test_t50_a3_a_file_named_like_the_live_file_is_refused_by_its_name_alone(tmp_path, live_place):
+    other = tmp_path / "elsewhere"
+    other.mkdir(mode=0o700)
+    f = other / "webull-live.env"                                    # not the live file, and naming no live name
+    f.write_text(ORDINARY)
+    f.chmod(0o600)
+    env = {}
+    with pytest.raises(s.LiveNameInReach) as exc:
+        s.load_env(f, environ=env)
+    assert env == {} and "webull-live.env" in str(exc.value)

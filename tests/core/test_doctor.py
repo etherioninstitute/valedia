@@ -986,3 +986,12 @@ def test_t50_a3_a_trading_file_that_cannot_be_loaded_fails_the_venues_check_and_
         f.chmod(0o600)
     clean = T50_PRACTICE not in detail and T50_KEY not in detail
     assert clean and status == D.FAIL and "could not be loaded" in detail and words in detail, detail
+
+
+@pytest.mark.parametrize("where", ["launchd", "agents"])
+def test_t50_a3_a_property_list_launchd_cannot_parse_is_a_failure_that_names_it(tmp_path, where):
+    launchd, agents, _ = _jobs(tmp_path)
+    target = (launchd if where == "launchd" else agents) / "com.valedia.broken.plist"
+    target.write_text("<plist><dict><key>Label</key>")                # clean words, not a property list
+    status, detail = _check_jobs(tmp_path, launchd, agents)
+    assert status == D.FAIL and target.name in detail and "could not be read" in detail, detail

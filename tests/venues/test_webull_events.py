@@ -626,6 +626,7 @@ def test_t50_the_probe_finds_a_live_name_in_the_ordinary_file_and_never_opens_th
     err = capsys.readouterr().err
     clean = LIVE_KEY not in err
     assert clean and code == 2 and fake.calls == [] and "WEBULL_LIVE_APP_KEY" in err
+    assert err.startswith("refused:"), err[:80]                        # the loader's refusal is the probe's refusal
     fake = FakeInstrument(series_pages={None: ([series_row("KXNBAGAME")], None)})
     code = we.main(["probe"], environ=dict(ENV), client=FakeData(fake), kalshi_fetch=kalshi_fetch_for({}),
                    sleep=lambda s: None)
