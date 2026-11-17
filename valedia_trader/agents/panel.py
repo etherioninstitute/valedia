@@ -1,8 +1,8 @@
 """Decision panel: several deciders and several vetters, pooled by measured track record.
 
 A decider returns the probability that a trade thesis is right. A vetter says whether the trade
-should be blocked. Members can be the typed Nimble v3 model (Ollama /v1/systemone), any
-OpenAI-compatible chat model (local Qwen), or a Hermes profile (scout, decider, auditor). Every
+should be blocked. Members can be the typed decision model (Elephant-1, the one shared instance on
+LM Studio, /v1/systemone), any OpenAI-compatible chat model (local Qwen), or a Hermes profile (scout, decider, auditor). Every
 forecast is written to a ledger; when a case settles each member is scored by Brier and its
 Darwinian weight moves. The panel never places an order: its output feeds the deterministic risk
 officer, which keeps the final veto.
@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from valedia_trader.agents.darwinian import DarwinianWeights
+from valedia_trader.core import decision_model as dm
 from valedia_trader.core import legacy
 
 __all__ = ["Verdict", "Member", "CallableMember", "SystemOneMember", "ChatMember", "HermesProfileMember",
@@ -130,21 +131,40 @@ def _loopback(url: str) -> bool:
 
 
 class SystemOneMember(Member):
-    """Nimble v3 typed decision through loopback Ollama. The model must match the pinned manifest."""
+    """A typed decision on the shared decision model (`core.decision_model`: Elephant-1, one instance on loopback
+    LM Studio). One ask reads the model list and, only when it shows exactly one right instance, posts the typed
+    request naming that instance. The instance is loaded and kept by the order-book collector's keeper: this member
+    never loads or unloads anything, so a missing or wrongly loaded instance is a refusal."""
 
-    def __init__(self, name: str, role: str, base_url: str = "http://127.0.0.1:11434", timeout: float = 60.0,
+    LIST_PATH, ASK_PATH, LIST_TIMEOUT = "/api/v1/models", "/v1/systemone", 5.0
+
+    def __init__(self, name: str, role: str, base_url: str = dm.URL, timeout: float = 60.0,
                  transport: Callable[[str, dict | None, float], Any] | None = None) -> None:
         super().__init__(name, role)
         if not _loopback(base_url):
             raise ValueError("System One is loopback-only")
         self.base, self.timeout, self._http = base_url.rstrip("/"), timeout, transport or _http_json
 
+    def _refusal(self) -> str | None:
+        """Why the list does not show exactly one right instance named dm.INSTANCE (None when it does), one line."""
+        try:
+            listing = self._http(self.base + self.LIST_PATH, None, self.LIST_TIMEOUT)
+        except Exception as exc:
+            return f"the model list at {self.base} did not answer ({type(exc).__name__})"
+        try:
+            _, found = dm._instances(listing)
+        except ValueError as exc:
+            return f"the model list at {self.base} is malformed: {exc}"
+        if not found:
+            return f"{dm.INSTANCE} is not loaded at {self.base}"
+        why = dm._wrong_found(found)
+        return None if why is None else f"{dm.INSTANCE} is not loaded as it must be: {why}"
+
     def _ask(self, case):
         v3 = legacy.load("systemone_v3_candidate")
-        tags = self._http(self.base + "/api/tags", None, 5.0)
-        version = self._http(self.base + "/api/version", None, 5.0).get("version")
-        if v3.pinned_tag(tags, version) != v3.TAG:
-            raise RuntimeError("nimble-v3 is missing or its digest differs from the pinned manifest")
+        why = self._refusal()
+        if why is not None:
+            raise RuntimeError(" ".join(why.split()))
         state = {"create_order": False, "thesis": case.get("thesis", ""), "facts": case.get("facts", {})}
         if self.role == "vetter":
             questions = {"risk": {"type": "noul", "instructions": "Does any fact in state show a breached risk limit, "
@@ -154,8 +174,11 @@ class SystemOneMember(Member):
         else:
             questions = {"thesis": {"type": "noul", "instructions": "Do the facts in state support the thesis in state?",
                                     "criteria": {"true": "the facts support the thesis", "false": "they do not"}}}
-        body = self._http(self.base + "/v1/systemone", v3.make_request(state, questions, tag=v3.TAG), self.timeout)
-        answers = v3.parse_answers(body, questions)
+        request = {**v3.make_request(state, questions, tag=v3.TAG), "model": dm.INSTANCE}   # validated, then named
+        body = self._http(self.base + self.ASK_PATH, request, self.timeout)
+        if not isinstance(body, dict) or body.get("model") != dm.INSTANCE:
+            raise RuntimeError(f"the reply is not from the instance {dm.INSTANCE}")
+        answers = v3.parse_answers({**body, "model": v3.TAG}, questions)            # the pinned parser's own name
         if self.role == "vetter":
             p_block = answers["risk"]["noul"]
             return p_block, p_block >= 0.5, f"typed probability of a risk problem {p_block:.2f}"
@@ -163,7 +186,7 @@ class SystemOneMember(Member):
 
 
 class ChatMember(Member):
-    """Any OpenAI-compatible chat endpoint (local Qwen on LM Studio or Ollama). Loopback unless allowed."""
+    """Any OpenAI-compatible chat endpoint (local Qwen on LM Studio). Loopback unless allowed."""
 
     def __init__(self, name: str, role: str, base_url: str, model: str, timeout: float = 120.0,
                  allow_remote: bool = False, transport: Callable[..., Any] | None = None) -> None:
@@ -359,7 +382,7 @@ def build_panel(roster: dict | None = None, ledger_path: str = ":memory:") -> De
             continue
         name, role, backend = spec["name"], spec["role"], spec["backend"]
         if backend == "systemone":
-            members.append(SystemOneMember(name, role, spec.get("base_url", "http://127.0.0.1:11434"), spec.get("timeout", 60.0)))
+            members.append(SystemOneMember(name, role, spec.get("base_url", dm.URL), spec.get("timeout", 60.0)))
         elif backend == "chat":
             members.append(ChatMember(name, role, spec["base_url"], spec["model"], spec.get("timeout", 120.0),
                                       spec.get("allow_remote", False)))

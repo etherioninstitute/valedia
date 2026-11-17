@@ -230,14 +230,16 @@ def test_t44_2_a_list_fault_is_a_one_line_refusal_and_nothing_is_posted(label, f
     _only_the_two_paths(fake)
 
 
+USAGE = {"input_tokens": 50, "output_tokens": 1}
 REPLY_FAULTS = [
     ("the old tag", {"model": "nimble-v3:9b-mxfp8", "answers": {"thesis": {"type": "noul", "noul": 0.73}}}, "RuntimeError"),
     ("another model", {"model": "qwen/qwen3.8-27b", "answers": {"thesis": {"type": "noul", "noul": 0.73}}}, "RuntimeError"),
     ("no model", {"answers": {"thesis": {"type": "noul", "noul": 0.73}}}, "RuntimeError"),
     ("not an object", [{"model": "elephant-1"}], "RuntimeError"),
-    ("no answers", {"model": "elephant-1", "answers": {}}, ""),
-    ("answers not typed", {"model": "elephant-1", "answers": {"thesis": {"type": "noul", "noul": "high"}}}, ""),
-    ("answers a string", {"model": "elephant-1", "answers": "yes"}, ""),
+    ("no answers", {"model": "elephant-1", "answers": {}, "usage": USAGE}, ""),
+    ("answers not typed", {"model": "elephant-1", "answers": {"thesis": {"type": "noul", "noul": "high"}}, "usage": USAGE}, ""),
+    ("answers a string", {"model": "elephant-1", "answers": "yes", "usage": USAGE}, ""),
+    ("no usage", {"model": "elephant-1", "answers": {"thesis": {"type": "noul", "noul": 0.73}}}, ""),
 ]
 
 

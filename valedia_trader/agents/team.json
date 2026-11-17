@@ -68,7 +68,7 @@
       "seat": "owner's assistant"
     }
   },
-  "local_forecasters": "Nimble and Qwen 8B (local models without a Hermes profile) vote in the panel.",
+  "local_forecasters": "Elephant-1 (the shared decision model on LM Studio, a local model without a Hermes profile) votes in the panel as a decider and as a risk vetter.",
   "research_round": {
     "proposer": "decider",
     "skeptic": "auditor"

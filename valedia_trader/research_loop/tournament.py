@@ -1,6 +1,6 @@
 """The forecast tournament: what each of Valedia's forecasters is actually worth, on any market.
 
-Every forecaster (Nimble v3, the local models, the Hermes bots, later a MiroFish swarm) is asked the same
+Every forecaster (elephant-1, the local models, the Hermes bots, later a MiroFish swarm) is asked the same
 dated yes-or-no questions and scored when they resolve, against a baseline that needs no intelligence.
 A forecaster earns a say in trading only by beating that baseline on enough resolved questions.
 

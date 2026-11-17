@@ -27,24 +27,13 @@
       "unseen_after_source": null
     },
     {
-      "name": "nimble-v3",
+      "name": "elephant-1",
       "role": "decider",
       "backend": "systemone",
       "timeout": 150,
-      "model_label": null,
-      "unseen_after": null,
-      "unseen_after_source": null
-    },
-    {
-      "name": "qwen3-8b",
-      "role": "decider",
-      "backend": "chat",
-      "base_url": "http://127.0.0.1:11434/v1",
-      "model": "qwen3:8b",
-      "timeout": 150,
-      "model_label": null,
-      "unseen_after": null,
-      "unseen_after_source": null
+      "model_label": "elephant-1@q8_0",
+      "unseen_after": "2026-10-22",
+      "unseen_after_source": "the date the model's publisher last updated its release (baselabs/elephant-1 on Hugging Face); its training data ends earlier"
     },
     {
       "name": "qwen3.8-27b",
@@ -69,13 +58,13 @@
       "unseen_after_source": null
     },
     {
-      "name": "nimble-v3-risk",
+      "name": "elephant-1-risk",
       "role": "vetter",
       "backend": "systemone",
       "timeout": 150,
-      "model_label": null,
-      "unseen_after": null,
-      "unseen_after_source": null
+      "model_label": "elephant-1@q8_0",
+      "unseen_after": "2026-10-22",
+      "unseen_after_source": "the date the model's publisher last updated its release (baselabs/elephant-1 on Hugging Face); its training data ends earlier"
     }
   ]
 }

@@ -197,17 +197,32 @@ def check_panel(paths: LoopPaths, live: bool = False) -> tuple[str, str]:
     return (OK, text + f"; all {len(answers)} members answered") if not bad else (FAIL, text + f"; no answer from {bad}")
 
 
-def check_models(paths: LoopPaths) -> tuple[str, str]:
-    from valedia_trader.core import legacy
-    notes, status = [], OK
+def _decision_model_refusal() -> str | None:
+    """Why LM Studio's model list does not show exactly one right instance of the shared decision model (None when
+    it does). Only the list is read: nothing is loaded or unloaded here."""
+    from valedia_trader.core import decision_model as dm
     try:
-        v3 = legacy.load("systemone_v3_candidate")
-        tags = _get("http://127.0.0.1:11434/api/tags"); version = _get("http://127.0.0.1:11434/api/version").get("version")
-        pinned = v3.pinned_tag(tags, version) == v3.TAG
-        notes.append(f"Ollama {version}: Nimble " + ("matches its pinned manifest" if pinned else "MISSING or changed"))
-        status = OK if pinned else FAIL
+        listing = _get(dm.URL + "/api/v1/models", 5.0)
     except Exception as exc:
-        notes.append(f"Ollama not reachable ({type(exc).__name__})"); status = FAIL
+        return f"LM Studio at {dm.URL} not reachable ({type(exc).__name__})"
+    try:
+        _, found = dm._instances(listing)
+    except ValueError as exc:
+        return f"the model list is malformed: {exc}"
+    if not found:
+        return f"instance {dm.INSTANCE} is not loaded"
+    why = dm._wrong_found(found)
+    return None if why is None else f"instance {dm.INSTANCE} is not loaded as it must be: {why}"
+
+
+def check_models(paths: LoopPaths) -> tuple[str, str]:
+    from valedia_trader.core import decision_model as dm
+    notes, status = [], OK
+    why = _decision_model_refusal()
+    if why is None:
+        notes.append(f"decision model Elephant-1: one right instance {dm.INSTANCE} loaded")
+    else:
+        notes.append("decision model Elephant-1: " + " ".join(why.split())); status = FAIL
     try:
         ids = {m.get("id") for m in _get("http://127.0.0.1:1235/v1/models").get("data", [])}
         notes.append("Bionic: 27B " + ("listed" if "qwen/qwen3.8-27b" in ids else "not listed (only the optional 27B members need it)"))
