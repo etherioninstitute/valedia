@@ -3581,3 +3581,51 @@ def test_the_file_itself_refuses_a_market_row_that_breaks_the_rule_and_a_change_
         raw.rollback()
         raw.close()
         assert ledger(path).order("m-1")["collar_price"] == 90.9, name
+
+
+def test_intends_refusals_are_its_own_words_before_the_file_is_asked():
+    """Each refusal is intend's own sentence, not the file's CHECK (which stands behind it)."""
+    led = ledger()
+    cases = [(dict(units=3.0, limit_price=90.9, collar_price=90.9), "a LIMIT order carries no collar price"),
+             (dict(units=0.5, order_type="MARKET"), "a MARKET order needs a collar price"),
+             (dict(units=0.5, limit_price=90.9, order_type="MARKET", collar_price=90.9), "a MARKET order carries no limit price"),
+             (dict(units=1.0, order_type="MARKET", collar_price=90.9), "a MARKET order must be under one unit in size"),
+             (dict(units=0.5, order_type="STOP"), "order_type must be one of LIMIT, MARKET"),
+             (dict(units=0.5, order_type="MARKET", collar_price=math.nan), "a collar price must be a finite number above zero")]
+    for kw, words in cases:
+        with pytest.raises(OrderError) as caught:
+            intend(led, tag="t", **kw)
+        assert str(caught.value).startswith(words) or words in str(caught.value), (kw, str(caught.value))
+        assert "CHECK" not in str(caught.value) and "could not be written" not in str(caught.value)
+    assert led.orders() == [] and led.events() == []
+
+
+def test_a_read_only_open_never_rolls_back_a_dead_writers_journal(tmp_path, old_orders):
+    """A writer killed in the middle of a large write leaves a hot journal (pages of the file already overwritten). A
+    read-only open refuses in words and leaves the file and the journal exactly as they are: rolling the journal back
+    is a write, left to the next open for writing."""
+    folder = tmp_path / "dead"
+    folder.mkdir()
+    path = _old_ledger_file(old_orders, folder / "orders.sqlite")
+    before = _look(path)
+    raw_before = path.read_bytes()
+    marker = tmp_path / "dead.marker"
+    writer = ("import sqlite3, sys, time\n"
+              "db = sqlite3.connect(sys.argv[1], isolation_level=None)\n"
+              "db.execute('PRAGMA cache_size = 2')\n"
+              "db.execute('BEGIN IMMEDIATE')\n"
+              "for i in range(3000):\n"
+              "    db.execute(\"INSERT INTO events (tag, time, to_state, note) VALUES ('x', 1, 'sent', hex(randomblob(1000)))\")\n"
+              "open(sys.argv[2], 'w').write('in the write')\n"
+              "time.sleep(120)\n")
+    proc = subprocess.Popen([sys.executable, "-I", "-B", "-c", writer, str(path), str(marker)])
+    assert _wait_for(marker, proc)
+    os.kill(proc.pid, signal.SIGKILL)
+    proc.wait(timeout=30)
+    journal = Path(str(path) + "-journal")
+    assert journal.read_bytes()[:8] != bytes(8) and path.read_bytes() != raw_before      # a hot journal, a changed file
+    files = {p.name: p.read_bytes() for p in folder.iterdir()}
+    with pytest.raises(OrderError, match="could not be read"):
+        orders.open_read_only(path)
+    assert {p.name: p.read_bytes() for p in folder.iterdir()} == files
+    assert _look(path) == before                               # an ordinary open rolls it back: layout 3 as it was

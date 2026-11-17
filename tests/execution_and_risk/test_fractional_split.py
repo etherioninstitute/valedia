@@ -297,3 +297,25 @@ def test_nothing_in_the_order_step_calls_the_split_yet():
     import inspect
     source = inspect.getsource(order_step)
     assert source.count("split_difference(") == 1                   # its own definition only (slice A1)
+
+
+EXACT_FIVE = [(0.5, 10.0), (0.05, 100.0), (0.25, 20.0), (2.5, 2.0), (0.04, 125.0), (0.0125, 400.0), (1.0, 5.0),
+              (0.00625, 800.0), (0.2, 25.0), (4.0, 1.25)]                  # target x quote = 5 exactly
+
+
+def test_a_target_worth_exactly_the_minimum_is_kept_and_a_step_less_is_zero():
+    rng = random.Random(55)
+    for target, quote in EXACT_FIVE:
+        n = _steps(_d(target))
+        for _ in range(20):
+            held_steps = rng.randint(0, 2 * n)
+            held = held_steps / STEPS
+            for steps, zeroed in ((n, False), (n - 1, True)):
+                difference = (steps - held_steps) / STEPS
+                if difference == 0:
+                    continue
+                side = "buy" if difference > 0 else "sell"
+                split = split_difference(difference, quote, side, held)
+                assert split.target_zeroed is zeroed, (target, quote, held, steps)
+                if zeroed:
+                    assert all(leg.units < 0 for leg in split.legs)
