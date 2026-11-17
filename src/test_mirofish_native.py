@@ -1138,4 +1138,84 @@ class TMF5PreflightTests(unittest.TestCase):
         self.assertIn("record['observer']=observer_record(out,process.returncode)", inspect.getsource(self.startup.launch))
 
 
+class TMF5TighteningTests(unittest.TestCase):
+    """The blind check's four tightenings: a hard floor, verification failures stop at once, the per-sample stops judged
+    whatever the level reads, and the relative --model guard."""
+    def test_1_hard_floor_any_single_sample_under_15(self):
+        from mirofish_native_run import ResourceRule, HARD_FLOOR_PERCENT
+        self.assertEqual(HARD_FLOOR_PERCENT, 15)
+        self.assertEqual(ResourceRule(1000.0).observe(reading(1000.4, free=14)), "memory free below 15 on one sample")
+        self.assertIsNone(ResourceRule(1000.0).observe(reading(1000.4, free=15)))
+        self.assertEqual(ResourceRule(1000.0).observe(reading(1000.4, free=14, level=None)), "memory free below 15 on one sample")   # whatever the level reads
+        # The checker's series: 5% free with one sample of 31 every 9.9 s, for 300 s.
+        series = [reading(1000.0 + i * 0.4, free=31 if (i * 0.4) % 9.9 < 0.4 else 5) for i in range(751)]
+        self.assertEqual(series[0]["free_percent"], 31)
+        reason, when = feed(ResourceRule(1000.0), series)
+        self.assertEqual(reason, "memory free below 15 on one sample"); self.assertEqual(when, series[1]["monotonic"])   # its first sample under 15
+        import mirofish_native_run as native
+        from unittest.mock import patch
+        with patch.object(native, "HARD_FLOOR_PERCENT", 0):   # without the floor the sustained rule alone never stops it
+            self.assertEqual(feed(ResourceRule(1000.0), series), (None, None))
+    def capsule_env(self, root):
+        import hashlib, hmac
+        from datetime import datetime, timezone
+        import mirofish_native_startup as startup
+        key = "k" * 64; sample = HostResourceCapsuleTests().sample()
+        sample.update(monotonic=time.monotonic(), utc=datetime.now(timezone.utc).isoformat(), host_deadline=time.monotonic() + 30, source_sha256=startup.digest(startup.__file__))
+        sign = lambda value: {"sample": value, "mac": hmac.new(key.encode(), encoded(value), hashlib.sha256).hexdigest()}
+        env = {"MIROFISH_RESOURCE_CAPSULE": str(root / "sample.json"), "MIROFISH_RESOURCE_KEY": key, "MIROFISH_RESOURCE_NONCE": sample["nonce"],
+               "MIROFISH_RESOURCE_HOST": json.dumps({"pid": sample["host_pid"], "started": sample["host_started"]})}
+        return sample, sign, env
+    def test_2_a_capsule_that_fails_verification_stops_at_once_only_missing_stale_unparseable_wait(self):
+        import mirofish_native_startup as startup, mirofish_native_run as native
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            root = Path(tmp); sample, sign, env = self.capsule_env(root)
+            bad_mac = sign(sample); bad_mac["mac"] = "0" * 64
+            extra = dict(sample, extra_field=1)
+            stop_cases = {"bad signature": bad_mac, "wrong identity (nonce)": sign(dict(sample, nonce="c" * 32)), "wrong identity (host pid)": sign(dict(sample, host_pid=999)),
+                          "field set does not match (extra)": sign(extra), "field set does not match (missing)": sign({k: v for k, v in sample.items() if k != "co_resident_rows"}),
+                          "envelope field set": dict(sign(sample), more=1)}
+            for name, envelope in stop_cases.items():
+                with self.subTest(stops=name), patch.dict(os.environ, env):
+                    startup._LAST.clear(); startup.atomic(root / "sample.json", envelope)
+                    with self.assertRaises(NativeRefused) as caught: native.observe_resource(native.ResourceRule(time.monotonic()), threading.Lock())
+                    self.assertTrue(str(caught.exception).startswith("resource capsule failed verification: "), str(caught.exception))
+            def missing(): (root / "sample.json").unlink(missing_ok=True)
+            def stale(): startup.atomic(root / "sample.json", sign(dict(sample, monotonic=time.monotonic() - 4)))
+            def unparseable(): (root / "sample.json").write_bytes(b'{"sample": {"trunc')
+            for name, make in [("missing", missing), ("stale", stale), ("unparseable", unparseable)]:
+                with self.subTest(waits=name), patch.dict(os.environ, env):
+                    startup._LAST.clear(); make()
+                    self.assertIsNone(native.observe_resource(native.ResourceRule(time.monotonic()), threading.Lock()))   # within 3 s: wait
+                    with self.assertRaises(NativeRefused) as caught: native.observe_resource(native.ResourceRule(time.monotonic() - 3.5), threading.Lock())
+                    self.assertEqual(str(caught.exception), "no fresh valid resource reading for 3 s")
+            with patch.dict(os.environ, env):   # and a good capsule passes
+                startup._LAST.clear(); startup.atomic(root / "sample.json", sign(sample))
+                self.assertEqual(native.observe_resource(native.ResourceRule(time.monotonic()), threading.Lock())["sequence"], 1)
+    def test_3_owned_bound_and_two_co_residents_judged_whatever_the_level_reads(self):
+        from mirofish_native_run import ResourceRule, TWO_CO_RESIDENTS
+        for level in [None, "1", 3, float("nan"), True]:
+            with self.subTest(level=level):
+                self.assertEqual(ResourceRule(1000.0).observe(reading(1000.4, level=level, owned=41 * 1024**3)), "conservative owned-model RSS upper bound exceeded")
+                self.assertEqual(ResourceRule(1000.0).observe(reading(1000.4, level=level, co_rows=2, co_bytes=2 * CO_GIB)), TWO_CO_RESIDENTS)
+                self.assertIsNone(ResourceRule(1000.0).observe(reading(1000.4, level=level, owned=39 * 1024**3, co_rows=1, co_bytes=CO_GIB)))
+        rule = ResourceRule(1000.0); rule.observe(reading(1000.4, level=None)); self.assertEqual(rule.gap(1003.5), "no fresh valid resource reading for 3 s")   # still not a reading
+    def test_4_a_relative_model_value_is_never_the_co_resident(self):
+        """Run from the folder where the relative value names the declared file: without the isabs guard it would resolve equal."""
+        import mirofish_native_startup as startup
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            root = Path(os.path.realpath(tmp)); model = root / "models/elephant-1.Q8_0.gguf"; model.parent.mkdir(); model.write_bytes(b"GGUF")
+            declared = startup.declared_co_resident(str(model)); relative = "models/elephant-1.Q8_0.gguf"; before = os.getcwd()
+            try:
+                os.chdir(root)
+                self.assertEqual(os.path.realpath(relative), declared)   # what the value resolves to if the guard is dropped
+                self.assertIsNone(startup.resolved_model(1, arguments=lambda pid: ["/x/.lmstudio/bin/llama-server", "--model", relative]))
+                self.assertEqual(startup.resolved_model(1, arguments=lambda pid: ["/x/.lmstudio/bin/llama-server", "--model", str(model)]), declared)
+                row = {"pid": 1, "start": "s", "comm": "/Users/x/.lmstudio/bin/llama-server"}
+                self.assertEqual(startup.co_resident_identities([row], declared, resolve=lambda pid: startup.resolved_model(pid, arguments=lambda p: ["llama-server", "--model", relative])), frozenset())
+            finally:
+                os.chdir(before)
+
+
 if __name__ == "__main__": unittest.main()
