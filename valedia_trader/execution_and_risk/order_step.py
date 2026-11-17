@@ -258,7 +258,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, Decimal, localcontext
 from pathlib import Path
 from typing import Callable
 
@@ -273,7 +273,8 @@ __all__ = ["TEST_ENVIRONMENT", "NOT_SENT", "PaperTargets", "OrderStepState", "Or
            "paper_targets", "open_ledger", "ledger_path_for", "state_path_for", "broker_book", "targets", "strategy_holdings",
            "round_units", "limit_price", "market_window", "max_orders_per_day", "minute_quotes", "wall_clock",
            "TicketBook", "ticket_path_for", "ticket_number", "TICKET_LIFE_SECONDS", "TICKET_QUOTE_MOVE", "Follow",
-           "judge_follow", "paper_strategies", "BROKER_BOOK_FILE"]
+           "judge_follow", "paper_strategies", "BROKER_BOOK_FILE", "split_difference", "Split", "SplitLeg",
+           "FRACTIONAL_MIN_VALUE"]
 
 TEST_ENVIRONMENT = "sandbox"                      # the only environment a run accepts (WebullVenue.environment)
 LIVE_ENVIRONMENT = "production"                   # live mode only (--live): Webull's production environment ...
@@ -297,6 +298,7 @@ SELL_BELOW_REDUCING = Decimal("0.02")             # ... less 2% when the sale re
 SETTLED_ABOVE_CASH = 0.01                         # settled cash may exceed cash by at most a cent (rounding)
 CASH_KEPT = 0.01                                  # purchases may use the venue's cash less 1%
 FRACTIONAL_DECIMALS = 5
+FRACTIONAL_MIN_VALUE = Decimal(5)                 # T51 R1: Webull's smallest fractional order value, in dollars (M)
 OPEN_STATES = ("accepted", "partly_filled", "sent", "unknown")   # orders that may still be open at the broker
 UNITS_EPS = 1e-12
 CENT = Decimal("0.01")
@@ -741,6 +743,111 @@ def limit_price(units: float, quote: float, reduces_risk: bool = False) -> float
     else:
         price = (q * (1 - (SELL_BELOW_REDUCING if reduces_risk else SELL_BELOW))).quantize(CENT, rounding=ROUND_CEILING)
     return float(price) if price > 0 else None
+
+
+@dataclass(frozen=True)
+class SplitLeg:
+    """One order of a split: the `whole` leg (a LIMIT order of whole shares) or the `remainder` leg (a MARKET order
+    by quantity of less than one share). `units` is signed: above zero buys, below zero sells."""
+    leg: str
+    order_type: str
+    units: Decimal
+
+
+@dataclass(frozen=True)
+class Split:
+    """What the split makes of one fund's difference, exact in Decimal.
+
+    `difference`: the difference rounded toward zero to FRACTIONAL_DECIMALS decimals, a sale capped at the ledger's
+    own holding (the units today's order step would send). `legs`: none, the whole leg, the remainder leg, or both
+    in that order, all on one side. `residual`: `difference` less what the legs send, so the legs and the residual
+    always sum to `difference` exactly; it is a remainder held back (worth less than the minimum with its margin),
+    or, when the target was taken as zero, the part of the difference that zeroing changed. `residual_value`: its
+    size at the judged quote. `target_zeroed`: the target was worth less than FRACTIONAL_MIN_VALUE and was taken as
+    zero. `why`: words for a residual that is not zero, else None."""
+    difference: Decimal
+    legs: tuple
+    residual: Decimal
+    residual_value: Decimal
+    target_zeroed: bool
+    why: str | None
+
+
+def _split_number(x, name: str, low: float, high: float, low_ok: bool) -> Decimal:
+    """`x` as an exact Decimal (of its float's shortest text, as `round_units` reads it), or OrderStepError in words
+    naming it when it is not a plain finite number in the range."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        raise OrderStepError(f"the split's {name} must be a number, not {type(x).__name__}; nothing is split")
+    try:
+        v = float(x)
+    except (OverflowError, ValueError):
+        v = math.nan
+    if not math.isfinite(v):
+        raise OrderStepError(f"the split's {name} must be a finite number, not {x!r}; nothing is split")
+    if not ((v >= low) if low_ok else (v > low)) or v > high:
+        raise OrderStepError(f"the split's {name} {v!r} is outside {'from' if low_ok else 'above'} {low:g} to "
+                             f"{high:g}; nothing is split")
+    return Decimal(repr(v))
+
+
+def split_difference(difference, quote, side: str, held) -> Split:
+    """T51 R1: one fund's difference between target and the ledger's own book, in units, split into a whole-share
+    LIMIT leg and a MARKET remainder leg by QUANTITY, at the judged `quote`. A pure function: it reads nothing but
+    its arguments and the module's constants, and writes nothing.
+
+    `difference` is target less `held` (signed, not zero); `side` is "buy" or "sell" and must agree with its sign;
+    `held` is the LEDGER'S OWN holding (never the baseline, never the venue's). The rule, exact in Decimal:
+      (i)   a sale is capped at `held`, and the difference is rounded toward zero to FRACTIONAL_DECIMALS decimals;
+      (ii)  a target (held + difference) worth less than FRACTIONAL_MIN_VALUE at the quote is a target of zero: the
+            whole holding is sold, as far as the legs allow (so the legs may sell when `side` says buy);
+      (iii) a = |rounded difference|, W = floor(a), r = a - W;
+      (iv)  a LIMIT leg of W when W >= 1; a MARKET leg of r when r > 0 and r x quote x (1 - TICKET_QUOTE_MOVE) is at
+            least FRACTIONAL_MIN_VALUE (a margin so a move the ticket allows still clears the minimum); otherwise r
+            is held back as the residual (never a fault).
+    Refuses in words (OrderStepError) a difference, quote or holding that is not a plain finite number, a
+    difference of zero or above MAX_UNITS in size, a quote not above zero or above MAX_QUOTE_PRICE, a holding below
+    zero or above MAX_UNITS, and a side that is not "buy" or "sell" or disagrees with the difference."""
+    with localcontext() as ctx:
+        ctx.prec = 100                                     # every product below is exact
+        d = _split_number(difference, "difference", -MAX_UNITS, MAX_UNITS, True)
+        q = _split_number(quote, "quote", 0.0, MAX_QUOTE_PRICE, False)
+        h = _split_number(held, "held (the ledger's own holding)", 0.0, MAX_UNITS, True)
+        if d == 0:
+            raise OrderStepError("the split's difference is zero: there is nothing to split")
+        if side not in ("buy", "sell") or type(side) is not str:
+            raise OrderStepError(f"the split's side must be 'buy' or 'sell', not {side!r}; nothing is split")
+        if (side == "buy") != (d > 0):
+            raise OrderStepError(f"the split's side {side!r} disagrees with the difference {d} "
+                                 f"(a {'purchase' if d > 0 else 'sale'}); nothing is split")
+        step = Decimal(1).scaleb(-FRACTIONAL_DECIMALS)
+        rounded = max(d, -h).quantize(step, rounding=ROUND_DOWN)
+        why = []
+        target_value = (h + d) * q
+        zeroed = target_value < FRACTIONAL_MIN_VALUE
+        effective = rounded
+        if zeroed:
+            effective = (-h).quantize(step, rounding=ROUND_DOWN)
+            why.append(f"the target is worth {target_value.quantize(CENT, rounding=ROUND_DOWN)}, less than the "
+                       f"minimum of {FRACTIONAL_MIN_VALUE}, and is taken as zero")
+        size = abs(effective)
+        sign = 1 if effective > 0 else -1
+        whole = size.to_integral_value(rounding=ROUND_FLOOR)
+        rest = size - whole
+        legs = []
+        if whole >= 1:
+            legs.append(SplitLeg("whole", "LIMIT", sign * whole))
+        if rest > 0:
+            margin = 1 - Decimal(repr(float(TICKET_QUOTE_MOVE)))
+            if rest * q * margin >= FRACTIONAL_MIN_VALUE:
+                legs.append(SplitLeg("remainder", "MARKET", sign * rest))
+            else:
+                why.append(f"the remainder of {rest} units is worth {(rest * q).quantize(CENT, rounding=ROUND_DOWN)} "
+                           f"at the quote, less than the minimum of {FRACTIONAL_MIN_VALUE} with its margin of "
+                           f"{TICKET_QUOTE_MOVE:g}; it is not sent")
+        sent = sum((leg.units for leg in legs), Decimal(0))
+        residual = rounded - sent
+        return Split(difference=rounded, legs=tuple(legs), residual=residual, residual_value=abs(residual) * q,
+                     target_zeroed=zeroed, why="; ".join(why) if residual != 0 else None)
 
 
 def max_orders_per_day(limits: dict | None) -> int:
