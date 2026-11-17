@@ -84,6 +84,8 @@ class Engine:
 
     def __enter__(self):
         self._prev = os.environ.get("VALEDIA_SYSTEMONE")
+        self._prev_log = os.environ.get("VALEDIA_SYSTEMONE_LOG")
+        os.environ["VALEDIA_SYSTEMONE_LOG"] = LOG  # scoped: other test modules set it at import
         self._g, self._p = s1._get, s1._post
         s1._get, s1._post = _get, self.post
         s1._reset_check()
@@ -99,6 +101,9 @@ class Engine:
         os.environ.pop("VALEDIA_SYSTEMONE", None)
         if self._prev is not None:
             os.environ["VALEDIA_SYSTEMONE"] = self._prev
+        os.environ.pop("VALEDIA_SYSTEMONE_LOG", None)
+        if self._prev_log is not None:
+            os.environ["VALEDIA_SYSTEMONE_LOG"] = self._prev_log
         return False
 
 
