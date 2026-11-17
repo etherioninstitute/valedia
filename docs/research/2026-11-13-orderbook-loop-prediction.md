@@ -519,3 +519,34 @@ used for nothing, not as part of this test. From then until the restart every de
 30 of 30 replies passed the strict parser; about 4.0 seconds a decision against the 10 second limit, whatever the
 number of slots; identical answers when one request was repeated; the instance was not unloaded when another model
 was loaded on demand.
+
+## Collector replaced under the two amendments (written at 03:56 UTC on 17 November, 19:56 PST on 16 November, before the restart; no answer has been scored)
+
+Under note 4 and the two amendments above. The pinned copy goes from commit 4133f56 to 636c625: 4133f56 plus
+five commits on its own branch (c6f61de to 3f2ad59 on main). They change
+`valedia_trader/research_loop/orderbook_loop.py`, add `valedia_trader/core/decision_model.py` (the model's file,
+instance and load settings, in one place), and change or add the two test files of those modules; nothing else.
+
+Two blind checks. The first (V159), of the new model client's structure: 82 single faults each gave their status
+with no call made; a reply naming any other model was stored as an error with no answers; against the old
+revision over 75 simulated minutes every table was equal outside the model's own columns, the state byte for
+byte; seven planted faults were all caught. The second (V161), of the rework for Elephant-1: 160 single faults
+fail closed, among them the server's default load settings; under 2,000 generated model lists the collector asks
+the server for nothing but the list, a load of this model and an unload of this instance; decisions, heartbeats,
+snapshots and trades equal to the old revision's over 80 simulated minutes; nine planted faults all caught. Two
+trials against the real server, into scratch stores that are not part of the record, each made two forced
+decisions, all ok (on the revision now deployed: 3.68 and 3.69 seconds).
+
+What is asked of Kalshi, the state, the battery and its hash, the slots and what each row means do not change.
+What changes is what the two amendments say, and three things they did not spell out: when the collector starts,
+the model file's check runs for about six seconds in the background and no call is made until it has passed
+(a decision in those seconds is `model_unavailable`); a new kind of event row, `model_load`, records each request
+the collector makes to the server to load or unload the model; and the check before every call also requires
+that there is exactly one instance of the model and that it has the load settings named in the second amendment.
+
+The loss before the restart: the last ok decision was at 00:38:10 UTC; from 00:39:10 UTC every decision row is
+`model_unavailable`, 412 of them by 03:55 UTC, beside 90 ok rows earlier in the day. The exact end is given with
+the restart's times.
+
+The replacement is one restart of the collector, the stop and the start both in the store; any decision slot
+lost in that minute is counted as lost like any other. The test period runs on this revision.
