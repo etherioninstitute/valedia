@@ -1318,8 +1318,9 @@ def test_t50_the_live_names_and_the_files_place_are_fixed_in_code():
     assert s.LIVE_ENV_FILE.parent == Path(pwd.getpwuid(os.geteuid()).pw_dir) / ".hermes" / "secrets"
     assert issubclass(s.LiveFileError, s.SecretError)
     assert inspect.signature(s.read_live_pair).parameters["path"].default is None
-    source = inspect.getsource(s.read_live_pair)
-    assert "environ" not in source and "getenv" not in source and "VALEDIA_ENV_FILE" not in source
+    for fn in (s.read_live_pair, s._live_fault, s._live_pairs):
+        source = inspect.getsource(fn)
+        assert "os.environ" not in source and "getenv" not in source and "VALEDIA_ENV_FILE" not in source, fn
 
 
 def test_t50_a_good_live_file_gives_the_pair_and_nothing_enters_the_process_environment(tmp_path):

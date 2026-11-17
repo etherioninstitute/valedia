@@ -862,10 +862,11 @@ def test_nothing_a_caller_passes_opens_live_mode_with_every_owner_file_met_in_an
     assert [lock["met"] for lock in state.locks[:2]] == [False, False] and state.confirmation is None
     # the function that builds the real production venue, given that object: only the repository's own path
     seen = []                                                     # T50 (rewritten): the live file's builder
-    monkeypatch.setattr(webull, "live_confirmation", lambda path=None, *a, **k: (seen.append(path) or None, "is missing"))
-    monkeypatch.setattr(webull.WebullVenue, "from_live_file", classmethod(lambda cls, *a, **kw: pytest.fail("built")))
-    with pytest.raises(cli._LiveRefused):
-        _REAL_LIVE_VENUE(pointing, env)
+    with monkeypatch.context() as m:
+        m.setattr(webull, "live_confirmation", lambda path=None, *a, **k: (seen.append(path) or None, "is missing"))
+        m.setattr(webull.WebullVenue, "from_live_file", classmethod(lambda cls, *a, **kw: pytest.fail("built")))
+        with pytest.raises(cli._LiveRefused):
+            _REAL_LIVE_VENUE(pointing, env)
     assert seen == [repo / "config" / "webull_live.json"]
     # the adapter given the other folder's confirmation
     v = webull.WebullVenue("k", "s", environment="production", client=Recorder(), confirmation_file=cfg / "webull_live.json")
@@ -2556,10 +2557,10 @@ def test_t50_live_mode_loads_the_ordinary_file_and_refuses_production_or_a_live_
 
 
 def test_t50_a_live_value_never_reaches_stdout_stderr_the_journal_an_exception_or_a_ticket(live_project, monkeypatch, capsys,
-                                                                                          tmp_path):
+                                                                                          tmp_path_factory):
     from valedia_trader.core import secrets
     root, venue, built, asked = live_project
-    live = _t50_live_file(tmp_path / "secrets")
+    live = _t50_live_file(tmp_path_factory.mktemp("live") / "secrets")      # outside the project folder scanned below
     leak = f"x-app-key={T50_KEY} x-app-secret={T50_SECRET}"
 
     class Leaky(_LiveVenue):
@@ -2582,8 +2583,11 @@ def test_t50_a_live_value_never_reaches_stdout_stderr_the_journal_an_exception_o
              cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"])]
     captured = capsys.readouterr()
     stored = b"".join(p.read_bytes() for p in root.rglob("*") if p.is_file())
-    clean = _t50_clean(captured.out + captured.err) and T50_KEY.encode() not in stored and T50_SECRET.encode() not in stored
-    assert clean and seen == [True, True] and codes[1] == 2
+    printed_clean = _t50_clean(captured.out + captured.err)
+    stored_clean = T50_KEY.encode() not in stored and T50_SECRET.encode() not in stored
+    assert printed_clean
+    assert stored_clean
+    assert seen == [True, True] and codes == [0, 2]           # check reads the class and last 4 only; propose stops
     masked, hits = secrets.redact(leak)
     assert _t50_clean(masked) and hits >= 2
     try:
