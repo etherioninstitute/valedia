@@ -307,8 +307,19 @@ def timing_listed(weights: pd.DataFrame, asset_returns: pd.DataFrame, prices: pd
     return {**out, "listed_start": s, "listed_bars": len(weights) - s, "listed_share": (len(weights) - s) / len(weights)}
 
 
+def _real(x) -> bool:
+    """A finite real number: never a flag (bool), a string or None."""
+    return (not isinstance(x, (bool, np.bool_)) and isinstance(x, (int, float, np.integer, np.floating))
+            and math.isfinite(float(x)))
+
+
+def _count(x) -> bool:
+    """A whole number (never a flag) of at least 1."""
+    return not isinstance(x, (bool, np.bool_)) and isinstance(x, (int, np.integer)) and int(x) >= 1
+
+
 def _p_ok(p, threshold: float) -> bool:
-    return p is not None and isinstance(p, (int, float)) and math.isfinite(p) and p <= threshold
+    return _real(p) and 0.0 <= p <= 1.0 and p <= threshold
 
 
 def edge_timing(weights: pd.DataFrame, asset_returns: pd.DataFrame, prices: pd.DataFrame, n_attempts: int) -> dict:
@@ -319,9 +330,15 @@ def edge_timing(weights: pd.DataFrame, asset_returns: pd.DataFrame, prices: pd.D
     * 0.05 / N below `floor` (region "enumerated"): the book must beat every one of the D copies, enumerated once; the
       level per test is then 1 / (D + 1), and the detail says the nominal level cannot be reached.
     `p_exact` from the enumeration is reported in both regions. A figure that is missing, unavailable or not finite
-    fails the check, and so does a listed window too short for the test (with that reason)."""
-    if isinstance(n_attempts, bool) or not isinstance(n_attempts, (int, np.integer)) or n_attempts < 1:
-        raise ValueError(f"the number of counted attempts is a whole number of at least 1, not {n_attempts!r}")
+    fails the check, and so does a listed window too short for the test (with that reason). Every figure the check
+    reads (N, the copies D, the floor, the drawn p-value, "beats every copy") must be of its kind, finite and in its
+    range; otherwise the check fails with a reason naming the figure."""
+    if not _count(n_attempts):
+        return {"attempts_counted": n_attempts, "threshold": None, "listed_start": None, "listed_bars": None,
+                "listed_share": None, "copies": None, "floor": None, "p_exact": None, "region": None,
+                "drawn_p_value": None, "passed": False, "listed": {"unavailable": "no valid number of attempts"},
+                "detail": f"fails: the number of counted attempts N is not a whole number of at least 1 "
+                          f"({n_attempts!r})"}
     n = int(n_attempts)
     threshold = ALPHA / n
     exact = timing_listed(weights, asset_returns, prices, exact=True)
@@ -329,21 +346,33 @@ def edge_timing(weights: pd.DataFrame, asset_returns: pd.DataFrame, prices: pd.D
            "listed_bars": exact.get("listed_bars"), "listed_share": exact.get("listed_share"),
            "copies": exact.get("copies"), "floor": exact.get("floor"), "p_exact": exact.get("p_exact"),
            "region": None, "drawn_p_value": None}
-    if "unavailable" in exact or not isinstance(exact.get("copies"), int) or exact["copies"] < 1:
+    if "unavailable" in exact:
         return {**out, "passed": False, "listed": exact,
                 "detail": f"fails: the listed window is too short for the re-timing test or holds nothing "
-                          f"({exact.get('unavailable', 'no copies')})"}
-    d, floor = exact["copies"], exact["floor"]
+                          f"({exact['unavailable']})"}
+    d, floor = exact.get("copies"), exact.get("floor")
+    if not _count(d):
+        return {**out, "passed": False, "listed": exact,
+                "detail": f"fails: the number of re-timed copies D is not a whole number of at least 1 ({d!r})"}
+    if not (_real(floor) and 0.0 < floor <= 1.0):
+        return {**out, "passed": False, "listed": exact,
+                "detail": f"fails: the reachable floor is not a number above 0 and at most 1 ({floor!r})"}
+    d = int(d)
     if threshold >= floor:
         drawn = timing_listed(weights, asset_returns, prices, n=r3_shifts(n))
         p = drawn.get("p_value")
-        passed = _p_ok(p, threshold)
-        shown = f"{p:.5f}" if _p_ok(p, math.inf) else f"{p!r} (missing: fails)"
-        return {**out, "region": "drawn", "drawn_p_value": p, "passed": passed, "listed": drawn,
-                "detail": f"re-timing p {shown} from {r3_shifts(n)} drawn shifts of the listed window "
+        if not (_real(p) and 0.0 <= p <= 1.0):
+            return {**out, "region": "drawn", "drawn_p_value": p, "passed": False, "listed": drawn,
+                    "detail": f"fails: the drawn re-timing p-value is not a number from 0 to 1 ({p!r}) from "
+                              f"{r3_shifts(n)} drawn shifts of the listed window ({d} distinct copies)"}
+        return {**out, "region": "drawn", "drawn_p_value": p, "passed": _p_ok(p, threshold), "listed": drawn,
+                "detail": f"re-timing p {p:.5f} from {r3_shifts(n)} drawn shifts of the listed window "
                           f"({d} distinct copies), against 0.05 / {n} = {threshold:.6f}"}
-    above = exact["copies_at_or_above"]
-    passed = bool(exact["beats_every_copy"])
+    above, beats = exact.get("copies_at_or_above"), exact.get("beats_every_copy")
+    if beats is not True and beats is not False:
+        return {**out, "region": "enumerated", "passed": False, "listed": exact,
+                "detail": f"fails: the figure 'beats every copy' is not the flag True or False ({beats!r})"}
+    passed = beats is True
     return {**out, "region": "enumerated", "passed": passed, "listed": exact,
             "detail": f"the listed window offers {d} distinct re-timed copies, so the nominal level 0.05 / {n} = "
                       f"{threshold:.6f} cannot be reached; the book must beat every copy (level per test 1 / {d + 1} = "
@@ -353,18 +382,25 @@ def edge_timing(weights: pd.DataFrame, asset_returns: pd.DataFrame, prices: pd.D
 def one_trial_sharpe(net: pd.Series, min_dsr: float) -> tuple[float | None, bool, str]:
     """The `sharpe_one_trial` check of an edge claim: the Probabilistic Sharpe of the out-of-sample net returns
     against zero for one trial (the value `_deflated` gives for one trial), at least `min_dsr`. Moments that cannot be
-    formed, or are not finite, fail."""
+    formed, or are not finite, fail; so does a pass mark that is not a number strictly between 0 and 1, and a
+    Probabilistic Sharpe that is not a number from 0 to 1."""
+    if not (_real(min_dsr) and 0.0 < min_dsr < 1.0):
+        return None, False, f"fails: the pass mark is not a number strictly between 0 and 1 ({min_dsr!r})"
     r = net.dropna().to_numpy(dtype=float)
     try:
         m = research.sharpe_moments(r)
     except ValueError as exc:
         return None, False, f"fails: no Sharpe moments ({str(exc)[:80]})"
-    if not all(math.isfinite(float(x)) for x in (m.sharpe, m.n_obs, m.skew, m.kurt)):
-        return None, False, "fails: the Sharpe moments are not finite numbers"
-    v = float(research.probabilistic_sharpe_ratio(m.sharpe, 0.0, m.n_obs, m.skew, m.kurt))
-    ok = bool(math.isfinite(v) and v >= min_dsr)
-    return v, ok, (f"{v:.3f} against {min_dsr} (the Probabilistic Sharpe for one trial)" if math.isfinite(v)
-                   else "fails: the Probabilistic Sharpe is not a finite number")
+    if not (_real(m.sharpe) and _real(m.skew) and _real(m.kurt) and _count(m.n_obs)):
+        return None, False, "fails: the Sharpe moments are not finite numbers (or the count is not a whole number)"
+    try:
+        v = research.probabilistic_sharpe_ratio(m.sharpe, 0.0, m.n_obs, m.skew, m.kurt)
+    except ValueError as exc:
+        return None, False, f"fails: no Probabilistic Sharpe from these moments ({str(exc)[:80]})"
+    if not (_real(v) and 0.0 <= v <= 1.0):
+        return None, False, f"fails: the Probabilistic Sharpe is not a number from 0 to 1 ({v!r})"
+    v = float(v)
+    return v, bool(v >= min_dsr), f"{v:.3f} against {min_dsr} (the Probabilistic Sharpe for one trial)"
 
 
 def booked_asset_returns(prices: pd.DataFrame) -> pd.DataFrame:
@@ -380,8 +416,24 @@ def booked_asset_returns(prices: pd.DataFrame) -> pd.DataFrame:
 
 
 def _fin(*xs) -> bool:
-    """Every figure a development check reads is a finite number (a check never passes on anything else)."""
-    return all(isinstance(x, (int, float, np.integer, np.floating)) and math.isfinite(float(x)) for x in xs)
+    """Every figure a development check reads is a finite number, never a flag (a check never passes on anything else)."""
+    return all(_real(x) for x in xs)
+
+
+def _worst_stretch_check(worst: list[dict], fail_if_drawdown_above: float) -> tuple[bool, str]:
+    """The `worst_periods` check: every worst stretch's strategy return is a finite number, and the worst of them
+    loses no more than the prediction's drawdown limit. No stretch at all fails, and so does any stretch whose return
+    is not a finite number (named), wherever it sits in the list."""
+    if not worst:
+        return False, "fails: no worst stretch could be formed from the market's returns"
+    for w in worst:
+        x = w.get("strategy_return")
+        if not _real(x):
+            return False, (f"fails: the strategy's return over the worst stretch {w.get('start')} to {w.get('end')} "
+                           f"is not a finite number ({x!r})")
+    worst_loss = min(float(w["strategy_return"]) for w in worst)
+    return (bool(worst_loss >= -fail_if_drawdown_above),
+            f"worst result in the market's {len(worst)} worst stretches: {worst_loss:+.1%}")
 
 
 def _attempt_pvalues(ledger: HypothesisLedger, hypothesis_id: int) -> list[float]:
@@ -531,7 +583,6 @@ class Gauntlet:
             breaker["timing_listed"] = timing_listed(w_oos, r_oos, px_oos, n=GATE_SHIFTS)      # reported, never a condition
 
         sharpe, dd = headline.get("sharpe", float("nan")), headline.get("max_drawdown", float("nan"))
-        worst_loss = min((w["strategy_return"] for w in worst), default=0.0)
         stress_sharpe, delayed_sharpe = breaker["double_costs"]["sharpe"], breaker["delayed_fills"]["sharpe"]
         checks = {
             "prediction_failure_terms": (bool(_fin(sharpe, dd) and sharpe >= prediction.fail_if_sharpe_below
@@ -554,9 +605,7 @@ class Gauntlet:
                              f"Sharpe {stress_sharpe:.2f} at twice the trading costs"),
             "delayed_fills": (bool(_fin(delayed_sharpe) and delayed_sharpe > c.min_stress_sharpe),
                               f"Sharpe {delayed_sharpe:.2f} with fills one day late"),
-            "worst_periods": ((bool(_fin(worst_loss) and worst_loss >= -prediction.fail_if_drawdown_above),
-                               f"worst result in the market's {len(worst)} worst stretches: {worst_loss:+.1%}") if worst else
-                              (False, "fails: no worst stretch could be formed from the market's returns")),
+            "worst_periods": _worst_stretch_check(worst, prediction.fail_if_drawdown_above),
         })
         passed = all(ok for ok, _ in checks.values())
         contrib = (base.weights.shift(1).iloc[oos] * r_oos).sum().sort_values()
