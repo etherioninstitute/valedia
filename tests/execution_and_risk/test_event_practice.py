@@ -2190,3 +2190,69 @@ def test_bad_units_are_refused_at_the_input_stage(tmp_path, units):
     before = person_state(w)
     out = confirm(w, pid, units=units)
     assert out["status"] == "refused" and out["stage"] == "input" and person_state(w) == before, out
+
+
+# ---- addendum 5
+
+@pytest.mark.parametrize("answer", [None, 0, "", False, (), {}])
+def test_unapplied_fills_answering_anything_but_a_list_is_unknown(answer):
+    class Odd(StandInLedger):
+        def unapplied_fills(self):
+            return answer
+    cents, why = ep.known_cents(Odd(GOOD_ORDER, GOOD_ROWS), [])
+    assert cents is None and why, (answer, cents)
+    assert ep.known_cents(StandInLedger(GOOD_ORDER, GOOD_ROWS), []) == (-41, None)        # a list: as before
+
+
+@pytest.mark.parametrize("case", ["fall then a piece below the rows", "fall after a piece with no fee"])
+def test_the_two_further_cases_that_stay_unknown_for_good(case):
+    # Beside the late zero fee: the ledger writes the later piece's row without a fee (orders.py:1119-1123), or
+    # writes nothing for the fall (orders.py:1105-1109), so the last fee figure stays older than the last contracts.
+    led, venue = OrderLedger(), CashVenue()
+    tag = trade(led, venue, f"{T}:yes", 2, [(1, 40, 3)])
+    if case == "fall then a piece below the rows":
+        venue.fee_falls(tag, 2)                                           # total 0.01, the rows hold 0.03
+        read(led, venue, [])
+        venue.fill(tag, 1, 41, 0)                                         # total 0.01 still, below the rows' 0.03
+    else:
+        venue.give_fee = False
+        venue.fill(tag, 1, 41, 0)                                         # a piece reported with no fee
+        read(led, venue, [])
+        venue.give_fee = True
+        venue.fee_falls(tag, 1)                                           # then the total falls to 0.02
+    for _ in range(3):
+        cents, why = read(led, venue, [])
+        assert cents is None and "older" in why, (case, cents, why)
+
+
+def test_the_docstring_states_the_ruling_and_the_cases_unknown_for_good():
+    doc = " ".join(ep.known_cents.__doc__.split())
+    for words in ("REPORTED in a readable way", "a move outside the ledger", "hand sale", "the label",
+                  "late zero fee", "below the sum of the rows' fees", "falls after a piece reported with no fee",
+                  "T45-3"):
+        assert words in doc, words
+
+
+@pytest.mark.parametrize("status,lifts", [("active", True), ("open", True), ("determined", False), ("settled", False),
+                                          ("closed", False), ("amended", False), ("finalized", False),
+                                          (" active", False), ("active ", False), ("open\n", False), ("ACTIVE", False),
+                                          (None, False), ("missing", False), (1, False)])
+def test_the_lift_after_a_withdrawal_needs_a_word_that_means_the_market_still_trades(tmp_path, status, lifts):
+    w, pid = pending_world(tmp_path)
+    w.exchange.held[f"{T}:yes"] = 1
+    assert withdraw(w, pid)["status"] == "withdrawn"
+    w.quote(f"{T}:yes", 0.70, 0.71)
+    rec = {**TONIGHT, "result": "", "settlement_value_dollars": None, "status": status}
+    if status == "missing":
+        del rec["status"]
+    w.markets[T] = rec
+    w.clock.t += 10
+    out = buy(w)
+    if lifts:
+        assert out["status"] == "done" and len(w.exchange.placed()) == 1, (status, out)
+    else:
+        assert out["status"] == "stopped" and out["stage"] == "settled" and w.exchange.placed() == [], (status, out)
+
+
+def test_the_trading_words_are_listed_once():
+    assert ep.KALSHI_TRADING_STATUSES == frozenset({"active", "open"})
