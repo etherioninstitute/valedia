@@ -813,9 +813,176 @@ def test_t50_the_label_decides_which_installed_agents_are_scanned_and_only_one_l
 
 def test_t50_missing_job_folders_are_said_and_nothing_raises(tmp_path):
     status, detail = _check_jobs(tmp_path, tmp_path / "no-launchd", tmp_path / "no-agents")
-    assert status == D.ATTENTION and "no job files found" in detail, detail
+    assert status == D.FAIL and "does not exist on this machine" in detail, detail       # addendum 3 (C3): never OK
+    assert str(tmp_path / "no-launchd") in detail and str(tmp_path / "no-agents") in detail
     bad = tmp_path / "agents"
     bad.mkdir()
     (bad / "com.valedia.broken.plist").write_text("not a plist --live")
     status, detail = _check_jobs(tmp_path, tmp_path / "no-launchd", bad)
     assert status == D.FAIL and "com.valedia.broken.plist" in detail, detail
+
+
+# ---- T50 addendum 3 (C, D): the jobs check reads what launchd reads; what it cannot read or find fails, named; no
+#      test of the doctor reads the real LaunchAgents folder
+
+import os  # noqa: E402
+import plistlib  # noqa: E402
+import pwd  # noqa: E402
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+_REAL_AGENTS = tuple({os.path.join(pwd.getpwuid(os.geteuid()).pw_dir, "Library", "LaunchAgents"),
+                      os.path.realpath(os.path.join(pwd.getpwuid(os.geteuid()).pw_dir, "Library", "LaunchAgents")),
+                      str(Path.home() / "Library" / "LaunchAgents")})
+_REAL_READS: list = []
+
+
+def _audit_real_agents(event, args):
+    if event in ("open", "os.listdir", "os.scandir") and args and isinstance(args[0], (str, bytes, os.PathLike)):
+        try:
+            where = os.fsdecode(args[0])
+        except Exception:
+            return
+        if where.startswith(_REAL_AGENTS):
+            _REAL_READS.append(event)
+
+
+sys.addaudithook(_audit_real_agents)
+
+
+@pytest.fixture(autouse=True)
+def _t50_no_real_launch_agents(tmp_path_factory, monkeypatch):
+    """Every test of this module gives the jobs check a temporary LaunchAgents folder (one that does not exist), and
+    fails if anything under the real one was opened or listed."""
+    monkeypatch.setattr(D, "LAUNCH_AGENTS", tmp_path_factory.mktemp("no-agents") / "LaunchAgents", raising=False)
+    _REAL_READS.clear()
+    yield
+    reads = list(_REAL_READS)
+    _REAL_READS.clear()
+    assert reads == [], f"the real LaunchAgents folder was read ({len(reads)} times)"
+
+
+def test_t50_a3_the_whole_doctor_reads_no_real_launch_agents_and_reports_the_missing_folder(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "_get", lambda *a, **k: (_ for _ in ()).throw(OSError("no server")))
+    rows = {r["check"]: r for r in D.run(tmp_path, only=("jobs",))}
+    assert rows["jobs"]["status"] == D.FAIL and "does not exist on this machine" in rows["jobs"]["detail"]
+    assert str(D.LAUNCH_AGENTS) in rows["jobs"]["detail"] and _REAL_READS == []
+
+
+def _ours(data):
+    return {"Label": "com.valedia.orderstep.paper", **data}
+
+
+@pytest.mark.parametrize("fmt", [plistlib.FMT_BINARY, plistlib.FMT_XML])
+@pytest.mark.parametrize("where", ["launchd", "agents"])
+def test_t50_a3_a_property_list_is_read_as_launchd_reads_it_binary_or_text(tmp_path, fmt, where):
+    launchd, agents, _ = _jobs(tmp_path)
+    folder = launchd if where == "launchd" else agents
+    target = folder / "com.valedia.orderstep.paper.plist"
+    for data in (_ours({"ProgramArguments": ["/bin/zsh", "-c", "cd /dépôt && python -m valedia_trader.research_loop "
+                                             "order-step --live --propose"]}),
+                 _ours({"ProgramArguments": ["/bin/zsh", "-c", "cd /dépôt && run"],
+                        "EnvironmentVariables": {"WEBULL_LIVE_APP_KEY": "café"}}),
+                 _ours({"ProgramArguments": ["/bin/echo", "ok"], "EnvironmentVariables": {"X": "é WEBULL_LIVE_APP_SECRET"}})):
+        target.write_bytes(plistlib.dumps(data, fmt=fmt))
+        status, detail = _check_jobs(tmp_path, launchd, agents)
+        assert status == D.FAIL and target.name in detail, detail
+    target.write_bytes(plistlib.dumps(_ours({"ProgramArguments": ["/bin/bash", str(launchd / "orderstep-paper.sh")]}),
+                                      fmt=fmt))
+    assert _check_jobs(tmp_path, launchd, agents)[0] == D.OK
+
+
+@pytest.mark.parametrize("spelled", ["&#45;-live", "-&#x2D;live", "--liv&#101;", "<![CDATA[--live]]>",
+                                     "WEBULL&#95;LIVE_APP_KEY=x"])
+def test_t50_a3_an_entity_or_section_spelling_in_a_text_property_list_is_seen(tmp_path, spelled):
+    launchd, agents, _ = _jobs(tmp_path)
+    target = launchd / "com.valedia.orderstep.paper.plist"
+    target.write_text('<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>Label</key>'
+                      '<string>com.valedia.orderstep.paper</string><key>ProgramArguments</key><array>'
+                      f'<string>python</string><string>order-step</string><string>{spelled}</string></array></dict></plist>\n')
+    status, detail = _check_jobs(tmp_path, launchd, agents)
+    assert status == D.FAIL and target.name in detail, detail
+
+
+def test_t50_a3_a_folder_that_does_not_exist_is_a_failure_that_names_it(tmp_path):
+    launchd, agents, _ = _jobs(tmp_path)
+    for missing_launchd in (True, False):
+        gone = tmp_path / "gone"
+        status, detail = _check_jobs(tmp_path, gone if missing_launchd else launchd, agents if missing_launchd else gone)
+        assert status == D.FAIL and str(gone) in detail and "does not exist on this machine" in detail, detail
+
+
+def _unreadable(path):
+    path.chmod(0o000)
+    return path
+
+
+@pytest.mark.parametrize("what", ["agents folder", "launchd folder", "launchd script", "launchd plist", "agent plist",
+                                  "named script"])
+def test_t50_a3_anything_the_check_cannot_read_is_a_failure_that_names_it(tmp_path, what):
+    launchd, agents, elsewhere = _jobs(tmp_path)
+    run = elsewhere / "run.sh"
+    run.write_text("#!/bin/bash\nexec python -m valedia_trader.research_loop order-step\n")
+    _plist(agents / "com.valedia.hidden.plist", "com.valedia.hidden", ["/bin/bash", run])
+    assert _check_jobs(tmp_path, launchd, agents)[0] == D.OK
+    target = {"agents folder": agents, "launchd folder": launchd, "launchd script": launchd / "orderstep-paper.sh",
+              "launchd plist": launchd / "com.valedia.orderstep.paper.plist",
+              "agent plist": agents / "com.valedia.hidden.plist", "named script": run}[what]
+    _unreadable(target)
+    try:
+        status, detail = _check_jobs(tmp_path, launchd, agents)
+    finally:
+        target.chmod(0o700)
+    assert status == D.FAIL and target.name in detail and "could not be read" in detail, detail
+
+
+@pytest.mark.parametrize("named", ["missing.sh", "folder/missing", "./gone.py"])
+def test_t50_a3_a_script_a_job_names_that_does_not_exist_is_a_failure_that_names_it(tmp_path, named):
+    launchd, agents, elsewhere = _jobs(tmp_path)
+    _plist(agents / "com.valedia.hidden.plist", "com.valedia.hidden", ["/bin/bash", named], workdir=elsewhere)
+    status, detail = _check_jobs(tmp_path, launchd, agents)
+    assert status == D.FAIL and Path(named).name in detail and "does not exist" in detail, detail
+    _plist(agents / "com.valedia.hidden.plist", "com.valedia.hidden", ["/bin/bash", elsewhere / "gone.sh"])
+    status, detail = _check_jobs(tmp_path, launchd, agents)
+    assert status == D.FAIL and "gone.sh" in detail, detail
+
+
+def test_t50_a3_plain_words_a_job_passes_are_not_taken_for_files(tmp_path):
+    launchd, agents, _ = _jobs(tmp_path)
+    _plist(agents / "com.valedia.words.plist", "com.valedia.words",
+           ["python3", "-m", "valedia_trader.research_loop", "order-step", "--root=/nowhere/at/all", "-c",
+            "cd /x && run it", "https://example.invalid/a/b"])
+    status, detail = _check_jobs(tmp_path, launchd, agents)
+    assert status == D.OK, detail
+
+
+# ---- T50 addendum 3 (C4, F): a trading file the doctor cannot load fails the venues check and says why (no value)
+
+T50_PRACTICE = "ZqPracticeKey1234567"
+
+
+@pytest.mark.parametrize("mode, text, words", [
+    (0o644, f"WEBULL_APP_KEY={T50_PRACTICE}\n", "readable by group or others"),
+    (0o000, f"WEBULL_APP_KEY={T50_PRACTICE}\n", "PermissionError"),
+    (0o600, f"WEBULL_APP_KEY={T50_PRACTICE}\nWEBULL_LIVE_APP_KEY={T50_KEY}\n", "WEBULL_LIVE_APP_KEY"),
+    (0o600, f"WEBULL_APP_KEY={T50_PRACTICE}\nWEBULL_APP_KEY={T50_PRACTICE}\n", "more than once"),
+])
+def test_t50_a3_a_trading_file_that_cannot_be_loaded_fails_the_venues_check_and_says_so(tmp_path, monkeypatch, mode, text,
+                                                                                        words):
+    from valedia_trader.venues import webull
+    for name in ("WEBULL_APP_KEY", "WEBULL_APP_SECRET", "WEBULL_ENV", "ALPACA_API_KEY", "ALPACA_SECRET_KEY",
+                 *T50_NAMES):
+        monkeypatch.setenv(name, "x")
+        monkeypatch.delenv(name)
+    monkeypatch.setattr(D, "live_mode_note", lambda paths: "live mode: not judged here")
+    monkeypatch.setattr(webull.WebullVenue, "__init__", lambda *a, **k: pytest.fail("a venue was built"))
+    f = tmp_path / "trading.env"
+    f.write_text(text)
+    f.chmod(mode)
+    monkeypatch.setenv("VALEDIA_ENV_FILE", str(f))
+    try:
+        status, detail = D.check_venues(LoopPaths(tmp_path))
+    finally:
+        f.chmod(0o600)
+    clean = T50_PRACTICE not in detail and T50_KEY not in detail
+    assert clean and status == D.FAIL and "could not be loaded" in detail and words in detail, detail

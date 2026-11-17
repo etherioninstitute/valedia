@@ -1331,10 +1331,14 @@ def test_t50_a_good_live_file_gives_the_pair_and_nothing_enters_the_process_envi
     assert right
     unchanged = dict(os.environ) == before
     assert unchanged
-    for text in (f"# the owner's live pair\n\nexport WEBULL_LIVE_APP_SECRET='{LIVE_SECRET}'\n"
-                 f"WEBULL_LIVE_APP_KEY=\"{LIVE_KEY}\"\n",):
-        right = s.read_live_pair(_live_file(tmp_path / "other", text)) == (LIVE_KEY, LIVE_SECRET)
+    for i, text in enumerate((f"WEBULL_LIVE_APP_SECRET={LIVE_SECRET}\nWEBULL_LIVE_APP_KEY={LIVE_KEY}\n",   # either order
+                              f"WEBULL_LIVE_APP_KEY={LIVE_KEY}\nWEBULL_LIVE_APP_SECRET={LIVE_SECRET}",     # no final LF
+                              )):
+        right = s.read_live_pair(_live_file(tmp_path / f"other{i}", text)) == (LIVE_KEY, LIVE_SECRET)
         assert right
+    edge = ("a" * 8, "~" * 512)                                          # 8 and 512 printable ASCII characters
+    right = s.read_live_pair(_live_file(tmp_path / "edge", f"WEBULL_LIVE_APP_KEY={edge[0]}\nWEBULL_LIVE_APP_SECRET={edge[1]}\n")) == edge
+    assert right
     right = s.read_live_pair(_live_file(tmp_path / "ro", mode=0o400)) == (LIVE_KEY, LIVE_SECRET)
     assert right
 
@@ -1349,18 +1353,41 @@ def test_t50_the_live_values_are_registered_with_the_output_guard(tmp_path):
     assert dropped
 
 
+KEY_LINE, SECRET_LINE = f"WEBULL_LIVE_APP_KEY={LIVE_KEY}", f"WEBULL_LIVE_APP_SECRET={LIVE_SECRET}"
+
+
 @pytest.mark.parametrize("text, words", [
     (GOOD_LIVE + "WEBULL_APP_KEY=ZqPracticeKey1234567\n", "line 3 names a setting other than"),
     (GOOD_LIVE + f"OTHER_NAME={LIVE_SECRET}\n", "line 3 names a setting other than"),
-    (GOOD_LIVE + f"WEBULL_LIVE_APP_KEY={LIVE_KEY}x\n", "sets WEBULL_LIVE_APP_KEY more than once (lines 1 and 3)"),
-    (f"WEBULL_LIVE_APP_KEY=\nWEBULL_LIVE_APP_SECRET={LIVE_SECRET}\n", "WEBULL_LIVE_APP_KEY is empty"),
-    (f"WEBULL_LIVE_APP_KEY={LIVE_KEY}\nWEBULL_LIVE_APP_SECRET=''\n", "WEBULL_LIVE_APP_SECRET is empty"),
-    (f"WEBULL_LIVE_APP_KEY={LIVE_KEY}\n", "WEBULL_LIVE_APP_SECRET is missing"),
+    (GOOD_LIVE + f"{KEY_LINE}x\n", "sets WEBULL_LIVE_APP_KEY more than once (lines 1 and 3)"),
+    (f"WEBULL_LIVE_APP_KEY=\n{SECRET_LINE}\n", "WEBULL_LIVE_APP_KEY is empty"),
+    (f"{KEY_LINE}\n", "WEBULL_LIVE_APP_SECRET is missing"),
     (GOOD_LIVE + f"{LIVE_SECRET}\n", "line 3 is not NAME=VALUE"),
     (f"{LIVE_KEY}={LIVE_SECRET}\n" + GOOD_LIVE, "line 1 names a setting other than"),
-    ("", "WEBULL_LIVE_APP_KEY is missing"),
-    (b"WEBULL_LIVE_APP_KEY=\xff\xfe\n", "is not UTF-8 text"),
+    ("", "is empty"),
     ("WEBULL_LIVE_APP_KEY=" + "a" * 5000 + "\n", "is larger than"),
+    # T50 addendum 3 (B): the format is exact
+    (f"# the owner's live pair\n{GOOD_LIVE}", "line 1 is a comment"),
+    (f"{KEY_LINE}\n\n{SECRET_LINE}\n", "line 2 is blank"),
+    (GOOD_LIVE + "\n", "line 3 is blank"),
+    (f"export {KEY_LINE}\n{SECRET_LINE}\n", "line 1 starts with export"),
+    (f'WEBULL_LIVE_APP_KEY="{LIVE_KEY}"\n{SECRET_LINE}\n', "line 1 holds a quote"),
+    (f"{KEY_LINE}\nWEBULL_LIVE_APP_SECRET='{LIVE_SECRET}'\n", "line 2 holds a quote"),
+    (f"WEBULL_LIVE_APP_KEY=Zq7Rt\"4Kw9PmXv\n{SECRET_LINE}\n", "line 1 holds a quote"),
+    (f"WEBULL_LIVE_APP_KEY=Zq7Rt`4Kw9PmXv\n{SECRET_LINE}\n", "line 1 holds a quote"),
+    (f"WEBULL_LIVE_APP_KEY=Zq7Rt 4Kw9PmXv\n{SECRET_LINE}\n", "line 1 holds a space or a tab"),
+    (f"WEBULL_LIVE_APP_KEY= {LIVE_KEY}\n{SECRET_LINE}\n", "line 1 holds a space or a tab"),
+    (f"{KEY_LINE} \n{SECRET_LINE}\n", "line 1 holds a space or a tab"),
+    (f"{KEY_LINE}\n {SECRET_LINE}\n", "line 2 holds a space or a tab"),
+    (f"WEBULL_LIVE_APP_KEY\t={LIVE_KEY}\n{SECRET_LINE}\n", "line 1 holds a space or a tab"),
+    (f"{KEY_LINE}\r\n{SECRET_LINE}\r\n", "carriage return"),
+    (f"{KEY_LINE}\n{SECRET_LINE}\r", "carriage return"),
+    (b"\xef\xbb\xbf" + GOOD_LIVE.encode(), "begins with a byte-order mark"),
+    (f"WEBULL_LIVE_APP_KEY=Zq7Rt\x014Kw9PmXv\n{SECRET_LINE}\n", "line 1 holds a byte that is not printable ASCII"),
+    (f"WEBULL_LIVE_APP_KEY={'é' * 10}\n{SECRET_LINE}\n", "line 1 holds a byte that is not printable ASCII"),
+    (b"WEBULL_LIVE_APP_KEY=\xff\xfeZq7Rt4Kw9\n" + SECRET_LINE.encode() + b"\n", "line 1 holds a byte that is not printable ASCII"),
+    (f"WEBULL_LIVE_APP_KEY=Zq7Rt4K\n{SECRET_LINE}\n", "WEBULL_LIVE_APP_KEY is shorter than 8 characters"),
+    (f"{KEY_LINE}\nWEBULL_LIVE_APP_SECRET={'a' * 513}\n", "WEBULL_LIVE_APP_SECRET is longer than 512 characters"),
 ])
 def test_t50_a_live_file_with_anything_but_the_two_names_once_each_is_refused_naming_the_fault(tmp_path, text, words):
     _refused_with(_refusal(_live_file(tmp_path / "secrets", text)), words)
@@ -1422,9 +1449,227 @@ def test_t50_the_live_names_in_reach_are_found_in_any_mapping_and_through_the_or
     f.write_text(f"WEBULL_APP_KEY=ZqPracticeKey1234567\nWEBULL_LIVE_APP_KEY={LIVE_KEY}\n")
     os.chmod(f, 0o600)
     env = {}
-    s.load_env(f, environ=env)
-    assert s.live_names_in(env) == ["WEBULL_LIVE_APP_KEY"]
+    with pytest.raises(s.LiveNameInReach):                       # addendum 3 (A): the loader refuses it, sets nothing
+        s.load_env(f, environ=env)
+    assert env == {}
     assert s.is_practice_environment({}) and s.is_practice_environment({"WEBULL_ENV": " Sandbox "})
     assert s.is_practice_environment({"WEBULL_ENV": ""})
     for word in ("production", "PRODUCTION", "live", "sandbox2", "paper"):
         assert not s.is_practice_environment({"WEBULL_ENV": word}), word
+
+
+# ---- T50 addendum 3 (A): the ordinary loader never loads the live file and never places a live name in the environment
+
+import sys  # noqa: E402
+
+ORDINARY = "WEBULL_APP_KEY=ZqPracticeKey1234567\nWEBULL_APP_SECRET=ZqPracticeSecret98765\nWEBULL_ENV=sandbox\n"
+_WATCHED: dict = {}                     # the live file's (device, inode) while a test watches it; empty otherwise
+_OPENS: list = []
+
+
+def _audit_live_opens(event, args):
+    if event == "open" and args and _WATCHED.get("inode"):
+        try:
+            st = os.stat(args[0]) if isinstance(args[0], (str, bytes, os.PathLike)) else None
+        except (OSError, ValueError, TypeError):
+            st = None
+        if st is not None and (st.st_dev, st.st_ino) == _WATCHED["inode"]:
+            _OPENS.append("opened")
+
+
+sys.addaudithook(_audit_live_opens)
+
+
+@pytest.fixture
+def live_place(tmp_path, monkeypatch):
+    """The live file at its place (secrets.LIVE_ENV_FILE moved into tmp), its reader failing the test if called, and
+    every open of it recorded (by device and inode, so a link or another spelling counts)."""
+    live = _live_file(tmp_path / "home" / ".hermes" / "secrets")
+    monkeypatch.setattr(s, "LIVE_ENV_FILE", live)
+    monkeypatch.setattr(s, "read_live_pair", lambda *a, **k: pytest.fail("the live file was read by its reader"))
+    st = os.stat(live)
+    _OPENS.clear()
+    _WATCHED["inode"] = (st.st_dev, st.st_ino)
+    yield live
+    _WATCHED.clear()
+    _OPENS.clear()
+
+
+def _ways(tmp_path, live):
+    """The live file itself, a link to it, another spelling of it, a hard link to it, and a copy under another name."""
+    links = tmp_path / "links"
+    links.mkdir(mode=0o700, exist_ok=True)
+    link = links / "trading.env"
+    if not link.exists():
+        link.symlink_to(live)
+    copy = tmp_path / "copies" / "trading.env"
+    if not copy.exists():
+        copy.parent.mkdir(mode=0o700)
+        copy.write_bytes(live.read_bytes())
+        copy.chmod(0o600)
+    return {"live": live, "link": link, "spelling": live.parent / ".." / "secrets" / ".." / "secrets" / live.name,
+            "copy": copy}
+
+
+WAYS = ("live", "link", "spelling", "copy")
+
+
+@pytest.mark.parametrize("way", WAYS)
+@pytest.mark.parametrize("override", [False, True])
+def test_t50_a3_the_ordinary_loader_refuses_the_live_file_however_it_is_named_and_sets_nothing(tmp_path, live_place, way,
+                                                                                              override):
+    path = _ways(tmp_path, live_place)[way]
+    _OPENS.clear()
+    for env in ({"VALEDIA_ENV_FILE": str(path)}, {}):
+        given = dict(env)
+        with pytest.raises(s.LiveNameInReach) as exc:
+            s.load_env(None if env else path, environ=env, override=override)
+        assert env == given                                           # nothing set from that file
+        why = str(exc.value)
+        clean = _no_value(why)
+        assert clean and ("webull-live.env" in why or "WEBULL_LIVE_APP_KEY" in why), why
+    assert _OPENS == [] or way == "copy"                              # the live file itself is refused before reading
+
+
+def test_t50_a3_a_hard_link_to_the_live_file_is_refused_before_it_is_read(tmp_path, live_place):
+    other = tmp_path / "other"
+    other.mkdir(mode=0o700)
+    os.link(live_place, other / "trading.env")
+    _OPENS.clear()
+    env = {}
+    with pytest.raises(s.LiveNameInReach) as exc:
+        s.load_env(other / "trading.env", environ=env)
+    assert env == {} and _OPENS == [] and "webull-live.env" in str(exc.value)
+
+
+@pytest.mark.parametrize("extra", [f"WEBULL_LIVE_APP_KEY={LIVE_KEY}\n", f"export WEBULL_LIVE_APP_SECRET='{LIVE_SECRET}'\n",
+                                   f"  WEBULL_LIVE_APP_KEY = {LIVE_KEY}\n", "# WEBULL_LIVE_APP_SECRET belongs elsewhere\n",
+                                   f"WEBULL_LIVE_APP_SECRET={LIVE_SECRET}\nWEBULL_LIVE_APP_KEY={LIVE_KEY}\n"])
+def test_t50_a3_an_ordinary_file_naming_a_live_name_anywhere_sets_nothing_at_all(tmp_path, extra):
+    f = tmp_path / "trading.env"
+    f.write_text(ORDINARY + extra)
+    f.chmod(0o600)
+    for override in (False, True):
+        env = {"KEEP": "1"}
+        with pytest.raises(s.LiveNameInReach) as exc:
+            s.load_env(f, environ=env, override=override)
+        assert env == {"KEEP": "1"}                                   # not even the ordinary names
+        why = str(exc.value)
+        clean = _no_value(why) and "ZqPractice" not in why
+        assert clean and any(n in why for n in s.LIVE_NAMES), why
+    if LIVE_KEY in extra:                                             # what was refused is still hidden from output
+        masked, _ = s.redact(f"value {LIVE_KEY} here")
+        assert LIVE_KEY not in masked
+
+
+class _EnvWatch:
+    """Each moment a live name or a live value is in the process environment: looked at after every write to it
+    (os.environ's __setitem__ and os.putenv) and at every call of a stand-in (`look`)."""
+
+    def __init__(self, monkeypatch):
+        self.looks, self.seen = 0, []
+        real_set, real_putenv = os._Environ.__setitem__, os.putenv
+        watch = self
+
+        def setitem(env, key, value):
+            real_set(env, key, value)
+            if env is os.environ:
+                watch.look(f"set {key}")
+
+        def putenv(key, value):
+            real_putenv(key, value)
+            k = key.decode() if isinstance(key, bytes) else str(key)
+            v = value.decode(errors="replace") if isinstance(value, bytes) else str(value)
+            if k in s.LIVE_NAMES or LIVE_KEY in v or LIVE_SECRET in v:
+                watch.seen.append(("putenv", [k]))
+
+        monkeypatch.setattr(os._Environ, "__setitem__", setitem)
+        monkeypatch.setattr(os, "putenv", putenv)
+
+    def look(self, where):
+        self.looks += 1
+        bad = sorted(k for k, v in os.environ.items() if k in s.LIVE_NAMES or LIVE_KEY in v or LIVE_SECRET in v)
+        if bad:
+            self.seen.append((where, bad))
+
+    def stand_in(self, where, result=None):
+        def call(*a, **k):
+            self.look(where)
+            return result() if callable(result) else result
+        return call
+
+
+def _entry_order_step(root, watch, monkeypatch):
+    from valedia_trader.research_loop import cli
+    monkeypatch.setattr(cli, "_order_step_venue", watch.stand_in("the order step's venue builder"))
+    return cli.main(["--root", str(root), "order-step"]) == 2
+
+
+def _entry_event_practice(root, watch, monkeypatch):
+    from valedia_trader.execution_and_risk import event_practice
+    return event_practice.main(["--reconcile-only"], build_venue=watch.stand_in("the events venue builder"),
+                               root=root) == 2
+
+
+def _entry_events_probe(root, watch, monkeypatch):
+    from valedia_trader.venues import webull_events
+    return webull_events.main(["probe"], client=watch.stand_in("the events client"),
+                              kalshi_fetch=watch.stand_in("kalshi", b"{}"), sleep=lambda s: None) == 2
+
+
+def _entry_webull_check(root, watch, monkeypatch):
+    from valedia_trader.venues import webull
+    monkeypatch.setattr(webull.WebullVenue, "__init__", watch.stand_in("the venue's constructor"))
+    monkeypatch.setattr(webull.WebullVenue, "check", watch.stand_in("the venue's check", {}))
+    return webull.main(["check"]) == 2
+
+
+def _entry_doctor_venues(root, watch, monkeypatch):
+    from valedia_trader import doctor
+    from valedia_trader.research_loop import LoopPaths
+    monkeypatch.setattr(doctor, "live_mode_note", watch.stand_in("the live-mode note", "live mode: not judged here"))
+    status, detail = doctor.check_venues(LoopPaths(root))
+    watch.look("after the venues check")
+    return status == doctor.FAIL and _no_value(detail)
+
+
+def _entry_owner_page(root, watch, monkeypatch):
+    from valedia_trader.research_loop import owner_page as op
+    monkeypatch.setattr(op, "SECTIONS", [(n, i, watch.stand_in(f"section {n}", ([], ""))) for n, i, _ in op.SECTIONS])
+    return op.main(["--root", str(root), "build", "--out", str(root / "page.html")]) == 2 and not (root / "page.html").exists()
+
+
+ENTRIES = {"order step": _entry_order_step, "event practice": _entry_event_practice, "events probe": _entry_events_probe,
+           "webull check": _entry_webull_check, "doctor venues": _entry_doctor_venues, "owner page": _entry_owner_page}
+
+
+@pytest.mark.parametrize("way", WAYS)
+@pytest.mark.parametrize("entry", list(ENTRIES))
+def test_t50_a3_every_practice_entry_pointed_at_the_live_file_refuses_and_no_live_value_is_ever_in_the_environment(
+        tmp_path, live_place, monkeypatch, capsys, entry, way):
+    path = _ways(tmp_path, live_place)[way]
+    root = tmp_path / "repo"
+    root.mkdir()
+    for name in (*s.LIVE_NAMES, "WEBULL_APP_KEY", "WEBULL_APP_SECRET", "WEBULL_ENV", "WEBULL_ACCOUNT_CLASS"):
+        monkeypatch.setenv(name, "x")
+        monkeypatch.delenv(name)                                      # the undo removes whatever a load puts there
+    monkeypatch.setenv("VALEDIA_ENV_FILE", str(path))
+    watch = _EnvWatch(monkeypatch)
+    real_load = s.load_env
+
+    def load_env(*a, **k):
+        try:
+            return real_load(*a, **k)
+        finally:
+            watch.look("after load_env")
+    monkeypatch.setattr(s, "load_env", load_env)
+    _OPENS.clear()
+    refused = ENTRIES[entry](root, watch, monkeypatch)
+    watch.look("after the entry")
+    printed = capsys.readouterr()
+    assert watch.seen == [], watch.seen                               # names only: never a value
+    assert not set(s.LIVE_NAMES) & set(os.environ)
+    clean = _no_value(printed.out + printed.err)
+    assert clean and refused, (entry, way)
+    assert watch.looks >= 2
+    assert _OPENS == [] or way == "copy", (entry, way, len(_OPENS))  # the live file itself is never opened

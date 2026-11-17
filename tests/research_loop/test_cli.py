@@ -2636,3 +2636,27 @@ def test_t50_the_practice_order_step_runs_beside_a_live_file_it_never_opens(orde
     for name in T50_NAMES:
         monkeypatch.delenv(name, raising=False)
     assert cli.main(["--root", str(root), "order-step"]) == 0
+
+
+# ---- T50 addendum 3 (C1): the order step's command line accepts no abbreviation of any flag
+
+@pytest.mark.parametrize("flags", [["--liv"], ["--li"], ["--l"], ["--live", "--chec"], ["--live", "--propos"],
+                                   ["--live", "--approv", "1"], ["--live", "--propose", "--capit", "100"], ["--chec"],
+                                   ["--propos"], ["--prop"], ["--approv", "1"], ["--capit", "100"], ["--fraction"],
+                                   ["--live", "--propose", "--fractiona"]])
+def test_t50_a3_the_order_step_accepts_no_abbreviation_of_any_flag(tmp_path, monkeypatch, capsys, flags):
+    monkeypatch.setattr(cli, "live_order_step_command", lambda *a, **k: pytest.fail("live mode ran"))
+    monkeypatch.setattr(cli, "_order_step_build", lambda *a, **k: pytest.fail("the order step ran"))
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--root", str(tmp_path), "order-step", *flags])
+    assert exc.value.code == 2 and "unrecognized arguments" in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_t50_a3_the_command_lines_own_flags_take_no_abbreviation_either(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "live_order_step_command", lambda *a, **k: pytest.fail("live mode ran"))
+    monkeypatch.setattr(cli, "_order_step_build", lambda *a, **k: pytest.fail("the order step ran"))
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--ro", str(tmp_path), "order-step", "--live"])
+    assert exc.value.code == 2
+    capsys.readouterr()

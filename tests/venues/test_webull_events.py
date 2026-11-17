@@ -630,3 +630,18 @@ def test_t50_the_probe_finds_a_live_name_in_the_ordinary_file_and_never_opens_th
     code = we.main(["probe"], environ=dict(ENV), client=FakeData(fake), kalshi_fetch=kalshi_fetch_for({}),
                    sleep=lambda s: None)
     assert code == 0                                                   # no live name: it runs, the live file unopened
+
+
+# ---- T50 addendum 3 (F): no host and no environment word of the events reader is read from a variable
+
+def test_t50_a3_planted_host_and_environment_variables_move_the_events_reader_nowhere(monkeypatch):
+    planted = {"WEBULL_HOST": "planted.invalid", "WEBULL_API_HOST": "planted.invalid", "WEBULL_SANDBOX_HOST":
+               "planted.invalid", "WEBULL_EVENTS_HOST": "planted.invalid", "WEBULL_ENDPOINT": "https://planted.invalid",
+               "WEBULL_ENVIRONMENT": "production", "WEBULL_EVENTS_ENV": "production", "WEBULL_LIVE_ENV": "sandbox"}
+    for name, value in planted.items():
+        monkeypatch.setenv(name, value)
+    fake = FakeInstrument(series_pages={None: ([series_row("KXNBAGAME")], None)})
+    report, reader = we.probe(environ={**ENV, **planted}, client=FakeData(fake), kalshi_fetch=kalshi_fetch_for({}),
+                              sleep=lambda s: None)
+    assert (report["environment"], report["host"]) == ("sandbox", wb.SANDBOX_HOST)
+    assert (reader.environment, reader.host) == ("sandbox", wb.SANDBOX_HOST)

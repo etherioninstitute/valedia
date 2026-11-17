@@ -3966,3 +3966,47 @@ def test_t50_the_connection_check_refuses_a_venue_whose_host_is_not_the_test_one
     monkeypatch.setattr(wb.WebullVenue, "check", lambda self: pytest.fail("the production venue was asked"))
     assert wb.main(["check"]) == 2
     assert capsys.readouterr().err.startswith("refused:")
+
+
+# ---- T50 addendum 3 (F): no host and no environment word is read from a variable; planted ones move nothing
+
+PLANTED = {"WEBULL_HOST": "planted.invalid", "WEBULL_API_HOST": "planted.invalid", "WEBULL_SANDBOX_HOST": "planted.invalid",
+           "WEBULL_PRODUCTION_HOST": "planted.invalid", "WEBULL_PRACTICE_HOST": "planted.invalid",
+           "WEBULL_LIVE_HOST": "planted.invalid", "WEBULL_ENDPOINT": "https://planted.invalid", "WEBULL_BASE_URL":
+           "https://planted.invalid", "WEBULL_REGION": "planted", "WEBULL_LIVE_ENV": "sandbox", "WEBULL_LIVE_ENVIRONMENT":
+           "sandbox", "WEBULL_ENVIRONMENT": "production", "WEBULL_PRACTICE_ENV": "production", "VALEDIA_LIVE_ENV": "sandbox",
+           "LIVE_ENV": "sandbox", "PRACTICE_ENVIRONMENT": "production", "WEBULL_LIVE": "sandbox", "WEBULL_SANDBOX":
+           "production", "SANDBOX_HOST": "planted.invalid", "PRODUCTION_HOST": "planted.invalid"}
+
+
+def test_t50_a3_planted_host_and_environment_variables_move_neither_venue(tmp_path, monkeypatch):
+    hosts = dict(wb.HOSTS)
+    for name, value in PLANTED.items():
+        monkeypatch.setenv(name, value)
+    practice = wb.WebullVenue.from_secrets({"WEBULL_APP_KEY": KEY, "WEBULL_APP_SECRET": SECRET, **PLANTED},
+                                           client=FakeClient(), confirmation_file=tmp_path / "x.json")
+    assert (practice.environment, practice.host, practice.name) == ("sandbox", wb.SANDBOX_HOST, "webull-sandbox")
+    live = wb.WebullVenue.from_live_file(_live_pair_file(tmp_path / "secrets"), account_class="INDIVIDUAL_CASH",
+                                         client=FakeClient(accounts=[dict(r) for r in PAPER_ACCOUNTS]),
+                                         confirmation_file=tmp_path / "x.json")
+    assert (live.environment, live.host, live.name) == ("production", wb.PRODUCTION_HOST, "webull-production")
+    assert dict(wb.HOSTS) == hosts and "planted" not in json.dumps(hosts)
+
+
+def test_t50_a3_a_fresh_import_with_planted_variables_fixes_the_same_hosts_and_words(tmp_path):
+    import os
+    import subprocess
+    here = Path(wb.__file__).resolve().parents[2]
+    probe = ("import json, valedia_trader.venues.webull as wb, valedia_trader.core.secrets as s; "
+             "print(json.dumps([wb.__file__, wb.SANDBOX_HOST, wb.PRODUCTION_HOST, wb.HOSTS, s.PRACTICE_ENVIRONMENT, "
+             "str(s.LIVE_ENV_FILE), list(s.LIVE_NAMES)]))")
+    base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path),
+            "VALEDIA_ENV_FILE": str(tmp_path / "no-such-trading.env"), "PYTHONDONTWRITEBYTECODE": "1"}
+    seen = []
+    for env in (base, {**base, **PLANTED}):
+        out = subprocess.run([sys.executable, "-I", "-c", f"import sys; sys.path.insert(0, {str(here)!r}); {probe}"],
+                             env=env, cwd=tmp_path, capture_output=True, text=True, timeout=120)
+        assert out.returncode == 0, out.stderr[-400:]
+        seen.append(json.loads(out.stdout))
+    assert seen[0] == seen[1] and Path(seen[0][0]).resolve() == Path(wb.__file__).resolve()
+    assert seen[0][1:4] == [wb.SANDBOX_HOST, wb.PRODUCTION_HOST, wb.HOSTS]

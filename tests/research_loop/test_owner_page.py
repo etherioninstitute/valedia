@@ -1189,14 +1189,42 @@ def test_t50_a_live_name_in_reach_is_a_flagged_row_without_its_value(world, monk
     assert name in _t50_flag(html) and "webull-live.env" in _t50_flag(html)
 
 
-def test_t50_a_live_name_in_the_trading_file_is_flagged_and_nothing_of_it_is_kept(bare_world, trading_file, monkeypatch):
+def test_t50_a_live_name_in_the_trading_file_stops_the_page_and_nothing_of_it_is_kept(bare_world, trading_file, monkeypatch):
+    # T50 addendum 3 (A): the ordinary loader refuses a file naming a live name and sets nothing, so the page is not built
     monkeypatch.setattr(s, "read_live_pair", lambda *a, **k: pytest.fail("the live file was read"))
     trading_file.write_text(trading_file.read_text() + f"WEBULL_LIVE_APP_SECRET={T50_SECRET}\n")
     monkeypatch.setenv("WEBULL_LIVE_APP_SECRET", "x")
     monkeypatch.delenv("WEBULL_LIVE_APP_SECRET")
     env = bare_world.env()
     env.environ = None
-    op.build(env, out=bare_world.tmp / "o.html")
-    html = (bare_world.tmp / "o.html").read_text()
-    clean = T50_SECRET not in html
-    assert clean and "WEBULL_LIVE_APP_SECRET" in _t50_flag(html) and "WEBULL_LIVE_APP_SECRET" not in os.environ
+    out = bare_world.tmp / "o.html"
+    with pytest.raises(al.TradingFileError) as exc:
+        op.build(env, out=out)
+    why = str(exc.value)
+    clean = T50_SECRET not in why
+    assert clean and "LiveNameInReach" in why and not out.exists() and "WEBULL_LIVE_APP_SECRET" not in os.environ
+
+
+def test_t50_a3_a_trading_file_that_is_the_live_file_stops_the_page_before_it_is_opened(bare_world, monkeypatch, tmp_path):
+    live = tmp_path / "home" / ".hermes" / "secrets" / "webull-live.env"
+    live.parent.mkdir(parents=True, mode=0o700)
+    live.write_text(f"WEBULL_LIVE_APP_KEY=ZqLiveKey7Rt4Kw9PmXv2Bn\nWEBULL_LIVE_APP_SECRET={T50_SECRET}\n")
+    live.chmod(0o600)
+    monkeypatch.setattr(s, "LIVE_ENV_FILE", live)
+    link = tmp_path / "trading-link.env"
+    link.symlink_to(live)
+    for named in (live, link, live.parent / ".." / "secrets" / live.name):
+        monkeypatch.setenv("VALEDIA_ENV_FILE", str(named))
+        env = bare_world.env()
+        env.environ, env.trading_file = None, None
+        opened = []
+        real_open = Path.open
+        monkeypatch.setattr(Path, "open", lambda self, *a, **k: opened.append(self) or real_open(self, *a, **k))
+        out = bare_world.tmp / "o.html"
+        with pytest.raises(al.TradingFileError) as exc:
+            op.build(env, out=out)
+        monkeypatch.setattr(Path, "open", real_open)
+        why = str(exc.value)
+        clean = T50_SECRET not in why
+        assert clean and "webull-live.env" in why and not out.exists()
+        assert not [p for p in opened if os.path.realpath(p) == os.path.realpath(live)]
