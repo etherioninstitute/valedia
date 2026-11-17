@@ -1,12 +1,17 @@
+import importlib.util
+import io
 import json
 import math
 import multiprocessing
 import os
 import random
+import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
 import sys
+import tarfile
 import time
 from pathlib import Path
 
@@ -3075,3 +3080,504 @@ def test_t34b3_the_replay_reproduces_every_figure_the_ledger_stored_over_generat
                     checked += 1
             kinds += 1
     assert checked > 1000 and kinds > 1000 and {"avg_restated", "fee_fell", "piece_unpriced"} <= seen, (checked, seen)
+
+
+# ---- T51 A1 (R7, ruling D): layout 4, `order_type` and `collar_price` on `orders`; a layout-3 file upgraded once
+
+
+OLD_COMMIT = "33ace6f"                                    # the last commit whose ledger writes layout 3
+ORDERS_FILE = Path(orders.__file__).resolve()
+REPO = ORDERS_FILE.parents[2]
+LEDGER_TABLES = ("orders", "events", "reconciles", "fills", "attention", "sqlite_sequence")
+DDL = ("ALTER", "CREATE", "DROP")
+
+
+@pytest.fixture(scope="module")
+def old_orders(tmp_path_factory):
+    """The ledger module exactly as commit 33ace6f has it (layout 3), taken with `git archive`, loaded under a name
+    of its own so it never stands in for the module under test."""
+    where = tmp_path_factory.mktemp("at-33ace6f")
+    rel = "valedia_trader/execution_and_risk/orders.py"
+    got = subprocess.run(["git", "-C", str(REPO), "archive", "--format=tar", OLD_COMMIT, rel], capture_output=True,
+                         timeout=60)
+    assert got.returncode == 0, f"git archive {OLD_COMMIT} failed: {got.stderr.decode(errors='replace')[:300]}"
+    with tarfile.open(fileobj=io.BytesIO(got.stdout)) as tar:
+        tar.extractall(where, filter="data")
+    spec = importlib.util.spec_from_file_location("orders_at_33ace6f", where / rel)
+    old = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(old)
+    assert old.LAYOUT_VERSION == 3 and old.__file__ != orders.__file__
+    return old
+
+
+def _old_ledger_file(old, path: Path, extra_orders: int = 0) -> Path:
+    """A layout-3 ledger written by the OLD code's own writer: orders filled, partly filled, refused, intended with
+    and without a limit, fill rows applied and not, reconciles, events and a negative-fee notice."""
+    clock = Clock()
+    led = old.OrderLedger(path, not_sent=(LocalRefusal,), clock=clock)
+    venue = FakeVenue()
+    assert led.reconcile(venue, {})["clean"]
+    led.intend("b1-XLE", "XLE", 10.0, 90.0, limit_price=90.9, batch="b1", parts=[{"strategy": "s1", "units": 10.0}])
+    led.submit_once(venue, "b1-XLE")
+    venue.set("b1-XLE", state="filled", filled_units=10.0, avg_price=90.5, fee=-0.25)
+    venue.held = {"XLE": 10.0}
+    clock.t += 60
+    led.reconcile(venue, {})
+    led.mark_applied([f["id"] for f in led.unapplied_fills()])
+    clock.t += 60
+    assert led.reconcile(venue, {"XLE": 10.0})["clean"]
+    led.intend("b2-XLE", "XLE", -0.5, 90.0, limit_price=88.2, batch="b2", parts=[{"strategy": "s1", "units": -0.5}])
+    led.submit_once(venue, "b2-XLE")
+    venue.set("b2-XLE", state="partly_filled", filled_units=0.2, avg_price=89.0, fee=0.0)
+    venue.held = {"XLE": 9.8}
+    clock.t += 60
+    led.reconcile(venue, {"XLE": 10.0})
+    led.intend("b2-QQQ", "QQQ", 3.0, 500.0, limit_price=505.0, batch="b2")
+    led.intend("e1-KX", "KX-YES", 4.0, 0.4, batch="e1")          # no limit (as the event practice records some)
+    for i in range(extra_orders):
+        led.intend(f"b3-{i}", "SPY", 1.0 + i, 600.0, limit_price=606.0, batch="b3")
+    led.close()
+    seen = _look(path)
+    assert seen["version"] == 3 and len(seen["rows"]["orders"]) == 4 + extra_orders
+    assert seen["rows"]["fills"] and seen["rows"]["attention"] and len(seen["rows"]["reconciles"]) >= 3
+    return path
+
+
+def _look(path: Path) -> dict:
+    """Everything in a ledger file: its layout number, its schema, every row of every table (an ordinary connection,
+    so a journal a killed process left is rolled back first, as any later opener does)."""
+    raw = sqlite3.connect(str(path))
+    try:
+        return {"version": raw.execute("PRAGMA user_version").fetchone()[0],
+                "master": sorted(tuple(r) for r in raw.execute("SELECT type, name, tbl_name, sql FROM sqlite_master")),
+                "columns": [r[1] for r in raw.execute("PRAGMA table_info(orders)")],
+                "rows": {t: raw.execute(f"SELECT * FROM {t} ORDER BY rowid").fetchall() for t in LEDGER_TABLES}}
+    finally:
+        raw.close()
+
+
+def _fresh_master(tmp_path: Path) -> list:
+    where = tmp_path / "fresh-layout4.sqlite"
+    ledger(where).close()
+    return _look(where)["master"]
+
+
+def _as_layout4(before: dict, fresh_master: list) -> dict:
+    """What a layout-3 file must read as once upgraded: every row as it was, each order a LIMIT with no collar."""
+    rows = dict(before["rows"])
+    rows["orders"] = [tuple(r) + ("LIMIT", None) for r in before["rows"]["orders"]]
+    return {"version": 4, "master": fresh_master, "columns": before["columns"] + ["order_type", "collar_price"],
+            "rows": rows}
+
+
+def _without_new_keys(records):
+    return [{k: v for k, v in r.items() if k not in ("order_type", "collar_price")} for r in records]
+
+
+def test_a_new_ledger_file_is_layout_4_with_order_type_and_collar_price(tmp_path):
+    path = tmp_path / "orders.sqlite"
+    led = ledger(path)
+    rec = intend(led)
+    assert (rec["order_type"], rec["collar_price"]) == ("LIMIT", None)
+    seen = _look(path)
+    assert seen["version"] == orders.LAYOUT_VERSION == 4 and seen["columns"][-2:] == ["order_type", "collar_price"]
+
+
+def test_a_layout3_file_written_by_the_old_code_is_upgraded_on_the_first_write_open(tmp_path, old_orders):
+    path = _old_ledger_file(old_orders, tmp_path / "orders.sqlite")
+    before = _look(path)
+    copy = tmp_path / "copy.sqlite"
+    shutil.copy2(path, copy)
+    old_led = old_orders.OrderLedger(copy, not_sent=(LocalRefusal,), clock=Clock(1_000_300.0))
+    led = ledger(path, clock=Clock(1_000_300.0))
+    assert _look(path) == _as_layout4(before, _fresh_master(tmp_path))
+    new = led.orders()
+    assert all((r["order_type"], r["collar_price"]) == ("LIMIT", None) for r in new)
+    assert _without_new_keys(new) == old_led.orders()               # every row reads as the old code read it
+    assert led.fills() == old_led.fills() and led.attention(False) == old_led.attention(False)
+    assert led.blocked() == old_led.blocked() and led.last_reconcile() == old_led.last_reconcile()
+    assert led.average_writes("b2-XLE") == old_led.average_writes("b2-XLE")
+    led.close()
+    again = _look(path)
+    ledger(path).close()                                              # a second open changes nothing
+    assert _look(path) == again
+
+
+def test_the_upgrade_is_one_transaction(tmp_path, old_orders, monkeypatch):
+    path = _old_ledger_file(old_orders, tmp_path / "orders.sqlite")
+    seen = []
+    original = OrderLedger._connect
+
+    def traced(self):
+        db = original(self)
+        db.set_trace_callback(seen.append)
+        return db
+    monkeypatch.setattr(OrderLedger, "_connect", traced)
+    ledger(path).close()
+    said = [s.strip().upper() for s in seen]
+    changes = [i for i, s in enumerate(said) if s.startswith(DDL) or s.startswith("PRAGMA USER_VERSION =")]
+    assert changes and any(said[i].startswith("ALTER") for i in changes), said
+    begin = max(i for i in range(changes[0]) if said[i].startswith("BEGIN"))
+    end = min(i for i in range(changes[-1], len(said)) if said[i] == "COMMIT")
+    between = said[begin + 1:end]
+    assert said[begin] == "BEGIN IMMEDIATE" and not any(s.startswith(("BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT",
+                                                                       "RELEASE")) for s in between), said
+
+
+CHILD = r'''
+import importlib.util, json, sys, time
+from pathlib import Path
+cfg = json.loads(sys.argv[1])
+spec = importlib.util.spec_from_file_location("orders_in_child", cfg["orders"])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+seen = []
+original = m.OrderLedger._connect
+DDL = ("ALTER", "CREATE", "DROP")
+
+def pause(sql):
+    Path(cfg["marker"]).write_text(sql)
+    time.sleep(cfg.get("sleep", 120))
+
+def connect(self):
+    db = original(self)
+    def trace(sql):
+        seen.append(sql)
+        if cfg["mode"] == "kill" and len(seen) == cfg["at"]:
+            pause(sql)
+        if cfg["mode"] == "hold" and sql.strip().upper() == "COMMIT" and not cfg.get("held") \
+                and any(s.lstrip().upper().startswith(DDL) for s in seen):
+            cfg["held"] = True
+            pause(sql)
+    db.set_trace_callback(trace)
+    return db
+
+m.OrderLedger._connect = connect
+go = cfg.get("go")
+while go and not Path(go).exists():
+    time.sleep(0.002)
+led = m.OrderLedger(cfg["ledger"])
+opened = len(seen)
+for i in range(cfg.get("rows", 0)):
+    led.intend(f"{cfg['name']}-{i}", "XLE", 1.0 + i, 90.0, limit_price=90.9, batch=cfg["name"])
+led.orders()
+led.close()
+print(json.dumps({"seen": seen, "opened": opened,
+                  "ddl": any(s.lstrip().upper().startswith(DDL) for s in seen[:opened])}))
+'''
+
+
+def _child(tmp_path: Path, **cfg) -> subprocess.Popen:
+    """A separate process running the module under test (by its file, `-I`: nothing else on its path) on a ledger."""
+    script = tmp_path / "child.py"
+    if not script.exists():
+        script.write_text(CHILD)
+    cfg = {"orders": str(ORDERS_FILE), **cfg}
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    return subprocess.Popen([sys.executable, "-I", "-B", str(script), json.dumps(cfg)], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=env)
+
+
+def _wait_for(marker: Path, proc: subprocess.Popen, seconds: float = 30.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if marker.exists():
+            return True
+        if proc.poll() is not None:
+            return False
+        time.sleep(0.005)
+    proc.kill()
+    raise AssertionError("the child neither paused nor finished")
+
+
+def _finish(proc: subprocess.Popen) -> dict:
+    out, err = proc.communicate(timeout=60)
+    assert proc.returncode == 0, err.decode(errors="replace")[-600:]
+    return json.loads(out)
+
+
+def test_a_real_kill_at_every_statement_of_the_upgrade_leaves_layout3_as_it_was_or_layout4_complete(tmp_path,
+                                                                                                    old_orders):
+    source = _old_ledger_file(old_orders, tmp_path / "source.sqlite", extra_orders=40)
+    before = _look(source)
+    after = _as_layout4(before, _fresh_master(tmp_path))
+    plain = tmp_path / "plain.sqlite"
+    shutil.copy2(source, plain)
+    trace = _finish(_child(tmp_path, mode="none", ledger=str(plain)))
+    said = [s.strip().upper() for s in trace["seen"]]
+    assert trace["ddl"] and _look(plain) == after
+    first_change = next(i for i, s in enumerate(said) if s.startswith(DDL))
+    commit = next(i for i in range(first_change, len(said)) if said[i] == "COMMIT") + 1   # 1-based statement
+    outcomes = {}
+    for at in range(1, trace["opened"] + 2):                 # every statement of the open, and the first after it
+        path = tmp_path / f"killed-{at}.sqlite"
+        shutil.copy2(source, path)
+        marker = tmp_path / f"killed-{at}.marker"
+        proc = _child(tmp_path, mode="kill", at=at, ledger=str(path), marker=str(marker))
+        assert _wait_for(marker, proc), f"the child ran past statement {at}"
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=30)
+        assert proc.returncode == -signal.SIGKILL
+        seen = _look(path)
+        if at <= commit:                                     # killed before its COMMIT ran: layout 3 exactly as it was
+            assert seen == before, (at, marker.read_text())
+        else:                                                # killed after it: layout 4, complete
+            assert seen == after, (at, marker.read_text())
+        outcomes[at] = seen["version"]
+        ledger(path).close()                                 # and the next open by new code upgrades it as usual
+        assert _look(path) == after
+    assert 3 in outcomes.values() and 4 in outcomes.values() and outcomes[commit] == 3
+
+
+def test_seeded_kills_at_random_moments_leave_layout3_as_it_was_or_layout4_complete(tmp_path, old_orders):
+    source = _old_ledger_file(old_orders, tmp_path / "source.sqlite", extra_orders=40)
+    before = _look(source)
+    after = _as_layout4(before, _fresh_master(tmp_path))
+    rng = random.Random(51)
+    for trial in range(12):
+        path = tmp_path / f"r{trial}.sqlite"
+        shutil.copy2(source, path)
+        go = tmp_path / f"r{trial}.go"
+        proc = _child(tmp_path, mode="none", ledger=str(path), go=str(go))
+        time.sleep(0.15)                                     # the child is up and waiting for the go
+        go.write_text("go")
+        time.sleep(rng.uniform(0.0, 0.012))
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=30)
+        assert _look(path) in (before, after), trial
+        ledger(path).close()
+        assert _look(path) == after
+
+
+def test_two_processes_opening_a_layout3_file_for_writing_at_once_upgrade_it_exactly_once(tmp_path, old_orders):
+    source = _old_ledger_file(old_orders, tmp_path / "source.sqlite")
+    before = _look(source)
+    fresh = _fresh_master(tmp_path)
+    # one holds the upgrade open (before its COMMIT) while the other is already waiting to open the file
+    path = tmp_path / "held.sqlite"
+    shutil.copy2(source, path)
+    marker = tmp_path / "held.marker"
+    a = _child(tmp_path, mode="hold", sleep=1.5, ledger=str(path), marker=str(marker), name="a", rows=5)
+    assert _wait_for(marker, a)
+    b = _child(tmp_path, mode="none", ledger=str(path), name="b", rows=5)
+    results = [_finish(a), _finish(b)]
+    assert [r["ddl"] for r in results] == [True, False]
+    seen = _look(path)
+    assert seen["version"] == 4 and seen["master"] == fresh
+    tags = [r[0] for r in seen["rows"]["orders"]]
+    assert tags[:len(before["rows"]["orders"])] == [r[0] for r in before["rows"]["orders"]]
+    assert sorted(tags[len(before["rows"]["orders"]):]) == sorted([f"a-{i}" for i in range(5)] + [f"b-{i}" for i in range(5)])
+    # released together, three times
+    for round_ in range(3):
+        path = tmp_path / f"race-{round_}.sqlite"
+        shutil.copy2(source, path)
+        go = tmp_path / f"race-{round_}.go"
+        procs = [_child(tmp_path, mode="none", ledger=str(path), go=str(go), name=f"{n}{round_}", rows=5) for n in "xy"]
+        time.sleep(0.15)
+        go.write_text("go")
+        results = [_finish(p) for p in procs]
+        assert sum(r["ddl"] for r in results) == 1, round_
+        seen = _look(path)
+        assert seen["version"] == 4 and seen["master"] == fresh
+        assert seen["rows"]["orders"][:len(before["rows"]["orders"])] == \
+            [tuple(r) + ("LIMIT", None) for r in before["rows"]["orders"]]
+        assert len(seen["rows"]["orders"]) == len(before["rows"]["orders"]) + 10
+
+
+def test_a_read_only_open_of_a_layout3_file_reads_it_and_writes_nothing(tmp_path, old_orders):
+    folder = tmp_path / "ledgers"
+    folder.mkdir()
+    path = _old_ledger_file(old_orders, folder / "orders.sqlite")
+    copy = tmp_path / "copy.sqlite"
+    shutil.copy2(path, copy)
+    old_led = old_orders.OrderLedger(copy, not_sent=(LocalRefusal,), clock=Clock(1_000_300.0))
+    raw_before, st_before, listing = path.read_bytes(), os.stat(path), sorted(os.listdir(folder))
+    led = orders.open_read_only(path, clock=Clock(1_000_300.0))
+    new = led.orders()
+    assert new and all((r["order_type"], r["collar_price"]) == ("LIMIT", None) for r in new)
+    assert _without_new_keys(new) == old_led.orders()
+    assert led.order("b1-XLE")["order_type"] == "LIMIT" and led.blocked() == old_led.blocked()
+    assert led.fills() == old_led.fills() and led.average_writes("b2-XLE") == old_led.average_writes("b2-XLE")
+    for write in (lambda: led.intend("x-1", "XLE", 1.0, 90.0, limit_price=90.9),
+                  lambda: led.mark_applied([f["id"] for f in led.fills()])):
+        with pytest.raises(OrderError):
+            write()
+    led.close()
+    st = os.stat(path)
+    assert path.read_bytes() == raw_before and (st.st_mtime_ns, st.st_size) == (st_before.st_mtime_ns, st_before.st_size)
+    assert sorted(os.listdir(folder)) == listing and _look(path)["version"] == 3
+
+
+def test_a_read_only_open_reads_a_layout4_file_too(tmp_path):
+    path = tmp_path / "orders.sqlite"
+    led = ledger(path)
+    intend(led, tag="m-1", units=0.5, order_type="MARKET", collar_price=90.9)
+    led.close()
+    raw = path.read_bytes()
+    ro = orders.open_read_only(path)
+    assert (ro.order("m-1")["order_type"], ro.order("m-1")["collar_price"]) == ("MARKET", 90.9)
+    ro.close()
+    assert path.read_bytes() == raw
+
+
+@pytest.mark.parametrize("version", [0, 2, 5, 99])
+def test_a_read_only_open_refuses_another_layout_in_words(tmp_path, version):
+    path = tmp_path / "other.sqlite"
+    raw = sqlite3.connect(str(path))
+    raw.executescript(REV3_LAYOUT + f"PRAGMA user_version = {version};")
+    raw.close()
+    before = path.read_bytes()
+    with pytest.raises(OrderError, match=f"layout {version}"):
+        orders.open_read_only(path)
+    assert path.read_bytes() == before
+    with pytest.raises(OrderError, match="no order ledger"):
+        orders.open_read_only(tmp_path / "missing.sqlite")
+    assert not (tmp_path / "missing.sqlite").exists()
+    notes = tmp_path / "notes.sqlite"
+    raw = sqlite3.connect(str(notes))
+    raw.execute("CREATE TABLE notes (x TEXT)")
+    raw.commit()
+    raw.close()
+    with pytest.raises(OrderError, match="not an order ledger"):
+        orders.open_read_only(notes)
+
+
+def test_a_file_that_says_layout3_but_has_other_tables_is_refused_and_not_upgraded(tmp_path, old_orders):
+    path = tmp_path / "odd.sqlite"
+    raw = sqlite3.connect(str(path))
+    raw.executescript(REV3_LAYOUT + "PRAGMA user_version = 3;")      # an older schema numbered 3
+    raw.close()
+    before = path.read_bytes()
+    with pytest.raises(OrderError, match="layout 3"):
+        ledger(path)
+    with pytest.raises(OrderError, match="layout 3"):
+        orders.open_read_only(path)
+    assert path.read_bytes() == before
+    good = _old_ledger_file(old_orders, tmp_path / "good.sqlite")  # a layout-3 file with a trigger gone
+    raw = sqlite3.connect(str(good))
+    raw.execute("DROP TRIGGER fills_no_delete")
+    raw.commit()
+    raw.close()
+    before = good.read_bytes()
+    with pytest.raises(OrderError, match="layout 3"):
+        ledger(good)
+    assert good.read_bytes() == before
+
+
+def test_todays_code_refuses_a_layout4_file_in_words(tmp_path, old_orders):
+    """Ruling D: the code at 33ace6f, handed a layout-4 file (new or upgraded), refuses it in words and changes
+    nothing, so a roll-back never misreads a ledger."""
+    new = tmp_path / "new.sqlite"
+    led = ledger(new)
+    intend(led, tag="m-1", units=0.5, order_type="MARKET", collar_price=90.9)
+    led.close()
+    upgraded = _old_ledger_file(old_orders, tmp_path / "upgraded.sqlite")
+    ledger(upgraded).close()
+    for path in (new, upgraded):
+        before = path.read_bytes()
+        with pytest.raises(old_orders.OrderError,
+                           match=r"different version of this module \(layout 4, this module writes layout 3\); "
+                                 r"it is not opened"):
+            old_orders.OrderLedger(path, not_sent=(LocalRefusal,), clock=Clock())
+        assert path.read_bytes() == before
+
+
+def test_intend_records_a_market_order_with_its_collar_and_the_venue_gets_no_limit():
+    clock = Clock()
+    led, venue = ledger(clock=clock), FakeVenue()
+    ready(led, venue)
+    rec = intend(led, tag="b-XLE.r", units=0.34567, order_type="MARKET", collar_price=90.9)
+    assert (rec["order_type"], rec["collar_price"], rec["limit_price"]) == ("MARKET", 90.9, None)
+    sale = intend(led, tag="b-QQQ.r", symbol="QQQ", units=-0.5, order_type="MARKET", collar_price=490.0)
+    assert (sale["order_type"], sale["collar_price"]) == ("MARKET", 490.0)
+    assert intend(led, tag="b-XLE.r", units=0.34567, order_type="MARKET", collar_price=90.9) == rec   # same again
+    with pytest.raises(OrderError, match="collar_price"):
+        intend(led, tag="b-XLE.r", units=0.34567, order_type="MARKET", collar_price=91.0)
+    plain = intend(led, tag="b-XLE", units=3.0, limit_price=90.9)
+    assert (plain["order_type"], plain["collar_price"]) == ("LIMIT", None)
+    with pytest.raises(OrderError, match="order_type"):
+        led.intend("b-XLE", "XLE", 0.5, 90.0, None, order_type="MARKET", collar_price=90.9)   # on file as a LIMIT
+    led.submit_once(venue, "b-XLE.r")
+    assert venue.calls[-1]["limit_price"] is None and venue.calls[-1]["units"] == 0.34567
+
+
+@pytest.mark.parametrize("units", [1.0, -1.0, 1.00001, -1.5, 2.0, 37.0, -250.0])
+def test_intend_refuses_a_market_order_of_one_unit_or_more(units):
+    led = ledger()
+    with pytest.raises(OrderError, match="MARKET order"):
+        intend(led, tag="m", units=units, order_type="MARKET", collar_price=90.9)
+    assert led.orders() == [] and led.events() == []
+
+
+def test_intend_refuses_a_market_order_without_a_collar_and_a_limit_order_with_one():
+    led = ledger()
+    with pytest.raises(OrderError, match="collar"):
+        intend(led, tag="m", units=0.5, order_type="MARKET")
+    with pytest.raises(OrderError, match="collar"):
+        intend(led, tag="m", units=0.5, order_type="MARKET", collar_price=None)
+    with pytest.raises(OrderError, match="collar"):
+        intend(led, tag="l", units=3.0, limit_price=90.9, collar_price=90.9)
+    with pytest.raises(OrderError, match="collar"):
+        intend(led, tag="l", units=3.0, limit_price=90.9, order_type="LIMIT", collar_price=90.9)
+    with pytest.raises(OrderError, match="limit"):
+        intend(led, tag="m", units=0.5, limit_price=90.9, order_type="MARKET", collar_price=90.9)
+    assert led.orders() == [] and led.events() == []
+
+
+def test_intend_over_seeded_orders_accepts_exactly_what_the_rule_allows():
+    """A MARKET order: under one unit in size, a collar price that is a finite number above zero, and no limit. A
+    LIMIT order: no collar price. Any other order type is refused. A refusal writes nothing."""
+    led = ledger()
+    rng = random.Random(4)
+    types = ["LIMIT", "MARKET", "market", "Limit", "STOP", "", None, 1, True]
+    collars = [None, 90.9, 0.01, 1e6, math.nan, math.inf, -math.inf, 0.0, -1.0, True, "90.9", 0]
+    limits = [None, None, 91.0]
+    accepted = refused = 0
+    for i in range(1500):
+        kind = rng.choice(types)
+        units = rng.choice([round(rng.uniform(0.00001, 0.99999), 5), float(rng.randint(1, 300)), 1.0,
+                            round(rng.uniform(1.0, 50.0), 5), 0.99999, 0.00001])
+        units *= rng.choice([1, -1])
+        collar, limit = rng.choice(collars), rng.choice(limits)
+        collar_ok = collar is not None and type(collar) is not bool and isinstance(collar, (int, float)) \
+            and math.isfinite(collar) and collar > 0
+        if kind == "LIMIT":
+            ok = collar is None
+        elif kind == "MARKET":
+            ok = collar_ok and limit is None and abs(units) < 1
+        else:
+            ok = False
+        tag = f"t-{i}"
+        if ok:
+            rec = led.intend(tag, "XLE", units, 90.0, limit, order_type=kind, collar_price=collar)
+            assert (rec["order_type"], rec["collar_price"], rec["limit_price"], rec["units"]) == \
+                (kind, None if collar is None else float(collar), limit, units)
+            accepted += 1
+        else:
+            with pytest.raises(OrderError):
+                led.intend(tag, "XLE", units, 90.0, limit, order_type=kind, collar_price=collar)
+            assert led.order(tag) is None and led.events(tag) == []
+            refused += 1
+    assert accepted > 300 and refused > 300
+
+
+def test_the_file_itself_refuses_a_market_row_that_breaks_the_rule_and_a_change_of_type(tmp_path, old_orders):
+    for name, path in (("new", tmp_path / "new.sqlite"),
+                       ("upgraded", _old_ledger_file(old_orders, tmp_path / "upgraded.sqlite"))):
+        led = ledger(path)
+        intend(led, tag="m-1", units=0.5, order_type="MARKET", collar_price=90.9)
+        led.close()
+        raw = sqlite3.connect(str(path))
+        insert = ("INSERT INTO orders (tag, symbol, units, reference_price, limit_price, state, created, updated, "
+                  "order_type, collar_price) VALUES (?, 'XLE', ?, 90, ?, 'intended', 1, 1, ?, ?)")
+        for bad in (("x1", 0.5, None, "MARKET", None), ("x2", 1.0, None, "MARKET", 90.9), ("x3", 0.5, 91.0, "MARKET", 90.9),
+                    ("x4", 3.0, 91.0, "LIMIT", 90.9), ("x5", 3.0, 91.0, "STOP", None), ("x6", -0.5, None, "MARKET", 0.0)):
+            with pytest.raises(sqlite3.IntegrityError):
+                raw.execute(insert, bad)
+        for change in ("UPDATE orders SET order_type = 'LIMIT', collar_price = NULL WHERE tag = 'm-1'",
+                       "UPDATE orders SET collar_price = 95.0 WHERE tag = 'm-1'"):
+            with pytest.raises(sqlite3.DatabaseError):
+                raw.execute(change)
+        raw.rollback()
+        raw.close()
+        assert ledger(path).order("m-1")["collar_price"] == 90.9, name
