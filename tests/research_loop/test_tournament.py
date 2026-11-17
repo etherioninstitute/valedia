@@ -852,18 +852,29 @@ def test_ask_records_the_rosters_model_and_date_and_rule_for_a_rule():
 def test_ask_without_a_roster_reads_the_panels_own_roster():
     led = tm.TournamentLedger()
     led.add([tm.Question("q", "funds", "forward", "2025-07-01", 5, "AAA", "t", {}, 0.5)])
-    spec = {s["name"]: s for s in panel_mod.load_roster()["members"]}["qwen3-8b"]
-    tm.ask(led, [CallableMember("qwen3-8b", "decider", lambda case: (0.6, None, ""))])
+    spec = {s["name"]: s for s in panel_mod.load_roster()["members"]}["elephant-1"]
+    tm.ask(led, [CallableMember("elephant-1", "decider", lambda case: (0.6, None, ""))])
     got = tuple(led._db.execute("SELECT model, unseen_after, prompt_sha FROM forecasts").fetchone())
     led.close()
-    assert got == (spec.get("model_label") or spec["model"], spec.get("unseen_after"), UNKNOWN_CALLABLE)
+    assert got == (spec["model_label"], spec["unseen_after"], UNKNOWN_CALLABLE)
+    assert got == ("elephant-1@q8_0", "2026-10-22", UNKNOWN_CALLABLE)               # T44-2 ruling 2
 
 
-def test_the_roster_carries_the_three_fields_unset_and_still_builds_a_panel():
+ELEPHANT_SOURCE = ("the date the model's publisher last updated its release (baselabs/elephant-1 on Hugging Face); "
+                   "its training data ends earlier")
+
+
+def test_the_roster_carries_the_three_fields_and_dates_only_the_sourced_seats_and_still_builds_a_panel():
     roster = panel_mod.load_roster()
+    sourced = {"elephant-1", "elephant-1-risk"}                                       # T44-2 ruling 2: the owner's source
     for spec in roster["members"]:
         assert {"model_label", "unseen_after", "unseen_after_source"} <= set(spec), spec["name"]
-        assert spec["unseen_after"] is None and spec["unseen_after_source"] is None     # no date is guessed here
+        if spec["name"] in sourced:
+            assert (spec["model_label"], spec["unseen_after"], spec["unseen_after_source"]) == (
+                "elephant-1@q8_0", "2026-10-22", ELEPHANT_SOURCE)
+        else:
+            assert spec["unseen_after"] is None and spec["unseen_after_source"] is None     # no date is guessed here
+    assert sourced <= {s["name"] for s in roster["members"]}
     assert "unseen_after" in roster["notes"] and "model_label" in roster["notes"]
     assert len(panel_mod.build_panel(roster).members) == sum(1 for s in roster["members"] if s.get("enabled", True))
     assert [m.name for m in tm.forecasters(roster=roster)] == [s["name"] for s in roster["members"]
@@ -1062,3 +1073,34 @@ def test_a_read_only_open_never_attempts_a_schema_change(tmp_path):
     seen = read_path_statements(tm, path)
     assert seen and any(q.lstrip().upper().startswith("SELECT") for q in seen)
     assert [q for q in seen if q.lstrip().upper().startswith(("ALTER", "CREATE", "INSERT", "UPDATE", "DELETE", "DROP"))] == []
+
+
+# ---- T44-2 ruling 2 and 4: the typed seat is `elephant-1`; the old name stays as stored history, scored as it was
+
+def test_t44_2_the_default_forecasters_name_elephant_1_and_the_removed_names_are_refused():
+    roster = panel_mod.load_roster()
+    names = [m.name for m in tm.forecasters(roster=roster)]
+    assert names == ["valedia-trading-decider", "elephant-1"]
+    assert isinstance(tm.forecasters(["elephant-1"], roster=roster)[0], panel_mod.SystemOneMember)
+    for gone in ("nimble-v3", "qwen3-8b"):
+        with pytest.raises(ValueError, match="not a decider in the panel roster"):
+            tm.forecasters([gone], roster=roster)
+
+
+def test_t44_2_an_open_question_answered_under_the_old_name_is_kept_and_scored_beside_the_new_seat():
+    led = tm.TournamentLedger()
+    led.add([tm.Question("f1", "funds", "forward", "2026-11-10", 5, "AAA", "t", {}, 0.5),
+             tm.Question("b1", "funds", "blind history", "2026-11-02", 5, "AAA", "t", {}, 0.5)])
+    led.record("f1", "nimble-v3", 0.8, None, 10.0)                     # answered before the rename, nothing known
+    tm.ask(led, [CallableMember("elephant-1", "decider", lambda case: (0.3, None, ""))], today="2026-11-12")
+    assert led.answered("nimble-v3") == {"f1"} and led.answered("elephant-1") == {"f1", "b1"}
+    led.settle("f1", 1)
+    led.settle("b1", 0)
+    rows = {(r["forecaster"], r["kind"]): r for r in led.scored_rows()}
+    assert set(rows) == {("nimble-v3", "forward"), ("elephant-1", "forward"), ("elephant-1", "blind history")}
+    assert (rows[("nimble-v3", "forward")]["model"], rows[("nimble-v3", "forward")]["probability"]) == (None, 0.8)
+    for key in (("elephant-1", "forward"), ("elephant-1", "blind history")):
+        assert (rows[key]["model"], rows[key]["unseen_after"]) == ("elephant-1@q8_0", "2026-10-22")
+    b = rows[("elephant-1", "blind history")]
+    assert tm.memory_class(b["kind"], b["model"], b["unseen_after"], b["asked_on"], b["answered_ts"]) == "after release"
+    led.close()

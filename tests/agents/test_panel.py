@@ -4,6 +4,7 @@ import math
 import pytest
 
 from valedia_trader.agents import panel as pn
+from valedia_trader.core import decision_model as dm
 from valedia_trader.core import legacy
 
 
@@ -126,41 +127,185 @@ def test_chat_and_hermes_members_use_their_transports():
     assert not silent.ask(CASE).valid
 
 
-def systemone_transport(digest_ok=True, choice="allow"):
+# ---- T44-2 ruling 1: the typed seats ask the shared decision model (Elephant-1 on LM Studio), never load anything
+
+LIST_PATH, ASK_PATH = "/api/v1/models", "/v1/systemone"
+
+
+def right_instance(**config):
+    return {"id": dm.INSTANCE, "config": {"context_length": dm.CONTEXT, "parallel": dm.SLOTS,
+                                          "physical_batch_size": dm.PHYSICAL_BATCH, "eval_batch_size": dm.EVAL_BATCH,
+                                          **config}}
+
+
+def right_entry(instances=None, **over):
+    return {"key": dm.KEY, "type": "decision", "decision_type": dm.DECISION_TYPE, "publisher": dm.PUBLISHER,
+            "quantization": {"name": dm.QUANT}, "size_bytes": dm.LISTED_SIZES[0],
+            "loaded_instances": [right_instance()] if instances is None else instances, **over}
+
+
+OTHER = {"key": "qwen/qwen3.8-27b", "type": "llm", "loaded_instances": [{"id": "qwen/qwen3.8-27b", "config": {}}]}
+RIGHT_LIST = {"models": [OTHER, right_entry()]}
+
+
+class FakeLMStudio:
+    """LM Studio on loopback, as the member sees it through its transport. Records every request."""
+
+    def __init__(self, listing=RIGHT_LIST, list_error=None, reply=None, choice="allow"):
+        self.listing, self.list_error, self.reply, self.choice, self.calls = listing, list_error, reply, choice, []
+
+    def __call__(self, url, payload, timeout, headers=None):
+        self.calls.append((url, payload, timeout))
+        if url == dm.URL + LIST_PATH and payload is None:
+            if self.list_error is not None:
+                raise self.list_error
+            return self.listing
+        if url == dm.URL + ASK_PATH and payload is not None:
+            if self.reply is not None:
+                return self.reply
+            if "risk" in payload["questions"]:
+                ans = {"risk": {"type": "noul", "noul": 0.9 if self.choice == "block" else 0.05}}
+            else:
+                ans = {"thesis": {"type": "noul", "noul": 0.73}}
+            return {"model": dm.INSTANCE, "answers": ans, "usage": {"input_tokens": 50, "output_tokens": 1}}
+        raise AssertionError(f"the member asked for {url}")
+
+    def posts(self):
+        return [c for c in self.calls if c[1] is not None]
+
+
+def _only_the_two_paths(fake):
+    assert {url for url, _, _ in fake.calls} <= {dm.URL + LIST_PATH, dm.URL + ASK_PATH}
+    assert not [url for url, _, _ in fake.calls if "load" in url]           # no load, no unload, ever
+
+
+def test_t44_2_a_right_list_gives_one_post_naming_the_instance_and_the_parsed_answer():
     v3 = legacy.load("systemone_v3_candidate")
-    def http(url, payload, timeout, headers=None):
-        if url.endswith("/api/tags"):
-            return {"models": [{"name": v3.TAG, "digest": "sha256:" + (v3.MANIFEST_SHA256 if digest_ok else "0" * 64)}]}
-        if url.endswith("/api/version"):
-            return {"version": "0.40.14"}
-        assert payload["model"] == v3.TAG and payload["state"]["create_order"] is False
-        if "risk" in payload["questions"]:
-            ans = {"risk": {"type": "noul", "noul": 0.9 if choice == "block" else 0.05}}
-        else:
-            ans = {"thesis": {"type": "noul", "noul": 0.73}}
-        return {"model": v3.TAG, "answers": ans, "usage": {"input_tokens": 50, "output_tokens": 1}}
-    return http
+    fake = FakeLMStudio()
+    d = pn.SystemOneMember("elephant-1", "decider", timeout=77.0, transport=fake).ask(CASE)
+    assert d.valid and d.error is None and d.probability == 0.73 and d.veto is None and d.rationale == "typed probability"
+    assert [(u, p is None, t) for u, p, t in fake.calls] == [(dm.URL + LIST_PATH, True, 5.0), (dm.URL + ASK_PATH, False, 77.0)]
+    body = fake.posts()[0][1]
+    state = {"create_order": False, "thesis": CASE["thesis"], "facts": CASE["facts"]}
+    assert body == {**v3.make_request(state, body["questions"], tag=v3.TAG), "model": dm.INSTANCE}
+    assert body["model"] == "elephant-1" and set(body) == {"model", "state", "questions"} and list(body["questions"]) == ["thesis"]
+    _only_the_two_paths(fake)
 
 
-def test_systemone_member_enforces_the_pin_and_parses_typed_answers():
-    d = pn.SystemOneMember("nimble", "decider", transport=systemone_transport()).ask(CASE)
-    assert d.valid and d.probability == 0.73
-    v = pn.SystemOneMember("nimble-risk", "vetter", transport=systemone_transport(choice="block")).ask(CASE)
-    assert v.valid and v.veto is True and v.probability == 0.9
-    bad = pn.SystemOneMember("nimble", "decider", transport=systemone_transport(digest_ok=False)).ask(CASE)
-    assert not bad.valid and "digest" in bad.error
-    with pytest.raises(ValueError):
-        pn.SystemOneMember("n", "decider", base_url="http://10.0.0.5:11434")
+@pytest.mark.parametrize("choice, p, veto", [("block", 0.9, True), ("allow", 0.05, False)])
+def test_t44_2_the_risk_seat_asks_the_risk_question_and_vetoes_at_one_half(choice, p, veto):
+    fake = FakeLMStudio(choice=choice)
+    v = pn.SystemOneMember("elephant-1-risk", "vetter", transport=fake).ask(CASE)
+    assert v.valid and v.probability == p and v.veto is veto and v.rationale == f"typed probability of a risk problem {p:.2f}"
+    assert len(fake.posts()) == 1 and list(fake.posts()[0][1]["questions"]) == ["risk"]
+    assert fake.posts()[0][1]["model"] == dm.INSTANCE
+    _only_the_two_paths(fake)
+
+
+LIST_FAULTS = [
+    ("unreachable", dict(list_error=OSError("connection refused")), "did not answer"),
+    ("not a list", dict(listing={"data": []}), "malformed"),
+    ("not json object", dict(listing=["elephant-1"]), "malformed"),
+    ("bad instances", dict(listing={"models": [right_entry(instances="elephant-1")]}), "malformed"),
+    ("no instance", dict(listing={"models": [OTHER, right_entry(instances=[])]}), "not loaded"),
+    ("no entry", dict(listing={"models": [OTHER]}), "not loaded"),
+    ("wrong setting", dict(listing={"models": [right_entry(instances=[right_instance(context_length=4096)])]}),
+     "context_length 4096, not 8192"),
+    ("wrong slots", dict(listing={"models": [right_entry(instances=[right_instance(parallel=4)])]}), "parallel 4, not 1"),
+    ("wrong file", dict(listing={"models": [right_entry(quantization={"name": "Q4_K_M"})]}), "quantisation 'Q4_K_M', not Q8_0"),
+    ("two instances", dict(listing={"models": [right_entry(instances=[right_instance(), right_instance()])]}),
+     "2 instances named elephant-1"),
+    ("two entries", dict(listing={"models": [right_entry(), right_entry()]}), "2 instances named elephant-1"),
+]
+
+
+@pytest.mark.parametrize("role", ["decider", "vetter"])
+@pytest.mark.parametrize("label, fault, words", LIST_FAULTS, ids=[f[0] for f in LIST_FAULTS])
+def test_t44_2_a_list_fault_is_a_one_line_refusal_and_nothing_is_posted(label, fault, words, role):
+    fake = FakeLMStudio(**fault)
+    v = pn.SystemOneMember("elephant-1", role, transport=fake).ask(CASE)
+    assert not v.valid and v.error.startswith("RuntimeError: ") and words in v.error, v.error
+    assert "\n" not in v.error and v.probability is None and v.veto is None
+    assert fake.posts() == [] and [u for u, _, _ in fake.calls] == [dm.URL + LIST_PATH]
+    _only_the_two_paths(fake)
+
+
+REPLY_FAULTS = [
+    ("the old tag", {"model": "nimble-v3:9b-mxfp8", "answers": {"thesis": {"type": "noul", "noul": 0.73}}}, "RuntimeError"),
+    ("another model", {"model": "qwen/qwen3.8-27b", "answers": {"thesis": {"type": "noul", "noul": 0.73}}}, "RuntimeError"),
+    ("no model", {"answers": {"thesis": {"type": "noul", "noul": 0.73}}}, "RuntimeError"),
+    ("not an object", [{"model": "elephant-1"}], "RuntimeError"),
+    ("no answers", {"model": "elephant-1", "answers": {}}, ""),
+    ("answers not typed", {"model": "elephant-1", "answers": {"thesis": {"type": "noul", "noul": "high"}}}, ""),
+    ("answers a string", {"model": "elephant-1", "answers": "yes"}, ""),
+]
+
+
+@pytest.mark.parametrize("label, reply, kind", REPLY_FAULTS, ids=[f[0] for f in REPLY_FAULTS])
+def test_t44_2_a_reply_naming_another_model_or_malformed_is_an_error_after_one_post(label, reply, kind):
+    fake = FakeLMStudio(reply=reply)
+    v = pn.SystemOneMember("elephant-1", "decider", transport=fake).ask(CASE)
+    assert not v.valid and v.error is not None and v.probability is None and v.error.startswith(kind)
+    if kind:
+        assert "elephant-1" in v.error
+    assert len(fake.posts()) == 1
+    _only_the_two_paths(fake)
+
+
+def test_t44_2_the_member_defaults_to_the_shared_address_and_stays_on_loopback():
+    assert pn.SystemOneMember("e", "decider").base == dm.URL == "http://127.0.0.1:1235"
+    built = pn.build_panel({"members": [{"name": "e", "role": "decider", "backend": "systemone"}]}).members[0]
+    assert isinstance(built, pn.SystemOneMember) and built.base == dm.URL
+    for remote in ("http://10.0.0.5:1235", "https://127.0.0.1:1235", "http://127.0.0.1.example.com:1235"):
+        with pytest.raises(ValueError):
+            pn.SystemOneMember("n", "decider", base_url=remote)
+    seen = []
+    other = pn.SystemOneMember("e", "decider", base_url="http://localhost:1235/",
+                               transport=lambda u, p, t, headers=None: seen.append(u) or (_ for _ in ()).throw(OSError("x")))
+    assert "did not answer" in other.ask(CASE).error and seen == ["http://localhost:1235" + LIST_PATH]
+
+
+# ---- T44-2 ruling 2: the roster's typed seats are Elephant-1; the Ollama-only member is gone
+
+ELEPHANT_SOURCE = ("the date the model's publisher last updated its release (baselabs/elephant-1 on Hugging Face); "
+                   "its training data ends earlier")
 
 
 def test_default_roster_builds_the_requested_panel():
     roster = pn.load_roster()
     panel = pn.build_panel(roster)
     by_role = {r: [m.name for m in panel.members if m.role == r] for r in ("decider", "vetter", "scout")}
-    assert by_role["decider"] == ["valedia-trading-decider", "nimble-v3", "qwen3-8b"]
-    assert by_role["vetter"] == ["valedia-trading-auditor", "nimble-v3-risk"] and by_role["scout"] == []
+    assert by_role["decider"] == ["valedia-trading-decider", "elephant-1"]
+    assert by_role["vetter"] == ["valedia-trading-auditor", "elephant-1-risk"] and by_role["scout"] == []
+    assert len(by_role["decider"]) >= roster["min_deciders"] and len(by_role["vetter"]) >= roster["min_vetters"]
+    specs = {s["name"]: s for s in roster["members"]}
+    for name, role in (("elephant-1", "decider"), ("elephant-1-risk", "vetter")):
+        assert specs[name] == {"name": name, "role": role, "backend": "systemone", "timeout": 150,
+                               "model_label": "elephant-1@q8_0", "unseen_after": "2026-10-22",
+                               "unseen_after_source": ELEPHANT_SOURCE}
+        assert isinstance([m for m in panel.members if m.name == name][0], pn.SystemOneMember)
+    assert not {"qwen3-8b", "nimble-v3", "nimble-v3-risk"} & set(specs)
+    for text in (pn.DEFAULT_ROSTER.read_text(), (pn.DEFAULT_ROSTER.parent / "team.json").read_text()):
+        assert "Nimble" not in text and "nimble" not in text and "Qwen 8B" not in text
+    assert "Elephant-1" in json.loads((pn.DEFAULT_ROSTER.parent / "team.json").read_text())["local_forecasters"]
     disabled = [m["name"] for m in roster["members"] if not m.get("enabled", True)]
     assert disabled == ["valedia-trading-scout", "qwen3.8-27b"]        # both load the 27B model; opt in deliberately
     assert json.loads(pn.DEFAULT_ROSTER.read_text())["veto_rule"] == "any"
     with pytest.raises(ValueError):
         pn.build_panel({"members": [{"name": "x", "role": "decider", "backend": "carrier-pigeon"}]})
+
+
+# ---- T44-2 ruling 5: nothing in the write set knows the Ollama path (the words are built here, not written)
+
+WRITE_SET = ("valedia_trader/agents/panel.py", "valedia_trader/agents/panel_roster.json", "valedia_trader/agents/team.json",
+             "valedia_trader/doctor.py", "valedia_trader/research_loop/tournament.py",
+             "valedia_trader/research_loop/owner_page.py", "tests/agents/test_panel.py", "tests/core/test_doctor.py",
+             "tests/research_loop/test_tournament.py", "tests/research_loop/test_owner_page.py")
+OLLAMA_WORDS = ("114" + "34", "/api/" + "tags", "/api/" + "version", "pinned" + "_tag")
+
+
+@pytest.mark.parametrize("rel", WRITE_SET)
+def test_t44_2_no_file_of_the_write_set_names_the_ollama_path(rel):
+    root = pn.DEFAULT_ROSTER.resolve().parents[2]
+    text = (root / rel).read_text()
+    assert [w for w in OLLAMA_WORDS if w in text] == [], rel

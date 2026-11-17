@@ -29,6 +29,61 @@ def test_an_empty_folder_fails_loudly_and_nothing_raises(tmp_path, monkeypatch, 
     assert {r["status"] for r in json.loads(capsys.readouterr().out)} <= {D.OK, D.ATTENTION, D.FAIL}
 
 
+# ---- T44-2 ruling 3: the local-models row checks the shared Elephant-1 instance on LM Studio, never Ollama
+
+def _entry(instances=None, **over):
+    from valedia_trader.core import decision_model as dm
+    inst = {"id": dm.INSTANCE, "config": {"context_length": dm.CONTEXT, "parallel": dm.SLOTS,
+                                          "physical_batch_size": dm.PHYSICAL_BATCH, "eval_batch_size": dm.EVAL_BATCH}}
+    return {"key": dm.KEY, "type": "decision", "decision_type": dm.DECISION_TYPE, "publisher": dm.PUBLISHER,
+            "quantization": {"name": dm.QUANT}, "size_bytes": dm.LISTED_SIZES[1],
+            "loaded_instances": [inst] if instances is None else instances, **over}
+
+
+def _models_row(monkeypatch, tmp_path, listing=None, error=None):
+    from valedia_trader.core import decision_model as dm
+    seen = []
+
+    def get(url, timeout=3.0):
+        seen.append(url)
+        if url == dm.URL + "/api/v1/models":
+            if error is not None:
+                raise error
+            return listing
+        if url == dm.URL + "/v1/models":                                   # the optional 27B line, unchanged
+            return {"data": [{"id": "qwen/qwen3.8-27b"}]}
+        raise AssertionError(f"the doctor asked for {url}")
+
+    monkeypatch.setattr(D, "_get", get)
+    status, detail = D.check_models(LoopPaths(tmp_path))
+    assert seen[0] == dm.URL + "/api/v1/models" and all(u.startswith(dm.URL + "/") for u in seen)
+    assert "Ollama" not in detail and "114" + "34" not in detail and "\n" not in detail
+    return status, detail
+
+
+def test_t44_2_the_models_row_is_ok_when_the_list_shows_one_right_instance(monkeypatch, tmp_path):
+    other = {"key": "qwen/qwen3.8-27b", "type": "llm", "loaded_instances": []}
+    status, detail = _models_row(monkeypatch, tmp_path, {"models": [other, _entry()]})
+    assert status == D.OK and "Elephant-1" in detail and "elephant-1" in detail and "loaded" in detail
+    assert "27B listed" in detail
+
+
+@pytest.mark.parametrize("label, listing, error, words", [
+    ("unreachable", None, OSError("refused"), "not reachable"),
+    ("malformed", {"data": []}, None, "malformed"),
+    ("bad instances", {"models": [_entry(instances="x")]}, None, "malformed"),
+    ("no instance", {"models": [_entry(instances=[])]}, None, "not loaded"),
+    ("no entry", {"models": []}, None, "not loaded"),
+    ("wrong file", {"models": [_entry(publisher="someone")]}, None, "publisher 'someone', not debackerl"),
+    ("wrong setting", {"models": [_entry(instances=[{"id": "elephant-1", "config": {"context_length": 8192}}])]}, None,
+     "parallel None, not 1"),
+    ("two instances", {"models": [_entry(), _entry()]}, None, "2 instances named elephant-1"),
+])
+def test_t44_2_the_models_row_fails_with_the_reason_in_one_line(monkeypatch, tmp_path, label, listing, error, words):
+    status, detail = _models_row(monkeypatch, tmp_path, listing, error)
+    assert status == D.FAIL and words in detail, detail
+
+
 def test_risk_limits_and_kill_switch_states(tmp_path):
     p = _paths(tmp_path)
     risk_gate.write_default_limits(p.risk_limits)
