@@ -34,7 +34,20 @@ Rules the code holds:
   was pulled, then recomputes the development result from THIS store and goes on only when that recomputed result
   passed and the given file equals it byte for byte. The sealed period is spent once per store: the store carries
   its own id and its own sealed marker, written and committed in the store BEFORE any sealed row is read (the
-  output folder's marker is a second sign). Output folders default to one named for the store's id.
+  output folder's marker is a second sign). Output folders default to one named for the store's id. The claim is
+  one atomic act: an immediate write lock and a plain insert of the marker that fails if the key exists, so of two
+  runs started together exactly one goes on. The marker's key present, whatever its value, means spent. The id is
+  written once, by the pull that makes the store; `develop` and `sealed` never write one and refuse a store without
+  a well-formed id. The limit that remains: a byte copy of a store made before the sealed run, analysed in a place
+  that has never seen the original's markers, cannot be told from the original, so the lead keeps one store and
+  records the sealed run in the project's ledger.
+* What a development run reads (and the recomputation inside `sealed`, before its claim): the candidates' trades
+  before 2026-07-01, plus the trades of 1 July only in tokens the wallet bought on 30 June (the 24-hour purchase sum
+  of a 30 June position); the resolutions of the markets of those trades only, selected in the query (a
+  development position, or a market a development standing touched, may resolve after June: that resolution row is
+  dated in the sealed period and is read, because the position's outcome and the 45-day test need it); the price
+  windows of development positions only. A resolution, price point or trade of a market that only sealed
+  positions touch is never fetched before the claim; bookkeeping checks are counting queries.
 * Money is whole cents decided on integers: trade cash is exact micro-dollars, a standing and a 24-hour sum are
   rounded to cents half up, a follower's price is rounded to the cent half up; means are computed at the end.
 * The event (Polymarket's event slug) is the unit of the resampling. Every left-out wallet, month, position, price
@@ -48,6 +61,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import sqlite3
 import sys
 import uuid
@@ -108,6 +122,8 @@ SPORTS_PREFIXES = ("nfl-", "nba-", "wnba-", "mlb-", "nhl-", "cfb-", "cbb-", "nca
 STORE = Path("artifacts") / "polymarket" / "copy_leaders.sqlite"
 OUT_DIR = Path("artifacts") / "polymarket" / "copy_leaders"
 REQUESTS_PER_SECOND = 3
+_BEFORE_CLAIM = None                      # a hook run just before the sealed claim (tests line two processes up here)
+ID_RE = r"[0-9a-f]{32}"
 
 
 class Refused(Exception):
@@ -700,13 +716,14 @@ def _j(v) -> str:
 class Store:
     """The SQLite file of one pull."""
 
-    def __init__(self, path):
+    def __init__(self, path, make_id: bool = False):
+        """Open (or make) a store. Only the pull passes `make_id`: the store's own identity, written once."""
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(str(self.path))
+        self.db = sqlite3.connect(str(self.path), timeout=60)
         self.db.executescript(SCHEMA)
-        if self.meta("store_id") is None:          # the store's own identity, written once when it is made
-            self.set_meta("store_id", uuid.uuid4().hex)
+        if make_id and not self.meta_raw("store_id")[0]:
+            self.db.execute("INSERT INTO meta VALUES ('store_id', ?)", (_j(uuid.uuid4().hex),))
             self.db.commit()
 
     def __enter__(self):
@@ -726,6 +743,24 @@ class Store:
     def meta(self, key: str, default=None):
         row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else default
+
+    def meta_raw(self, key: str) -> tuple[bool, str | None]:
+        """(the key is present, its stored text), never parsed."""
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return (row is not None, row[0] if row else None)
+
+    def checked_id(self) -> str:
+        """The store's id, or a refusal in words: a store without a well-formed id was not made by the pull."""
+        present, raw = self.meta_raw("store_id")
+        if not present:
+            raise Refused("the store %s has no id: it was not made by pull (nothing written)" % self.path)
+        try:
+            sid = json.loads(raw)
+        except (TypeError, ValueError):
+            sid = None
+        if not isinstance(sid, str) or not re.fullmatch(ID_RE, sid):
+            raise Refused("the store %s has a malformed id %r (nothing written)" % (self.path, (raw or "")[:40]))
+        return sid
 
     def set_meta(self, key: str, value) -> None:
         self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, _j(value)))
@@ -816,8 +851,15 @@ class Store:
             self.db.execute("INSERT OR REPLACE INTO resolution_answers VALUES (?,?,?)", (cond, answers[cond], read_at))
             self._finish("resolutions", cond, w, rejects=False)
 
-    def resolution_answers(self) -> dict:
-        return dict(self.db.execute("SELECT condition_id, answer FROM resolution_answers"))
+    def resolution_answers(self, conditions=None) -> dict:
+        """Every answer, or (selected in the query) those of `conditions`."""
+        if conditions is None:
+            return dict(self.db.execute("SELECT condition_id, answer FROM resolution_answers"))
+        out: dict = {}
+        for part in _chunks(sorted(set(conditions))):
+            out.update(self.db.execute("SELECT condition_id, answer FROM resolution_answers WHERE condition_id IN (%s)"
+                                       % ",".join("?" * len(part)), part))
+        return out
 
     def record_plan(self, targets: dict, leave_out, months) -> None:
         """The plan: the planned positions and their base windows; the 10-minute windows are added later."""
@@ -861,10 +903,14 @@ class Store:
         self._finish("prices", key, w)
 
     # ------------------------------------------------------------ reads for the analysis
-    def trade_rows(self, wallet: str, max_ts: int) -> list:
+    def trade_rows(self, wallet: str, end: int, spill: int = 0) -> list:
+        """A wallet's trades before `end`, and those in [end, end + spill) only in tokens it bought in the day before
+        `end` (the 24-hour purchase sums of the last day's positions), selected in the query."""
         cur = self.db.execute("SELECT seq, proxy_wallet, side, token_id, condition_id, size, price, timestamp, event_slug, "
-                              "outcome_index, transaction_hash, slug FROM trades WHERE wallet=? AND timestamp < ? "
-                              "ORDER BY seq", (wallet, max_ts))
+                              "outcome_index, transaction_hash, slug FROM trades WHERE wallet=? AND (timestamp < ? OR "
+                              "(timestamp < ? AND token_id IN (SELECT token_id FROM trades WHERE wallet=? AND side='BUY' "
+                              "AND timestamp >= ? AND timestamp < ?))) ORDER BY seq",
+                              (wallet, end, end + spill, wallet, end - BUY_WINDOW, end))
         keys = ("seq", "proxy_wallet", "side", "token_id", "condition_id", "size", "price", "timestamp", "event_slug",
                 "outcome_index", "transaction_hash", "slug")
         return [dict(zip(keys, r)) for r in cur]
@@ -873,21 +919,30 @@ class Store:
         return {r[0] for r in self.db.execute("SELECT DISTINCT condition_id FROM trades")}
 
     def resolution_rows(self, conditions) -> dict:
-        want = set(conditions)
+        """The resolution rows of `conditions` only, selected in the query."""
         out = {}
-        for cond, status, payouts, resolved_at, resolved_ts in self.db.execute(
-                "SELECT condition_id, status, payouts, resolved_at, resolved_ts FROM resolutions"):
-            if cond in want:
+        for part in _chunks(sorted(set(conditions))):
+            for cond, status, payouts, resolved_at, resolved_ts in self.db.execute(
+                    "SELECT condition_id, status, payouts, resolved_at, resolved_ts FROM resolutions WHERE condition_id "
+                    "IN (%s)" % ",".join("?" * len(part)), part):
                 out[cond] = {"condition_id": cond, "status": status, "payouts": json.loads(payouts),
                              "resolved_at": resolved_at, "resolved_ts": resolved_ts}
         return out
 
+    def counts_by_reason(self) -> dict:
+        """{kind: {reason: rows}} of every row the store set aside (repeats, conflicts, out-of-span times, rejects)."""
+        out: dict = {}
+        for kind, reason, n in self.db.execute("SELECT kind, reason, COUNT(*) FROM rejects GROUP BY kind, reason "
+                                               "ORDER BY kind, reason"):
+            out.setdefault(kind, {})[reason] = n
+        return out
+
     def price_points(self, keys, counts: Counter | None = None) -> dict:
         """{window key: [Point]} of the named windows that finished (a window not finished is absent)."""
-        done = self.finished_keys("prices")
         out: dict = {}
         for k in sorted(set(keys)):
-            if k not in done:
+            if self.db.execute("SELECT 1 FROM walks WHERE kind='prices' AND key=? AND status='finished'",
+                               (k,)).fetchone() is None:
                 continue
             pts = []
             for ts, res, price in self.db.execute("SELECT timestamp, resolution_seconds, price FROM price_points "
@@ -901,11 +956,16 @@ class Store:
         return out
 
 
-def _stored_trades(s: Store, wallets, max_ts: int, counts: Counter | None = None) -> dict:
+def _chunks(items, n: int = 500):
+    for i in range(0, len(items), n):
+        yield items[i:i + n]
+
+
+def _stored_trades(s: Store, wallets, end: int, counts: Counter | None = None, spill: int = 0) -> dict:
     out = {}
     for w in wallets:
         rows = []
-        for r in s.trade_rows(w, max_ts):
+        for r in s.trade_rows(w, end, spill):
             t, why = trade_from_row(w, r["seq"], r)
             if why:
                 if counts is not None:
@@ -931,12 +991,13 @@ def phase1_problems(s: Store, leave_out=()) -> list:
     open_wallets = [w for w in s.unfinished("trades") if w not in leave]
     if open_wallets:
         out.append("trade walks of %d wallets (%s)" % (len(open_wallets), ", ".join(open_wallets[:5])))
-    missing = s.traded_conditions() - set(s.resolution_answers())
+    missing = s.db.execute("SELECT COUNT(DISTINCT t.condition_id) FROM trades t LEFT JOIN resolution_answers a "
+                           "ON a.condition_id = t.condition_id WHERE a.condition_id IS NULL").fetchone()[0]
     if missing:
-        out.append("no resolution answer for %d traded conditions" % len(missing))
-    started = s.unfinished("resolutions")
+        out.append("no resolution answer for %d traded conditions" % missing)
+    started = s.db.execute("SELECT COUNT(*) FROM walks WHERE kind='resolutions' AND status!='finished'").fetchone()[0]
     if started:
-        out.append("%d resolution walks started and not finished" % len(started))
+        out.append("%d resolution walks started and not finished" % started)
     return out
 
 
@@ -965,7 +1026,7 @@ def pull(store_path, client: pd.PolymarketData, phase: int = 1, leave_out=(), sa
     if phase not in (1, 2):
         raise ValueError("phase is 1 or 2")
     errors = []
-    with Store(store_path) as s:
+    with Store(store_path, make_id=True) as s:     # the pull makes the store and its id
         if phase == 1:
             _pull_phase1(s, client, say, errors)
         else:
@@ -1077,6 +1138,7 @@ class Data:
     wallets_left_out: list
     unfinished_left_out: list
     months: list
+    store_counts: dict = field(default_factory=dict)
 
 
 def _period_bounds(period: str) -> tuple[int, int]:
@@ -1089,15 +1151,17 @@ def _period_bounds(period: str) -> tuple[int, int]:
 
 
 def load(store, period: str, leave_out=()) -> Data:
-    """The data of one period, the wall applied in the reads: trades before the period's end plus one day, the
-    resolutions of those trades' conditions, the price windows of this period's positions only. Refuses an
-    unfinished pull unless every wallet it touches is left out."""
+    """The data of one period, the wall applied in the reads (see the module's note on what a development run
+    reads): trades before the period's end, and the next day's only in tokens bought on its last day; the resolutions
+    of those trades' markets; the price windows of this period's positions only. Refuses an unfinished pull unless
+    every wallet it touches is left out, and a store without a well-formed id."""
     lo, hi = _period_bounds(period)
     path = Path(store)
     if not path.is_file():
         raise Refused("the store %s is missing: run pull first" % path)
     counts = Counter()
     with Store(path) as s:
+        s.checked_id()
         cands = s.candidates()
         if not cands:
             raise Refused("the store holds no candidate set: run pull first")
@@ -1108,8 +1172,8 @@ def load(store, period: str, leave_out=()) -> Data:
         kept = [w for w in cands if w not in leave]
         implicated = {w: ["trades walk"] for w in s.unfinished("trades")}
         done = s.finished_keys("trades")
-        trades = _stored_trades(s, [w for w in kept if w in done], hi + SPILL, counts)
-        answered = set(s.resolution_answers())
+        trades = _stored_trades(s, [w for w in kept if w in done], hi, counts, SPILL)
+        answered = set(s.resolution_answers({t.condition for ts in trades.values() for t in ts}))
         for w, ts in trades.items():
             if any(t.condition not in answered for t in ts):
                 implicated.setdefault(w, []).append("resolutions")
@@ -1130,8 +1194,9 @@ def load(store, period: str, leave_out=()) -> Data:
         if missing:
             raise Refused("the pull is unfinished for wallets %s (%s); name them with --leave-out to run without them"
                           % (missing, "; ".join("%s: %s" % (w, implicated[w][0]) for w in missing[:10])))
+        store_counts = s.counts_by_reason()
     return Data(period, kept, trades, resolutions, points, counts, leave,
-                sorted(w for w in implicated if w in leave), months)
+                sorted(w for w in implicated if w in leave), months, store_counts)
 
 
 # ---------------------------------------------------------------- the analysis
@@ -1215,6 +1280,7 @@ def analyze(data: Data) -> dict:
     return {"period": data.period, "months": [month_name(m) for m in data.months], "candidates": len(data.candidates),
             "wallets_left_out": data.wallets_left_out, "unfinished_left_out": data.unfinished_left_out,
             "load_rejects": dict(sorted(data.counts.items())), "book_counts": dict(sorted(book_counts.items())),
+            "store_counts": data.store_counts,
             "sells_beyond_holding": sells_beyond_summary(books, leader_months),
             "month_table": table, "months_left_out": dict(months_left_out),
             "wallet_skips": dict(sorted(wallet_skips.items())), "position_skips": dict(sorted(position_skips.items())),
@@ -1294,20 +1360,34 @@ READINGS = (
 )
 
 
-def store_id(store) -> str:
+def store_id(store):
+    """The store's id as stored (None when it has none). Opening never writes one."""
     with Store(store) as s:
-        return s.meta("store_id")
+        present, raw = s.meta_raw("store_id")
+    if not present:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return raw
 
 
 def store_sealed_marker(store):
-    """The sealed marker written in the store, or None."""
+    """The sealed marker written in the store (its parsed value, or its text when malformed), or None."""
     with Store(store) as s:
-        return s.meta("sealed_marker")
+        present, raw = s.meta_raw("sealed_marker")
+    if not present:
+        return None
+    try:
+        v = json.loads(raw)
+    except (TypeError, ValueError):
+        return raw
+    return v if v is not None else "null"
 
 
 def _provenance(store: Path) -> dict:
     with Store(store) as s:
-        boards, sid = s.board_read_at(), s.meta("store_id")
+        boards, sid = s.board_read_at(), s.checked_id()
     return {"prediction_commit": PREDICTION_COMMIT, "time_correction_commit": TIME_CORRECTION_COMMIT,
             "amendment_commit": AMENDMENT_COMMIT, "second_amendment_commit": SECOND_AMENDMENT_COMMIT,
             "prediction_doc": PREDICTION_DOC, "code_sha256": code_sha256(),
@@ -1375,8 +1455,11 @@ def sealed_bookkeeping_problems(s: Store, leave: list) -> list:
     these wallets left out that covers the sealed months and has its 10-minute windows, and every sealed window of
     that plan pulled and finished."""
     out = phase1_problems(s, leave)
-    plan_meta = s.meta("plan")
-    if plan_meta is None:
+    try:
+        plan_meta = s.meta("plan")
+    except ValueError:
+        return out + ["the phase-2 plan's record is malformed: run pull --phase 2"]
+    if not isinstance(plan_meta, dict):
         return out + ["no phase-2 plan: run pull --phase 2"]
     if plan_meta.get("leave_out") != leave:
         out.append("the plan left out %s, not %s: run pull --phase 2 with the same --leave-out"
@@ -1385,13 +1468,31 @@ def sealed_bookkeeping_problems(s: Store, leave: list) -> list:
         out.append("the plan does not cover the sealed months")
     if not plan_meta.get("ten_minute_windows_added"):
         out.append("the 10-minute windows were not yet planned: price windows not pulled; run pull --phase 2")
-    done = s.finished_keys("prices")
-    plan = s.plan()
-    sealed = [k for k, wd in s.plan_windows().items() if tuple(plan[wd.target].month) in SEALED_MONTHS]
-    missing = sorted(k for k in sealed if k not in done)
+    months = [month_name(m) for m in SEALED_MONTHS]
+    total, missing = s.db.execute(            # one counting query: no row of a sealed window is fetched
+        "SELECT COUNT(*), COUNT(*) - COUNT(k.key) FROM plan_windows w JOIN plan p ON p.key = w.target "
+        "LEFT JOIN walks k ON k.kind = 'prices' AND k.key = w.key AND k.status = 'finished' "
+        "WHERE p.month IN (%s)" % ",".join("?" * len(months)), months).fetchone()
     if missing:
-        out.append("%d of %d sealed price windows not pulled (first: %s)" % (len(missing), len(sealed), missing[0]))
+        out.append("%d of %d sealed price windows not pulled" % (missing, total))
     return out
+
+
+def _claim(path: Path, sid: str, note: dict) -> None:
+    """The claim, one atomic act that succeeds once: an immediate write lock, then a plain INSERT of the marker,
+    which fails when the key exists. The run that does not get it refuses, having written nothing."""
+    db = sqlite3.connect(str(path), timeout=60, isolation_level=None)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            db.execute("INSERT INTO meta (key, value) VALUES ('sealed_marker', ?)", (_j(note),))
+        except sqlite3.IntegrityError:
+            db.execute("ROLLBACK")
+            raise Refused("the sealed period of store %s was already claimed by another run (nothing written)"
+                          % sid) from None
+        db.execute("COMMIT")
+    finally:
+        db.close()
 
 
 def run_sealed(*, store=None, out_dir=None, flag: bool = False, leave_out=(), develop_file=None) -> dict:
@@ -1406,15 +1507,20 @@ def run_sealed(*, store=None, out_dir=None, flag: bool = False, leave_out=(), de
         raise Refused("the store %s is missing (nothing written)" % path)
     leave = sorted(set(leave_out))
     with Store(path) as s:
-        sid, spent = s.meta("store_id"), s.meta("sealed_marker")
-    if spent is not None:
-        raise Refused("the sealed period of store %s was already run (its marker in the store is dated %s): it is "
+        sid = s.checked_id()
+        spent, raw = s.meta_raw("sealed_marker")
+    if spent:                                      # the key present, whatever its value, means spent
+        raise Refused("the sealed period of store %s was already run (its marker in the store reads %r): it is "
                       "spent. If its result is missing it must be recomputed by hand from the store by the lead, never "
-                      "run again" % (sid, spent.get("time")))
+                      "run again" % (sid, (raw or "")[:80]))
     od = _out_dir(out_dir, sid)
     marker = od / "sealed.used"
     if marker.exists():
         raise Refused("the sealed period was already run (%s exists)" % marker)
+    default_marker = _out_dir(None, sid) / "sealed.used"
+    if out_dir is not None and default_marker.exists():
+        raise Refused("the default folder for this store's id holds a sealed marker (%s): the sealed period was "
+                      "already run for this store (nothing written)" % default_marker)
     dev = Path(develop_file) if develop_file is not None else od / "develop.json"
     dev_raw, dev_sha = _read_development_file(dev)
     with Store(path) as s:                         # bookkeeping only: no sealed row is read before the marker
@@ -1430,11 +1536,9 @@ def run_sealed(*, store=None, out_dir=None, flag: bool = False, leave_out=(), de
         raise Refused("%s (nothing written)" % _why_differs(dev_raw, recomputed, leave))
     note = {"time": datetime.now(UTC).isoformat(), "development_sha256": dev_sha, "development_file": str(dev),
             "wallets_left_out": leave, "store_id": sid, "store": str(path.resolve())}
-    with Store(path) as s:                         # the store's own marker, committed BEFORE any sealed row is read
-        if s.meta("sealed_marker") is not None:
-            raise Refused("the sealed period of store %s was already run" % sid)
-        s.set_meta("sealed_marker", note)
-        s.commit()
+    if _BEFORE_CLAIM is not None:
+        _BEFORE_CLAIM()
+    _claim(path, sid, note)                        # the store's own marker, committed BEFORE any sealed row is read
     marker.parent.mkdir(parents=True, exist_ok=True)
     try:
         with open(marker, "x") as f:               # the folder's marker: a second sign
@@ -1470,6 +1574,8 @@ def format_table(doc: dict) -> str:
                                                      r["months"][-1] if r["months"] else "-",
                                                      r["months_left_out"] or "none"),
              "rows rejected on load: %s; trade book: %s" % (r["load_rejects"] or "none", r["book_counts"] or "none"),
+             "rows the store set aside, by kind and reason (repeats, conflicts, out-of-span times, rejects): %s"
+             % (r.get("store_counts") or "none"),
              "%d of %d wallets sold beyond what their trades show they held; in the leaders' standing windows %d of "
              "%d sells (%s) were such sells, and their excess earned nothing in the standing" % (
                  sb["wallets_with_sells_beyond_holding"], sb["candidates"], sb["leader_window_sells_beyond_holding"],

@@ -5,8 +5,9 @@ No key and no account: every request is a plain GET with a generic client name, 
 kalshi_data: at most three requests a second; a 429 or a server error is retried after a growing wait (1, 2, 4, 8 s,
 or the server's Retry-After), five tries in all, then a clear error; a timeout, a reset or a dropped connection is
 retried the same way. Any other non-200 answer is raised at once. A redirect is NEVER followed: a 3xx answer is an
-error naming its status, after exactly one request, and is not retried. The address must be https on that host with
-no user, no port and a path under /v2/ with no `..` or `//`, after percent-decoding.
+error naming its status, after exactly one request, and is not retried. The address is checked against an allow-list:
+exactly `https://data-api.polymarket.com`, then a path matching `/v2/[a-z0-9/_-]+` (no percent sign, no dot, no
+whitespace), then an optional query of the characters the reader's own encoding produces; nothing else.
 
 Routes (field names from the service's published specification, /v2/openapi.json, read 2026-11-17):
 
@@ -25,18 +26,19 @@ Routes (field names from the service's published specification, /v2/openapi.json
 * every row is validated; a row of the wrong shape is a counted reject (reason in `Walk.rejects`), never a guess.
   A bool, None, NaN, infinity or a string where a number belongs is wrong. A time must be whole epoch seconds from
   2020-01-01 to one day after the client was made (a time in milliseconds is out of that span).
-* one identity per row within a walk; a repeat is dropped and counted ("repeated_row"). A trade: wallet (case
-  folded), transaction hash, token, condition, side, size, price, time and outcome index (the feed has no fill id,
-  so two fills of one transaction alike in all of these are one row). A price point: token, time and grain. A
-  resolution row: the whole row (two different rows for one condition are left to `resolution_batches`, which does
-  not trust them).
+* one identity per row within a walk. A true repeat (the whole row equal) is dropped and counted ("repeated_row");
+  rows alike in identity and different elsewhere are a conflict ("conflicting_row"): a trade keeps the first and
+  counts the rest; a price point in conflict is never kept (all its rows are counted as conflicts), so it can never
+  be a price. A trade's identity: wallet (case folded), transaction hash, token, condition, side, size, price, time
+  and outcome index (the feed has no fill id). A price point's: token, time and grain. A resolution row's: the whole
+  row (two different rows for one condition are left to `resolution_batches`, which does not trust them).
 """
 from __future__ import annotations
 
 import http.client
 import json
 import math
-import posixpath
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -58,7 +60,6 @@ POSITION_STATUSES = (None, "CLOSED")
 MAX_CONDITIONS = 20
 TS_MIN = 1_577_836_800             # 2020-01-01T00:00:00Z: no time of this service is earlier
 TS_AFTER_START = 86_400            # a time may be at most one day after the client was made
-HOST = "data-api.polymarket.com"
 
 
 class HttpError(Exception):
@@ -91,17 +92,15 @@ class Pacer:
         self.last = self.clock()
 
 
+PATH_RE = r"/v2/[a-z0-9/_-]+"
+QUERY_RE = r"[A-Za-z0-9_.~%+=&-]*"            # what urllib.parse.urlencode writes
+ALLOWED_URL = re.compile(re.escape(BASE_URL) + "(" + PATH_RE + r")(?:\?" + QUERY_RE + ")?")
+
+
 def _allowed(url: str) -> bool:
-    """https, exactly the service's host (no user, no port), a path under /v2/ with no `..` segment and no `//`,
-    judged after percent-decoding and again after normalising."""
-    try:
-        parts = urllib.parse.urlsplit(url)
-    except ValueError:
-        return False
-    path = urllib.parse.unquote(parts.path)
-    return (parts.scheme == "https" and parts.netloc == HOST and path.startswith("/v2/") and "//" not in path
-            and ".." not in path.split("/") and "\\" not in path and posixpath.normpath(path).startswith("/v2/")
-            and not parts.fragment)
+    """The allow-list: the whole address is the service's base, a /v2/ path of lower-case letters, digits, `/`, `_`
+    and `-`, and an optional query as the reader encodes it. Nothing else passes."""
+    return isinstance(url, str) and ALLOWED_URL.fullmatch(url) is not None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -330,14 +329,19 @@ class Walk:
         self.rows.append(good)
         self.row_read_at.append(read_at)
 
-    def add(self, row, validator, read_at: str, identity=None, ids: set | None = None) -> None:
+    def add(self, row, validator, read_at: str, identity=None, ids: dict | None = None,
+            conflicted: set | None = None) -> None:
         good, why = validator(row)
         if why is None and identity is not None:
-            k = identity(good)
-            if k in ids:
+            k, sig = identity(good), _signature(row)
+            if k not in ids:
+                ids[k] = sig
+            elif ids[k] == sig:
                 why = "repeated_row"
             else:
-                ids.add(k)
+                why = "conflicting_row"
+                if conflicted is not None:
+                    conflicted.add(k)
         self.raw.append((row, why))
         self.raw_read_at.append(read_at)
         if why is None:
@@ -345,6 +349,24 @@ class Walk:
             self.row_read_at.append(read_at)
         else:
             self.rejects[why] += 1
+
+    def drop_conflicted(self, identity, conflicted: set) -> None:
+        """Turn every kept row whose identity is in conflict into a counted conflict (none of them is kept)."""
+        if not conflicted:
+            return
+        rows, at, k = [], [], 0
+        for i, (raw, why) in enumerate(self.raw):
+            if why is not None:
+                continue
+            good, when = self.rows[k], self.row_read_at[k]
+            k += 1
+            if identity(good) in conflicted:
+                self.raw[i] = (raw, "conflicting_row")
+                self.rejects["conflicting_row"] += 1
+            else:
+                rows.append(good)
+                at.append(when)
+        self.rows, self.row_read_at = rows, at
 
     @classmethod
     def from_rows(cls, rows, read_at: str) -> "Walk":
@@ -356,6 +378,11 @@ class Walk:
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _signature(raw) -> str:
+    """The whole row, for telling a true repeat from a conflict."""
+    return json.dumps(raw, sort_keys=True, default=repr)
 
 
 # ---------------------------------------------------------------- the client
@@ -375,7 +402,7 @@ class PolymarketData:
     def get_json(self, path: str, params: dict | None = None):
         """GET base + path (a /v2/ path) with the query `params`; retries 429, 5xx and transport errors (a timeout, a
         reset, a dropped connection) with waits of 1, 2, 4, 8 s (or Retry-After, at most 60 s)."""
-        if not (isinstance(path, str) and path.startswith("/v2/") and ".." not in path and "//" not in path):
+        if not (isinstance(path, str) and re.fullmatch(PATH_RE, path)):
             raise PolymarketDataError("refused path %r" % (path,))
         url = BASE_URL + path + ("?" + urllib.parse.urlencode(params) if params else "")
         last: HttpError | None = None
@@ -405,12 +432,20 @@ class PolymarketData:
         raise PolymarketDataError("gave up after %d tries: %s at %s" % (self.tries, last_err or "?", url))
 
     def walk(self, path: str, params: dict, validator, *, page_cap: int = DEFAULT_PAGE_CAP, max_rows: int | None = None,
-             cursor_alone: bool = False, identity=None) -> Walk:
+             cursor_alone: bool = False, identity=None, drop_conflicts: bool = False) -> Walk:
         """Every row of a cursor-paged list route, validated, each identity once (`identity(row)`; a repeat is a
         counted "repeated_row"). Stops when has_more is false (or, with `max_rows`, once that many rows were served).
         Raises on a wrong envelope, has_more without a cursor, a repeated cursor, or a `page_cap`-th page that still
-        promises more."""
-        w, seen, cursor, ids = Walk(), set(), None, set()
+        promises more. With `drop_conflicts`, no row of an identity in conflict is kept."""
+        ids: dict = {}
+        conflicted: set = set()
+        w = self._walk(path, params, validator, page_cap, max_rows, cursor_alone, identity, ids, conflicted)
+        if drop_conflicts:
+            w.drop_conflicted(identity, conflicted)
+        return w
+
+    def _walk(self, path, params, validator, page_cap, max_rows, cursor_alone, identity, ids, conflicted) -> Walk:
+        w, seen, cursor = Walk(), set(), None
         resend = {k: v for k, v in params.items() if k != "limit"}
         while True:
             if w.pages >= page_cap:
@@ -424,7 +459,7 @@ class PolymarketData:
             for row in rows:
                 if max_rows is not None and len(w.raw) >= max_rows:
                     return w
-                w.add(row, validator, read_at, identity, ids)
+                w.add(row, validator, read_at, identity, ids, conflicted)
             if max_rows is not None and len(w.raw) >= max_rows:
                 return w
             if not more:
@@ -486,7 +521,7 @@ class PolymarketData:
         pg = ans.get("pagination")
         if pg is not None and (not isinstance(pg, dict) or pg.get("has_more") is not False):
             raise PolymarketDataError("/v2/resolutions answered a paged list; this reader cannot page it")
-        w, ids = Walk(pages=1, read_at=[read_at]), set()
+        w, ids = Walk(pages=1, read_at=[read_at]), {}
         for row in ans["data"]:
             w.add(row, lambda r: validate_resolution(r, self.ts_max), read_at,
                   lambda good: json.dumps(good, sort_keys=True), ids)
@@ -521,4 +556,5 @@ class PolymarketData:
             raise ValueError("a token id and 0 < start < end, whole seconds")
         params = {"token_id": token_id, "start": start, "end": end}
         return self.walk("/v2/prices-history", params, lambda r: validate_price_point(r, self.ts_max),
-                         page_cap=page_cap, identity=lambda p: (token_id, p["timestamp"], p["resolution_seconds"]))
+                         page_cap=page_cap, identity=lambda p: (token_id, p["timestamp"], p["resolution_seconds"]),
+                         drop_conflicts=True)
