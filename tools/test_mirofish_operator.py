@@ -2086,7 +2086,7 @@ class Addendum5(Base):
             self.assertIn('%s (%s)' % (iid, key), line); self.assertIn('%s (%s)' % (iid, key), row['announcement'])
         self.assertEqual(sorted(b['instance_id'] for _, _, b in self.w.posts()), ['copy', 'qwen3.8-27b-chat'])
 
-    def test_G2_a_model_that_appears_after_the_announcement_is_reported_and_left_alone(self):
+    def test_G2_a_model_that_appears_after_the_announcement_is_never_unloaded(self):
         orig = self.w.http; added = []
         def http(method, url, body=None, timeout=None):
             reply = orig(method, url, body, timeout)
@@ -2094,11 +2094,9 @@ class Addendum5(Base):
                 added.append(1)
                 self.w.models['models'].append({'key': 'late/model', 'type': 'llm', 'loaded_instances': [{'id': 'late-1', 'config': {}}]})
             return reply
-        self.assertEqual(self.main(RUN, http=http), 0, self.w.text())
+        self.assertNotEqual(self.main(RUN, http=http), 0, self.w.text())      # addendum 6: not launched
         self.assertEqual([b['instance_id'] for _, _, b in self.w.posts()], ['qwen3.8-27b-chat'])
-        row = self.w.rows()[-1]
-        self.assertTrue(any('LOADED AFTER THE ANNOUNCEMENT' in a and 'late-1' in a for a in row['alerts']), row['alerts'])
-        self.assertTrue(row['launched'])
+        self.assertFalse(self.w.rows()[-1]['launched'])
 
     # ---- G (3): the load path's own instance, named before its load, is the only thing its unload names
     def test_G3_the_load_tests_instance_is_named_before_its_load_and_is_all_its_unload_names(self):
@@ -2186,6 +2184,90 @@ class Addendum5(Base):
                 self.assertTrue(self.w.picks_loaded)
                 if argv is RUN:
                     self.assertIn('elsewhere.plist', self.w.rows()[-1]['refused'])
+
+
+class Addendum6(Base):
+    """A model that appears after the announcement: before the spawn the run is not launched; after it, an alert and no count."""
+    LT = LoadTest.LT
+    intent = Addendum3.intent
+    at = Addendum3.at
+    fresh = Addendum3.fresh
+
+    LATE = {'key': 'late/model', 'type': 'llm', 'loaded_instances': [{'id': 'late-1', 'config': {}}]}
+
+    def appear(self, world=None):
+        w = world or self.w
+        if not any(e.get('key') == 'late/model' for e in w.models['models']):
+            w.models['models'].append(copy.deepcopy(self.LATE))
+
+    def assertNotLaunchedAndRestored(self, rc, row):
+        self.assertNotEqual(rc, 0, self.w.text()); self.assertFalse(row['launched'])
+        self.assertIn('late-1 (late/model)', row['refused'])
+        self.assertEqual(row['loaded_after_announcement'], [{'instance_id': 'late-1', 'key': 'late/model'}])
+        self.assertTrue(self.w.picks_loaded); self.assertFalse(self.intent.exists())
+        self.assertNotIn('late-1', [b['instance_id'] for _, _, b in self.w.posts()])
+
+    def test_run_a_model_appearing_at_the_unloads_is_not_launched(self):
+        orig = self.w.http
+        def http(method, url, body=None, timeout=None):
+            reply = orig(method, url, body, timeout)
+            if method == 'POST':
+                self.appear()
+            return reply
+        rc = self.main(RUN, http=http)
+        self.assertNotLaunchedAndRestored(rc, self.w.rows()[-1]); self.assertEqual(self.w.spawned, [])
+
+    def test_run_a_model_appearing_after_the_unloads_and_before_the_spawn_is_not_launched(self):
+        orig = self.w.run
+        def run(argv, cwd=None, env=None, timeout=None):
+            if '--preflight' in [str(a) for a in argv]:
+                self.appear()
+            return orig(argv, cwd, env, timeout)
+        rc = self.main(RUN, run=run)
+        self.assertNotLaunchedAndRestored(rc, self.w.rows()[-1]); self.assertEqual(self.w.spawned, [])
+        self.assertFalse((Path(self.w.rows()[-1]['staged_folder']) / OP.GATE_NAME).exists())
+
+    def test_run_a_model_appearing_after_the_spawn_is_an_alert_and_the_run_does_not_count(self):
+        self.at(40, lambda world: self.appear(world))
+        rc = self.main(RUN)
+        row = self.w.rows()[-1]
+        self.assertTrue(row['launched']); self.assertFalse(row['counts']); self.assertNotEqual(rc, 0)
+        self.assertTrue(row['verdicts']['pipeline_clean'] and row['verdicts']['collector_unharmed'])   # it would have counted
+        self.assertEqual(row['loaded_after_announcement'], [{'instance_id': 'late-1', 'key': 'late/model'}])
+        self.assertTrue(any('LOADED AFTER THE ANNOUNCEMENT' in a and 'late-1' in a for a in row['alerts']), row['alerts'])
+        self.assertIsNone(row['stopped']); self.assertEqual(self.w.signals, [])          # no new stop
+        self.assertNotIn('late-1', [b['instance_id'] for _, _, b in self.w.posts()])
+
+    def test_run_without_a_late_model_still_counts(self):
+        self.assertEqual(self.main(RUN), 0); self.assertTrue(self.w.rows()[-1]['counts'])
+        self.assertEqual(self.w.rows()[-1]['loaded_after_announcement'], [])
+
+    def lt_result(self):
+        return json.loads(sorted((self.w.tmp / 'artifacts/load-tests').glob('*.json'))[-1].read_text())
+
+    def test_load_test_a_model_appearing_before_the_load_is_not_loaded(self):
+        def hook(world):
+            if world.t > START + 30 and not world.loads:
+                self.appear(world)
+        self.w.on_sleep.append(hook)
+        rc = self.main(self.LT)
+        r = self.lt_result()
+        self.assertNotEqual(rc, 0); self.assertEqual(self.w.loads, []); self.assertIn('late-1 (late/model)', r['refused'])
+        self.assertEqual(r['loaded_after_announcement'], [{'instance_id': 'late-1', 'key': 'late/model'}])
+        self.assertTrue(self.w.picks_loaded); self.assertFalse(self.intent.exists())
+        self.assertNotIn('late-1', [b['instance_id'] for _, _, b in self.w.posts()])
+
+    def test_load_test_a_model_appearing_after_the_load_is_an_alert(self):
+        def hook(world):
+            if world.load_t is not None and world.t >= world.load_t + 30:
+                self.appear(world)
+        self.w.on_sleep.append(hook)
+        rc = self.main(self.LT)
+        r = self.lt_result()
+        self.assertNotEqual(rc, 0); self.assertEqual(len(self.w.loads), 1); self.assertTrue(r['unload']['proven'])
+        self.assertEqual(r['loaded_after_announcement'], [{'instance_id': 'late-1', 'key': 'late/model'}])
+        self.assertTrue(any('LOADED AFTER THE ANNOUNCEMENT' in a for a in r['alerts']))
+        self.assertNotIn('late-1', [b['instance_id'] for _, _, b in self.w.posts()])
 
 
 if __name__ == '__main__':
