@@ -1663,6 +1663,8 @@ def test_t50_a3_every_practice_entry_pointed_at_the_live_file_refuses_and_no_liv
         finally:
             watch.look("after load_env")
     monkeypatch.setattr(s, "load_env", load_env)
+    from valedia_trader.core import alerts
+    monkeypatch.setattr(alerts, "load_env", load_env)                 # the owner page's loader, imported by name
     _OPENS.clear()
     refused = ENTRIES[entry](root, watch, monkeypatch)
     watch.look("after the entry")
@@ -1671,5 +1673,5 @@ def test_t50_a3_every_practice_entry_pointed_at_the_live_file_refuses_and_no_liv
     assert not set(s.LIVE_NAMES) & set(os.environ)
     clean = _no_value(printed.out + printed.err)
     assert clean and refused, (entry, way)
-    assert watch.looks >= 2
+    assert watch.looks >= 1                                           # the last look; a refusal before any call is the aim
     assert _OPENS == [] or way == "copy", (entry, way, len(_OPENS))  # the live file itself is never opened
