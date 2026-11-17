@@ -358,12 +358,19 @@ startup copy and refuses a plan whose own serving file resolves to it.
 **The stop rule.** The start check is one reading against the start threshold. While running, the run stops when any of
 these holds: the kernel's pressure level (`kern.memorystatus_vm_pressure_level`) is 4 on any sample; it is 2 or more on every
 sample for 10 s; free memory is below 30% on every sample for 10 s; or there is no fresh, valid reading for 3 s (a level that
-is not exactly 1, 2 or 4 is not a reading). The owned memory bound (40 GiB) still holds on every sample. On the four recorded
+is not exactly 1, 2 or 4 is not a reading). On every sample whose own fields are valid, whatever its pressure level reads, the
+run also stops at once when free memory is below 15% (a hard floor; the lowest single sample on record is 27), when the owned
+figure exceeds its 40 GiB bound, or when two processes serve the co-resident's file. A capsule that fails verification (its
+signature, the sampler's identity, its field set or shape) stops the run at once; only a missing, stale or unparseable reading
+waits for the 3-second rule. On the four recorded
 runs of 2026-11-15 (`swarm8-b2q8-b`, `-c`, `-d`, `swarm48-b2q8-a`) none of these stops; the lowest 10-second levels (the lowest,
 over the run, of the highest free reading in any 10-second window) are 37, 38, 69 and 68. Swap used is recorded in every
 sample and stops nothing. The receipt's `resource` block carries `lowest_sustained_free_percent_10s`, `max_pressure_level`
 and `co_resident_rss_bytes_max`; `builder/observer-identity.json` (pid, ps start string, process group, time) is written right
 after the observer is spawned.
+
+Staging itself contacts LM Studio once: the WebSocket handshake on its loopback listening ports (other than 1235) that finds
+the live SDK port; it lists, loads and calls no model.
 
 **The start threshold** is `floor + margin + setup_cost + fall` from the table `START_TERMS` in
 `tools/mirofish_swarm_limits.py`, each value with its source: 30 + 10 + 24 + 10 = 74% free, for every model named. The lead
