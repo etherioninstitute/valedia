@@ -235,11 +235,15 @@ def check_models(paths: LoopPaths) -> tuple[str, str]:
 
 def check_venues(paths: LoopPaths) -> tuple[str, str]:
     from valedia_trader.core.secrets import SecretError, load_env, secret
+    notes, ready, unloaded = [], 0, None
     try:
         load_env()
-    except Exception:
-        pass
-    notes, ready = [], 0
+    except SecretError as exc:                         # T50 addendum 3: said, never swallowed (its text names no value)
+        unloaded = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        unloaded = type(exc).__name__
+    if unloaded is not None:
+        notes.append(f"the trading secrets file could not be loaded ({unloaded}); nothing of it was used")
     for label, key, good in (("Alpaca paper", "ALPACA_API_KEY", lambda v: v.startswith("PK")),
                              ("Webull", "WEBULL_APP_KEY", lambda v: len(v) >= 8)):
         try:
@@ -267,6 +271,8 @@ def check_venues(paths: LoopPaths) -> tuple[str, str]:
         notes.append(f"a live key name is in reach of the practice runs: {' and '.join(found)} (the process environment "
                      "or the trading secrets file); every practice run refuses to build a venue while it is there; the "
                      "live pair belongs in webull-live.env only")
+        return FAIL, "; ".join(notes)
+    if unloaded is not None:
         return FAIL, "; ".join(notes)
     return (OK if ready else ATTENTION), "; ".join(notes)
 
@@ -485,101 +491,170 @@ def check_schedule(paths: LoopPaths) -> tuple[str, str]:
 LIVE_FLAG = re.compile(r"(?<![\w-])--live(?![\w-])")    # the flag as a whole word: not --liveness, not --live-ish
 JOB_SCAN_MAX_BYTES = 4 * 1024 * 1024
 OUR_LABEL = "com.valedia."
+# The running user's LaunchAgents folder, from the password database (not $HOME); tests give the check another one.
+LAUNCH_AGENTS = Path(__import__("pwd").getpwuid(os.geteuid()).pw_dir) / "Library" / "LaunchAgents"
+_SCRIPT_SUFFIXES = (".sh", ".zsh", ".bash", ".py", ".command")
+_INTERPRETER = re.compile(r"(ba|z|da|k|c|tc)?sh|python[0-9.]*|perl|ruby|node|osascript")
 
 
 def _job_hits(text: str) -> list[str]:
-    """What a job file holds that a scheduled job must not: the --live flag, either live key name (never a value)."""
+    """What a job file holds that a scheduled job must not: the --live flag, either live key name (never a value).
+    The order step's command line takes no abbreviation of a flag (T50 addendum 3), so --live is the only spelling."""
     from valedia_trader.core.secrets import LIVE_NAMES
     return (["--live"] if LIVE_FLAG.search(text) else []) + [name for name in LIVE_NAMES if name in text]
 
 
-def _read_job_file(p: Path, skip_binary: bool) -> str | None:
-    """The text of a regular file (bytes that are not UTF-8 replaced), or None when it is not a regular file, cannot
-    be read, is larger than JOB_SCAN_MAX_BYTES or (with `skip_binary`) holds a NUL byte in its first 8 KB."""
+def _read_job_bytes(p: Path, skip_binary: bool) -> tuple[bytes | None, str | None]:
+    """(the bytes of a regular file, None), (None, None) for a binary skipped (`skip_binary`: a NUL byte in its first
+    8 KB), or (None, why) when it cannot be read: not a regular file, unreadable, larger than JOB_SCAN_MAX_BYTES."""
     try:
-        if not p.is_file() or p.stat().st_size > JOB_SCAN_MAX_BYTES:
-            return None
-        raw = p.read_bytes()
-    except OSError:
-        return None
-    if skip_binary and b"\0" in raw[:8192]:
-        return None
-    return raw.decode("utf-8", errors="replace")
+        if not p.is_file():
+            return None, "is not a regular file"
+        with p.open("rb") as fh:
+            head = fh.read(8192)
+            if skip_binary and b"\0" in head:
+                return None, None
+            rest = fh.read(JOB_SCAN_MAX_BYTES + 1 - len(head))
+    except OSError as exc:
+        return None, type(exc).__name__
+    raw = head + rest
+    if len(raw) > JOB_SCAN_MAX_BYTES:
+        return None, f"larger than {JOB_SCAN_MAX_BYTES} bytes"
+    return raw, None
 
 
-def _job_plist(p: Path) -> dict | None:
+def _job_plist(raw: bytes) -> dict | None:
+    """The property list as launchd reads it (text or binary, entities and sections resolved), or None."""
     import plistlib
     try:
-        data = plistlib.loads(p.read_bytes())
+        data = plistlib.loads(raw)
     except Exception:
         return None
     return data if isinstance(data, dict) else None
 
 
+def _plist_strings(obj) -> list[str]:
+    """Every string a parsed property list holds, keys included, at any depth."""
+    if isinstance(obj, str):
+        return [obj]
+    if isinstance(obj, bytes):
+        return [obj.decode("utf-8", errors="replace")]
+    if isinstance(obj, dict):
+        return [s for k, v in obj.items() for s in _plist_strings(k) + _plist_strings(v)]
+    if isinstance(obj, (list, tuple)):
+        return [s for v in obj for s in _plist_strings(v)]
+    return []
+
+
+def _a_file_word(w) -> bool:
+    return (isinstance(w, str) and bool(w) and not w.startswith("-") and "://" not in w
+            and not any(c.isspace() for c in w))
+
+
 def _named_by(data: dict | None) -> list[Path]:
-    """The files a job's Program and ProgramArguments name (one level: not what those files name in turn), relative
-    names taken from its WorkingDirectory (launchd's default: /)."""
+    """The files a job runs (one level: not what those files name in turn), relative names taken from its
+    WorkingDirectory (launchd's default: /): its program when given as a path (a bare command name is found on the
+    PATH and is not a script of ours), the first argument after an interpreter (bash, zsh, sh, python, ...), and every
+    argument ending in a script suffix (.sh, .zsh, .bash, .py, .command)."""
     if not data:
         return []
-    args = data.get("ProgramArguments")
-    words = [w for w in ([data.get("Program")] + (list(args) if isinstance(args, list) else [])) if isinstance(w, str) and w]
+    raw_args = data.get("ProgramArguments")
+    args = [w if isinstance(w, str) else "" for w in (raw_args if isinstance(raw_args, list) else [])]
+    program = data.get("Program") if isinstance(data.get("Program"), str) else (args[0] if args else "")
+    words = [program] if _a_file_word(program) and "/" in program else []
+    if len(args) > 1 and _INTERPRETER.fullmatch(os.path.basename(program or "")) and _a_file_word(args[1]):
+        words.append(args[1])
+    words += [w for w in args[1:] if _a_file_word(w) and w.endswith(_SCRIPT_SUFFIXES)]
     workdir = data.get("WorkingDirectory") if isinstance(data.get("WorkingDirectory"), str) else "/"
-    out = []
+    out: list[Path] = []
     for w in words:
         p = Path(w).expanduser()
-        out.append(p if p.is_absolute() else Path(workdir) / p)
+        p = p if p.is_absolute() else Path(workdir) / p
+        if p not in out:
+            out.append(p)
     return out
 
 
 def check_jobs(paths: LoopPaths, launchd_dir: str | Path | None = None, agents_dir: str | Path | None = None) -> tuple[str, str]:
     """T50: no scheduled job may run live mode. Scanned: the repository's job files (tools/launchd/*.plist and *.sh,
-    or `launchd_dir`), the installed LaunchAgents whose Label starts with com.valedia. (~/Library/LaunchAgents, or
-    `agents_dir`; a plist that cannot be parsed counts as one of ours when its file name starts so), and the files each
-    of those plists names in its Program and ProgramArguments, one level down (binaries are skipped). A file holding
-    --live as a whole word or either live key name fails the check, named; nothing a file holds is printed."""
+    or `launchd_dir`), the installed LaunchAgents whose Label starts with com.valedia. (LAUNCH_AGENTS, or `agents_dir`;
+    a property list is read as launchd reads it, text or binary, and every string inside it is tested as well as its
+    raw text), and the files each of those property lists runs (_named_by), one level down (binaries are skipped). A
+    file holding --live as a whole word or either live key name fails the check, named; so does anything the check
+    could not read or find (a folder, a job file, a property list it cannot parse, a file a job runs), named, and a
+    folder that does not exist on this machine is said to be so. Nothing a file holds is printed."""
     launchd = Path(launchd_dir) if launchd_dir is not None else paths.root / "tools" / "launchd"
-    agents = Path(agents_dir) if agents_dir is not None else Path.home() / "Library" / "LaunchAgents"
+    agents = Path(agents_dir) if agents_dir is not None else LAUNCH_AGENTS
     scanned: set[Path] = set()
-    hits, unread, named = [], [], []
+    hits, unread, missing = [], [], []
+    named: list[tuple[Path, str]] = []
 
-    def scan(p: Path, skip_binary: bool) -> None:
+    def listing(folder: Path) -> list[Path]:
+        if not os.path.lexists(folder):
+            missing.append(f"the folder {folder} does not exist on this machine")
+            return []
+        try:
+            return sorted(folder.iterdir())
+        except OSError as exc:
+            unread.append(f"the folder {folder} ({type(exc).__name__})")
+            return []
+
+    def scan(p: Path, shown: str, plist: bool, skip_binary: bool = False) -> dict | None:
         key = Path(os.path.abspath(p))
         if key in scanned:
-            return
-        text = _read_job_file(p, skip_binary)
-        if text is None:
-            if not skip_binary:
-                unread.append(p.name)
-            return
+            return None
+        raw, why = _read_job_bytes(p, skip_binary)
+        if raw is None:
+            if why is not None:
+                unread.append(f"{shown} ({why})")
+            return None
         scanned.add(key)
-        found = _job_hits(text)
+        texts = [raw.decode("utf-8", errors="replace")]
+        data = None
+        if plist:
+            data = _job_plist(raw)
+            if data is None:
+                unread.append(f"{shown} (not a property list launchd can read)")
+            else:
+                texts += _plist_strings(data)
+        found = sorted({h for text in texts for h in _job_hits(text)}, key=lambda h: (h != "--live", h))
         if found:
-            hits.append(f"{p.name if not skip_binary else p} ({', '.join(found)})")
+            hits.append(f"{shown} ({', '.join(found)})")
+        return data
 
-    if launchd.is_dir():
-        for p in sorted(launchd.iterdir()):
-            if p.suffix in (".plist", ".sh"):
-                scan(p, False)
-                if p.suffix == ".plist":
-                    named += _named_by(_job_plist(p))
-    if agents.is_dir():
-        for p in sorted(agents.glob("*.plist")):
-            data = _job_plist(p)
-            label = data.get("Label") if data else None
-            if (isinstance(label, str) and label.startswith(OUR_LABEL)) or (data is None and p.name.startswith(OUR_LABEL)):
-                scan(p, False)
-                named += _named_by(data)
-    for q in named:
-        scan(q, True)
-    if hits:
-        return FAIL, ("a scheduled job names live mode or a live key name, and live mode never runs from a job: "
-                      + "; ".join(hits))
+    for p in listing(launchd):
+        if p.suffix in (".plist", ".sh"):
+            data = scan(p, p.name, p.suffix == ".plist")
+            named += [(q, p.name) for q in _named_by(data)]
+    for p in listing(agents):
+        if p.suffix != ".plist":
+            continue
+        raw, why = _read_job_bytes(p, False)
+        if raw is None:
+            unread.append(f"{p.name} ({why})")             # whose it is cannot be told
+            continue
+        data = _job_plist(raw)
+        label = data.get("Label") if data else None
+        if data is None or (isinstance(label, str) and label.startswith(OUR_LABEL)):
+            data = scan(p, p.name, True)
+            named += [(q, p.name) for q in _named_by(data)]
+    for q, by in named:
+        if not os.path.lexists(q):
+            missing.append(f"{q}, which {by} runs, does not exist")
+        elif not q.is_dir():
+            scan(q, str(q), False, skip_binary=True)
+    if hits or unread or missing:
+        parts = []
+        if hits:
+            parts.append("a scheduled job names live mode or a live key name, and live mode never runs from a job: "
+                         + "; ".join(hits))
+        if unread:
+            parts.append("could not be read: " + "; ".join(unread))
+        parts += missing
+        return FAIL, "; ".join(parts)
     if not scanned:
         return ATTENTION, f"no job files found (looked in {launchd} and {agents})"
-    note = f"{len(scanned)} job files scanned; none names --live or a live key name"
-    if unread:
-        return ATTENTION, f"{note}; could not be read: {', '.join(unread)}"
-    return OK, note
+    return OK, f"{len(scanned)} job files scanned; none names --live or a live key name"
 
 
 def check_mirofish(paths: LoopPaths) -> tuple[str, str]:

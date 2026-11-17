@@ -582,10 +582,13 @@ def probe(series_symbols: Iterable[str] = DEFAULT_SERIES, environ: dict | None =
     if not 1 <= len(asked) <= PROBE_MAX_SERIES or len(set(asked)) != len(asked) or not all(
             type(s) is str and _EVENT_SYMBOL.fullmatch(s) for s in asked):
         raise ProbeRefused(f"--series takes 1 to {PROBE_MAX_SERIES} distinct series symbols")
-    from valedia_trader.core.secrets import live_names_in, load_env, secret
+    from valedia_trader.core.secrets import LiveNameInReach, live_names_in, load_env, secret
     env = os.environ if environ is None else environ
     if environ is None:
-        load_env()
+        try:
+            load_env()
+        except LiveNameInReach as exc:                                 # the loader refused it and set nothing (T50)
+            raise ProbeRefused(f"{exc}; a practice run never runs with a live name in reach") from None
     found = live_names_in(env)
     if found:
         raise ProbeRefused(f"{' and '.join(found)} {'is' if len(found) == 1 else 'are'} in reach of the probe (the "

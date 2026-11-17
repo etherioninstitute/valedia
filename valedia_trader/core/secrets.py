@@ -101,7 +101,7 @@ from urllib.parse import quote, quote_plus, unquote
 __all__ = ["env_file_path", "load_env", "secret", "SecretError", "DEFAULT_ENV_FILE", "SECRETS_DIR",
            "redact", "redact_json", "tripped", "remember", "child_env", "install_output_guard",
            "remove_output_guard", "ensure_output_guard", "LIVE_NAMES", "LIVE_ENV_FILE", "LiveFileError", "LiveNameInReach",
-           "read_live_pair", "live_names_in", "is_practice_environment", "PRACTICE_ENVIRONMENT"]
+           "read_live_pair", "live_names_in", "is_practice_environment", "PRACTICE_ENVIRONMENT", "is_live_file"]
 
 SECRETS_DIR = Path("~/.hermes/secrets").expanduser()
 DEFAULT_ENV_FILE = SECRETS_DIR / "trading.env"
@@ -151,11 +151,20 @@ def load_env(path: str | Path | None = None, environ=None, override: bool = Fals
     ensure_output_guard()
     env = os.environ if environ is None else environ
     p = Path(path).expanduser() if path else env_file_path(env)
+    if is_live_file(p):                                  # T50: before anything is read from it
+        raise LiveNameInReach(f"the file named as the trading secrets file is the live key file ({LIVE_FILE_NAME}); the "
+                              "ordinary loader never reads it, and nothing was loaded")
     if not p.is_file():
         return []
     if stat.S_IMODE(p.stat().st_mode) & 0o077:
         raise SecretError(f"{p} is readable by group or others; run chmod 600 on it")
-    pairs = parse_env(p.read_text())
+    text = p.read_text()
+    found = [name for name in LIVE_NAMES if name in text]
+    if found:                                            # T50: the whole file judged first; nothing of it is set
+        _remember_live_lines(text)
+        raise LiveNameInReach(f"{' and '.join(found)} {'is' if len(found) == 1 else 'are'} named in the trading secrets "
+                              f"file; the live pair belongs in {LIVE_FILE_NAME} only, so nothing was loaded from that file")
+    pairs = parse_env(text)
     for key in _SINGLE_SOURCE:
         if key in pairs and key in env and env[key] != pairs[key]:
             raise SecretError(f"the trading file's {key} and the {key} already in the environment disagree; set it in one "
@@ -200,8 +209,41 @@ class LiveFileError(SecretError):
 
 
 class LiveNameInReach(SecretError):
-    """A practice entry found a live name (LIVE_NAMES) in its process environment or its ordinary secrets file; the
-    message names the names, never a value."""
+    """A practice entry found a live name (LIVE_NAMES) in its process environment or its ordinary secrets file, or the
+    ordinary loader was pointed at the live file or at a file naming a live name; the message names the names (or the
+    live file), never a value."""
+
+
+def is_live_file(path) -> bool:
+    """Whether `path` is the live file (LIVE_ENV_FILE) however it is named: the same real path, the same file on disk
+    (device and inode, so a hard link counts), or a file whose own or real name is the live file's name. Looks at the
+    names and at the file's metadata only; never opens it."""
+    try:
+        given = os.path.abspath(os.fspath(path))
+        real = os.path.realpath(given)
+    except (OSError, TypeError, ValueError):
+        return False
+    if LIVE_FILE_NAME in (os.path.basename(given), os.path.basename(real)):
+        return True
+    live = os.fspath(LIVE_ENV_FILE)
+    if real == os.path.realpath(live):
+        return True
+    try:
+        a, b = os.stat(given), os.stat(live)
+    except (OSError, ValueError):
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def _remember_live_lines(text: str) -> None:
+    """Hand the values of the lines naming a live name to the output guard (the file is refused, but what it holds is
+    still hidden from anything printed)."""
+    for line in text.splitlines():
+        name, eq, value = line.partition("=")
+        if eq and any(n in name for n in LIVE_NAMES):
+            value = value.strip().strip('"').strip("'")
+            if len(value) >= 8:
+                remember(value)
 
 
 def _live_fault(p: Path) -> tuple[int | None, str | None]:
@@ -248,34 +290,57 @@ def _live_fault(p: Path) -> tuple[int | None, str | None]:
     return fd, None
 
 
-def _live_pairs(text: str) -> tuple[dict[str, str] | None, str | None]:
-    """The two live names and their values, or (None, why): every line that is not blank or a comment must be
-    NAME=VALUE (`export NAME=VALUE` as in the secrets file), NAME one of LIVE_NAMES, each once, each value non-empty.
-    `why` names a line number or a live name only: nothing a line holds is repeated."""
+LIVE_VALUE_MIN, LIVE_VALUE_MAX = 8, 512
+_LIVE_QUOTES = b"\"'`"
+
+
+def _live_pairs(raw: bytes) -> tuple[dict[str, str] | None, str | None]:
+    """The two live names and their values, or (None, why). The file is exactly two lines `NAME=value`, each of
+    LIVE_NAMES once, in either order, each ended by a single line feed (the last one optional), and nothing else: no
+    comment, no blank line, no `export`, no quote, no space or tab anywhere, no carriage return, no byte-order mark,
+    only printable ASCII, a value of LIVE_VALUE_MIN to LIVE_VALUE_MAX characters. `why` names the departure and a
+    line number or a live name only: nothing a line holds is repeated."""
+    if not raw:
+        return None, "is empty"
+    if raw.startswith((b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff")):
+        return None, "begins with a byte-order mark (save it as plain ASCII text)"
+    body = raw[:-1] if raw.endswith(b"\n") else raw
     out: dict[str, str] = {}
     first: dict[str, int] = {}
-    for number, raw in enumerate(text.splitlines(), start=1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
+    for number, line in enumerate(body.split(b"\n"), start=1):
+        if b"\r" in line:
+            return None, f"line {number} holds a carriage return (a CRLF line end: use a single line feed)"
+        if not line:
+            return None, f"line {number} is blank (the file is exactly two NAME=value lines)"
+        if line.startswith(b"#"):
+            return None, f"line {number} is a comment (the file is exactly two NAME=value lines)"
+        if line.startswith(b"export"):
+            return None, f"line {number} starts with export (write NAME=value only)"
+        if b" " in line or b"\t" in line:
+            return None, f"line {number} holds a space or a tab"
+        if any(q in line for q in _LIVE_QUOTES):
+            return None, f"line {number} holds a quote (write the value bare)"
+        if any(not 0x21 <= c <= 0x7e for c in line):
+            return None, f"line {number} holds a byte that is not printable ASCII"
+        if b"=" not in line:
             return None, f"line {number} is not NAME=VALUE"
-        name, value = line.split("=", 1)
-        name = name.strip()
-        if name.startswith("export "):
-            name = name[len("export "):].strip()
+        name, value = line.decode("ascii").split("=", 1)
         if name not in LIVE_NAMES:
             return None, (f"line {number} names a setting other than {' and '.join(LIVE_NAMES)} (the live file holds "
                           "those two only)")
         if name in first:
             return None, f"sets {name} more than once (lines {first[name]} and {number}); keep exactly one line for it"
         first[name] = number
-        out[name] = value.strip().strip('"').strip("'")
+        if not value:
+            return None, f"{name} is empty"
+        if len(value) < LIVE_VALUE_MIN:
+            return None, f"{name} is shorter than {LIVE_VALUE_MIN} characters"
+        if len(value) > LIVE_VALUE_MAX:
+            return None, f"{name} is longer than {LIVE_VALUE_MAX} characters"
+        out[name] = value
     for name in LIVE_NAMES:
         if name not in out:
             return None, f"{name} is missing"
-        if not out[name].strip():
-            return None, f"{name} is empty"
     return out, None
 
 
@@ -303,11 +368,7 @@ def read_live_pair(path: str | Path | None = None) -> tuple[str, str]:
         raise LiveFileError(f"{LIVE_FILE_NAME} cannot be read") from None
     finally:
         os.close(fd)
-    try:
-        text = b"".join(chunks).decode("utf-8")
-    except UnicodeDecodeError:
-        raise LiveFileError(f"{LIVE_FILE_NAME} is not UTF-8 text") from None
-    pairs, why = _live_pairs(text)
+    pairs, why = _live_pairs(b"".join(chunks))
     if pairs is None:
         raise LiveFileError(f"{LIVE_FILE_NAME} {why}")
     for value in pairs.values():

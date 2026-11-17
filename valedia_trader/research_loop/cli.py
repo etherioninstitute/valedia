@@ -545,10 +545,14 @@ def _order_step_refused() -> bool:
     """True, with one line on stderr, when a live name is in reach (T50), when the configured environment is not the
     test environment, or when the secrets file cannot be loaded (the line names the error's class only, nothing from
     the file or its path; for a live name, the name only)."""
+    from valedia_trader.core.secrets import LiveNameInReach
     from valedia_trader.execution_and_risk.order_step import TEST_ENVIRONMENT, _venue_error
     try:
         configured = _order_step_environment()
         found = _order_step_live_names()
+    except LiveNameInReach as exc:                       # the loader refused the file and set nothing (names, no value)
+        print(f"refused: {exc}; the practice order step never runs with a live name in reach", file=sys.stderr)
+        return True
     except Exception as exc:
         print(f"refused: the trading secrets file could not be loaded ({_venue_error(exc)}); it must be readable by its "
               "owner only (chmod 600) and hold KEY=VALUE lines", file=sys.stderr)
@@ -927,6 +931,7 @@ def live_order_step_command(args, paths: LoopPaths, environ=None, build_venue=No
     checked right after the flags and before anything is read; then the ordinary environment must be a practice one
     (_live_environment_refusal: WEBULL_ENV sandbox or absent, no live name in it). The venue's pair comes from
     webull-live.env only (`live_file` is for tests), its environment and host are fixed in code."""
+    from valedia_trader.core.secrets import LiveNameInReach
     from valedia_trader.execution_and_risk import go_live, order_step
     from valedia_trader.venues.webull import ny_date
     why = _live_args_refusal(args) or _live_root_refusal(paths)
@@ -942,6 +947,10 @@ def live_order_step_command(args, paths: LoopPaths, environ=None, build_venue=No
     if environ is None:
         try:
             environ = _live_environ()
+        except LiveNameInReach as exc:                   # the loader refused the file and set nothing (names, no value)
+            print(f"refused: {exc}; live mode reads the live pair from webull-live.env only; nothing was read from the "
+                  "account", file=sys.stderr)
+            return 2
         except Exception as exc:
             print(f"refused: the trading secrets file could not be loaded ({order_step._venue_error(exc)}); it must be "
                   "readable by its owner only (chmod 600) and hold KEY=VALUE lines", file=sys.stderr)
@@ -1052,7 +1061,8 @@ def run_cycle(args, paths: LoopPaths, ledger: HypothesisLedger) -> dict:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="research_loop", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(prog="research_loop", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 allow_abbrev=False)   # T50: no flag is taken from a prefix of it
     ap.add_argument("--root", default=None, help="project root (default: the repository)")
     ap.add_argument("--data", default="artifacts/data")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1075,7 +1085,8 @@ def main(argv=None) -> int:
     p.add_argument("--refresh", action="store_true", help="download the latest prices first")
     p.add_argument("--alpaca", action="store_true", help="also mirror orders to the Alpaca paper account")
     p.add_argument("--webull", action="store_true", help="no longer sends anything: orders reach Webull only through order-step")
-    p = sub.add_parser("order-step", help="send the paper book's differences to Webull's test environment, inside market hours")
+    p = sub.add_parser("order-step", help="send the paper book's differences to Webull's test environment, inside market hours",
+                       allow_abbrev=False)   # T50: --liv, --li, --l and every other prefix are errors, not --live
     p.add_argument("--capital", type=float, default=None,
                    help="the broker capital the paper book is scaled to (default: the paper equity, a scale of 1)")
     p.add_argument("--fractional", action="store_true", help="fractional units (5 decimals) instead of whole shares")

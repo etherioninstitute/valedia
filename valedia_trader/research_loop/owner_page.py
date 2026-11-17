@@ -637,7 +637,18 @@ SECTIONS = [("Strategies", "strategies", strategies_section), ("Paper account", 
             ("Research tests in progress", "research", research_section), ("Health", "health", health_section)]
 
 
+def refuse_the_live_file(env: al.Env) -> None:
+    """T50: the trading file the page would read must not be the live key file, however it is named (a link, another
+    spelling, a hard link): judged from names and metadata, before the file is opened. Raises TradingFileError."""
+    from valedia_trader.core.secrets import env_file_path, is_live_file
+    path = Path((env.trading_file if env.trading_file else None) or env_file_path()).expanduser()
+    if is_live_file(path):
+        raise al.TradingFileError("the file named as the trading file is the live key file (webull-live.env); the owner "
+                                  "page never opens it; nothing was done")
+
+
 def render(env: al.Env) -> str:
+    refuse_the_live_file(env)                         # before the trading file is opened
     al.register_trading_file(env)                     # before anything is read: every value of the trading file known to the guard
     ctx = Context(env)
     parts = []
