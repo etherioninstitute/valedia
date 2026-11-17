@@ -11,7 +11,10 @@ is paper / sandbox / unreconciled / backfill / shadow (mirofish_accuracy_ledger.
 _ftl_pairs, which uses forward_test_ledger._is_non_real_source).
 
 Sources scored (one key per source; a filter "x" matches "x" and "x:*"):
-  nimble_decide:<point>  Nimble 2 decisions (data/systemone/decisions.jsonl).
+  decide:elephant-1@q8_0:<point>  decisions of the shared Elephant-1 instance (systemone_pin.SOURCE_PREFIX),
+      admitted only from a row whose `model` is the instance name. Scored exactly as below, under its own
+      key: no row under another key is ever mixed into it, and its rows enter no other key.
+  nimble_decide:<point>  Nimble 2 decisions (data/systemone/decisions.jsonl), kept as history.
       p = P(buy): answers.action_probabilities normalised over their finite values;
       no probabilities (or no "buy" key) -> unscorable "no_p_buy". The logged
       `confidence` is NEVER the forecast: Nimble 2 returns 1 - normalised entropy of
@@ -53,9 +56,10 @@ earns exactly its base; no skill or worse earns 0. Never raises.
 Plugging in (later, Burton approves; backtest first):
   - valedia_config.effective_mirofish_weight() (valedia_config.py:629): wrap the
     mirofish_accuracy_ledger result as min(current, earned_weight("mirofish", ...)).
-  - Nimble per-point trust: nimble_decide.decide_candidate / nimble_wiring.gate could gate
-    veto mode on earned_weight("nimble_decide:<pt>") > 0. The veto already reads
-    calibrate("nimble_decide:<pt>", p_buy) (calibration_map.py; confidence = sharpness floor).
+  - Per-point trust: nimble_decide.decide_candidate / nimble_wiring.gate could gate
+    veto mode on earned_weight("decide:elephant-1@q8_0:<pt>") > 0. The veto already reads
+    calibrate_ex("decide:elephant-1@q8_0:<pt>", p_buy) and holds until it is isotonic
+    (calibration_map.py; confidence = sharpness floor).
 
 CLI: python3 calibration_ledger.py [--source X] [--since ISO] [--json]
 Writes data/calibration/summary.json (gitignored) unless --no-write.
@@ -75,6 +79,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import mirofish_accuracy_ledger as mfl  # noqa: E402  (outcome matching is reused, not copied)
+import systemone_pin as _pin  # noqa: E402  (the decision model's source key prefix and instance name)
 
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 SUMMARY_PATH = os.path.join(ROOT, "data", "calibration", "summary.json")
@@ -182,15 +187,20 @@ def _nimble_items(dec_rows, pairs):
         if res in ("yes", "no") and ets is not None:
             markets.append((e.get("ticker") or s.get("ticker"), res, ets))
     out = []
+    inst = _pin.dm.INSTANCE if _pin.dm is not None else None
     for r in dec_rows:
         src = str(r.get("source") or "")
+        # The shared instance's key: only a row that names the instance as its model.
+        current = bool(_pin.SOURCE_PREFIX) and src.startswith(_pin.SOURCE_PREFIX + ":")
+        if current and (inst is None or r.get("model") != inst):
+            continue
         # A v3 source must carry the full pinned digest and its own model identity;
         # old rows are never promoted by sharing a decision-point name.
         if src.startswith("nimble_decide:v3:"):
             import systemone_v3_candidate as v3
             if not src.startswith("nimble_decide:v3:" + v3.MANIFEST_SHA256 + ":") or r.get("model") != v3.TAG:
                 continue
-        if not (src == NIMBLE_PREFIX or src.startswith(NIMBLE_PREFIX + ":")):
+        if not (current or src == NIMBLE_PREFIX or src.startswith(NIMBLE_PREFIX + ":")):
             continue
         dts = _ts(r.get("ts"))
         ans = r.get("answers") if isinstance(r.get("answers"), dict) else {}

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Prediction-market wiring for the Nimble 2 decision layer (nimble_decide).
+"""Prediction-market wiring for the decision layer (nimble_decide; named for the first model, Nimble).
+
+The one decision model is the shared Elephant-1 instance (systemone_hotpath_client).
 
 Every PREDICTION-MARKET decision point (master_allocator live Kalshi,
 sports_evidence, weather_live, poly_loop paper, vaughan_arb_paper) calls

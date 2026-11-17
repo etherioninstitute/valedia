@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Nimble 2 annotations, annotate only. Replaces the retired Jev shadow.
+"""Model annotations, annotate only (module named for the first model, Nimble). Replaces the retired Jev shadow.
 
-Nimble 2 is the only decision model. There is no cloud backend and no key. Every
-annotation is one loopback call through systemone_hotpath_client.ask (Nimble 2
-digest pin, NaN coercion, append-only decision log with source
+The shared Elephant-1 instance is the only decision model. There is no cloud backend and no key. Every
+annotation is one loopback typed call through systemone_hotpath_client.ask (instance list
+pin, NaN coercion, append-only decision log with source
 `nimble_annotate:<kind>:<caller>` and the code's own label). Off unless
 VALEDIA_SYSTEMONE=1: identity / None and zero calls.
 

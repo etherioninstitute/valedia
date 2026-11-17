@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
-"""Nimble 2 quick decision for every asset class: stock, crypto, prediction.
+"""Quick decision for every asset class: stock, crypto, prediction (module named for the first model, Nimble).
 
-One narrow question (buy / hold / skip, plus an optional risk label). Every
-number and comparison is computed in code first (stock_facts / crypto_facts /
-prediction_facts and informed_facts); the state carries booleans only and the
-questions contain no digits apart from the risk choice labels. Every call is
-logged by systemone_hotpath_client.ask (digest pin, loopback, NaN coercion,
-latency budget) with source "nimble_decide:<source>" and the code's own
-decision in `label`.
+The one decision model is the shared Elephant-1 instance (systemone_hotpath_client). One narrow question
+(buy / hold / skip, plus an optional risk label). Every number and comparison is computed in code first
+(stock_facts / crypto_facts / prediction_facts and informed_facts); the state carries booleans only and the
+questions contain no digits apart from the risk choice labels. Every call is logged by
+systemone_hotpath_client.ask (instance list pin, loopback, typed contract, NaN coercion, latency budget) with
+the source key "decide:elephant-1@q8_0:<source>" (systemone_pin.SOURCE_PREFIX; it names the model, so no
+record of another model is ever mixed in) and the code's own decision in `label`.
 
 Modes (env VALEDIA_NIMBLE_MODE_STOCK / _CRYPTO / _PREDICTION, else
 VALEDIA_NIMBLE_MODE, else shadow):
 - off:    no call, allow True.
 - shadow: call when VALEDIA_SYSTEMONE=1, compute + stamp the veto rule, allow ALWAYS True.
-- veto:   allow only when the veto rule below passes. Engine off, error, refusal, digest
-          mismatch or timeout → allow False (fail-closed).
+- veto:   allow only when the veto rule below passes. Engine off, error, refusal, a failed
+          instance check or timeout → allow False (fail-closed).
 Exits (side sell/exit/close, or candidate action sell / exit True) are never blocked and
 never sent. Veto only removes an order; it never adds, sizes, flips or reprices one.
 
-Confidence semantics (verified on Burton's Mac): `confidence` = 1 - normalized entropy of
-`probabilities` (sharpness), NOT P(chosen): buy .4765 / skip .5235 → confidence .00159.
+Confidence semantics: the typed contract's `confidence` is read as given (sharpness, NOT P(chosen));
+it is never replaced by a probability.
 Veto rule (entries only): allow iff action == "buy" and confidence >= min_sharpness (only a
 "not a coin flip" floor) and p_cal >= required_p, where
   min_sharpness  VALEDIA_NIMBLE_MIN_SHARPNESS (0.05); old VALEDIA_NIMBLE_MIN_CONF is ignored;
-  p_cal          calibration_ledger.calibrate("nimble_decide:<source>", p_buy): identity under
-                 30 scorable decisions, then isotonic (`calibration` records which);
+  p_cal          calibration_ledger.calibrate_ex("decide:elephant-1@q8_0:<source>", p_buy): HELD
+                 (None, `untrained_hold`, so veto gives veto_no_p_buy) until a map fitted on >= 30
+                 scorable rows under that same key exists, then isotonic; an error gives None
+                 (`unavailable`). No map of another model's rows is ever applied;
   required_p     max(VALEDIA_NIMBLE_P_FLOOR (0.60), break_even_p + margin), floor if unknown;
   margin         VALEDIA_NIMBLE_BASE_MARGIN (0.02) * phi_multiplier;
   phi_multiplier 0.5 + 2.5 * (1 - rf), rf = valedia_config._risk_factor(), the SAME Etherion
@@ -171,12 +173,8 @@ def many_cap_s():
 
 
 def warm(post=None, get=None, timeout=None):
-    """systemone warmup once per process (cold-load timeout unless given). None if skipped."""
-    global _WARMED
-    if _WARMED or s1._WARM or not s1.enabled() or s1._pin._raw_model() == s1._v3.TAG:
-        return None
-    _WARMED = True
-    return s1.warmup(post=post, timeout=timeout, get=get)
+    """No warmup request: the shared instance is loaded and kept by another program. Always None."""
+    return None
 
 
 # ---------------------------------------------------------------- fact builders
@@ -341,22 +339,20 @@ def apply_rule(action, confidence, p_cal, rule):
 
 
 def _cal_source(source):
-    base = "nimble_decide:%s" % source
-    return ("nimble_decide:v3:%s:%s" % (s1._v3.MANIFEST_SHA256, source)
-            if s1.model_pin() == s1._v3.TAG else base)
+    """The decision's source key; it names the model (systemone_pin.SOURCE_PREFIX)."""
+    return "%s:%s" % (s1._pin.SOURCE_PREFIX or "decide:unavailable", source)
 
 
 def _calibrate(source, p_buy):
+    """Held (p_cal None) until a map fitted on rows under this same key exists; error -> unavailable."""
     try:
         import calibration_ledger as cl
         result = cl.calibrate_ex(source, p_buy)
-        if s1.model_pin() == s1._v3.TAG and result.get("calibration") != "isotonic":
-            return {"p_cal": None, "calibration": "untrained_v3_identity_hold", "n": result.get("n", 0)}
+        if result.get("calibration") != "isotonic":
+            return {"p_cal": None, "calibration": "untrained_hold", "n": result.get("n", 0)}
         return result
     except Exception:
-        if s1.model_pin() == s1._v3.TAG:
-            return {"p_cal": None, "calibration": "unavailable"}
-        return {"p_cal": p_buy, "calibration": "identity"}
+        return {"p_cal": None, "calibration": "unavailable"}
 
 
 # ---------------------------------------------------------------- decide
@@ -366,9 +362,7 @@ def _parse(body):
     choice = str(act.get("choice") or "").strip().lower()
     action = choice if choice in ACTIONS else None
     probs = s1._probs(act.get("probabilities"))
-    conf = _num(act.get("confidence"))
-    if conf is None and action and probs and s1.model_pin() != s1._v3.TAG:
-        conf = probs.get(action)
+    conf = _num(act.get("confidence"))  # typed: read as given, never filled from a probability
     if conf is not None and not 0.0 <= conf <= 1.0:
         conf = None
     # confidence is 1 - normalized entropy, not P(chosen): record the real odds beside it.

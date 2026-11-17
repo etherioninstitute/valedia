@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""Nimble System One shadow client. Loopback Ollama only. Fail-open.
+"""System One shadow client (named for the first model, Nimble): the shared Elephant-1 instance on the
+loopback LM Studio, and nothing else. Fail-closed on the pin, fail-open for the scan.
 
-VALEDIA_SYSTEMONE=1 turns the movers scan onto POST /v1/systemone.
-Default off. Model pin is Nimble 2 (Bespoke-Nimble-9B-v2, 8192 ctx).
-Nimble v1 tags and Tev1, including Tev1-0.8B, are refused and never
-posted. Burton's Nimble 2 is the Ollama tag `nimble:latest` (digest
-24e550a16a70, confirmed 2026-10-01). A floating `latest` tag can change on
-the next pull, so `nimble:latest` and bare `nimble` are accepted ONLY while
-/api/tags shows a digest starting with NIMBLE2_DIGEST (digest pin). Code still owns the fee-true label and the would-have size.
-This module never places an order. A down server returns a stub and
-the scan continues.
+VALEDIA_SYSTEMONE=1 turns the chain on (POST <decision_model.URL>/v1/systemone). Default off: no request at
+all. The pin is systemone_pin's list test of the shared module (exactly one right instance). Only two URLs are
+ever requested: the model list (GET) and the typed call (POST). The request names decision_model.INSTANCE, the
+reply's `model` must equal it, and the reply is checked by the pinned typed parser (systemone_v3_candidate,
+given the reply with `model` set to its own TAG). The client never loads or unloads a model: the instance is
+loaded and kept by the order-book collector, so there is no warmup request. An injected `post` is not honoured
+on the typed call; an injected `get` for the read-only list check is. Code still owns the fee-true label and
+the would-have size. This module never places an order. A down server returns a stub and the scan continues.
 
-Gates live in code, not in the model call. Nimble 2 is weak at arithmetic
-and counting, so every threshold and comparison is computed in code
-(facts()) and the questions only refer to those facts, with no numbers.
-Every call is logged, yes and no alike, to an append-only decisions.jsonl.
+Gates live in code, not in the model call. Every threshold and comparison is computed in code (facts()) and the
+questions only refer to those facts, with no numbers. Every call is logged, yes and no alike, to an
+append-only decisions.jsonl.
 """
 from __future__ import annotations
 
@@ -52,15 +51,6 @@ def _bounded_json(resp):
             todo.extend((v, depth + 1) for v in node)
     return value
 
-def _steward_decision_post(payload, timeout):
-    """Nimble v3 typed decision through loopback Ollama: no redirects, bounded response."""
-    _check_url(DECIDE_URL)
-    data = json.dumps(payload, allow_nan=False).encode()
-    req = urllib.request.Request(
-        DECIDE_URL, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    with _HTTP.open(req, timeout=timeout) as resp:
-        return _bounded_json(resp)
-
 def synthetic_smoke(get=None):
     """One exact, nonfinancial fixture through the same admitted client path."""
     if SMOKE_STATE != {"symbol": "SYNTHETIC", "create_order": False} or SMOKE_QUESTIONS != {
@@ -72,28 +62,17 @@ def synthetic_smoke(get=None):
 
 from systemone_log import budget_ms, finite_tree, log_decision, log_path  # noqa: F401
 
-HOST = "127.0.0.1"
-PORT = 11434
-# Nimble 2 = Hugging Face bespokelabs/Bespoke-Nimble-9B-v2 (release
-# Bespoke-Nimble-9B-v2, 8192 ctx). On Burton's Mac it is the Ollama tag
-# `nimble:latest`, digest 24e550a16a70 (`ollama list`: 9.5 GB; Burton
-# confirmed 2026-10-01). Override the tag with VALEDIA_SYSTEMONE_MODEL.
-# Pin and digest-pin logic lives in systemone_pin (pure move, re-exported here).
+# The pin lives in systemone_pin (re-exported here); the shared module is reached through it, by file.
 from systemone_pin import (  # noqa: F401,E402
-    DIGEST_ENV, DIGEST_RETRY_S, MODEL_DEFAULT, NIMBLE2_DIGEST, _DIGEST, _FLOATING, _V2_BANNED,
-    _V2_RE, _digest_from_tags, _digest_key, _digest_set, _raw_model, _reset_digest,
-    configured_model, digest_prefix, digest_status, is_floating_nimble, is_nimble2, model_pin,
-    pin_refusal)
+    CHECK_RETRY_S, LIST_URL, _raw_model, _reset_check, check_status, configured_model, model_pin,
+    pin_refusal, refusal_reason)
 import systemone_pin as _pin  # noqa: E402
-import systemone_v3_candidate as _v3
+import systemone_v3_candidate as _v3  # noqa: E402  (the pinned typed parser, unchanged)
 
-DECIDE_URL = "http://127.0.0.1:11434/v1/systemone"
-VERSION_URL = "http://127.0.0.1:11434/api/version"
-TAGS_URL = _pin.TAGS_URL
-ALLOWED_URLS = frozenset({DECIDE_URL, VERSION_URL, TAGS_URL})
-TIMEOUT_S = 120.0  # ponytail: cold 9B load; warm calls are far under this
-KEEP_ALIVE = "10m"
-_WARM = False  # a successful call this process: the model is resident
+DECIDE_URL = _pin.dm.URL + "/v1/systemone" if _pin.dm is not None else ""
+ALLOWED_URLS = frozenset(u for u in (DECIDE_URL, LIST_URL) if u)
+TIMEOUT_S = 60.0  # the typed call's deadline: 0 < timeout <= TIMEOUT_S
+_WARM = False  # a successful call this process
 
 # Same three judgments as packs/valedia-paper-v1. Stamp only. No numbers and
 # no comparisons live here: the state carries code-computed `facts` booleans
@@ -156,13 +135,13 @@ _INFORMED_PATHS = (
 
 
 def enabled():
-    # Explicit opt-in only (owner direction 2026-11-10: serve Nimble through Ollama). Shadow path.
+    # Explicit opt-in only. Shadow path. Nothing in the repository sets it.
     return os.environ.get("VALEDIA_SYSTEMONE") == "1"
 
 
-def verify_digest(get=None, timeout=3.0, force=False):
-    """Verify the model digest via /api/tags (see systemone_pin). Cached per process."""
-    return _pin.verify_digest(get or _get, timeout, force)
+def verify_instance(get=None, timeout=3.0, force=False):
+    """The pin's list check (systemone_pin.verify) through `get` or this module's own GET. Cached."""
+    return _pin.verify(get or _get, timeout, force)
 
 
 
@@ -213,7 +192,7 @@ def _flags(row, informed):
 
 
 def _finite(value):
-    """Ollama rejects NaN/Infinity. Missing print is null, not a token."""
+    """Strict JSON rejects NaN/Infinity. Missing print is null, not a token."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return value
     if isinstance(value, float) and not math.isfinite(value):
@@ -305,30 +284,14 @@ def _answers(body):
     }
 
 
-def _version_ok(version):
-    parts = []
-    for piece in str(version or "").split("."):
-        num = ""
-        for ch in piece:
-            if ch.isdigit():
-                num += ch
-            else:
-                break
-        if not num:
-            break
-        parts.append(int(num))
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts[:3]) >= (0, 35, 0)
-
-
-def _check_url(url):
-    if url not in ALLOWED_URLS:
-        raise ValueError("refusing non-loopback systemone url")
+def _check_url(url, allowed=None):
+    if not url or url not in ALLOWED_URLS or allowed is not None and url != allowed:
+        raise ValueError("refusing systemone url")
 
 
 def _post(url, payload, timeout):
-    _check_url(url)
+    """The module's own transport for the typed call: that one URL, no redirects, bounded response."""
+    _check_url(url, DECIDE_URL)
     data = json.dumps(payload, allow_nan=False).encode()
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}, method="POST")
@@ -337,28 +300,19 @@ def _post(url, payload, timeout):
 
 
 def _get(url, timeout):
-    _check_url(url)
+    """The module's own GET: the model list only."""
+    _check_url(url, LIST_URL)
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
     with _HTTP.open(req, timeout=timeout) as resp:
         return _bounded_json(resp)
 
 
-def _response_model_ok(body, pin):
-    if pin == _v3.TAG:
-        return isinstance(body, dict) and body.get("model") == pin
-    got = (body or {}).get("model") or pin
-    if is_nimble2(got):
-        return True
-    # A floating answer name is fine only when the pin itself is the
-    # digest-verified floating tag; a v1 name never is.
-    return is_floating_nimble(got) and is_floating_nimble(pin) and model_pin() == pin
-
-
 def ask(state, questions, *, source, label=None, post=None, timeout=None, parse=None, get=None):
-    """One loopback shadow call. Always logged. Never raises.
+    """One loopback typed call to the shared instance. Always logged. Never raises.
 
-    Returns {pin, body, error, answers, cold, latency_ms, within_budget}.
-    error is None only when a model answer came back from an allowed pin.
+    Returns {pin, body, error, answers, cold, latency_ms, within_budget}. error is None only when a typed
+    answer came back from the instance. `post` is accepted and NOT honoured: the call goes through this
+    module's own `_post`. `get` (the read-only list check) is honoured. timeout: 0 < timeout <= TIMEOUT_S.
     """
     # Direct callers, including synthetic_smoke, must not bypass enabled().
     if not enabled():
@@ -368,47 +322,38 @@ def ask(state, questions, *, source, label=None, post=None, timeout=None, parse=
     state = finite_tree(state)
     t0 = time.perf_counter()
     start = time.monotonic()
-    pin = None
     res = {"pin": None, "body": None, "error": None, "answers": None, "cold": not _WARM}
     try:
-        verify_digest(get)  # read-only provenance check; bounded by the same v3 deadline
+        verify_instance(get)  # read-only list check; bounded by the same deadline
         pin = model_pin()
         res["pin"] = pin or None
         if not pin:
             res["error"] = pin_refusal() or "model_refused"
+            res["refusal"] = refusal_reason()
         else:
-            payload = (_v3.make_request(state, questions, tag=pin) if pin == _v3.TAG else
-                       {"model": pin, "state": state, "questions": questions})
-            if pin == _v3.TAG:
-                if timeout is not None and not 0 < timeout <= 60:
-                    raise ValueError("v3 deadline must be at most 60s")
-            else:
-                payload["keep_alive"] = KEEP_ALIVE
-            if pin == _v3.TAG:
-                # An injected post never bypasses Steward on the v3 path.
-                duration = 60 if timeout is None else timeout
-                remaining = duration - (time.monotonic() - start)
-                if remaining <= 0:
-                    raise TimeoutError("client admission deadline elapsed")
-                body = _steward_decision_post(payload, remaining)
-            else:
-                body = (post or _post)(DECIDE_URL, payload, TIMEOUT_S if timeout is None else timeout)
+            duration = TIMEOUT_S if timeout is None else timeout
+            if not 0 < duration <= TIMEOUT_S:
+                raise ValueError("the typed call's deadline must be at most %ds" % TIMEOUT_S)
+            payload = _v3.make_request(state, questions, tag=_v3.TAG)  # the typed contract's checks
+            payload["model"] = pin                                      # the request names the instance
+            remaining = duration - (time.monotonic() - start)
+            if remaining <= 0:
+                raise TimeoutError("client admission deadline elapsed")
+            body = _post(DECIDE_URL, payload, remaining)  # never an injected transport
             res["body"] = body
             if not isinstance(body, dict):
                 res["error"] = "bad_response"
-            elif not _response_model_ok(body, pin):
+            elif body.get("model") != pin:
                 res["error"] = "model_refused"
             elif "answers" not in body:
                 res["error"] = "no_answers"
-            elif pin == _v3.TAG:
-                typed = _v3.parse_response(body, questions)
+            else:
+                typed = _v3.parse_response(dict(body, model=_v3.TAG), questions)
                 res["typed_answers"] = typed["answers"]
                 res["answers"] = typed["answers"]
                 res["usage"] = typed["usage"]
                 if parse:
                     res["answers"] = parse({"answers": typed["answers"]})
-            elif parse:
-                res["answers"] = parse(body)
     except Exception as e:
         res["error"] = type(e).__name__
     res["latency_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
@@ -421,11 +366,8 @@ def ask(state, questions, *, source, label=None, post=None, timeout=None, parse=
 
 
 def warmup(post=None, timeout=None, get=None):
-    """One tiny call so the model is resident (keep_alive). Once per scan."""
-    if not enabled() or _pin._raw_model() == _v3.TAG:
-        return None
-    return ask({"symbol": "warmup", "create_order": False}, WARM_QUESTIONS,
-               source="warmup", post=post, timeout=timeout, get=get)
+    """No request: the shared instance is loaded and kept by another program. Kept for its callers."""
+    return None
 
 
 def decide(state, post=None, timeout=None, label=None, source="movers_scan", get=None):
@@ -462,64 +404,19 @@ def decide(state, post=None, timeout=None, label=None, source="movers_scan", get
 
 
 def health(get=None, timeout=3.0):
-    """Version + tags only. Does not send a decide.
+    """The list check only (forced). Does not send a typed call. Off: no request at all.
 
-    For the floating `nimble:latest` it also checks the digest pin against
-    /api/tags and caches the verdict for this process (digest field).
-    """
-    fn = get or _get
-    raw = _raw_model()
-    try:
-        ver_body = fn(VERSION_URL, timeout)
-        tags_body = fn(TAGS_URL, timeout)
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": type(e).__name__,
-            "version": None,
-            "model_present": False,
-            "model": configured_model() or None,
-            "digest": digest_status(raw),
-            "mode": "shadow",
-            "enforcement": "none",
-        }
-    version = str((ver_body or {}).get("version") or "") if isinstance(ver_body, dict) else ""
-    names = []
-    if isinstance(tags_body, dict):
-        for row in tags_body.get("models") or []:
-            if isinstance(row, dict) and row.get("name"):
-                names.append(str(row["name"]))
-    pin = configured_model().lower()
-    # Ollama lists an untagged pull as <name>:latest.
-    want = {pin, pin + ":latest"} if pin and ":" not in pin.rsplit("/", 1)[-1] else {pin}
-    present = bool(pin) and any(n.lower() in want for n in names)
-    digest = None
-    if present and raw == _v3.TAG:
-        digest = _pin.verify_digest(fn, timeout, force=True)
-    elif present and is_floating_nimble(raw):
-        digest = _digest_set(raw, _digest_from_tags(tags_body))
-    elif is_floating_nimble(raw):
-        digest = digest_status(raw)
-    digest_ok = digest in (None, "ok")
-    ready = (_v3.version_ok(version) if raw == _v3.TAG else _version_ok(version)) and present and digest_ok
-    if ready:
-        err = None
-    elif not (_v3.version_ok(version) if raw == _v3.TAG else _version_ok(version)):
-        err = "version"
-    elif not present:
-        err = "model_missing"
-    else:
-        err = digest
-    return {
-        "ok": ready,
-        "error": err,
-        "version": version,
-        "model_present": present,
-        "model": configured_model() or None,
-        "digest": digest,
-        "mode": "shadow",
-        "enforcement": "none",
-    }
+    ok is the list check; `version` stays as a key and is None (no version endpoint is allowed)."""
+    out = {"ok": False, "error": None, "version": None, "model_present": False,
+           "model": configured_model() or None, "instance_check": None, "mode": "shadow",
+           "enforcement": "none"}
+    if not enabled():
+        out["error"] = "systemone_disabled"
+        return out
+    status = verify_instance(get, timeout, force=True)
+    out.update(ok=status == "ok", error=None if status == "ok" else status,
+               model_present=status in ("ok", "instance_wrong"), instance_check=status)
+    return out
 
 
 def summary(ranked, informed=None):
@@ -554,7 +451,7 @@ def summary(ranked, informed=None):
         "enforcement": "none",
         "create_order": False,
         "model": configured_model() or None,
-        "digest": digest_status(),
+        "instance_check": check_status(),
         "judge": "dont_trade",
         "n_ok": len(ok),
         "n": len(rows),

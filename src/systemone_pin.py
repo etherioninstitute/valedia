@@ -1,211 +1,156 @@
-"""Nimble 2 pin and digest pin for the System One shadow client. Fail-open.
+"""Pin for the System One shadow client: the one shared Elephant-1 instance on LM Studio. Fail-closed.
 
-Pure move out of systemone_hotpath_client (kept under the 500-line rule); the
-client re-exports every name here. Explicit Nimble 2 tags pass by name. The
-floating `nimble:latest` / bare `nimble` pass ONLY while GET /api/tags shows a
-digest starting with NIMBLE2_DIGEST (Burton's Nimble 2, confirmed 2026-10-01).
-Never places an order. No network of its own: the caller passes the getter.
+Named for the first model this chain spoke to; it now knows exactly one decision model, the shared instance
+described by `valedia_trader/core/decision_model.py`. That module is loaded here BY FILE, from the copy in the
+same tree as this `src/` file (any interpreter, nothing put on sys.path, never raises at import). If it does not
+load, every pin refuses with a one-line reason. Its constants and its list test are used as they are; none is
+copied here.
+
+The pin is the shared module's list test: `GET <decision_model.URL>/api/v1/models` shows exactly one right
+instance (`_wrong_found` is None). A passed check is trusted for check_ttl() seconds (env
+VALEDIA_SYSTEMONE_DIGEST_TTL_S, the name kept from the first model); a failed one is not retried inside
+CHECK_RETRY_S. `VALEDIA_SYSTEMONE_MODEL` unset or `elephant-1` is accepted, any other value is refused.
+`VALEDIA_SYSTEMONE_DIGEST` is ignored (one deprecation line, once). Never loads or unloads a model, never places
+an order. No network of its own: the caller passes the getter.
 """
 from __future__ import annotations
 
+import importlib.util
 import os
-import re
+import sys
 import time
+from pathlib import Path
 
-from systemone_v3_candidate import TAG as V3_TAG, pinned_tag as v3_pinned_tag
-
-MODEL_DEFAULT = "nimble-v3:9b-mxfp8"  # Activated after one Steward-owned synthetic transaction.
-TAGS_URL = "http://127.0.0.1:11434/api/tags"
-VERSION_URL = "http://127.0.0.1:11434/api/version"
-
-# Digest pin for the floating tag. `ollama list` shows the first 12 hex chars
-# of the sha256 that /api/tags returns in models[].digest. Env override for a
-# deliberate re-pin: VALEDIA_SYSTEMONE_DIGEST (hex prefix, at least 12 chars).
-NIMBLE2_DIGEST = "24e550a16a70"
-DIGEST_ENV = "VALEDIA_SYSTEMONE_DIGEST"
-DIGEST_RETRY_S = 30.0  # a failed digest check is not retried inside this window
-# A passed check expires too, so a later re-pull with another digest is caught.
-# Env override (seconds, > 0): VALEDIA_SYSTEMONE_DIGEST_TTL_S.
-DIGEST_OK_TTL_S = 300.0
-DIGEST_TTL_ENV = "VALEDIA_SYSTEMONE_DIGEST_TTL_S"
-# Explicit Nimble 2 names only. Full-match, case-insensitive. The floating
-# tags (nimble, nimble:latest) are NOT here: they pass only via the digest pin.
-# v1 tags (nimble:9b, nimble:1, ...) match nothing and stay refused.
-_TAG = r"[a-z0-9][a-z0-9._-]*"
-_QUANT = r"(?:q\d[a-z0-9_]*|iq\d[a-z0-9_]*|fp16|fp32|bf16|f16|f32|int4|int8)"
-_V2_RE = re.compile(
-    r"nimble2(?::" + _TAG + r")?"                        # nimble2, nimble2:<tag>
-    r"|nimble:(?:2|v2|9b-v2)(?:-" + _QUANT + r")?"       # nimble:2, :v2, :9b-v2 [+ quant]
-    # Release name, bare or under the vendor namespace only. Other namespaces
-    # and hosts have no provenance here, so they are refused.
-    r"|(?:(?:hf\.co/)?bespokelabs/)?bespoke-nimble-9b-v2(?::" + _TAG + r")?"
-)
-_FLOATING = ("nimble", "nimble:latest")  # Ollama resolves bare `nimble` to :latest
-_V2_BANNED = ("v1", "tev", "0.8")
-# Digest verification of a floating tag, cached per process:
-# {"key": (tag, prefix), "status": "ok"|"digest_mismatch"|"digest_unverified", "ts": t}
-_DIGEST = {"key": None, "status": None, "ts": 0.0}
-_V3 = {"status": "digest_unverified", "ts": 0.0}
+DM_PATH = Path(__file__).resolve().parent.parent / "valedia_trader" / "core" / "decision_model.py"
 
 
-def is_nimble2(name):
-    """True for an EXPLICIT Nimble 2 tag only (case-insensitive). Never v1, never Tev.
-
-    Stateless. The floating `nimble:latest` / `nimble` are False here: they
-    pass only through the digest pin (is_floating_nimble + verify_digest).
-    """
-    low = str(name or "").strip().lower()
-    if not low or any(bad in low for bad in _V2_BANNED):
-        return False
-    return _V2_RE.fullmatch(low) is not None
-
-
-def is_floating_nimble(name):
-    """True for `nimble:latest` or bare `nimble` (the digest-pinned candidates)."""
-    return str(name or "").strip().lower() in _FLOATING
+def _load_dm(path=DM_PATH):
+    """(module, None) or (None, one-line reason). Never raises."""
+    try:
+        spec = importlib.util.spec_from_file_location("valedia_decision_model_by_file", path)
+        if spec is None or spec.loader is None:
+            return None, "decision model file not loadable: %s" % path
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for name in ("URL", "KEY", "INSTANCE", "QUANT", "_instances", "_wrong_found"):
+            getattr(mod, name)
+        return mod, None
+    except Exception as e:  # missing, unreadable or broken: the pin refuses
+        return None, "decision model file not loaded (%s): %s" % (type(e).__name__, path)
 
 
-def digest_prefix():
-    """Pinned digest hex prefix (env VALEDIA_SYSTEMONE_DIGEST). "" if unusable."""
-    raw = os.environ.get(DIGEST_ENV, NIMBLE2_DIGEST).strip().lower()
-    if raw.startswith("sha256:"):
-        raw = raw[7:]
-    return raw if re.fullmatch(r"[0-9a-f]{12,64}", raw) else ""
+dm, DM_ERROR = _load_dm()
+
+MODEL_ENV = "VALEDIA_SYSTEMONE_MODEL"
+DEPRECATED_ENV = "VALEDIA_SYSTEMONE_DIGEST"     # ignored since the port to the shared instance
+TTL_ENV = "VALEDIA_SYSTEMONE_DIGEST_TTL_S"      # the cache window's override, name kept
+CHECK_RETRY_S = 30.0   # a failed list check is not retried inside this window
+CHECK_OK_TTL_S = 300.0  # a passed check expires too, so a later change of the instance is caught
+LIST_URL = dm.URL + "/api/v1/models" if dm is not None else ""
+# Source key prefix of a decision: names the model, so no record of another model is ever mixed in.
+SOURCE_PREFIX = "decide:%s@%s" % (dm.INSTANCE, dm.QUANT.lower()) if dm is not None else ""
+
+_CHECK = {"status": None, "why": None, "ts": 0.0}
+_NOTED = {"deprecated": False}
+
+
+def _note_deprecated():
+    if os.environ.get(DEPRECATED_ENV, "").strip() and not _NOTED["deprecated"]:
+        _NOTED["deprecated"] = True
+        print("systemone_pin: %s is ignored: the pin is the shared instance's list test" % DEPRECATED_ENV,
+              file=sys.stderr)
 
 
 def _raw_model():
-    return os.environ.get("VALEDIA_SYSTEMONE_MODEL", MODEL_DEFAULT).strip()
+    return os.environ.get(MODEL_ENV, "").strip()
 
 
 def configured_model():
-    """The configured tag if it could be Nimble 2 (explicit v2 or floating). Else ""."""
-    raw = _raw_model()
-    return raw if raw == V3_TAG or is_nimble2(raw) or is_floating_nimble(raw) else ""
+    """The instance name when the env allows it (unset or the instance name), else ""."""
+    _note_deprecated()
+    if dm is None:
+        return ""
+    return dm.INSTANCE if _raw_model() in ("", dm.INSTANCE) else ""
 
 
-def _digest_key(raw):
-    return ("nimble:latest", digest_prefix()) if is_floating_nimble(raw) else None
-
-
-def _digest_from_tags(tags_body):
-    """Compare the local digest of nimble:latest with the pin. Pure."""
-    prefix = digest_prefix()
-    if not prefix or not isinstance(tags_body, dict):
-        return "digest_unverified"
-    rows = [r for r in (tags_body.get("models") or []) if isinstance(r, dict)
-            and "nimble:latest" in (str(r.get("name") or "").strip().lower(),
-                                    str(r.get("model") or "").strip().lower())]
-    digs = [str(r.get("digest") or "").strip().lower() for r in rows]
-    digs = [d[7:] if d.startswith("sha256:") else d for d in digs]
-    digs = [d for d in digs if d]
-    if not digs:
-        return "digest_unverified"
-    return "ok" if any(d.startswith(prefix) for d in digs) else "digest_mismatch"
-
-
-def digest_ok_ttl():
-    """Seconds a passed digest check stays valid. Bad or non-positive env: the default."""
+def listing_status(listing):
+    """(status, why) for a model list: ok / instance_missing / instance_wrong / instance_unverified. Pure."""
     try:
-        v = float(os.environ.get(DIGEST_TTL_ENV, DIGEST_OK_TTL_S))
+        _, found = dm._instances(listing)
+        if not found:
+            return "instance_missing", "no loaded instance named %s" % dm.INSTANCE
+        why = dm._wrong_found(found)
+    except Exception as e:
+        return "instance_unverified", "model list malformed: %s" % (str(e)[:80] or type(e).__name__)
+    return ("instance_wrong", why) if why else ("ok", None)
+
+
+def check_ttl():
+    """Seconds a passed check stays valid. Bad or non-positive env: the default."""
+    try:
+        v = float(os.environ.get(TTL_ENV, CHECK_OK_TTL_S))
     except (TypeError, ValueError):
-        return DIGEST_OK_TTL_S
-    return v if v > 0 and v == v and v != float("inf") else DIGEST_OK_TTL_S
+        return CHECK_OK_TTL_S
+    return v if v > 0 and v == v and v != float("inf") else CHECK_OK_TTL_S
 
 
-def _fresh_ok():
-    return _DIGEST["status"] == "ok" and time.monotonic() - _DIGEST["ts"] < digest_ok_ttl()
+def _reset_check():
+    _CHECK.update(status=None, why=None, ts=0.0)
 
 
-def _digest_set(raw, status):
-    _DIGEST.update(key=_digest_key(raw), status=status, ts=time.monotonic())
+def check_status():
+    """Cached list-check status. Reads the cache only; a passed check older than check_ttl() is unverified."""
+    st = _CHECK["status"]
+    if st is None or st == "ok" and time.monotonic() - _CHECK["ts"] >= check_ttl():
+        return "instance_unverified"
+    return st
+
+
+def verify(get, timeout=3.0, force=False):
+    """Run the list check through `get(url, timeout)` (the caller's transport). Cached. Never raises.
+
+    No request when the decision model file did not load or the env names another model."""
+    if dm is None:
+        return "decision_model_unavailable"
+    if not configured_model():
+        return "model_refused"
+    st, age = _CHECK["status"], time.monotonic() - _CHECK["ts"]
+    if not force and st is not None and (st == "ok" and age < check_ttl() or st != "ok" and age < CHECK_RETRY_S):
+        return st
+    try:
+        status, why = listing_status(get(LIST_URL, timeout))
+    except Exception as e:
+        status, why = "instance_unverified", "model list unreachable: %s" % type(e).__name__
+    _CHECK.update(status=status, why=why, ts=time.monotonic())
     return status
 
 
-def _reset_digest():
-    _DIGEST.update(key=None, status=None, ts=0.0)
-    _V3.update(status="digest_unverified", ts=0.0)
-
-
-def digest_status(raw=None):
-    """Cached status for the configured floating tag: ok / digest_mismatch / digest_unverified.
-
-    None for an explicit v2 tag (no digest needed). Reads the cache only. A passed
-    check older than digest_ok_ttl() reads as digest_unverified until re-verified.
-    """
-    raw = _raw_model() if raw is None else raw
-    if raw == V3_TAG:
-        return _V3["status"] if _V3["status"] != "ok" or time.monotonic() - _V3["ts"] < digest_ok_ttl() else "digest_unverified"
-    key = _digest_key(raw)
-    if key is None:
-        return None
-    if _DIGEST["key"] != key or not _DIGEST["status"]:
-        return "digest_unverified"
-    if _DIGEST["status"] == "ok" and not _fresh_ok():
-        return "digest_unverified"
-    return _DIGEST["status"]
-
 def model_pin():
-    """Pin to POST, or "" (the caller must not POST). Never touches the network.
-
-    Explicit Nimble 2 passes as before. `nimble:latest` / `nimble` pass only if
-    this process already verified the digest (verify_digest / health / ask).
-    """
-    raw = _raw_model()
-    if raw == V3_TAG and digest_status(raw) == "ok":
-        return raw
-    if is_nimble2(raw):
-        return raw
-    if is_floating_nimble(raw) and digest_status(raw) == "ok":
-        return raw
-    return ""
+    """The instance name to call, or "" (the caller must not call). Never touches the network."""
+    if dm is None or not configured_model():
+        return ""
+    return dm.INSTANCE if check_status() == "ok" else ""
 
 
 def pin_refusal():
-    """Why model_pin() is empty: model_refused, digest_unverified, digest_mismatch."""
-    raw = _raw_model()
-    if raw == V3_TAG:
-        status = digest_status(raw)
-        return None if status == "ok" else status
-    if is_nimble2(raw):
+    """Why model_pin() is empty (None when it is not): decision_model_unavailable, model_refused, or the
+    list check's status."""
+    if model_pin():
         return None
-    if is_floating_nimble(raw):
-        status = digest_status(raw)
-        return None if status == "ok" else status
-    return "model_refused"
+    if dm is None:
+        return "decision_model_unavailable"
+    if not configured_model():
+        return "model_refused"
+    return check_status()
 
 
-def verify_digest(get, timeout=3.0, force=False):
-    """Verify the floating tag's digest via GET /api/tags. Cached per process.
-
-    ok is cached for digest_ok_ttl() (then re-verified); a failure is cached for
-    DIGEST_RETRY_S so a scan does not hammer /api/tags. Never raises.
-    None for an explicit v2 tag. `get(url, timeout)` is the caller's transport.
-    """
-    raw = _raw_model()
-    if raw == V3_TAG:
-        if not force and (_V3["status"] == "ok" and digest_status(raw) == "ok" or
-                          _V3["status"] != "ok" and time.monotonic() - _V3["ts"] < DIGEST_RETRY_S):
-            return _V3["status"]
-        try:
-            version = get(VERSION_URL, timeout)
-            tags = get(TAGS_URL, timeout)
-            if not isinstance(version, dict) or not isinstance(tags, dict):
-                status = "digest_unverified"
-            else:
-                status = "ok" if v3_pinned_tag(tags, version.get("version")) else "digest_mismatch"
-        except Exception:
-            status = "digest_unverified"
-        _V3.update(status=status, ts=time.monotonic())
-        return status
-    key = _digest_key(raw)
-    if key is None:
+def refusal_reason():
+    """One line saying why the pin refuses, or None."""
+    code = pin_refusal()
+    if code is None:
         return None
-    if not force and _DIGEST["key"] == key and _DIGEST["status"]:
-        if _fresh_ok() or (_DIGEST["status"] != "ok"
-                           and time.monotonic() - _DIGEST["ts"] < DIGEST_RETRY_S):
-            return _DIGEST["status"]
-    try:
-        body = get(TAGS_URL, timeout)
-    except Exception:
-        return _digest_set(raw, "digest_unverified")
-    return _digest_set(raw, _digest_from_tags(body))
+    if code == "decision_model_unavailable":
+        return DM_ERROR
+    if code == "model_refused":
+        return "%s=%r is refused: only %s is accepted" % (MODEL_ENV, _raw_model()[:60], dm.INSTANCE)
+    return "%s: %s" % (code, _CHECK["why"] or "the list check has not passed")

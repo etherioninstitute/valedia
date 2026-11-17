@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Wiring helpers: Nimble 2 (nimble_decide) at every stock + crypto entry point.
+"""Wiring helpers: the decision layer (nimble_decide) at every stock + crypto entry point.
+
+Named for the first model, Nimble; the one decision model is the shared Elephant-1 instance.
 
 One call per ENTRY candidate, at the LAST step before a buy / paper fill, after
 every existing code gate passed. The code's decision is never changed in shadow

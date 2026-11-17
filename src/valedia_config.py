@@ -328,7 +328,8 @@ def self_adjust_enabled():
 def systemone_enabled():
     """Same switch as systemone_hotpath_client.enabled(): env VALEDIA_SYSTEMONE == "1".
 
-    Nimble 2 (loopback, digest-pinned) is the only decision model. Off: zero calls.
+    The shared Elephant-1 instance on the loopback LM Studio (list-pinned) is the only decision
+    model. Off: zero calls.
     """
     return _os.environ.get("VALEDIA_SYSTEMONE") == "1"
 
@@ -927,8 +928,8 @@ def controls_snapshot():
          "tag_prior-alone is never create-eligible. Env cannot enable. "
          "US writes stay blocked while POLYMARKET_US_LIVE is off."),
         ("VALEDIA_SYSTEMONE", systemone_enabled(), _src("VALEDIA_SYSTEMONE"), "autonomy",
-         "Nimble 2 is the only decision model (Jev retired). off=zero model calls; "
-         "on=loopback Nimble 2 decide + notes on CONVICTION, weather, MiroFish, movers; "
+         "the shared Elephant-1 instance is the only decision model (Jev retired). off=zero model "
+         "calls; on=loopback Elephant-1 decide + notes on CONVICTION, weather, MiroFish, movers; "
          "notes never gate or size; fail-open; not OMS"),
         ("VALEDIA_SELF_ADJUST", self_adjust_enabled(),
          _src("VALEDIA_SELF_ADJUST"), "autonomy",
