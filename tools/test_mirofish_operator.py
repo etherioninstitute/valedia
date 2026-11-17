@@ -23,6 +23,8 @@ CREATE TABLE heartbeats (id INTEGER PRIMARY KEY, iso TEXT, ts REAL, watched INTE
     kalshi_failures INTEGER, model_calls INTEGER, paused INTEGER);"""
 PICKS_PLIST = '/fake/LaunchAgents/com.valedia.picks.hourly.plist'
 OBSERVER_PID, OBSERVER_START = 5151, 'Mon Nov 16 12:00:05 2026'
+LAUNCHER_PID, LAUNCHER_START = 4242, 'Mon Nov 16 12:00:04 2026'
+LINK_OFF = 'You have disabled LM Link. To re-enable it, run lms link enable.\n'
 
 
 def decision_entry():
@@ -46,21 +48,22 @@ def done(rc=0, out='', err=''):
 
 class FakeLauncher:
     def __init__(self, world, work):
-        self.world, self.work, self.pid, self.returncode = world, Path(work), 4242, None
+        self.world, self.work, self.pid, self.returncode = world, Path(work), LAUNCHER_PID, None
         self.started = world.t
 
     def poll(self):
         w = self.world
         if self.returncode is not None:
             return self.returncode
-        termed = w.procs.get(OBSERVER_PID, {}).get('termed_at')
+        termed = w.procs.get(OBSERVER_PID, {}).get('termed_at') or w.procs.get(LAUNCHER_PID, {}).get('termed_at')
         if (termed is not None and w.t >= termed + w.cleanup_s) or (termed is None and w.t >= self.started + w.run_s):
             receipt = copy.deepcopy(w.receipt)
             if termed is not None:
                 receipt.update(complete=False, failure={'type': 'NativeRefused', 'reason': 'supervisor interrupted'})
             (self.work / 'builder/native-run-receipt.json').write_text(json.dumps(receipt))
             (self.work / 'builder/gateway-ledger.json').write_text(json.dumps(w.ledger))
-            w.procs.pop(OBSERVER_PID, None); self.returncode = 0 if receipt.get('complete') else 1
+            w.procs.pop(OBSERVER_PID, None); w.procs.pop(LAUNCHER_PID, None)
+            self.returncode = 0 if receipt.get('complete') else 1
         return self.returncode
 
     def wait(self, timeout=None):
@@ -100,10 +103,12 @@ class World:
         with sqlite3.connect(self.store) as db:
             db.executescript(SCHEMA)
         self.crew = self.tmp / 'crew'; self.crew.mkdir()
-        self.collector_listed = True; self.beating = True
+        self.collector_listed = True; self.beating = True; self.per_minute = 2
         self.latency = lambda t: 1.2; self.status = lambda t: 'ok'
-        self.picks_loaded = True; self.bootout_rc = 0; self.bootstrap_rc = 0
-        self.link_text = 'LM Link: disabled\n'
+        self.picks_loaded = True; self.bootout_rc = 0; self.bootstrap_rc = 0; self.picks_running = False
+        self.link_text = LINK_OFF; self.link_rc = 0
+        self.write_identity = True; self.pipeline_writes_identity = True; self.launcher_pgid = LAUNCHER_PID
+        self.group_signals = []
         self.free, self.free_after_load, self.pressure, self.swap_mb = 80, 60, 1, 100.0
         self.models = listing(); self.unload_status = 200
         self.procs = {}; self.calls = []; self.http_calls = []; self.signals = []; self.out = []
@@ -125,7 +130,7 @@ class World:
                 self.last_minute += 1; ts = self.last_minute * 60.0
                 if self.beating:
                     db.execute('INSERT INTO heartbeats (ts, paused) VALUES (?, 0)', (ts,))
-                for k in range(2):
+                for k in range(self.per_minute):
                     db.execute('INSERT INTO decisions (decision_ts, status, latency_s, answers_json, raw_response, state_json) '
                                'VALUES (?, ?, ?, ?, ?, ?)', (ts + 1 + k, self.status(ts), self.latency(ts), '{"a":1}', 'x', '{}'))
 
@@ -141,7 +146,7 @@ class World:
     def run(self, argv, cwd=None, env=None, timeout=None):
         argv = [str(a) for a in argv]; self.calls.append(argv)
         if argv[0].endswith('lms') and argv[1:] == ['link', 'status']:
-            return done(0, self.link_text)
+            return done(self.link_rc, self.link_text)
         if argv[:2] == ['/bin/launchctl', 'print']:
             label = argv[2].rsplit('/', 1)[1]
             if label == OP.COLLECTOR_LABEL:
@@ -149,8 +154,9 @@ class World:
             if label == OP.PICKS_LABEL:
                 if not self.picks_loaded:
                     return done(113, '', 'Could not find service')
-                return done(0, 'gui/501/com.valedia.picks.hourly = {\n\tpath = %s\n\tstate = not running\n\targuments = {\n'
-                               '\t\tpicks --token=SECRETKEY\n\t}\n\tstdout path = /x/out.log\n}\n' % PICKS_PLIST)
+                state = 'running\n\tpid = 6161' if self.picks_running else 'not running'
+                return done(0, 'gui/501/com.valedia.picks.hourly = {\n\tpath = %s\n\tstate = %s\n\targuments = {\n'
+                               '\t\tpicks --token=SECRETKEY\n\t}\n\tstdout path = /x/out.log\n}\n' % (PICKS_PLIST, state))
         if argv[:2] == ['/bin/launchctl', 'bootout']:
             if self.bootout_rc == 0:
                 self.picks_loaded = False
@@ -176,6 +182,8 @@ class World:
             if self.stage_rc:
                 return done(self.stage_rc, '', 'refused: fake')
             (work / 'builder').mkdir(parents=True); (work / 'owned-source/observer-entry').mkdir(parents=True)
+            (work / 'owned-source/observer-entry/mirofish_native_run.py').write_text(
+                "atomic(work/'builder/observer-identity.json', identity)\n" if self.pipeline_writes_identity else '# an older revision\n')
             manifest = {'launch_authorized': False, 'model_profile': {'start_threshold': {'percent_free': self.threshold}}}
             (work / 'builder/candidate-manifest.json').write_text(json.dumps(manifest))
             digest = hashlib.sha256((work / 'builder/candidate-manifest.json').read_bytes()).hexdigest()
@@ -191,10 +199,18 @@ class World:
         if self.spawn_error:
             raise self.spawn_error
         work = Path(argv[argv.index('--work') + 1])
+        self.procs[LAUNCHER_PID] = {'start': LAUNCHER_START, 'pgid': self.launcher_pgid}
         self.procs[OBSERVER_PID] = {'start': OBSERVER_START, 'pgid': OBSERVER_PID}
-        (work / 'builder/observer-identity.json').write_text(json.dumps(
-            {'pid': OBSERVER_PID, 'start': self.identity_start, 'pgid': OBSERVER_PID, 'written_utc': '2026-11-16T12:00:05+00:00'}))
+        if self.write_identity:
+            (work / 'builder/observer-identity.json').write_text(json.dumps(
+                {'pid': OBSERVER_PID, 'start': self.identity_start, 'pgid': OBSERVER_PID, 'written_utc': '2026-11-16T12:00:05+00:00'}))
         self.launcher = FakeLauncher(self, work); return self.launcher
+
+    def send_group_signal(self, pgid, sig):
+        self.group_signals.append((pgid, sig))
+        for proc in self.procs.values():
+            if proc['pgid'] == pgid:
+                proc.setdefault('termed_at', self.t)
 
     def send_signal(self, pid, sig):
         self.signals.append((pid, sig))
@@ -215,7 +231,7 @@ class World:
 
     def host(self, **overrides):
         values = dict(run=self.run, spawn=self.spawn, http=self.http, now=self.now, sleep=self.sleep,
-                      send_signal=self.send_signal, disk_free=lambda path: 400 * 10**9, uid=501, store=self.store,
+                      send_signal=self.send_signal, send_group_signal=self.send_group_signal, disk_free=lambda path: 400 * 10**9, uid=501, store=self.store,
                       crew=self.crew, record=self.tmp / 'artifacts/runs.jsonl', load_tests=self.tmp / 'artifacts/load-tests',
                       load_path=lambda work, out, profile, hold_s: FakeLoadPath(self, work, out, profile),
                       out=self.out.append, lms='/fake/bin/lms')
@@ -292,17 +308,33 @@ class StoreRules(Base):
 
 
 class Pure(unittest.TestCase):
-    def test_lm_link_parse_both_ways(self):
-        self.assertTrue(OP.link_disabled('LM Link: disabled\n'))
-        self.assertTrue(OP.link_disabled('Status: Disabled'))
-        for text in ('LM Link: enabled', 'LM Link is not enabled', '', 'connected to 2 devices', 'disabled? enabled'):
-            self.assertFalse(OP.link_disabled(text), text)
+    def test_lm_link_wording_addendum_6(self):
+        self.assertTrue(OP.link_disabled(LINK_OFF, 0))
+        self.assertTrue(OP.link_disabled('\n   You have disabled LM Link. To re-enable it, run lms link enable.  \n', 0))
+        for text, rc in (('You have enabled LM Link.', 0), ('', 0), ('   \n', 0), (LINK_OFF, 1),
+                         ('LM Link status\nYou have disabled LM Link.', 0), (LINK_OFF.lower(), 0),
+                         ('LM Link: disabled', 0), ('you have disabled LM Link.', 0)):
+            self.assertFalse(OP.link_disabled(text, rc), (text, rc))
+
+    def test_breach_statuses_addendum_1(self):
+        def rows(*statuses):
+            return [{'status': s, 'latency_s': 1.0, 'decision_ts': i} for i, s in enumerate(statuses)]
+        for s in ('model_unavailable', 'tag_mismatch'):          # at once, even one among many oks
+            self.assertIn(s, OP.breach_of(rows('ok', 'ok', s, 'ok', 'ok'), 10, True))
+        for s in ('late', 'error'):
+            self.assertIsNone(OP.breach_of(rows('ok', s, 'ok', 'ok'), 10, True), s)            # one alone: ordinary
+            self.assertIsNone(OP.breach_of(rows(s, 'ok', 'ok', s, 'ok'), 10, True), s)         # never two in any three
+            self.assertIn('two of three', OP.breach_of(rows('ok', s, 'ok', s), 10, True))      # two of the last three
+            self.assertIn('two of three', OP.breach_of(rows(s, s), 10, True))
+        self.assertIn('two of three', OP.breach_of(rows('late', 'error', 'ok', 'ok'), 10, True))   # met earlier in the watch
+        self.assertIsNone(OP.breach_of(rows('stale_data', 'stale_data', 'stale_data'), 10, True))
 
     def test_breach_rules_both_ways(self):
         ok = [{'status': 'ok', 'latency_s': 1.0, 'decision_ts': i} for i in range(5)]
         self.assertIsNone(OP.breach_of(ok, 10, True))
         self.assertIn('not listed', OP.breach_of(ok, 10, False))
-        self.assertIn('heartbeat', OP.breach_of(ok, 91, True)); self.assertIsNone(OP.breach_of(ok, 90, True))
+        self.assertIn('heartbeat', OP.breach_of(ok, 151, True)); self.assertIsNone(OP.breach_of(ok, 150, True))
+        self.assertIsNone(OP.breach_of(ok, 120, True))                     # an ordinary slow minute
         self.assertIn('heartbeat', OP.breach_of(ok, None, True))
         one_slow = ok[:2] + [{'status': 'ok', 'latency_s': 9.0, 'decision_ts': 2}] + ok[3:]
         self.assertIsNone(OP.breach_of(one_slow, 10, True))
@@ -310,7 +342,7 @@ class Pure(unittest.TestCase):
         self.assertIn('in a row', OP.breach_of(two_slow, 10, True))
         self.assertIsNone(OP.breach_of(ok[:2] + [{'status': 'ok', 'latency_s': 8.0, 'decision_ts': 2}] * 2, 10, True))
         for status in OP.MODEL_FAILURE_STATUSES:
-            self.assertIn(status, OP.breach_of(ok + [{'status': status, 'latency_s': None, 'decision_ts': 9}], 10, True))
+            self.assertIn(status, OP.breach_of(ok + [{'status': status, 'latency_s': None, 'decision_ts': 9}] * 2, 10, True))
         self.assertIsNone(OP.breach_of(ok + [{'status': 'stale_data', 'latency_s': None, 'decision_ts': 9}], 10, True))
 
     def test_streaks(self):
@@ -395,7 +427,44 @@ class Refusals(Base):
         self.assertIn('--announced', self.w.text()); self.assertEqual(self.w.calls, []); self.assertEqual(self.w.rows(), [])
 
     def test_lm_link_enabled(self):
-        self.w.link_text = 'LM Link: enabled'; self.assertRefused('LM Link')
+        self.w.link_text = 'You have enabled LM Link.'; self.assertRefused('LM Link')
+
+    def test_lm_link_status_failing(self):
+        self.w.link_rc = 1; self.assertRefused('LM Link')
+
+    def test_collector_too_quiet_to_judge(self):
+        self.w.per_minute = 0; self.w.sleep(16 * 60)
+        self.w.per_minute = 1; self.w.sleep(4 * 60)            # 4 decisions in the last 15 minutes
+        self.assertRefused('too quiet to judge')
+
+    def test_five_decisions_in_15_minutes_are_enough(self):
+        self.w.per_minute = 0; self.w.sleep(16 * 60)
+        self.w.per_minute = 1; self.w.sleep(5 * 60)
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+
+    def test_an_old_failure_outside_15_minutes_does_not_refuse(self):
+        self.w.status = lambda t: 'model_unavailable'; self.w.sleep(120)
+        self.w.status = lambda t: 'ok'; self.w.sleep(16 * 60)
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+
+    def test_a_single_error_in_the_window_does_not_refuse(self):
+        self.w.status = lambda t: 'error' if t == T0 + 60 else 'ok'; self.w.per_minute = 1; self.w.sleep(5 * 60)
+        self.assertEqual(self.main(RUN), 0, self.w.text())
+
+    def test_two_errors_of_three_refuse(self):
+        self.w.status = lambda t: 'error' if t == T0 + 60 else 'ok'; self.w.sleep(5 * 60)   # two a minute: both error
+        self.assertRefused('two of three')
+
+    def test_pick_reader_running_refuses_and_says_when_it_started(self):
+        self.w.picks_running = True; self.w.procs[6161] = {'start': 'Mon Nov 16 12:00:01 2026', 'pgid': 6161}
+        self.assertRefused('Mon Nov 16 12:00:01 2026')
+        self.assertIn('running', self.w.rows()[-1]['refused'])
+
+    def test_pipeline_too_old_to_name_its_observer_is_not_launched(self):
+        self.w.pipeline_writes_identity = False
+        self.assertRefused('too old', switched=True)
+        work = Path(self.w.rows()[-1]['staged_folder'])
+        self.assertFalse((work / 'root-one-native-attempt.json').exists())     # no gate written
 
     def test_decision_instance_missing(self):
         self.w.models['models'][0]['loaded_instances'] = []; self.assertRefused('decision instance')
@@ -410,7 +479,12 @@ class Refusals(Base):
         self.w.status = lambda t: 'model_unavailable'; self.w.sleep(60); self.assertRefused('model_unavailable')
 
     def test_collector_no_heartbeat(self):
-        self.w.beating = False; self.w.sleep(120); self.assertRefused('heartbeat')
+        self.w.beating = False; self.w.sleep(180); self.assertRefused('heartbeat')
+
+    def test_collector_slow_heartbeat_under_150_s_does_not_refuse(self):
+        self.w.beating = False; self.w.sleep(120)
+        self.w.on_sleep.append(lambda world: setattr(world, 'beating', True))    # it writes again at its next minute
+        self.assertEqual(self.main(RUN), 0, self.w.text())
 
     def test_collector_job_not_listed(self):
         self.w.collector_listed = False; self.assertRefused('not listed')
@@ -573,6 +647,48 @@ class RunRecipe(Base):
         self.assertEqual(self.w.signals, [])
         row = self.w.rows()[-1]
         self.assertIn('start', row['stop']['not_signalled'])
+        self.assertTrue(any('NOT SIGNALLED' in a for a in row['alerts']))
+        self.assertEqual(self.w.group_signals, [])
+
+    def slow_after(self, seconds):
+        def slow(world):
+            if world.launcher is not None and world.t >= world.launcher.started + seconds:
+                world.latency = lambda t: 9.5
+        self.w.on_sleep.append(slow)
+
+    def test_no_identity_file_after_60_s_is_alerted_and_a_breach_stops_the_launcher_group_once(self):
+        self.w.write_identity = False; self.w.cleanup_s = 120; self.slow_after(30)
+        rc = self.main(RUN)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.w.group_signals, [(LAUNCHER_PID, signal.SIGTERM)]); self.assertEqual(self.w.signals, [])
+        row = self.w.rows()[-1]
+        self.assertEqual(row['stop']['by'], 'group'); self.assertEqual(row['stop']['pgid'], LAUNCHER_PID)
+        self.assertEqual(row['stopped'], 'collector breach')
+        self.assertTrue(any('OBSERVER IDENTITY FILE NOT WRITTEN WITHIN 60 S' in a for a in row['alerts']))
+        self.assertTrue(row['launcher']['own_group'])
+        self.assertTrue(self.w.picks_loaded)
+
+    def test_no_identity_file_and_no_breach_only_alerts(self):
+        self.w.write_identity = False
+        rc = self.main(RUN)
+        self.assertEqual(rc, 3)
+        self.assertEqual(self.w.group_signals, []); self.assertEqual(self.w.signals, [])
+        self.assertTrue(any('OBSERVER IDENTITY FILE NOT WRITTEN' in a for a in self.w.rows()[-1]['alerts']))
+
+    def test_identity_file_present_never_stops_by_group(self):
+        self.w.cleanup_s = 120; self.slow_after(30)
+        self.main(RUN)
+        self.assertEqual(self.w.group_signals, []); self.assertEqual(self.w.signals, [(OBSERVER_PID, signal.SIGTERM)])
+        row = self.w.rows()[-1]
+        self.assertEqual(row['stop']['by'], 'observer')
+        self.assertFalse(any('IDENTITY FILE NOT WRITTEN' in a for a in row['alerts']))
+
+    def test_a_launcher_not_in_its_own_group_is_never_group_signalled(self):
+        self.w.write_identity = False; self.w.launcher_pgid = 1; self.slow_after(30)
+        self.main(RUN)
+        self.assertEqual(self.w.group_signals, []); self.assertEqual(self.w.signals, [])
+        row = self.w.rows()[-1]
+        self.assertFalse(row['launcher']['own_group'])
         self.assertTrue(any('NOT SIGNALLED' in a for a in row['alerts']))
 
     def test_decision_instance_wrong_after_the_run_is_said_in_capitals_and_never_reloaded(self):
