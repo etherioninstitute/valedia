@@ -359,7 +359,8 @@ startup copy and refuses a plan whose own serving file resolves to it.
 these holds: the kernel's pressure level (`kern.memorystatus_vm_pressure_level`) is 4 on any sample; it is 2 or more on every
 sample for 10 s; free memory is below 30% on every sample for 10 s; or there is no fresh, valid reading for 3 s (a level that
 is not exactly 1, 2 or 4 is not a reading). On every sample whose own fields are valid, whatever its pressure level reads, the
-run also stops at once when free memory is below 15% (a hard floor; the lowest single sample on record is 27), when the owned
+run also stops at once when free memory is below 15% (a hard floor; the lowest single sample in the four recorded runs is 27,
+and one start check outside them read 23), when the owned
 figure exceeds its 40 GiB bound, or when two processes serve the co-resident's file. A capsule that fails verification (its
 signature, the sampler's identity, its field set or shape) stops the run at once; only a missing, stale or unparseable reading
 waits for the 3-second rule. On the four recorded
@@ -369,8 +370,8 @@ sample and stops nothing. The receipt's `resource` block carries `lowest_sustain
 and `co_resident_rss_bytes_max`; `builder/observer-identity.json` (pid, ps start string, process group, time) is written right
 after the observer is spawned.
 
-Staging itself contacts LM Studio once: the WebSocket handshake on its loopback listening ports (other than 1235) that finds
-the live SDK port; it lists, loads and calls no model.
+Staging itself contacts LM Studio only to find the live SDK port: one WebSocket handshake on each of its loopback listening
+ports other than 1235; it lists, loads and calls no model.
 
 **The start threshold** is `floor + margin + setup_cost + fall` from the table `START_TERMS` in
 `tools/mirofish_swarm_limits.py`, each value with its source: 30 + 10 + 24 + 10 = 74% free, for every model named. The lead
