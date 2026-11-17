@@ -851,9 +851,9 @@ def test_an_unfinished_price_window_names_the_leader_that_needs_it(tmp_path):
 class FakeService:
     """A synthetic data service: three wallets, a few trades each. Records every URL; no request leaves."""
 
-    def __init__(self, fail_wallet=None, reset_wallet=None):
+    def __init__(self, fail_wallet=None, reset_wallet=None, reset_condition=None):
         self.urls = []
-        self.fail_wallet, self.reset_wallet = fail_wallet, reset_wallet
+        self.fail_wallet, self.reset_wallet, self.reset_condition = fail_wallet, reset_wallet, reset_condition
         t0 = MS(2026, 2)
         self.trades = {
             "0xa": [{"proxy_wallet": "0xa", "side": "BUY", "token_id": "ta", "condition_id": "ca", "size": 4000.0,
@@ -883,6 +883,8 @@ class FakeService:
                 raise ConnectionResetError("reset by peer")
             return pg(self.trades[q["user"]])
         if p == "/v2/resolutions":
+            if self.reset_condition in q["condition"].split(","):
+                raise ConnectionResetError("reset by peer")
             return json.dumps({"data": [{"condition_id": c, "status": "resolved", "payouts": [1_000_000, 0],
                                          "resolved_at": "2026-02-10T00:00:00Z"}
                                         for c in q["condition"].split(",") if c != "cb24"]}).encode()
@@ -974,6 +976,20 @@ def test_a_reset_connection_is_retried_then_left_unfinished_and_the_pull_goes_on
     svc2 = FakeService()
     cl.pull(store, _client(svc2), phase=1, say=said.append)
     assert [u for u in svc2.urls if "/v2/trades" in u] == [u for u in svc2.urls if "user=0xa" in u]
+
+
+def test_a_failed_resolution_batch_is_left_unfinished_and_the_next_batch_is_still_read(tmp_path):
+    store = tmp_path / "pm.sqlite"
+    svc, said = FakeService(reset_condition="ca"), []
+    with pytest.raises(cl.PullIncomplete, match="resolutions"):
+        cl.pull(store, _client(svc), phase=1, say=said.append)
+    with cl.Store(store) as s:
+        answers = s.resolution_answers()
+        assert "ca" not in answers and len(answers) == 6                 # the second batch of six was read
+        assert "ca" in s.unfinished("resolutions")
+    svc2 = FakeService()
+    cl.pull(store, _client(svc2), phase=1, say=said.append)
+    assert len([u for u in svc2.urls if "/v2/resolutions" in u]) == 1
 
 
 def test_the_store_refuses_a_second_candidate_set(tmp_path):
