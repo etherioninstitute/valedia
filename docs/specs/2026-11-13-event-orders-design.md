@@ -66,37 +66,56 @@ fraction, or a holding that vanishes before Kalshi says `finalized`.
 
 **What is built (T45-1, `event_practice.py`, `KalshiData.market`).**
 
-- *What counts.* An expected event holding (baseline or bought here) that the account shows at exactly 0 is
-  settled only when every one of the following holds:
+- *First witness: Kalshi's record.* For each holding the ledger expects (baseline or bought here) that the
+  account shows at exactly 0, all of the following must hold:
   - Kalshi's record for exactly that ticker (`/markets/<ticker>`, or `/historical/markets/<ticker>` on a 404
     only) has, as plain strings, `ticker` the same, `market_type` "binary", `status` "finalized", `result` "yes"
     or "no", and `settlement_value_dollars` exactly "1.0000" for yes or "0.0000" for no.
-  - Its `settlement_ts` is a well-formed UTC time in the past and later than every fill of the program on that
-    name.
+  - Its `settlement_ts` is a well-formed UTC time in the past and later than every `sent_at` of the ledger's
+    orders on that name that filled. A fill cannot precede its order; baseline holdings have no order.
   - No order of the ledger on the holding is open or of unknown outcome, and no fill on it is unapplied.
   - No other name differs from baseline plus fills.
 
-  Anything else is not a settlement, and the run stops as before, naming the fact. A partial disappearance is
-  never a settlement.
+  If any of this fails, nothing is settled and the run stops as before, naming the fact. The holdings gone in one
+  run (K) are judged together; if one fails, none is settled.
+- *Second witness: the account's cash.* Each run reads buying power once, only with no order of the ledger open,
+  and stores it with the ledger's known cash in whole cents: each fill's cost (a purchase) or proceeds (a sale)
+  less its fee, plus each settlement's payout. A fill without a price for all its contracts or without a fee, or
+  a figure not in whole cents, makes the known cash unknown. A reading counts as `prev` only if it was taken
+  after a clean reconcile; a reading taken while a holding is missing never counts. K is settled only if, exactly,
+  `now - prev == (known_now - known_prev) + payouts(K)`.
+- *Order of steps:*
+  1. Journal the rows that are not yet journaled.
+  2. Reconcile, cancel, reconcile.
+  3. Find K and judge it against Kalshi's record.
+  4. Take the reading `now`, before anything of K is written.
+  5. If the equation holds, write the settlements and reconcile a third time with the new book; that reconcile
+     must be clean, so the ledger's latest reconcile stays usable for the next order.
+  6. If the equation does not hold, write one pending record per name and stop at stage `settlement` with the
+     figures.
+- *Pending.* While any record is pending, nothing is sent. `--confirm-settlement ID --who NAME --note TEXT`
+  (person's words: trimmed, not empty, no control characters) reads Kalshi's record again, requires the first
+  witness again, journals the settlement with `witnesses` "kalshi_record+person", who and the note, and then
+  reconciles for a fresh reading. A later run never settles a pending record by itself.
 - *The entry.* A `settlement` journal entry, once per name: the whole expected holding closed at 1.00 a contract
-  when its outcome won (yes holding: Kalshi's YES value; no holding: one minus it), else 0.00. The entry carries
-  the baseline and program parts, the fields read, and `fee` null with `fee_seen` "none seen". Order of writes: a
-  row with an integer id in the state file, then the journal entry keyed by that `settlement_id` and synced, then
-  the row marked journaled. A crash at any point journals it exactly once. The expected book becomes baseline
-  plus applied fills minus settled units. Settlement runs between the first reconcile and the cancels, so the next
-  reconcile is clean. Any later order on a settled ticker is refused, and the sale check subtracts settled
-  units, so the baseline is never sold.
-- *Cash.* The Events account gives buying power only. Buying power is read and journaled at every run, after the
-  cancels and the second reconcile, so no order of the ledger is open. A reading that fails, or is not a finite
-  number from 0, is journaled as unread and never guessed. For a settlement at 1.00 the command compares this
-  reading against the last one taken while the holding was shown. With no fill, no order and no other
-  settlement between the two, the rise must equal the payout exactly, to the cent. If it does not, the command
-  opens a hold in the state file, and nothing is sent until a person runs `--clear-hold ID --who NAME --note
-  TEXT`. That clearing is journaled with who, note and time. If a win cannot be compared, the journal says why;
-  there is no hold and the run goes on. The flag `win_cash_observed` stays false until a comparable win has
-  matched exactly, and every summary shows it. A win's cash effect is unobserved until the first one.
-- *State file.* Layout 2 adds the `settlements`, `readings` and `holds` tables. A layout-1 file is migrated in
-  place, and its `meta`, `baseline` and `sends` are left byte for byte. Any other layout is refused.
+  when its outcome won (yes holding: Kalshi's YES value; no holding: one minus it), else 0.00. It carries the
+  baseline and program parts, the fields read, the two readings, `witnesses`, and `fee` null with `fee_seen`
+  "none seen".
+- *Writes.* Every settlement, pending record and reading is a row with an integer id. The journal line is keyed
+  by that id and synced, then the row is marked journaled. A line whose write failed is written at the next run,
+  exactly once.
+- *After a settlement.* The expected book becomes baseline plus applied fills minus settled units. Any later
+  order on a settled ticker is refused, and the sale check subtracts settled units, so the baseline is never
+  sold.
+- *What a loss is confirmed as.* A loss is confirmed by three facts: Kalshi's record says it lost, the account
+  shows none of it, and the account's cash moved by exactly what the ledger knows, no more and no less. A
+  transfer out, or a hand sale netting exactly zero after fees, would be recorded as a settlement with the money
+  still right. The account's own order history is the third witness a later ticket adds. For a win the equation
+  is real evidence. `win_cash_observed` turns true on the first win settled on it and is shown in every summary.
+- *State file.* Layout 3 adds the `settlements`, `pending` and `readings` tables. A layout-1 file holding exactly
+  its three tables is migrated in place, and its `meta`, `baseline` and `sends` are left byte for byte. Any other
+  layout is refused. That includes a layout-1 file missing a table, and the layout 2 of the first T45-1 build
+  (with its `holds` table), which was never deployed. The old hold and `--clear-hold` are gone.
 
 **What Webull's help pages say (read by the lead 2026-11-17).** Every opening and every closing trade costs 0.01
 dollars commission plus 0.01 dollars exchange fee a contract. Holding to settlement costs nothing, and neither
@@ -107,12 +126,12 @@ removed. Event buying power is derived from that linked account's settled cash (
 
 **Limits.**
 
-- The exact buying-power comparison is meaningful as built only where nothing else moves that cash, as in the
-  paper Events account. Before any live use it must account for activity in the linked cash account. A
-  `win_cash_observed` set in the paper account does not prove the live cash path.
+- In a real account buying power also moves with the linked brokerage account, so there the equation will often
+  not hold, and a person (or, later, the account's own order history) confirms. The exact equation is meaningful
+  as built only in the paper Events account. A `win_cash_observed` set there does not prove the live cash path.
 - A correction by Kalshi after `finalized` is not handled and would show only as a cash difference.
 - A holding Webull drops before Kalshi finalizes (for example while `determined`) stops the run. That blocks the
-  whole Events path until Kalshi finalizes. A multi-market strategy will need a pending-settlement state per name
+  whole Events path until Kalshi finalizes. A multi-market strategy will need a per-name waiting state for that
   next.
 - Settlement entries are read by no page and no tax figure yet (`research_loop/owner_page.py`,
   `execution_and_risk/tax.py`).

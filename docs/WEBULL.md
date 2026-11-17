@@ -225,27 +225,43 @@ what settlement looks like.
   account with no order and no fill. `--reconcile-only` then stopped: the ledger expected 1, the account showed
   0. Kalshi's public record for that ticker showed `market_type` "binary", `status` "finalized", `result` "no",
   `settlement_value_dollars` "0.0000" and `settlement_ts` "2026-11-14T03:49:44.800032Z" (close 03:47:58Z).
-- **What the command now does.** A holding the ledger expects that the account shows at exactly 0 is closed
-  when Kalshi's record for that ticker has exactly those safe values: `ticker` the same, `market_type`
-  "binary", `status` "finalized", `result` yes or no, a settlement value of exactly "1.0000" for yes or "0.0000"
-  for no, and `settlement_ts` in the past and later than every fill of the program on that name. The record is read
-  from `/markets/<ticker>`, and from `/historical/markets/<ticker>` only when the first answers 404. The holding
-  must also have no open order and no unapplied fill, and no other name may differ. The closing entry is
-  journaled once, at 1.00 a contract for a holding whose outcome won and 0.00 otherwise (a held `no` with result
-  "no" wins). The fee is recorded as "none seen", because no settlement fee has been seen, not because one is
+- **What the command now does: two witnesses.** A holding the ledger expects that the account shows at exactly 0
+  is closed only when both of these agree:
+  - *Kalshi's record* for that ticker has exactly the safe values: `ticker` the same, `market_type` "binary",
+    `status` "finalized", `result` yes or no, a settlement value of exactly "1.0000" for yes or "0.0000" for no,
+    and `settlement_ts` in the past and later than every time the program submitted an order on that name that
+    filled. The record is read from `/markets/<ticker>`, and from `/historical/markets/<ticker>` only when the
+    first answers 404.
+  - *The account's own cash.* Every run reads buying power once, only with no order of its own open, together
+    with the cash the ledger knows: every fill's cost or proceeds less its fee, plus every settlement's payout.
+    A holding gone now is confirmed only against the latest earlier reading taken after a clean reconcile.
+    Exactly, in whole cents, the buying power must have moved by the change in known cash plus the payouts of
+    every holding gone now.
+
+  The holding must also have no open order and no unapplied fill, and no other name may differ. Holdings gone
+  in the same run are settled together on one figure. The closing entry is journaled once, at 1.00 a contract
+  for a holding whose outcome won and 0.00 otherwise (a held `no` with result "no" wins). It names its
+  `witnesses`. The fee is recorded as "none seen", because no settlement fee has been seen, not because one is
   known to be zero. After it, no order of either outcome is sent on that ticker.
-- **Anything else stops the run, which names the fact**: a partial disappearance, a status before `finalized`
-  (for example `determined`), a fraction, a void, another ticker, a missing or malformed field, or a read error.
-  Webull can drop a holding before Kalshi finalizes it, so the whole Events path waits until Kalshi does.
-- **Not yet seen: a win.** The Events balance gives buying power only. What a winning settlement does to it, and
-  whether Webull charges anything at settlement, is unobserved until the first win. The command reads buying power
-  at every run, and only with no order of its own open. For a win it compares the reading against the last one
-  taken while the holding was still shown. With no fill, order or other settlement between the two, the buying
-  power must have risen by exactly the payout, to the cent. If it did not, the command opens a hold and sends
-  nothing more until a person clears it:
-  `python -m valedia_trader.execution_and_risk.event_practice --clear-hold ID --who NAME --note TEXT`.
-  If a win cannot be compared, the journal says why and the run goes on. Every summary shows the flag
-  `win_cash_observed`, which stays false until one comparable win has matched.
+- **When Kalshi's record fails, the run stops and names the fact**: a partial disappearance, a status before
+  `finalized` (for example `determined`), a fraction, a void, another ticker, a missing or malformed field, or a
+  read error. Webull can drop a holding before Kalshi finalizes it, so the whole Events path waits until Kalshi
+  does.
+- **When the cash does not confirm it**, nothing is settled and the run stops. This covers four cases: no earlier
+  reading, a reading now that cannot be taken (an order still open, an unread or non-cent figure), known cash
+  that cannot be computed, or an equation off by even a cent (for example a contract sold by hand for 0.60). The
+  stop gives the figures, and one pending record per name waits; nothing is sent until a person runs
+  `python -m valedia_trader.execution_and_risk.event_practice --confirm-settlement ID --who NAME --note TEXT`.
+  That command reads Kalshi's record again and requires the same safe values, journals the settlement with
+  `witnesses` "kalshi_record+person", who and the note, then reconciles and takes a fresh reading. A later run
+  never settles a pending record by itself. The 17 November holding has no earlier reading, so it waits for that
+  command.
+- **What a loss is confirmed as.** A loss is confirmed by three facts: Kalshi's record says the contract lost, the
+  account shows none of it, and the account's cash moved by exactly what the ledger knows, no more and no less.
+  A contract transferred out, or sold by hand for a price that nets exactly zero after fees, would be recorded
+  the same way. The money would still be right; only the word "settlement" would be wrong. The account's own
+  order history is the third witness a later ticket adds. For a win, the cash rising by exactly the payout is
+  real evidence, and the flag `win_cash_observed`, shown in every summary, turns true on the first one.
 - **Not handled:** a correction Kalshi makes after `finalized` would show only as a cash difference.
 
 ### Fees and settlement in a real account (Webull's help pages, read by the lead 2026-11-17)
@@ -257,10 +273,11 @@ what settlement looks like.
 - **Settlement** ("Event Contract Settlement and Payouts", help/faq/11172; "Event Contract Funding and Buying
   Power", help/faq/11052). Winning proceeds go to the balance of the *linked brokerage account*, and losing
   positions are simply removed. Event buying power is derived from that linked account's settled cash.
-- **What this means for the cash check.** The exact buying-power comparison above holds only where nothing else
-  moves that cash, as in the paper Events account. Before any live use, the comparison must account for activity
-  in the linked cash account (trades, deposits, withdrawals, settling stock proceeds). A `win_cash_observed` set
-  in the paper account does not prove the live cash path.
+- **What this means for the cash witness.** In a real account, buying power also moves with the linked brokerage
+  account (its trades, deposits, withdrawals, settling stock proceeds), so there the equation will often not hold.
+  The settlement then waits for a person (or, later, the account's own order history) to confirm it. The exact
+  equation is meaningful as built in the paper Events account, where nothing else moves that cash. A
+  `win_cash_observed` set in the paper account does not prove the live cash path.
 
 ## Not covered yet
 

@@ -737,6 +737,19 @@ def pending_world(tmp_path):
     return w, w.entries("settlement_pending")[0]["pending_id"]
 
 
+def test_nothing_is_sent_while_a_record_is_pending_even_when_the_holding_shows_again(tmp_path):
+    # Second line: while the name is still gone the run stops at `settlement` before any send. If the account shows
+    # the holding again the reconcile is clean, and only the pending gate in the send step still holds the order back.
+    w, pid = pending_world(tmp_path)
+    w.exchange.held[f"{T}:yes"] = 1
+    out = w.run(reconcile_only=True)
+    assert out["status"] == "done" and [r["id"] for r in w.state().open_pending()] == [pid], out
+    w.quote(f"{OTHER}:yes", 0.40, 0.41)
+    out = w.run(ticker=OTHER, outcome="yes", contracts=1, side="buy")
+    assert out["status"] == "stopped" and out["stage"] == "pending" and str(pid) in out["reason"], out
+    assert w.exchange.placed() == [] and w.entries("settlement") == []
+
+
 def test_a_confirmation_is_refused_unless_every_input_and_kalshis_record_hold_now(tmp_path):
     w, pid = pending_world(tmp_path)
     before = (len(w.entries()), [r["id"] for r in w.state().open_pending()])
@@ -880,7 +893,8 @@ def test_a_settlement_between_the_two_readings_is_inside_the_known_cash(tmp_path
     w.exchange.bp = None
     assert w.run(reconcile_only=True)["status"] == "done"                # unread: never a prev
     out = vanish(w, {f"{T}:yes": WIN}, "1001")                            # 1001 would ignore OTHER's payout
-    assert pending(out, w), out
+    assert out["status"] == "stopped" and out["stage"] == "settlement" and len(w.entries("settlement")) == 1, out
+    assert "a difference of -100 cents" in out["reason"] and len(out["pending_open"]) == 1
     w2 = World(tmp_path / "b", held={f"{T}:yes": 1, f"{OTHER}:yes": 1})
     assert w2.run(reconcile_only=True)["status"] == "done"
     w2.clock.t = NOW

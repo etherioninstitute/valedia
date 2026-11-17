@@ -2,7 +2,7 @@
 
     python -m valedia_trader.execution_and_risk.event_practice --ticker T --outcome yes|no --contracts N --side buy|sell [--limit P]
     python -m valedia_trader.execution_and_risk.event_practice --reconcile-only
-    python -m valedia_trader.execution_and_risk.event_practice --clear-hold ID --who NAME --note TEXT
+    python -m valedia_trader.execution_and_risk.event_practice --confirm-settlement ID --who NAME --note TEXT
 
 Design: docs/specs/2026-11-13-event-orders-design.md, part 2 (roadmap 4.7). No strategy is wired to it: it proves the
 order path for event contracts with the guarantees the order step gives stocks (an order is sent at most once, an
@@ -30,18 +30,20 @@ One run, in order. A failure at any step sends nothing; the reason is returned (
                  ledger still open, reconcile again; each new fill journaled once (keyed by its fill id), the
                  journal file synced to disk, then marked applied. A blocked ledger, an order still open, or a holding
                  that differs from baseline plus fills stops the run.
-    settle       (T45-1, between the first reconcile and the cancels) an expected event holding the account shows at
-                 exactly 0 is settled only when Kalshi's record (KalshiData.market) shows exactly a settlement
-                 (judge_settlement), no ledger order on it is open or unknown, no fill on it is unapplied and no other
-                 name differs; else nothing is settled and the stop names the fact. A settlement is a row with an
-                 integer id in the state file, then a journal entry keyed by it (synced), then the row marked
-                 journaled; the expected book is baseline plus fills less settled units; no order is sent on a settled
-                 ticker.
-    cash         after the second reconcile (no order of this ledger open) the buying power is read and journaled
-                 (unread when it is not a finite number from 0). A settlement at 1.00 is compared with the last reading
-                 taken while the holding was shown: with no fill, order or other settlement between, the rise must be
-                 exactly the payout, else a hold (nothing is sent until a person clears it with --clear-hold); one that
-                 cannot be compared is journaled as such. `win_cash_observed` stays false until a win has matched.
+    settle       (T45-1) first, every state row whose journal line is missing is written. After the cancels and the
+                 second reconcile, the holdings K the ledger expects and the account shows at exactly 0 (and nothing
+                 else differs) are settled, together, only on two witnesses: Kalshi's record shows exactly a
+                 settlement for each (judge_settlement; no ledger order on it open, no fill on it unapplied, the time
+                 after every submission of a filled order on it), and the account's cash confirms it: a reading now,
+                 with no order of this ledger open, against the latest clean earlier reading, exactly in cents,
+                 now - prev == (known cash now - known cash then) + the payouts of K (known_cents). Then each is a row
+                 with an integer id, a journal line keyed by it (synced), the row marked journaled, and a third
+                 reconcile with the new book, which must be clean. If the record fails, nothing is settled and the
+                 stop names the fact; if the cash fails, one pending record per name waits for a person
+                 (--confirm-settlement) and nothing is sent meanwhile. No order is sent on a settled ticker.
+    cash         every run reads the buying power once (unread unless a finite number from 0 in whole cents), with the
+                 known cash; only a reading after a clean reconcile can be the earlier side of the equation.
+                 `win_cash_observed` stays false until a win has been settled on the equation.
  4. cap          at most MAX_ORDERS_PER_DAY orders handed to the ledger in one New York day, across runs.
  5. sale         a sale is only of contracts this program bought (the ledger's fills of that name), never the baseline;
                  the adapter checks the account's holdings of that ticker and outcome less its open sales as well.
@@ -90,7 +92,7 @@ from valedia_trader.venues.webull import EVENTS_CLASS, parse_event_name
 
 __all__ = ["MAX_CONTRACTS", "MAX_ORDER_DOLLARS", "MAX_ORDERS_PER_DAY", "QUOTE_MAX_AGE_SECONDS", "MAX_SPREAD", "MAX_CROSS",
            "PracticeState", "PracticeError", "NotSettled", "run_event_practice", "quote_from_book", "choose_limit",
-           "kalshi_book", "kalshi_market", "judge_settlement", "clear_hold", "build_events_venue", "state_path_for", "main"]
+           "kalshi_book", "kalshi_market", "judge_settlement", "known_cents", "confirm_settlement", "build_events_venue", "state_path_for", "main"]
 
 MAX_CONTRACTS = 5
 MAX_ORDER_DOLLARS = Decimal("5.00")
@@ -277,7 +279,8 @@ def judge_settlement(record, ticker: str, now: float, after: float | None = None
     shape) shows exactly one, else NotSettled naming the fact that is missing. Every field must be a plain str of
     exactly the safe value: `ticker` equal to the one asked, `market_type` "binary", `status` "finalized", `result`
     "yes" or "no", `settlement_value_dollars` "1.0000" for yes and "0.0000" for no, `settlement_ts` a well-formed UTC
-    time before `now` and, when `after` is given (the latest fill of this program on that name), later than it.
+    time before `now` and, when `after` is given (the latest time this ledger submitted an order on that name that
+    filled; a fill cannot precede its order), later than it.
     Nothing is inferred: another spelling, a padded or empty string, a number, a bool or None is not a settlement."""
     if not isinstance(record, dict):
         raise NotSettled("Kalshi's record is not an object")
@@ -308,12 +311,13 @@ def judge_settlement(record, ticker: str, now: float, after: float | None = None
     if not ts < now:
         raise NotSettled("Kalshi's settlement time is not in the past")
     if after is not None and not ts > after:
-        raise NotSettled("Kalshi's settlement time is not later than every fill of this program on that name")
+        raise NotSettled("Kalshi's settlement time is not later than every time this program submitted an order on that "
+                         "name that filled")
     return SETTLED_VALUES[value]
 
 
 def _person_words(x, most: int) -> str | None:
-    """A person's words for clearing a hold: a plain str, trimmed, not empty, at most `most` characters, and no
+    """A person's words for confirming a settlement: a plain str, trimmed, not empty, at most `most` characters, and no
     control or format character (Unicode category C) anywhere; else None."""
     if type(x) is not str:
         return None
@@ -323,6 +327,139 @@ def _person_words(x, most: int) -> str | None:
     return t
 
 
+def _whole_cents(d: Decimal) -> int | None:
+    """An amount in dollars as whole cents, or None when it is not exactly a whole number of cents."""
+    try:
+        c = d * 100
+        return int(c) if c.is_finite() and c == c.to_integral_value() else None
+    except (InvalidOperation, OverflowError, ValueError):
+        return None
+
+
+def _dec(x) -> Decimal | None:
+    v = _as_float(x)
+    return Decimal(repr(v)) if v is not None else None
+
+
+def known_cents(fills: list[dict], settlements: list[dict]) -> tuple[int | None, str | None]:
+    """The ledger's cumulative known cash in whole cents: each fill's cash (a purchase: minus price times contracts
+    minus its fee; a sale: plus price times contracts minus its fee) plus each settlement's payout. (None, why) when
+    a piece is not known exactly: a fill not yet applied, without a fee, without a price for all its contracts
+    (price_covers_units differing from its units), or not in whole cents."""
+    total = 0
+    for f in fills:
+        if not f.get("applied"):
+            return None, "a fill is not yet applied"
+        units, fee = _dec(f.get("units")), _dec(f.get("fee"))
+        if units is None or fee is None:
+            return None, "a fill has no readable number of contracts or no fee"
+        if units == 0:
+            piece = -fee
+        else:
+            price, covers = _dec(f.get("price")), _dec(f.get("price_covers_units"))
+            if price is None or covers is None or covers != units:
+                return None, "a fill has no price for all its contracts"
+            piece = -(price * units) - fee
+        c = _whole_cents(piece)
+        if c is None:
+            return None, "a fill's cash is not in whole cents"
+        total += c
+    for r in settlements:
+        units = _dec(r.get("units"))
+        if units is None or r.get("price") not in ("1.00", "0.00"):
+            return None, "a settlement's payout cannot be read"
+        c = _whole_cents(units * Decimal(r["price"]))
+        if c is None:
+            return None, "a settlement's payout is not in whole cents"
+        total += c
+    return total, None
+
+
+def _cash_equation(prev: dict | None, now: dict, rows: list[dict]) -> tuple[dict, str | None]:
+    """(the figures, None) when, exactly in cents, now - prev == (known now - known then) + the payouts of `rows`;
+    else (the figures, why). `prev` is the latest clean reading (PracticeState.last_clean_reading), `now` this run's."""
+    payout = 0
+    for r in rows:
+        c = _whole_cents(Decimal(repr(float(r["units"]))) * Decimal(r["price"]))
+        payout = None if c is None or payout is None else payout + c
+    figures = {"reading_prev": prev["id"] if prev else None, "reading_now": now["id"],
+               "prev_cents": prev["cents"] if prev else None, "now_cents": now["cents"],
+               "known_prev_cents": prev["known_cents"] if prev else None, "known_now_cents": now["known_cents"],
+               "payout_cents": payout, "difference_cents": None}
+    if prev is None:
+        return figures, "there is no earlier reading after a clean reconcile with its buying power and known cash"
+    if now["cents"] is None:
+        return figures, f"this run's reading is unread: {now['unread']}"
+    if now["known_cents"] is None:
+        return figures, f"the known cash could not be computed: {now['known_why']}"
+    if payout is None:
+        return figures, "the payouts are not in whole cents"
+    moved, known = now["cents"] - prev["cents"], now["known_cents"] - prev["known_cents"]
+    figures["difference_cents"] = diff = moved - known - payout
+    if diff != 0:
+        return figures, (f"buying power moved by {moved} cents, the ledger knows of {known} cents and the payouts are "
+                         f"{payout} cents: a difference of {diff} cents")
+    return figures, None
+
+
+def _settle_blockers(sym: str, unapplied: set, busy: set) -> None:
+    """NotSettled when a fill of this program on `sym` is unapplied or an order of this ledger on it is open or of
+    unknown outcome. A second line: today every fill is applied right after the reconcile that wrote it, before this
+    runs, so the first cannot fire; the second can (a cancel that did not take)."""
+    if sym in unapplied:
+        raise NotSettled("a fill of this program on it is not yet applied")
+    if sym in busy:
+        raise NotSettled("an order of this ledger on it is open or its outcome is not known; the next run looks again")
+
+
+def _program_owned(name: str, fills: list[dict], settlements: list[dict]) -> float:
+    """Contracts of `name` this program bought and still holds: its fills less its settled part. A second line: an
+    order on a settled ticker is refused before the sale check, so the subtraction cannot matter today."""
+    return math.fsum([float(f["units"]) for f in fills if f["symbol"] == name]
+                     + [-float(r["program_units"]) for r in settlements if r["symbol"] == name])
+
+
+def _latest_submission(ledger: OrderLedger, fills: list[dict]) -> float | None:
+    """The latest time this ledger submitted (`sent_at`) an order with one of `fills`; None for none (a baseline
+    holding). NotSettled when such an order has no submission time."""
+    times = []
+    for tag in sorted({f["tag"] for f in fills}):
+        rec = ledger.order(tag)
+        t = _as_float(rec.get("sent_at")) if rec else None
+        if t is None:
+            raise NotSettled("an order of this program on it that filled has no submission time")
+        times.append(t)
+    return max(times) if times else None
+
+
+def _settlement_row(sym: str, outcome: str, units: float, base: float, program: float, yes_value: Decimal, record: dict,
+                    batch) -> dict:
+    price = yes_value if outcome == "yes" else Decimal("1.00") - yes_value
+    tier = record.get("tier")
+    kalshi = {**{k: record[k] for k in MARKET_RECORD_KEYS}, "tier": tier if type(tier) is str and tier in TIERS else None}
+    return {"symbol": sym, "units": float(units), "baseline_units": base, "program_units": program, "price": f"{price:.2f}",
+            "kalshi": kalshi, "batch": batch}
+
+
+def _settlement_entry(r: dict) -> dict:
+    return {"event": "settlement", "settlement_id": r["id"], "symbol": r["symbol"], "units": -float(r["units"]),
+            "baseline_units": float(r["baseline_units"]), "program_units": float(r["program_units"]),
+            "price": float(Decimal(r["price"])), "fee": None, "fee_seen": "none seen", "kalshi": r["kalshi"],
+            "witnesses": r["witnesses"], "confirmed_by": r["confirmed_by"], "note": r["note"], "pending_id": r["pending_id"],
+            "reading_prev": r["reading_prev"], "reading_now": r["reading_now"]}
+
+
+def _pending_entry(r: dict) -> dict:
+    return {"event": "settlement_pending", "pending_id": r["id"], "symbol": r["symbol"], "units": -float(r["units"]),
+            "baseline_units": float(r["baseline_units"]), "program_units": float(r["program_units"]),
+            "price": float(Decimal(r["price"])), "kalshi": r["kalshi"], "figures": r["figures"], "reason": r["reason"]}
+
+
+def _reading_entry(r: dict) -> dict:
+    return {"event": "buying_power", "reading_id": r["id"], "buying_power": r["buying_power"], "cents": r["cents"],
+            "unread": r["unread"], "clean": bool(r["clean"]), "known_cents": r["known_cents"], "known_why": r["known_why"]}
+
+
 def state_path_for(ledger_path: str | Path, venue_name: str) -> Path:
     """The practice command's state file: beside the order ledger, named for the venue."""
     return Path(ledger_path).with_name(f"event_practice-{re.sub(r'[^A-Za-z0-9_.-]', '_', str(venue_name))}.sqlite")
@@ -330,31 +467,38 @@ def state_path_for(ledger_path: str | Path, venue_name: str) -> Path:
 
 # ---- the state file
 
-STATE_LAYOUT = 2
+STATE_LAYOUT = 3
 LAYOUT_1_SCHEMA = [                                      # layout 1 (T19), kept as it was
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS baseline (symbol TEXT PRIMARY KEY, units REAL NOT NULL)",
     "CREATE TABLE IF NOT EXISTS sends (tag TEXT PRIMARY KEY, day TEXT NOT NULL, time REAL NOT NULL, outcome TEXT)",
 ]
-LAYOUT_2_ADDED = [                                       # layout 2 (T45-1): settlements, buying-power readings, holds
+LAYOUT_3_ADDED = [                                       # layout 3 (T45-1): settlements, pending records, readings
     "CREATE TABLE IF NOT EXISTS settlements (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL UNIQUE, units REAL NOT NULL, "
     "baseline_units REAL NOT NULL, program_units REAL NOT NULL, price TEXT NOT NULL, kalshi TEXT NOT NULL, "
-    "time REAL NOT NULL, batch TEXT, journaled INTEGER NOT NULL DEFAULT 0, cash_check TEXT)",
+    "time REAL NOT NULL, batch TEXT, witnesses TEXT NOT NULL, confirmed_by TEXT, note TEXT, pending_id INTEGER, "
+    "reading_prev INTEGER, reading_now INTEGER, journaled INTEGER NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS pending (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, units REAL NOT NULL, "
+    "baseline_units REAL NOT NULL, program_units REAL NOT NULL, price TEXT NOT NULL, kalshi TEXT NOT NULL, "
+    "figures TEXT NOT NULL, reason TEXT NOT NULL, time REAL NOT NULL, batch TEXT, settlement_id INTEGER, "
+    "journaled INTEGER NOT NULL DEFAULT 0)",
     "CREATE TABLE IF NOT EXISTS readings (id INTEGER PRIMARY KEY, time REAL NOT NULL, batch TEXT, buying_power REAL, "
-    "unread TEXT, book TEXT NOT NULL, fills INTEGER NOT NULL, orders INTEGER NOT NULL, last_settlement INTEGER NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS holds (id INTEGER PRIMARY KEY, time REAL NOT NULL, settlement_id INTEGER, "
-    "reason TEXT NOT NULL, cleared_by TEXT, cleared_note TEXT, cleared_time REAL)",
+    "cents INTEGER, unread TEXT, book TEXT NOT NULL, clean INTEGER NOT NULL, known_cents INTEGER, known_why TEXT, "
+    "journaled INTEGER NOT NULL DEFAULT 0)",
 ]
-STATE_SCHEMA = LAYOUT_1_SCHEMA + LAYOUT_2_ADDED
+STATE_SCHEMA = LAYOUT_1_SCHEMA + LAYOUT_3_ADDED
 LAYOUT_1_TABLES = frozenset({"meta", "baseline", "sends"})
-LAYOUT_2_TABLES = LAYOUT_1_TABLES | {"settlements", "readings", "holds"}
+LAYOUT_3_TABLES = LAYOUT_1_TABLES | {"settlements", "pending", "readings"}
+WITNESSES = ("kalshi_record+cash_equation", "kalshi_record+person")
 
 
 class PracticeState:
     """The command's own small file: the baseline (recorded once), each order handed to the ledger with its New York
-    day and outcome, and (layout 2) each settlement, each buying-power reading and each hold. Every write is one
-    IMMEDIATE transaction. A layout-1 file is migrated in place to layout 2 by adding the three new tables only (its
-    meta, baseline and sends are not touched); any other layout is not opened."""
+    day and outcome, and (layout 3) each settlement, each pending settlement and each buying-power reading, every one
+    with a flag saying whether its journal line was written. Every write is one IMMEDIATE transaction. A layout-1 file
+    holding exactly its three tables is migrated in place to layout 3 by adding the three new tables only (its meta,
+    baseline and sends are not touched); any other layout is not opened, the layout 2 of the first T45-1 build (with
+    its holds table) included: it was never deployed."""
 
     def __init__(self, path: str | Path, clock: Callable[[], float] = wall_clock) -> None:
         self.path, self.clock = str(path), clock
@@ -372,11 +516,11 @@ class PracticeState:
                     for statement in STATE_SCHEMA:
                         self._db.execute(statement)
                     self._db.execute(f"PRAGMA user_version = {STATE_LAYOUT}")
-                elif version == 1 and tables <= LAYOUT_1_TABLES:          # layout 1 -> 2: the new tables only
-                    for statement in LAYOUT_2_ADDED:
+                elif version == 1 and tables == LAYOUT_1_TABLES:          # layout 1 -> 3: the new tables only
+                    for statement in LAYOUT_3_ADDED:
                         self._db.execute(statement)
                     self._db.execute(f"PRAGMA user_version = {STATE_LAYOUT}")
-                elif not (version == STATE_LAYOUT and tables == LAYOUT_2_TABLES):
+                elif not (version == STATE_LAYOUT and tables == LAYOUT_3_TABLES):
                     raise PracticeError(f"{path} is not an event-practice state file of layout {STATE_LAYOUT}; it is not opened")
         except BaseException:
             self._db.close()
@@ -449,80 +593,105 @@ class PracticeState:
         return {parse_event_name(r["symbol"])[0] for r in self._rows("SELECT symbol FROM settlements")
                 if parse_event_name(r["symbol"]) is not None}
 
-    def add_settlement(self, symbol: str, units: float, baseline_units: float, program_units: float, price: str,
-                       kalshi: dict, batch: str | None) -> int:
-        """Record a settlement, not yet journaled; its integer id keys the journal entry. Once per name."""
-        if parse_event_name(symbol) is None or price not in ("1.00", "0.00"):
-            raise PracticeError("a settlement is of an event name at 1.00 or 0.00")
+    def add_settlements(self, rows: list[dict], *, witnesses: str, observed: bool = False, pending_id: int | None = None,
+                        confirmed_by: str | None = None, note: str | None = None, reading_prev: int | None = None,
+                        reading_now: int | None = None) -> list[int]:
+        """Record settlements (not yet journaled) in one write; each integer id keys its journal entry. Once per name.
+        With `observed` the flag win_cash_observed is set in the same write; with `pending_id` that pending record is
+        resolved by the first of them in the same write."""
+        if witnesses not in WITNESSES:
+            raise PracticeError("a settlement names its witnesses")
+        for r in rows:
+            if parse_event_name(r["symbol"]) is None or r["price"] not in ("1.00", "0.00"):
+                raise PracticeError("a settlement is of an event name at 1.00 or 0.00")
+        ids = []
         with self._write():
-            if self._db.execute("SELECT 1 FROM settlements WHERE symbol = ?", (symbol,)).fetchone():
-                raise PracticeError("that name is already settled; a settlement is recorded once")
-            cur = self._db.execute("INSERT INTO settlements (symbol, units, baseline_units, program_units, price, kalshi, time, "
-                                   "batch, journaled) VALUES (?,?,?,?,?,?,?,?,0)",
-                                   (symbol, float(units), float(baseline_units), float(program_units), price,
-                                    json.dumps(kalshi, sort_keys=True), float(self.clock()), batch))
-            return int(cur.lastrowid)
+            for r in rows:
+                if self._db.execute("SELECT 1 FROM settlements WHERE symbol = ?", (r["symbol"],)).fetchone():
+                    raise PracticeError("that name is already settled; a settlement is recorded once")
+                cur = self._db.execute(
+                    "INSERT INTO settlements (symbol, units, baseline_units, program_units, price, kalshi, time, batch, "
+                    "witnesses, confirmed_by, note, pending_id, reading_prev, reading_now, journaled) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                    (r["symbol"], float(r["units"]), float(r["baseline_units"]), float(r["program_units"]), r["price"],
+                     json.dumps(r["kalshi"], sort_keys=True), float(self.clock()), r.get("batch"), witnesses, confirmed_by,
+                     note, pending_id, reading_prev, reading_now))
+                ids.append(int(cur.lastrowid))
+            if observed:
+                self._db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('win_cash_observed', 'true')")
+            if pending_id is not None:
+                changed = self._db.execute("UPDATE pending SET settlement_id = ? WHERE id = ? AND settlement_id IS NULL",
+                                           (ids[0], pending_id)).rowcount
+                if changed != 1:
+                    raise PracticeError(f"pending record {pending_id} is not open")
+        return ids
 
     def mark_settlement_journaled(self, sid: int) -> None:
         with self._write():
             self._db.execute("UPDATE settlements SET journaled = 1 WHERE id = ?", (sid,))
 
-    def pending_cash_checks(self) -> list[dict]:
-        """Journaled settlements whose cash effect has not been looked at yet."""
-        return [r for r in self.settlements() if r["journaled"] and r["cash_check"] is None]
-
-    def record_cash_check(self, sid: int, words: str, observed: bool = False, hold_reason: str | None = None) -> int | None:
-        """Write what the cash check found, and in the same write set the flag (a comparable win that matched) or
-        open a hold (one that did not). Returns the hold's id when one was opened."""
-        hid = None
-        with self._write():
-            self._db.execute("UPDATE settlements SET cash_check = ? WHERE id = ? AND cash_check IS NULL", (words, sid))
-            if observed:
-                self._db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('win_cash_observed', 'true')")
-            if hold_reason is not None:
-                cur = self._db.execute("INSERT INTO holds (time, settlement_id, reason) VALUES (?,?,?)",
-                                       (float(self.clock()), sid, hold_reason))
-                hid = int(cur.lastrowid)
-        return hid
-
     def win_cash_observed(self) -> bool:
-        """False until a comparable win has shown exactly its payout in the buying power."""
+        """False until a win has been settled on the cash equation (the account's cash showed exactly its payout)."""
         row = self._db.execute("SELECT value FROM meta WHERE key = 'win_cash_observed'").fetchone()
         return row is not None and row[0] == "true"
 
-    # -- buying-power readings
-    def add_reading(self, batch: str | None, buying_power: float | None, unread: str | None, book: dict, fills: int,
-                    orders: int, last_settlement: int) -> int:
+    # -- pending settlements: Kalshi's record says settled, the account's cash does not confirm it
+    def add_pending(self, rows: list[dict], figures: dict, reason: str, batch: str | None) -> list[int]:
+        ids = []
         with self._write():
-            cur = self._db.execute("INSERT INTO readings (time, batch, buying_power, unread, book, fills, orders, "
-                                   "last_settlement) VALUES (?,?,?,?,?,?,?,?)",
-                                   (float(self.clock()), batch, buying_power, unread, json.dumps(book, sort_keys=True),
-                                    int(fills), int(orders), int(last_settlement)))
+            for r in rows:
+                if self._db.execute("SELECT 1 FROM pending WHERE symbol = ? AND settlement_id IS NULL", (r["symbol"],)).fetchone():
+                    raise PracticeError("a pending record of that name is already open")
+                cur = self._db.execute(
+                    "INSERT INTO pending (symbol, units, baseline_units, program_units, price, kalshi, figures, reason, time, "
+                    "batch, journaled) VALUES (?,?,?,?,?,?,?,?,?,?,0)",
+                    (r["symbol"], float(r["units"]), float(r["baseline_units"]), float(r["program_units"]), r["price"],
+                     json.dumps(r["kalshi"], sort_keys=True), json.dumps(figures, sort_keys=True), reason,
+                     float(self.clock()), batch))
+                ids.append(int(cur.lastrowid))
+        return ids
+
+    def pending(self) -> list[dict]:
+        rows = self._rows("SELECT * FROM pending ORDER BY id")
+        for r in rows:
+            r["kalshi"], r["figures"] = json.loads(r["kalshi"]), json.loads(r["figures"])
+        return rows
+
+    def open_pending(self) -> list[dict]:
+        return [r for r in self.pending() if r["settlement_id"] is None]
+
+    def mark_pending_journaled(self, pid: int) -> None:
+        with self._write():
+            self._db.execute("UPDATE pending SET journaled = 1 WHERE id = ?", (pid,))
+
+    # -- buying-power readings
+    def add_reading(self, batch: str | None, buying_power: float | None, cents: int | None, unread: str | None,
+                    book: dict, clean: bool, known: int | None, known_why: str | None) -> int:
+        with self._write():
+            cur = self._db.execute("INSERT INTO readings (time, batch, buying_power, cents, unread, book, clean, known_cents, "
+                                   "known_why, journaled) VALUES (?,?,?,?,?,?,?,?,?,0)",
+                                   (float(self.clock()), batch, buying_power, cents, unread, json.dumps(book, sort_keys=True),
+                                    int(bool(clean)), known, known_why))
             return int(cur.lastrowid)
 
-    def last_reading_showing(self, symbol: str, before: int) -> dict | None:
-        """The latest reading before id `before` whose book held `symbol` (more than nothing)."""
-        for r in self._rows("SELECT * FROM readings WHERE id < ? ORDER BY id DESC", (before,)):
-            book = json.loads(r["book"])
-            if (_as_float(book.get(symbol)) or 0.0) > 0:
-                r["book"] = book
+    def readings(self) -> list[dict]:
+        rows = self._rows("SELECT * FROM readings ORDER BY id")
+        for r in rows:
+            r["book"] = json.loads(r["book"])
+        return rows
+
+    def last_clean_reading(self) -> dict | None:
+        """The latest reading taken after a clean reconcile with its buying power and the known cash both read: the
+        only kind that may be the earlier side of the cash equation. A reading taken while a holding was missing is
+        not clean and is never this."""
+        for r in reversed(self.readings()):
+            if r["clean"] and r["cents"] is not None and r["known_cents"] is not None:
                 return r
         return None
 
-    # -- holds
-    def hold(self, hid: int) -> dict | None:
-        rows = self._rows("SELECT * FROM holds WHERE id = ?", (hid,))
-        return rows[0] if rows else None
-
-    def open_holds(self) -> list[dict]:
-        return self._rows("SELECT * FROM holds WHERE cleared_time IS NULL ORDER BY id")
-
-    def clear_hold(self, hid: int, who: str, note: str, when: float) -> None:
+    def mark_reading_journaled(self, rid: int) -> None:
         with self._write():
-            changed = self._db.execute("UPDATE holds SET cleared_by = ?, cleared_note = ?, cleared_time = ? "
-                                       "WHERE id = ? AND cleared_time IS NULL", (who, note, float(when), hid)).rowcount
-            if changed != 1:
-                raise PracticeError(f"hold {hid} is not open")
+            self._db.execute("UPDATE readings SET journaled = 1 WHERE id = ?", (rid,))
 
     def settle_sends(self, ledger: OrderLedger) -> None:
         """A send whose outcome was never written gets the ledger's state now; one still `intended` was never sent."""
@@ -594,6 +763,9 @@ class _Run:
         self.settlements_journaled = 0
         self.buying_power: float | None = None
         self._settled_seen: set = set()
+        self._pending_seen: set = set()
+        self._reading_seen: set = set()
+        self._read_this_run = False
         self._settle_why: dict[str, str] = {}
         self.view = _LedgerVenue(venue, ledger)
         self.name, self.batch, self.day = "?", None, None
@@ -780,9 +952,12 @@ class _Run:
         # happens to look like a remembered secret, and a key holding text would then never match again
         self._seen = {e.get("fill_id") for e in entries
                       if e.get("type") == JOURNAL_TYPE and e.get("event") == "fill" and e.get("venue") == self.name}
-        self._settled_seen = {e.get("settlement_id") for e in entries
-                              if e.get("type") == JOURNAL_TYPE and e.get("event") == "settlement" and e.get("venue") == self.name
-                              and type(e.get("settlement_id")) is int}
+        def ids(event, key):
+            return {e.get(key) for e in entries if e.get("type") == JOURNAL_TYPE and e.get("event") == event
+                    and e.get("venue") == self.name and type(e.get(key)) is int}
+        self._settled_seen = ids("settlement", "settlement_id")
+        self._pending_seen = ids("settlement_pending", "pending_id")
+        self._reading_seen = ids("buying_power", "reading_id")
 
     # -- 2
     def _baseline(self) -> dict[str, float]:
@@ -836,9 +1011,8 @@ class _Run:
 
     def _reconcile_and_cancel(self, baseline: dict) -> None:
         self.state.settle_sends(self.ledger)
-        self._journal_settlements()                      # a settlement on file but not journaled (a crash): first
-        result = self._reconcile(baseline)
-        self._settle(baseline, result)                   # before the cancels, so the next reconcile can be clean
+        self._journal_rows()                             # what the state knows and the journal does not (a crash): first
+        self._reconcile(baseline)
         for o in self.ledger.orders(OPEN_STATES):
             tag = self._tag_word(o["tag"]) or "an order"
             try:
@@ -851,6 +1025,9 @@ class _Run:
             self._write({"event": "cancel", "tag": tag, "answer": word})
         result = self._reconcile(baseline)
         still = self.ledger.orders(OPEN_STATES)
+        if self._settle(baseline, result, still):       # settled on both witnesses: the book changed, reconcile again
+            result = self._reconcile(baseline)
+            still = self.ledger.orders(OPEN_STATES)
         if still or self.ledger.blocked():
             raise _Stop("reconcile", "; ".join(self._ledger_words(still, result))[:2000])
 
@@ -890,34 +1067,39 @@ class _Run:
             reasons.append(f"{len(result['anomalies'])} anomaly(ies) in the reconcile; a person must look")
         return reasons or ["the order ledger is blocked"]
 
-    # -- 3b settlement (T45-1)
-    def _settlement_entry(self, r: dict) -> dict:
-        return {"event": "settlement", "settlement_id": r["id"], "symbol": r["symbol"], "units": -float(r["units"]),
-                "baseline_units": float(r["baseline_units"]), "program_units": float(r["program_units"]),
-                "price": float(Decimal(r["price"])), "fee": None, "fee_seen": "none seen", "kalshi": r["kalshi"]}
+    # -- 3b settlement (T45-1): two witnesses, Kalshi's record and the account's cash
+    def _journal_rows(self) -> None:
+        """Every reading, pending record and settlement in the state whose journal line was not written (a crash or a
+        failed write): its line, keyed by its integer id, written once (not again when the journal already has it),
+        the journal file synced, then the row marked journaled."""
+        kinds = ((self.state.readings, _reading_entry, self._reading_seen, self.state.mark_reading_journaled),
+                 (self.state.pending, _pending_entry, self._pending_seen, self.state.mark_pending_journaled),
+                 (self.state.settlements, _settlement_entry, self._settled_seen, self.state.mark_settlement_journaled))
+        for rows, entry, seen, mark in kinds:
+            for r in rows():
+                if r["journaled"]:
+                    continue
+                if r["id"] not in seen:
+                    self._write(entry(r))
+                    path = self._journal_file()
+                    if path is not None:
+                        _sync_file(path)
+                    seen.add(r["id"])
+                    if entry is _settlement_entry:
+                        self.settlements_journaled += 1
+                mark(r["id"])
 
-    def _journal_settlements(self) -> None:
-        """Each settlement row not yet journaled: its entry, keyed by its integer id, written once (not again when the
-        journal already has it), the journal file synced to disk, then the row marked journaled."""
-        for r in self.state.settlements():
-            if r["journaled"]:
-                continue
-            if r["id"] not in self._settled_seen:
-                self._write(self._settlement_entry(r))
-                path = self._journal_file()
-                if path is not None:
-                    _sync_file(path)
-                self._settled_seen.add(r["id"])
-                self.settlements_journaled += 1
-            self.state.mark_settlement_journaled(r["id"])
-
-    def _settle(self, baseline: dict, result: dict) -> None:
-        """A holding the ledger expects that the account shows at exactly 0 is settled when Kalshi's record says so
-        exactly (judge_settlement), no order of this ledger on it is open or of unknown outcome, no fill on it is
-        unapplied, and no other name differs. Anything else settles nothing; the reason is kept for the stop."""
+    def _settle(self, baseline: dict, result: dict, still: list[dict]) -> bool:
+        """After the cancels and the second reconcile. The holdings K the ledger expects and the account shows at
+        exactly 0 are settled, all together, only when (1) for each Kalshi's record shows exactly a settlement
+        (judge_settlement; no order of this ledger on it open, no fill on it unapplied) and no other name differs,
+        and (2) the account's cash confirms it: a reading now (no order of this ledger open) against the latest
+        clean earlier reading, exactly in cents, now - prev == (known cash now - known cash then) + the payouts of K.
+        (1) failing settles nothing and the stop names the fact; (2) failing keeps one pending record per name for a
+        person (--confirm-settlement) and stops at stage `settlement`. True when K was settled."""
         diffs = result.get("position_differences") or {}
         if not diffs:
-            return
+            return False
         expected = self._applied_positions(baseline)
         candidates, others = [], []
         for sym, d in diffs.items():
@@ -928,7 +1110,7 @@ class _Run:
             else:
                 others.append(sym)
         if not candidates:
-            return
+            return False
         unclean = [w for w, k in (("the venue's positions could not be read", "positions_error"),
                                   ("an order's status could not be read", "unresolved"),
                                   ("the reconcile found an anomaly", "anomalies")) if result.get(k)]
@@ -936,111 +1118,96 @@ class _Run:
             why = unclean[0] if unclean else "another holding also differs from baseline plus fills"
             for sym in candidates:
                 self._settle_why[sym] = f"{why}, so none is taken as settled"
-            return
+            return False
+        waiting = {r["symbol"]: r["id"] for r in self.state.open_pending()}
+        if any(sym in waiting for sym in candidates):
+            ids = sorted(waiting[s] for s in candidates if s in waiting)
+            raise _Stop("settlement", f"pending record(s) {', '.join(map(str, ids))} wait for a person: Kalshi's record shows "
+                                      "the result, but the account's cash does not confirm the holding was still there; "
+                                      "only a person settles it: --confirm-settlement ID --who NAME --note TEXT")
         unapplied = {f["symbol"] for f in self.ledger.unapplied_fills()}
-        busy = {o["symbol"] for o in self.ledger.orders(OPEN_STATES)}
-        now = self._now()
-        for sym in candidates:
+        busy = {o["symbol"] for o in still}
+        now_t = self._now()
+        judged = []
+        for sym in sorted(candidates):
             try:
-                self._settle_one(sym, expected[sym], baseline, unapplied, busy, now)
+                judged.append(self._judge(sym, expected[sym], baseline, unapplied, busy, now_t))
             except NotSettled as why:
                 self._settle_why[sym] = str(why)
+        if len(judged) != len(candidates):
+            for j in judged:
+                self._settle_why[j["symbol"]] = ("Kalshi's record shows it settled, but another holding that is gone is not, "
+                                                 "and holdings gone together are settled together")
+            return False
+        now = self._take_reading(baseline, clean=False, open_orders=bool(still))     # before anything of K is settled
+        prev = self.state.last_clean_reading()
+        figures, why = _cash_equation(prev, now, judged)
+        if why is None:
+            ids = self.state.add_settlements(judged, witnesses=WITNESSES[0], observed=any(j["price"] == "1.00" for j in judged),
+                                             reading_prev=prev["id"], reading_now=now["id"])
+            self.settled_now += [{"settlement_id": i, "symbol": j["symbol"], "units": -float(j["units"]),
+                                  "price": float(Decimal(j["price"]))} for i, j in zip(ids, judged)]
+            self._journal_rows()
+            return True
+        names = ", ".join(j["symbol"] for j in judged)
+        reason = (f"Kalshi's record shows the result of {names}, but the account's cash does not confirm the holding was "
+                  f"still there ({why}); nothing of it is settled")
+        pids = self.state.add_pending(judged, figures, reason, self.batch)
+        self._journal_rows()
+        raise _Stop("settlement", f"{reason}; pending record(s) {', '.join(map(str, pids))} wait for a person: "
+                                  "--confirm-settlement ID --who NAME --note TEXT")
 
-    def _settle_one(self, sym: str, units: float, baseline: dict, unapplied: set, busy: set, now: float) -> None:
+    def _judge(self, sym: str, units: float, baseline: dict, unapplied: set, busy: set, now: float) -> dict:
+        """The first witness for one holding: the row to settle it with, or NotSettled naming the fact."""
         ticker, outcome = parse_event_name(sym)
-        if sym in unapplied:
-            raise NotSettled("a fill of this program on it is not yet applied")
-        if sym in busy:
-            raise NotSettled("an order of this ledger on it is open or its outcome is not known; the next run looks again")
+        _settle_blockers(sym, unapplied, busy)
         fills = [f for f in self.ledger.fills() if f["symbol"] == sym]
-        times = [_as_float(f["time"]) for f in fills]
-        if any(t is None for t in times):
-            raise NotSettled("a fill of this program on it has no readable time")
+        after = _latest_submission(self.ledger, fills)
         try:
             record = self.market(ticker)
         except Exception as exc:
             raise NotSettled(f"Kalshi's record could not be read ({_venue_error(exc)})") from None
-        yes_value = judge_settlement(record, ticker, now, max(times) if times else None)
-        price = yes_value if outcome == "yes" else Decimal("1.00") - yes_value
-        program = math.fsum(float(f["units"]) for f in fills)
-        base = float(baseline.get(sym, 0.0))
-        tier = record.get("tier")
-        kalshi = {**{k: record[k] for k in MARKET_RECORD_KEYS}, "tier": tier if type(tier) is str and tier in TIERS else None}
-        sid = self.state.add_settlement(sym, units, base, program, f"{price:.2f}", kalshi, self.batch)
-        self.settled_now.append({"settlement_id": sid, "symbol": sym, "units": -units, "price": float(price)})
-        self._journal_settlements()
+        yes_value = judge_settlement(record, ticker, now, after)
+        return _settlement_row(sym, outcome, units, float(baseline.get(sym, 0.0)), math.fsum(float(f["units"]) for f in fills),
+                               yes_value, record, self.batch)
 
-    # -- 3c buying power, after the cancels and the second reconcile (no order of this ledger open)
-    def _read_buying_power(self) -> tuple[float | None, str | None]:
-        """(buying power, None) when the venue gives a finite number from 0, else (None, the shape of the reason)."""
+    # -- 3c buying power, read only with no order of this ledger open
+    def _read_buying_power(self) -> tuple[float | None, int | None, str | None]:
+        """(buying power, its whole cents, None) when the venue gives a finite number from 0 in whole cents, else
+        (None, None, the shape of the reason)."""
         try:
             cash = self.venue.cash()
         except Exception as exc:
-            return None, f"the venue's cash() raised {_venue_error(exc)}"
+            return None, None, f"the venue's cash() raised {_venue_error(exc)}"
         if not isinstance(cash, dict):
-            return None, f"the venue's cash() gave a {type(cash).__name__}, not an object"
+            return None, None, f"the venue's cash() gave a {type(cash).__name__}, not an object"
         v = cash.get("buying_power")
         f = _as_float(v)
         if f is None:
-            return None, f"buying_power is a {type(v).__name__}, not a finite number"
+            return None, None, f"buying_power is a {type(v).__name__}, not a finite number"
         if f < 0:
-            return None, "buying_power is below 0"
-        return f, None
+            return None, None, "buying_power is below 0"
+        cents = _whole_cents(Decimal(repr(f)))
+        if cents is None:
+            return None, None, "buying_power is not in whole cents"
+        return f, cents, None
+
+    def _take_reading(self, baseline: dict, clean: bool, open_orders: bool) -> dict:
+        if open_orders:
+            bp, cents, unread = None, None, "an order of this ledger is open, so buying power is not read"
+        else:
+            bp, cents, unread = self._read_buying_power()
+        known, known_why = known_cents(self.ledger.fills(), self.state.settlements())
+        book = {s: u for s, u in self._applied_positions(baseline).items() if u > 1e-9}
+        rid = self.state.add_reading(self.batch, bp, cents, unread, book, clean and not open_orders, known, known_why)
+        self.buying_power, self._read_this_run = bp, True
+        self._journal_rows()
+        return {"id": rid, "cents": cents, "unread": unread, "known_cents": known, "known_why": known_why}
 
     def _cash(self, baseline: dict) -> None:
-        if self.ledger.orders(OPEN_STATES):
-            raise _Stop("cash", "an order of this ledger is open; buying power is read only with none open")
-        bp, unread = self._read_buying_power()
-        self.buying_power = bp
-        book = {s: u for s, u in self._applied_positions(baseline).items() if u > 1e-9}
-        settlements = self.state.settlements()
-        now = {"buying_power": bp, "fills": len(self.ledger.fills()), "orders": len(self.ledger.orders()),
-               "last_settlement": max((r["id"] for r in settlements), default=0)}
-        now["id"] = self.state.add_reading(self.batch, bp, unread, book, now["fills"], now["orders"], now["last_settlement"])
-        self._write({"event": "buying_power", "reading_id": now["id"], "buying_power": bp, "unread": unread})
-        for r in self.state.pending_cash_checks():
-            self._check_win(r, now, settlements)
-
-    def _check_win(self, r: dict, now: dict, settlements: list[dict]) -> None:
-        """A settlement at 1.00: buying power must have risen by exactly the payout since the last reading taken while
-        the holding was shown, with no fill, no order and no other settlement between; else a hold. When that cannot
-        be compared the settlement stands, and the journal says why (no hold)."""
-        sid, sym = r["id"], r["symbol"]
-        if r["price"] != "1.00":
-            self.state.record_cash_check(sid, "none needed: a settlement at 0.00")
-            return
-        prev = self.state.last_reading_showing(sym, now["id"])
-        why = None
-        if prev is None:
-            why = "no reading of buying power was taken while the holding was shown"
-        elif prev["buying_power"] is None:
-            why = "the last reading while the holding was shown is unread"
-        elif now["buying_power"] is None:
-            why = "this run's reading is unread"
-        elif prev["fills"] != now["fills"]:
-            why = "a fill was recorded between the two readings"
-        elif prev["orders"] != now["orders"]:
-            why = "an order was handed to the ledger between the two readings"
-        elif [x["id"] for x in settlements if x["id"] > prev["last_settlement"]] != [sid]:
-            why = "another settlement was recorded between the two readings"
-        if why is not None:
-            self.state.record_cash_check(sid, f"not comparable: {why}")
-            self._write({"event": "win_cash", "settlement_id": sid, "symbol": sym, "result": "not comparable",
-                         "reason": f"the win's cash effect could not be compared: {why}"})
-            return
-        rise = Decimal(repr(float(now["buying_power"]))) - Decimal(repr(float(prev["buying_power"])))
-        payout = Decimal(repr(float(r["units"]))) * Decimal(r["price"])
-        numbers = {"settlement_id": sid, "symbol": sym, "before": float(prev["buying_power"]),
-                   "after": float(now["buying_power"]), "rise": float(rise), "payout": float(payout)}
-        if rise == payout:
-            self.state.record_cash_check(sid, "matched", observed=True)
-            self._write({"event": "win_cash", "result": "matched", **numbers})
-            return
-        reason = (f"the winning settlement of {sym} did not show the expected cash (buying power rose by {rise}, the payout "
-                  f"is {payout}); a person must look")
-        hid = self.state.record_cash_check(sid, "differs: held", hold_reason=reason)
-        self._write({"event": "win_cash", "result": "differs", **numbers})
-        self._write({"event": "hold", "hold_id": hid, "settlement_id": sid, "reason": reason})
+        """The run's reading after a clean reconcile (one already taken for a settlement is the run's reading)."""
+        if not self._read_this_run:
+            self._take_reading(baseline, clean=True, open_orders=bool(self.ledger.orders(OPEN_STATES)))
 
     # -- 4 to 9
     def _fresh(self, quote_at: float) -> None:
@@ -1050,11 +1217,12 @@ class _Run:
 
     def _send(self, req: dict) -> None:
         name, contracts, side = req["name"], req["contracts"], req["side"]
-        self.stage = "hold"
-        holds = self.state.open_holds()
-        if holds:
-            raise _Stop("hold", f"{len(holds)} hold(s) open (" + ", ".join(str(h["id"]) for h in holds) + "): nothing is sent "
-                                "until a person clears it with --clear-hold ID --who NAME --note TEXT")
+        self.stage = "pending"
+        waiting = self.state.open_pending()
+        if waiting:
+            raise _Stop("pending", f"{len(waiting)} pending settlement record(s) (" + ", ".join(str(r["id"]) for r in waiting)
+                                   + ") wait for a person: nothing is sent until each is confirmed with --confirm-settlement "
+                                     "ID --who NAME --note TEXT")
         self.stage = "settled"
         if req["ticker"] in self.state.settled_tickers():
             raise _Stop("settled", f"the market {req['ticker']} has settled; no order is sent on a settled ticker")
@@ -1063,8 +1231,7 @@ class _Run:
             raise _Stop("cap", f"the day's cap of {MAX_ORDERS_PER_DAY} practice orders ({self.day}, New York) is reached")
         if side == "sell":
             self.stage = "sale"
-            owned = math.fsum([float(f["units"]) for f in self.ledger.fills() if f["symbol"] == name]
-                              + [-float(r["program_units"]) for r in self.state.settlements() if r["symbol"] == name])
+            owned = _program_owned(name, self.ledger.fills(), self.state.settlements())
             if owned < contracts - 1e-9:
                 raise _Stop("sale", f"a sale is only of contracts this program bought: the ledger holds {owned:g} of {name}; "
                                     "the baseline is never sold")
@@ -1125,14 +1292,14 @@ class _Run:
             except Exception:
                 pass
         try:
-            holds_open = [h["id"] for h in self.state.open_holds()] if self.state is not None else None
+            pending_open = [r["id"] for r in self.state.open_pending()] if self.state is not None else None
             observed = self.state.win_cash_observed() if self.state is not None else None
         except Exception:
-            holds_open, observed = None, None
+            pending_open, observed = None, None
         summary = {"status": status, "stage": stage, "reason": reason, "venue": self.name, "batch": self.batch, "day": self.day,
                    "order": self.order, "quote": self.quote, "cancels": self.cancels, "fills_journaled": self.fills_journaled,
                    "settlements": self.settled_now, "settlements_journaled": self.settlements_journaled,
-                   "buying_power": self.buying_power, "holds_open": holds_open, "win_cash_observed": observed,
+                   "buying_power": self.buying_power, "pending_open": pending_open, "win_cash_observed": observed,
                    "caps": {"contracts": MAX_CONTRACTS, "dollars": float(MAX_ORDER_DOLLARS), "orders_a_day": MAX_ORDERS_PER_DAY,
                             "quote_age_seconds": QUOTE_MAX_AGE_SECONDS, "spread": float(MAX_SPREAD), "cross": float(MAX_CROSS)}}
         try:
@@ -1145,19 +1312,22 @@ class _Run:
         return summary
 
 
-# ---- clearing a hold (a person's command)
+# ---- confirming a pending settlement (a person's command)
 
 
-def clear_hold(*, journal, state, venue_name: str, hold_id, who, note, clock: Callable[[], float] = wall_clock) -> dict:
-    """Clear an open hold, saying who looked and what they found. `hold_id` a plain int from 1; `who` and `note` plain
-    text, not empty after trimming, without control or format characters (who at most WHO_MAX characters, the note at
-    most NOTE_MAX). Under the run's lock: the clearing is journaled (who, note, time) and synced, then the hold is
-    closed. A hold that does not exist or is already cleared, or anything malformed, is refused and nothing changes.
-    Asks nothing of the venue or of Kalshi."""
+def confirm_settlement(*, journal, state, ledger: OrderLedger, venue_name: str, pending_id, who, note,
+                       market: Callable | None = None, clock: Callable[[], float] = wall_clock) -> dict:
+    """A person settles a pending record: `pending_id` a plain int from 1; `who` and `note` plain text, not empty after
+    trimming, without control or format characters (who at most WHO_MAX characters, the note at most NOTE_MAX).
+    Kalshi's record is read again and must show exactly the same settlement now (judge_settlement, the time guard on
+    the ledger's submissions included). Under the run's lock: the settlement row (witnesses kalshi_record+person, who
+    and the note) and the record's resolution in one write, then the journal line (synced), then the row marked
+    journaled; a failed line is written by the next run. Anything else is refused and nothing changes. The command
+    line then runs a reconcile, which takes the fresh reading the next settlement starts from."""
     def refused(why: str) -> dict:
-        return {"status": "refused", "hold_id": hold_id if type(hold_id) is int else None, "reason": why}
-    if type(hold_id) is not int or hold_id < 1:
-        return refused("the hold id must be a whole number from 1")
+        return {"status": "refused", "pending_id": pending_id if type(pending_id) is int else None, "reason": why}
+    if type(pending_id) is not int or pending_id < 1:
+        return refused("the pending record's id must be a whole number from 1")
     w, n = _person_words(who, WHO_MAX), _person_words(note, NOTE_MAX)
     if w is None or n is None:
         return refused(f"--who and --note are both needed: plain text, not empty after trimming, without control "
@@ -1166,7 +1336,7 @@ def clear_hold(*, journal, state, venue_name: str, hold_id, who, note, clock: Ca
         return refused("the venue is not an Events venue")
     path = state.path if isinstance(state, PracticeState) else str(state)
     if not isinstance(state, PracticeState) and not Path(path).is_file():
-        return refused("there is no practice state file for this venue, so no hold")
+        return refused("there is no practice state file for this venue, so no pending record")
     lock = _RunLock(path)
     try:
         if not lock.acquire():
@@ -1176,25 +1346,49 @@ def clear_hold(*, journal, state, venue_name: str, hold_id, who, note, clock: Ca
     st = None
     try:
         st = state if isinstance(state, PracticeState) else PracticeState(path, clock)
-        hold = st.hold(hold_id)
-        if hold is None:
-            return refused(f"no hold has id {hold_id}")
-        if hold["cleared_time"] is not None:
-            return refused(f"hold {hold_id} is already cleared")
-        now = float(clock())
-        if not math.isfinite(now):
+        found = [r for r in st.pending() if r["id"] == pending_id]
+        if not found:
+            return refused(f"no pending record has id {pending_id}")
+        p = found[0]
+        if p["settlement_id"] is not None:
+            return refused(f"pending record {pending_id} is already settled")
+        if p["symbol"] in {r["symbol"] for r in st.settlements()}:
+            return refused(f"{p['symbol']} is already settled")
+        ticker, outcome = parse_event_name(p["symbol"])
+        now = _as_float(clock())
+        if now is None:
             return refused("the clock did not give a finite number of seconds")
+        try:
+            fills = [f for f in ledger.fills() if f["symbol"] == p["symbol"]]
+            after = _latest_submission(ledger, fills)
+            try:
+                record = (market or kalshi_market)(ticker)
+            except Exception as exc:
+                raise NotSettled(f"Kalshi's record could not be read ({_venue_error(exc)})") from None
+            yes_value = judge_settlement(record, ticker, now, after)
+        except NotSettled as why:
+            return refused(f"Kalshi's record does not show the settlement now: {why}")
         stamp = pd.Timestamp(now, unit="s", tz="UTC").tz_convert(NEW_YORK)
-        day = str(stamp.date())
-        journal.write(day, {"type": JOURNAL_TYPE, "venue": venue_name, "batch": f"ep-{stamp:%Y%m%d-%H%M%S}-{os.urandom(3).hex()}",
-                            "event": "hold_cleared", "hold_id": hold_id, "who": w, "note": n, "time": now})
-        d = getattr(journal, "dir", None)
-        if d is not None:
-            _sync_file(Path(d) / f"{day}.jsonl")
-        st.clear_hold(hold_id, w, n, now)
-        return {"status": "cleared", "hold_id": hold_id, "who": w, "note": n, "time": now}
-    except (PracticeError, sqlite3.Error, OSError) as exc:
-        return refused(f"the state file or the journal failed: {_venue_error(exc)}")
+        batch = f"ep-{stamp:%Y%m%d-%H%M%S}-{os.urandom(3).hex()}"
+        row = _settlement_row(p["symbol"], outcome, p["units"], p["baseline_units"], p["program_units"], yes_value, record, batch)
+        if row["price"] != p["price"]:
+            return refused("Kalshi's record now gives another result than when the pending record was made; a person must look")
+        sid = st.add_settlements([row], witnesses=WITNESSES[1], pending_id=pending_id, confirmed_by=w, note=n)[0]
+        entry = _settlement_entry([r for r in st.settlements() if r["id"] == sid][0])
+        out = {"status": "confirmed", "pending_id": pending_id, "settlement_id": sid, "symbol": p["symbol"],
+               "price": entry["price"], "who": w, "note": n, "time": now}
+        try:
+            day = str(stamp.date())
+            journal.write(day, {"type": JOURNAL_TYPE, "venue": venue_name, "batch": batch, **entry})
+            d = getattr(journal, "dir", None)
+            if d is not None:
+                _sync_file(Path(d) / f"{day}.jsonl")
+            st.mark_settlement_journaled(sid)
+        except (sqlite3.Error, OSError) as exc:
+            out["journal_error"] = f"{_venue_error(exc)}; the next run writes the line"
+        return out
+    except (PracticeError, sqlite3.Error, OSError, OrderError) as exc:
+        return refused(f"the state file, the ledger or the journal failed: {_venue_error(exc)}")
     finally:
         if st is not None and not isinstance(state, PracticeState):
             st.close()
@@ -1239,17 +1433,18 @@ def main(argv: list[str] | None = None, *, environ=None, build_venue: Callable |
                                     "the bid less a cent to sell)")
     ap.add_argument("--reconcile-only", action="store_true", help="send nothing: reconcile, cancel this ledger's open "
                                                                    "orders, journal the fills and settlements")
-    ap.add_argument("--clear-hold", type=int, metavar="ID", help="clear hold ID (a person has looked); needs --who and --note")
-    ap.add_argument("--who", help="with --clear-hold: who looked")
-    ap.add_argument("--note", help="with --clear-hold: what they found")
+    ap.add_argument("--confirm-settlement", type=int, metavar="ID", help="settle pending record ID (a person has looked); "
+                                                                          "needs --who and --note, then reconciles")
+    ap.add_argument("--who", help="with --confirm-settlement: who looked")
+    ap.add_argument("--note", help="with --confirm-settlement: what they found")
     args = ap.parse_args(argv)
-    if args.clear_hold is not None:
+    if args.confirm_settlement is not None:
         if args.reconcile_only or any(x is not None for x in (args.ticker, args.outcome, args.contracts, args.side, args.limit)):
-            ap.error("--clear-hold is given alone, with --who and --note")
+            ap.error("--confirm-settlement is given alone, with --who and --note")
     elif not args.reconcile_only and None in (args.ticker, args.outcome, args.contracts, args.side):
         ap.error("--ticker, --outcome, --contracts and --side are needed unless --reconcile-only is given")
     elif args.who is not None or args.note is not None:
-        ap.error("--who and --note go with --clear-hold")
+        ap.error("--who and --note go with --confirm-settlement")
     from valedia_trader.core.secrets import SecretError
     from valedia_trader.venues.webull import WebullError
     try:
@@ -1279,17 +1474,21 @@ def main(argv: list[str] | None = None, *, environ=None, build_venue: Callable |
     paths = LoopPaths(Path(root)) if root is not None else LoopPaths()
     clock = clock or wall_clock
     ledger_path = ledger_path_for(paths.memory, venue.name)
-    if args.clear_hold is not None:
-        out = clear_hold(journal=Journal(paths.journal), state=state_path_for(ledger_path, venue.name), venue_name=venue.name,
-                         hold_id=args.clear_hold, who=args.who, note=args.note, clock=clock)
-        print(json.dumps(out, indent=2, default=str))
-        return 0 if out["status"] == "cleared" else 2
     ledger = open_ledger(ledger_path, clock=clock)
     try:
+        reconcile_only = args.reconcile_only
+        if args.confirm_settlement is not None:
+            confirmed = confirm_settlement(journal=Journal(paths.journal), state=state_path_for(ledger_path, venue.name),
+                                           ledger=ledger, venue_name=venue.name, pending_id=args.confirm_settlement,
+                                           who=args.who, note=args.note, market=market, clock=clock)
+            print(json.dumps(confirmed, indent=2, default=str))
+            if confirmed["status"] != "confirmed":
+                return 2
+            reconcile_only = True                        # the fresh reading the next settlement starts from
         out = run_event_practice(ledger=ledger, venue=venue, journal=Journal(paths.journal),
                                  state=state_path_for(ledger_path, venue.name), ticker=args.ticker, outcome=args.outcome,
                                  contracts=args.contracts, side=args.side, limit=args.limit,
-                                 reconcile_only=args.reconcile_only, book=book, clock=clock, market=market)
+                                 reconcile_only=reconcile_only, book=book, clock=clock, market=market)
     finally:
         ledger.close()
     print(json.dumps(out, indent=2, default=str))
