@@ -1148,7 +1148,8 @@ class TMF5TighteningTests(unittest.TestCase):
         self.assertIsNone(ResourceRule(1000.0).observe(reading(1000.4, free=15)))
         self.assertEqual(ResourceRule(1000.0).observe(reading(1000.4, free=14, level=None)), "memory free below 15 on one sample")   # whatever the level reads
         # The checker's series: 5% free with one sample of 31 every 9.9 s, for 300 s.
-        series = [reading(1000.0 + i * 0.4, free=31 if (i * 0.4) % 9.9 < 0.4 else 5) for i in range(751)]
+        ticks = lambda i: int(round(i * 0.4, 6) // 9.9)   # the 9.9 s period a sample falls in; its first sample reads 31
+        series = [reading(1000.0 + i * 0.4, free=31 if i == 0 or ticks(i) != ticks(i - 1) else 5) for i in range(751)]
         self.assertEqual(series[0]["free_percent"], 31)
         reason, when = feed(ResourceRule(1000.0), series)
         self.assertEqual(reason, "memory free below 15 on one sample"); self.assertEqual(when, series[1]["monotonic"])   # its first sample under 15
