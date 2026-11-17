@@ -30,6 +30,7 @@ TOOL_PID, TOOL_PARENT, TOOL_START = 3131, 3030, 'Mon Nov 16 11:59:00 2026'      
 NEAR_NEUTRAL = 'derived report not usable evidence'          # src/mirofish_provenance.py:437, via mirofish_native_run.py:806
 COLLECTOR_PID, COLLECTOR_START = 7171, 'Mon Nov 16 08:00:00 2026'
 PICKS_PID = 6161
+REAL_WAIT_S = 20                         # the bound on any wait for a real child's state (addendum 6)
 SECRET = 'SECRETKEY'                     # in every fake command line: it must never reach an output, a row or a file
 # Addendum 4, part B: real child processes for the kill tests. A launcher that starts an observer and stops it on SIGINT;
 # an observer that ends on TERM; both end by themselves within 60 s. The stager writes them in place of the staged scripts.
@@ -153,7 +154,7 @@ class World:
         self.handle_signals = []; self.launcher_end_t = None; self.handlers = {}; self.installs = []
         self.ps_unreadable = set(); self.ps_raises = {}; self.fsync_raises = None; self.staged_wall = None
         self.commands = {}; self.collector_pid = None; self.scan_raises = None; self.command_raises = None
-        self.real = False; self.kill_at = None; self.term_in_spawn = False; self.on_bootstrap = None; self.on_fsync = None
+        self.real = False; self.signalled_real = set(); self.kill_at = None; self.term_in_spawn = False; self.on_bootstrap = None; self.on_fsync = None
         self.staged_manifest_wall = None; self.staged_startup = True; self.intent_at_bootout = 'unseen'
         self.free, self.free_after_load, self.pressure, self.swap_mb = 80, 60, 1, 100.0
         self.models = listing(); self.unload_status = 200
@@ -189,7 +190,13 @@ class World:
         if self.real:
             if self.kill_at == 'sleep' and self.spawned:
                 os.kill(os.getpid(), signal.SIGKILL)
-            time.sleep(0.25)               # real time for real children to end and be reaped
+            # addendum 6: no fixed sleep. Once a real child of this test was signalled, the fake clock advances only after
+            # every real child has ended (its command no longer names this test's folder), waited for on that condition
+            # with a bound; the bound running out fails the test that expected them gone, never a sleep too short.
+            if self.signalled_real:
+                end = time.monotonic() + REAL_WAIT_S
+                while time.monotonic() < end and any(self.ours(p) for p in self.real_set()):
+                    time.sleep(0.02)
         self.t += seconds; self.collector_step()
         for callback in list(self.on_sleep):
             callback(self)
@@ -343,7 +350,7 @@ class World:
         self.signals.append((pid, sig))
         if self.real and pid in self.real_set():
             if self.ours(pid):                                    # a process this test started, still running
-                os.kill(pid, sig)
+                os.kill(pid, sig); self.signalled_real.add(pid)
             return
         if pid in self.procs:
             self.procs[pid].setdefault('termed_at', self.t)
@@ -1831,9 +1838,9 @@ class Addendum4(Base):
                 os._exit(99)
         _, status = os.waitpid(child, 0)
         self.assertTrue(os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL, (kill_at, status))
-        end = time.time() + 10
-        while time.time() < end and len([p for p in self.w.real_set() if self.w.ours(p)]) < 2:
-            time.sleep(0.05)
+        end = time.monotonic() + REAL_WAIT_S        # bounded wait on a condition: both real children running
+        while time.monotonic() < end and len([p for p in self.w.real_set() if self.w.ours(p)]) < 2:
+            time.sleep(0.02)
         self.assertEqual(len([p for p in self.w.real_set() if self.w.ours(p)]), 2, kill_at)
         self.w.kill_at = None; self.w.picks_loaded = False          # the killed tool had booted the reader out
         self.w.out.clear(); self.w.calls.clear(); self.w.signals.clear(); self.w.timed.clear()
