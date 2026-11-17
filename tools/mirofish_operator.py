@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import fcntl
 import importlib.util
 import json
 import os
@@ -57,12 +58,17 @@ RECORD = ROOT / 'artifacts/mirofish/runs.jsonl'
 LOAD_TESTS = ROOT / 'artifacts/mirofish/load-tests'
 LOGS = ROOT / 'artifacts/mirofish/operator-logs'
 INTENT = ROOT / 'artifacts/mirofish/operator-intent.json'   # addendum 3, item 2: written before the first switch-off
+LOCK = ROOT / 'artifacts/mirofish/operator.lock'             # addendum 4, D: held by run and load-test for their whole life
+PICKS_PLIST = Path.home() / 'Library/LaunchAgents/com.valedia.picks.hourly.plist'   # addendum 4, C: the one plist recover loads
 LMS = Path.home() / '.lmstudio/bin/lms'
 LMSTUDIO = DM.URL
 
 # ---- names
 COLLECTOR_LABEL = 'com.valedia.orderbook-collector'
 PICKS_LABEL = 'com.valedia.picks.hourly'
+LAUNCHER_SCRIPT = 'mirofish_native_startup.py'      # what the launcher's command runs (launch below)
+OBSERVER_SCRIPT = 'mirofish_native_run.py'          # what the observer's command runs (src/mirofish_native_startup.py:163)
+ROLE_SCRIPTS = {'launcher': LAUNCHER_SCRIPT, 'observer': OBSERVER_SCRIPT}
 EMBEDDING_INSTANCE = 'ym-research-embedding'
 NATIVE_PREFIX = 'mf-native-'
 OUTCOME = 'VALEDIA-MIROFISH-FRESH-1'                 # mirofish_native_run.py OUTCOME, what the gate must name
@@ -149,6 +155,21 @@ def _spawn(argv, cwd=None, env=None):
                             start_new_session=True)
 
 
+def _proc_command(pid):
+    """Addendum 4, A: one process's own command, for the proof alone. The caller only tests it and drops it: it is never
+    printed, logged, stored, put in a row or in an exception text."""
+    r = subprocess.run(['/bin/ps', '-ww', '-p', str(int(pid)), '-o', 'command='], capture_output=True, text=True, timeout=CMD_S)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _proc_scan(uid):
+    """Addendum 4, B: the pids of this user's processes (pids only)."""
+    r = subprocess.run(['/bin/ps', '-U', str(int(uid)), '-o', 'pid='], capture_output=True, text=True, timeout=CMD_S)
+    if r.returncode != 0:
+        raise OperatorError('the process scan failed (exit %d)' % r.returncode)
+    return [int(x) for x in r.stdout.split()]
+
+
 def _http(method, url, body=None, timeout=HTTP_S):
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(url, data=data, method=method, headers={'Content-Type': 'application/json'})
@@ -165,7 +186,8 @@ def _http(method, url, body=None, timeout=HTTP_S):
 
 class Host:
     def __init__(self, *, run=None, spawn=None, http=None, now=None, sleep=None, send_signal=None, disk_free=None, uid=None, store=STORE, crew=CREW, record=RECORD, load_tests=LOAD_TESTS, load_path=None, out=None,
-                 lms=LMS, self_pid=None, parent_pid=None, fsync=None, install_signal=None, intent=INTENT):
+                 lms=LMS, self_pid=None, parent_pid=None, fsync=None, install_signal=None, intent=INTENT,
+                 proc_command=None, proc_scan=None, picks_plist=PICKS_PLIST, lock=LOCK):
         self.run, self.spawn, self.http = run or _run, spawn or _spawn, http or _http   # _spawn: its own session and group
         self.now, self.sleep, self.send_signal = now or time.time, sleep or time.sleep, send_signal or os.kill
         self.disk_free = disk_free or (lambda path: shutil.disk_usage(path).free)
@@ -179,6 +201,9 @@ class Host:
         self.fsync = fsync or os.fsync
         self.install_signal = install_signal or signal.signal
         self.intent = Path(intent)
+        self.proc_command = proc_command or _proc_command
+        self.proc_scan = proc_scan or (lambda: _proc_scan(self.uid))
+        self.picks_plist, self.lock = str(picks_plist), Path(lock)
 
 
 def utc(t):
@@ -624,6 +649,8 @@ class SwitchOffs:
         if before['listed']:
             if not before['plist']:
                 raise OperatorError('the pick reader\'s plist path is unknown, so it could not be bootstrapped back; not booted out')
+            if before['plist'] != host.picks_plist:     # addendum 4, C: recover loads the constant plist only
+                raise Refused('the pick reader is loaded from %s, not from %s: not booted out' % (before['plist'], host.picks_plist))
             pr['restore_intent'] = True       # addendum 2, item 7: before the bootout is issued, so no interrupt can skip it
             r = host.run(['/bin/launchctl', 'bootout', 'gui/%d/%s' % (host.uid, PICKS_LABEL)], timeout=CMD_S)
             pr['booted_out'] = not pick_reader_state(host)['listed']
@@ -699,6 +726,7 @@ class SignalGuard:
     def __init__(self, host, row):
         self.host, self.row, self.old = host, row, {}
         self.holding = self.cleaning = self.raised = False; self.pending = None
+        self.stage = 'the run'          # addendum 4, F: the cleanup names each of its stages here
         row['signals_received'] = []
 
     def install(self):
@@ -711,7 +739,7 @@ class SignalGuard:
     def handler(self, signum, frame):
         name = signal.Signals(signum).name
         self.row['signals_received'].append({'signal': name, 'utc': utc(self.host.now()),
-                                             'during': 'the cleanup' if self.cleaning or self.raised else 'the run'})
+                                             'during': self.stage if self.cleaning or self.raised else 'the run'})
         if self.cleaning or self.raised:
             return
         exc = KeyboardInterrupt() if signum == signal.SIGINT else OperatorSignalled(name)
@@ -765,6 +793,99 @@ class IntentFile:
         return True
 
 
+class OperatorLock:
+    """Addendum 4, D: one exclusive advisory lock (flock) on artifacts/mirofish/operator.lock, held by `run` and
+    `load-test` from before their first changing action until after their row, and by `recover` while it works. It is
+    taken without waiting; the kernel drops it when the holder ends, however it ends (a KILL included). The descriptor
+    is not inherited by the launcher (os.open is non-inheritable and Popen closes descriptors). The file is never removed."""
+
+    def __init__(self, host):
+        self.path, self.fd = host.lock, None
+
+    def take(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        self.fd = fd
+        return True
+
+    def release(self):
+        if self.fd is not None:
+            fd, self.fd = self.fd, None
+            os.close(fd)
+
+    def refusal(self):
+        return ('ANOTHER OPERATOR COMMAND HOLDS THE LOCK %s: A RUN, A LOAD TEST OR A RECOVER IS STILL GOING ON; wait for it '
+                'to end' % self.path)
+
+
+# ============================================================================ the proof that a process is this run's
+def command_names(host, pid, work, role):
+    """Addendum 4, A: whether the process's own command names BOTH the staged candidate folder and the script of its
+    role, the way this run started it: the launcher `... -B mirofish_native_startup.py --work <work> ...` (launch), the
+    observer `... -B <work>/owned-source/observer-entry/mirofish_native_run.py` (src/mirofish_native_startup.py:163).
+    The command is read for this test alone and dropped: only True or False leaves this function; a failure to read it
+    is False and its text is never kept."""
+    try:
+        text = host.proc_command(pid)
+    except Exception:
+        return None                     # unknown: the caller treats it as a test that could not be made
+    if not isinstance(text, str):
+        return False
+    tokens = text.split(); text = None
+    w = str(work)
+    pairs = list(zip(tokens, tokens[1:]))
+    if role == 'launcher':
+        return ('-B', LAUNCHER_SCRIPT) in pairs and ('--work', w) in pairs
+    return ('-B', '%s/owned-source/observer-entry/%s' % (w, OBSERVER_SCRIPT)) in pairs
+
+
+def ancestors(host):
+    """This process and every ancestor, by its parent pids, up to 1."""
+    out = {host.self_pid, host.parent_pid, 0, 1}
+    pid = host.parent_pid
+    for _ in range(64):
+        seen = observed_identity(host, pid) if type(pid) is int and pid > 1 else None
+        if seen is None or seen['ppid'] in out:
+            break
+        out.add(seen['ppid']); pid = seen['ppid']
+    return out
+
+
+def job_pids(host):
+    """The collector's and the pick reader's job pids, read from launchd by their fixed labels."""
+    return {label: launchd_print(host, label)['pid'] for label in (COLLECTOR_LABEL, PICKS_LABEL)}
+
+
+def proof_failure(host, pid, start, role, work, guard):
+    """None when the process is proven to be this run's `role`; else which test failed, in words that never carry the
+    command. `guard` holds the ancestors and the job pids. Every test must pass: the pid is above 1, not this process or an
+    ancestor, not the collector's or the pick reader's job pid; it runs with the start held for it (when one is held);
+    its own command names the staged folder and the script of its role."""
+    if type(pid) is not int or pid <= 1:
+        return 'pid %s is not above 1' % repr(pid)[:40]
+    if pid in guard['ancestors']:
+        return 'pid %d is this tool or one of its ancestors' % pid
+    for label, job in guard['jobs'].items():
+        if job == pid:
+            return 'pid %d is the pid of the job %s (%s)' % (pid, label, 'the collector' if label == COLLECTOR_LABEL else 'the pick reader')
+    seen = observed_identity(host, pid)
+    if seen is None:
+        return 'gone'
+    if start is not None and seen['start'] != start:
+        return 'pid %d has another start time than the one recorded' % pid
+    names = command_names(host, pid, work, role)
+    if names is None:
+        return 'pid %d: its command could not be read' % pid
+    if not names:
+        return 'pid %d: its command does not name the staged folder and %s' % (pid, ROLE_SCRIPTS[role])
+    return None
+
+
 def intent_start(host, command, row, summary):
     """What is about to be switched off and its before-state, the work folder, this tool's own pid and start, the time."""
     try:
@@ -773,6 +894,7 @@ def intent_start(host, command, row, summary):
         me = None
     pr = summary['pick_reader']
     return dict(command=command, utc=utc(host.now()), tool={'pid': host.self_pid, 'start': me and me['start']},
+                profile=row.get('profile'), scripts=dict(ROLE_SCRIPTS), launch=None,
                 pick_reader={'label': PICKS_LABEL, 'before': {'listed': pr['listed'], 'plist': pr['plist'], 'state': pr['state']}},
                 models_to_unload=[o['instance_id'] for o in summary['models']['others']], models_note=NOT_RELOADED,
                 work=row.get('staged_folder'), twin=row.get('twin_folder'), launcher=None, record=str(host.record))
@@ -905,14 +1027,18 @@ def launch(host, work, gate, row, stopper, guard, intent):
     statement, so nothing runs between the spawn and the binding: from then on the launcher is this tool's own unreaped
     child, and the stop path can always reach it through the handle. Its start and group are then read, with retries;
     a start that cannot be read leaves the handle as the stop route."""
-    argv = [str(PIPELINE_PY), '-B', 'mirofish_native_startup.py', '--work', str(work), '--gate', str(gate)]
+    argv = [str(PIPELINE_PY), '-B', LAUNCHER_SCRIPT, '--work', str(work), '--gate', str(gate)]
+    # addendum 4, B: synced before the spawn: the staged folder and the two scripts (already in the intent) prove a
+    # survivor even if the tool dies before the launcher's pid is written
+    intent.write(launch={'spawning_utc': utc(host.now())})
     guard.holding = True
     try:
         stopper.proc = host.spawn(argv, cwd=str(work / 'owned-source/observer-entry'), env=pipeline_env())
+        row['launched'] = True
+        row['launcher'] = {'pid': stopper.proc.pid, 'start': None, 'pgid': None, 'own_group': None, 'read_errors': []}
+        intent.write(launcher={'pid': stopper.proc.pid, 'start': None, 'pgid': None})
     finally:
         guard.holding = False
-    row['launched'] = True
-    row['launcher'] = {'pid': stopper.proc.pid, 'start': None, 'pgid': None, 'own_group': None, 'read_errors': []}
     guard.release()
     seen = None
     for attempt in range(LAUNCHER_PS_TRIES):
@@ -1062,7 +1188,11 @@ def pipeline_outcome(work, plan, launcher_exit=None):
         calls = (json.loads(ledger.read_text()) or {}).get('calls') if ledger.is_file() else None
     except (OSError, ValueError, AttributeError):
         calls = None                       # an unreadable ledger leaves the call counts null: not clean
-    if isinstance(calls, list) and all(isinstance(c, dict) for c in calls):
+    if isinstance(calls, list) and not all(type(c) is dict and (c.get('state') is None or type(c.get('state')) is str)
+                                           for c in calls):
+        out['ledger_failure'] = 'a ledger call or its state has the wrong type'   # addendum 4, E: not clean, no exception
+        calls = None
+    if isinstance(calls, list):
         states = Counter(c.get('state') for c in calls)
         out.update(calls=len(calls), refused_calls=states.get('refused_before_forward', 0),
                    failed_calls=sum(n for s, n in states.items() if s not in ('complete', 'refused_before_forward')))
@@ -1084,8 +1214,11 @@ RECEIPT_TYPES = (       # every receipt field pipeline_outcome and memory_outcom
 
 def receipt_type_errors(receipt):
     wrong = [k for k, types_ in RECEIPT_TYPES if k in receipt and receipt[k] is not None and type(receipt[k]) not in types_]
-    if type(receipt.get('events')) is list and not all(type(e) is dict for e in receipt['events']):
-        wrong.append('events (an entry is not an object)')
+    if type(receipt.get('events')) is list:
+        if not all(type(e) is dict for e in receipt['events']):
+            wrong.append('events (an entry is not an object)')
+        elif not all(e.get(k) is None or type(e.get(k)) is str for e in receipt['events'] for k in ('event', 'boundary')):
+            wrong.append('events (an event or boundary is not a string)')      # addendum 4, E
     return wrong
 
 
@@ -1119,7 +1252,7 @@ def verdicts(collector, pipeline, memory):
     return {'collector_unharmed': (collector['breach'] is None and collector['over_8s'] == 0
                                    and not any(st.get(k, 0) for k in HARMFUL_STATUSES) and st.get('error', 0) < HARMFUL_ERRORS),
             'pipeline_clean': pipeline_clean(pipeline),
-            'room_to_spare': None if not isinstance(low, (int, float)) else low >= STOP_FLOOR + ROOM_POINTS}
+            'room_to_spare': None if type(low) not in (int, float) else low >= STOP_FLOOR + ROOM_POINTS}
 
 
 def post_state(host, row):
@@ -1189,7 +1322,7 @@ def streaks(rows):
     for key, profile, target in STREAKS:
         n = 0
         for r in rows:
-            if r.get('command') == 'run' and r.get('launched') is True and r.get('profile') == profile:
+            if r.get('command') in ('run', 'recover') and r.get('launched') is True and r.get('profile') == profile:
                 n = n + 1 if r.get('counts') is True else 0
         out[key] = {'profile': profile, 'streak': n, 'target': target, 'reached': n >= target}
     return out
@@ -1305,13 +1438,15 @@ def cmd_run(host, args):
         return 2 if s['refusals'] else 0
     switch = SwitchOffs(host, row); stopper = None; work = None; own = {'lowest': None, 'max_pressure': None}
     swap_start = None; kept = None
-    guard = SignalGuard(host, row); intent = IntentFile(host)
+    guard = SignalGuard(host, row); intent = IntentFile(host); lock = OperatorLock(host)
     try:
         # Addendum 3, item 2: the TERM and HUP handlers before anything is switched off. Addendum 2, item 5: (a) every
         # refusal that needs no switch-off; (b) staging, which switches nothing off, the old-pipeline refusal and the
         # staged deadline (addendum 3, item 5); (c) the intent file, then the switch-offs; (d) the free reading after the
         # unloads settled; (e) the twin's preflight; (f) the gate and the launch.
         guard.install()
+        if not lock.take():                                       # addendum 4, D: before the first changing action
+            raise Refused(lock.refusal())
         if s['refusals']:
             raise Refused('; '.join(s['refusals']))
         work = fresh_folder(host, args.profile); twin = Path(str(work) + '-twin')
@@ -1320,10 +1455,13 @@ def cmd_run(host, args):
         stage(host, args.profile, flags, twin)
         require_stoppable(work)
         deadline = row['deadline'] = staged_deadline(work)
+        # addendum 4, F: the announcement at the start states the STAGED wall, not the limits table's
+        row['announcement'] = announcement('run', args.profile, plan, {'expected_s': s['durations']['expected_s'],
+                                                                      'wall_s': deadline['staged_wall_s']}, s, host.now())
         say('check passed and staged; expected %d s (tools/mirofish_swarm_limits.py, %s on %s), staged deadline %d s (%s), '
             'watched to %d s after the launch; switching off: %s' % (
                 s['durations']['expected_s'], args.profile, plan_label(plan), deadline['staged_wall_s'], deadline['source'],
-                deadline['watch_deadline_s'], s['announcement']))
+                deadline['watch_deadline_s'], row['announcement']))
         intent.write(**intent_start(host, 'run', row, s))
         switch.apply(s)
         settle_after_unloads(host, row)
@@ -1368,6 +1506,7 @@ def cmd_run(host, args):
             # ended, or after it gave up waiting, which is alerted): stop it the documented way and wait, boundedly.
             if proc is not None and proc.poll() is None and not any('LEFT RUNNING' in a for a in row['alerts']):
                 stopper.attempt(); wait_after_stop(host, proc, stopper, row)
+        guard.stage = 'the stop'
         steps.run('the stop', stop_if_running)
         if stopper is not None and stopper.rec['by'] == 'launcher interrupt':
             steps.run('the check after the launcher interrupt', after_interrupt_check, host, stopper, row)
@@ -1375,10 +1514,12 @@ def cmd_run(host, args):
             row['alerts'].append('RUN NOT STOPPED: OBSERVER NOT SIGNALLED: %s' % stopper.rec['not_signalled'])
         if proc is not None:
             row['launcher']['exit'] = steps.run('reading the launcher\'s exit', proc.poll)
+        guard.stage = 'the restore'
         restored = switch.restore(steps)
         if not restored:
             row['alerts'].append('PICK READER NOT RESTORED: %s IS NOT LOADED AGAIN FROM %s; BOOTSTRAP IT BY HAND' % (
                 PICKS_LABEL, (row['switch_offs']['pick_reader'] or {}).get('before', {}).get('plist')))
+        guard.stage = 'finishing the row'
         try:
             finish_run_row(host, row, work, plan, t_start, swap_start, own)
         except BaseException as e:
@@ -1386,12 +1527,20 @@ def cmd_run(host, args):
                 row['alerts'].append('THE RUN ROW COULD NOT BE COMPLETED: %s: %s' % (type(e).__name__, e))
             else:                  # addendum 2, item 8: interrupted while recording: a minimal row, then raised again
                 steps.kept = steps.kept or e
-                row = steps.row = minimal_row(row, host, e)
+                row = steps.row = guard.row = minimal_row(row, host, e)
 
         def append():
-            append_record(host.record, row, host.fsync); return True
+            n = len(row['signals_received'])
+            append_record(host.record, row, host.fsync)
+            if len(row['signals_received']) > n:       # addendum 4, F: a signal while the row itself was written
+                append_record(host.record, {'command': 'signal-note', 'utc_start': row['utc_start'], 'utc': utc(host.now()),
+                                            'signals_received': row['signals_received'][n:]}, host.fsync)
+            return True
+        guard.stage = 'the row'
         written = steps.run('the record append (RECORD NOT WRITTEN to %s)' % host.record, append) is True
-        intent_left = finish_intent(host, intent, steps, restored, written)
+        guard.stage = 'the intent file'
+        alive = proc is not None and steps.run('reading the launcher', proc.poll) is None
+        intent_left = finish_intent(host, intent, steps, restored, written, alive)
 
         def summary():
             say('RUN SUMMARY')
@@ -1399,27 +1548,40 @@ def cmd_run(host, args):
                 say(line)
             if intent_left:
                 say(intent_left)
+        guard.stage = 'the summary'
         steps.run('the summary', summary)
         steps.run('putting the signal handlers back', guard.restore)
+        lock.release()
         steps.reraise()
-    if not restored or not written or intent_left:
-        return 3
+    return run_exit(row, restored, written, intent_left)
+
+
+def run_exit(row, restored, written, intent_left):
+    """Addendum 4, F: 0 exactly when the run counts (its row written) and the restore succeeded, whatever arrived during
+    the cleanup; else 2 refused, 3 a restore, the row or the intent file not done or an alert, 1 otherwise (stopped,
+    failed, or ended without counting)."""
+    if row.get('counts') is True and restored and written:
+        return 0
     if row['refused']:
         return 2
-    if row['error'] or row['stopped'] or row['signals_received']:
+    if not restored or not written or intent_left:
+        return 3
+    if row['error'] or row['stopped']:
         return 1
-    return 3 if row['alerts'] else 0
+    return 3 if row['alerts'] else 1
 
 
-def finish_intent(host, intent, steps, restored, written):
-    """Addendum 3, items 2 and 3: the intent file is removed only once the restore and the row are done. Otherwise it
-    stays, so that no path ends with neither a row nor the intent file; returns the line that says so, or None."""
+def finish_intent(host, intent, steps, restored, written, alive=False):
+    """Addendum 3, items 2 and 3, and addendum 4, F: the intent file is removed only once the restore and the row are
+    done and the launcher has ended (a stop that could not be sent leaves it). Otherwise it stays, so that no path ends with
+    neither a row nor the intent file; returns the line that says so, or None."""
     if not intent.written:
         return None
-    if restored and written and steps.run('removing the intent file', intent.remove) is True:
+    if restored and written and not alive and steps.run('removing the intent file', intent.remove) is True:
         return None
-    return ('THE INTENT FILE %s WAS LEFT IN PLACE (%s): RUN `recover` BEFORE THE NEXT RUN' % (
-        intent.path, 'the restore or the row did not complete' if not (restored and written) else 'its removal failed'))
+    why = ('the launcher may still be running' if alive else 'the restore or the row did not complete'
+           if not (restored and written) else 'its removal failed')
+    return 'THE INTENT FILE %s WAS LEFT IN PLACE (%s): RUN `recover` BEFORE THE NEXT RUN' % (intent.path, why)
 
 
 def minimal_row(row, host, exc):
@@ -1438,10 +1600,15 @@ def finish_run_row(host, row, work, plan, t_start, swap_start, own):
     row['utc_end'] = utc(host.now())
     receipt = {}
     exit_code = (row.get('launcher') or {}).get('exit')
-    if work is not None and row['launched']:
-        row['pipeline'], receipt = pipeline_outcome(work, plan, exit_code)
-    else:
-        row['pipeline'] = pipeline_outcome(Path('/nonexistent'), plan, exit_code)[0]
+    try:
+        if work is not None and row['launched']:
+            row['pipeline'], receipt = pipeline_outcome(work, plan, exit_code)
+        else:
+            row['pipeline'] = pipeline_outcome(Path('/nonexistent'), plan, exit_code)[0]
+    except Exception as e:     # addendum 4, E: whatever the receipt holds, the collector, memory and post checks still run
+        row['pipeline'] = dict(pipeline_outcome(Path('/nonexistent'), plan, exit_code)[0], receipt_found=None,
+                               failure='the receipt or the ledger could not be walked: %s' % type(e).__name__)
+        receipt = {}
     health = collector_health(host, since=t_start)
     row['collector'] = collector_figures(health)
     if row.get('first_breach'):
@@ -1555,9 +1722,11 @@ def cmd_load_test(host, args):
                model, BASELINE_S, model, args.hold_minutes))
         return 2 if s['refusals'] else 0
     switch = SwitchOffs(host, result); lp = None; asked = False; base, hold = [], []; kept = None
-    guard = SignalGuard(host, result); intent = IntentFile(host)
+    guard = SignalGuard(host, result); intent = IntentFile(host); lock = OperatorLock(host)
     try:
         guard.install()                                          # addendum 3, item 2: before the first switch-off
+        if not lock.take():                                      # addendum 4, D
+            raise Refused(lock.refusal())
         if s['refusals']:
             raise Refused('; '.join(s['refusals']))
         work = fresh_folder(host, 'loadtest-' + re.sub(r'[^a-z0-9.-]', '-', model.lower()))
@@ -1602,7 +1771,7 @@ def cmd_load_test(host, args):
     except BaseException as e:
         guard.cleaning = True; result['stopped'] = 'interrupted (%s)' % type(e).__name__; kept = e
     finally:
-        guard.cleaning = True
+        guard.cleaning = True; guard.stage = 'the unload'
         steps = Steps(result); steps.kept = kept   # addendum 2, item 1: every step to its end, a Ctrl-C kept and raised at the end
         if lp is not None and asked:
             def unload():
@@ -1613,9 +1782,11 @@ def cmd_load_test(host, args):
                 result['alerts'].append('THE TEST MODEL\'S UNLOAD IS NOT PROVEN: %s' % result['unload'])
         if lp is not None:
             steps.run('the load path\'s helper stop', lp.close)
+        guard.stage = 'the restore'
         restored = switch.restore(steps)
         if not restored:
             result['alerts'].append('PICK READER NOT RESTORED: %s IS NOT LOADED AGAIN; BOOTSTRAP IT BY HAND' % PICKS_LABEL)
+        guard.stage = 'the result'
 
         def finish():
             result['utc_end'] = utc(host.now())
@@ -1645,7 +1816,10 @@ def cmd_load_test(host, args):
                 say(intent_left)
         steps.run('the summary', summary)
         steps.run('putting the signal handlers back', guard.restore)
+        lock.release()
         steps.reraise()
+    if result['refused']:
+        return 2
     if not restored or not written or intent_left:
         return 3
     if result['refused']:
@@ -1656,131 +1830,263 @@ def cmd_load_test(host, args):
 
 
 # ============================================================================ check, record, main
+def intent_shape_errors(intent):
+    """Addendum 4, E: the whole intent parsed against one typed shape before anything is done; the fields that fail."""
+    if not isinstance(intent, dict):
+        return ['the intent (not a JSON object)']
+    wrong = []
+    required = {'command', 'utc', 'tool', 'profile', 'pick_reader', 'models_to_unload', 'models_note', 'work', 'twin',
+                'launcher', 'record', 'scripts', 'launch'}
+    wrong += ['%s (missing)' % k for k in sorted(required - set(intent))]
+    wrong += ['%s (not a field of an intent)' % k for k in sorted(set(intent) - required - {'load_identifier'})]
+    S = lambda v: type(v) is str
+    I = lambda v: type(v) is int
+    SN = lambda v: v is None or type(v) is str
+    IN = lambda v: v is None or type(v) is int
+    D = lambda v, keys: type(v) is dict and set(v) == set(keys)
+    g = intent.get
+
+    def need(path, ok):
+        if not ok:
+            wrong.append(path)
+    need('command', S(g('command')) and g('command') in ('run', 'load-test'))
+    need('utc', S(g('utc')))
+    tool = g('tool')
+    need('tool', D(tool, ('pid', 'start')) and I(tool['pid']) and SN(tool['start']))
+    need('profile', SN(g('profile')))
+    pr = g('pick_reader')
+    if not D(pr, ('label', 'before')):
+        need('pick_reader', False)
+    else:
+        need('pick_reader.label', S(pr['label']))
+        before = pr['before']
+        if not D(before, ('listed', 'plist', 'state')):
+            need('pick_reader.before', False)
+        else:
+            need('pick_reader.before.listed', type(before['listed']) is bool)
+            need('pick_reader.before.plist', SN(before['plist']))
+            need('pick_reader.before.state', SN(before['state']))
+    need('models_to_unload', type(g('models_to_unload')) is list and all(S(x) for x in g('models_to_unload')))
+    need('models_note', S(g('models_note')))
+    need('work', S(g('work')))
+    need('twin', SN(g('twin')))
+    need('record', S(g('record')))
+    need('scripts', g('scripts') == ROLE_SCRIPTS and type(g('scripts')) is dict)
+    launch = g('launch')
+    need('launch', launch is None or (D(launch, ('spawning_utc',)) and S(launch['spawning_utc'])))
+    launcher = g('launcher')
+    if launcher is not None:
+        if not D(launcher, ('pid', 'start', 'pgid')):
+            need('launcher', False)
+        else:
+            need('launcher.pid', I(launcher['pid']))
+            need('launcher.start', SN(launcher['start']))
+            need('launcher.pgid', IN(launcher['pgid']))
+    if 'load_identifier' in intent:
+        need('load_identifier', SN(intent['load_identifier']))
+    return wrong
+
+
+def intent_mismatch(host, intent):
+    """Addendum 4, C: recover loads one thing only, the pick reader's own plist, a constant. An intent that names another
+    label or another plist, or a work folder that is not a staged folder of the crew folder, is refused whole."""
+    pr = intent['pick_reader']; before = pr['before']
+    out = []
+    if pr['label'] != PICKS_LABEL:
+        out.append('the intent names the job %r, not %s' % (pr['label'][:200], PICKS_LABEL))
+    if before['plist'] not in (None, host.picks_plist) or (before['listed'] and before['plist'] is None):
+        out.append('the intent names the plist %r, not %s' % ((before['plist'] or '')[:300], host.picks_plist))
+    work = Path(intent['work'])
+    if work.parent != host.crew or not work.name.startswith('valedia-native-') or '..' in work.parts:
+        out.append('the intent names the work folder %r, not a staged folder in %s' % (intent['work'][:300], host.crew))
+    return out
+
+
+def find_survivors(host, intent):
+    """Addendum 4, A and B: every process proposed as this run's launcher or observer (by the intent's launcher entry, by
+    the observer identity file in the staged folder, and by a scan of this user's processes for the two commands), each
+    put to the proof. Returns (proven, doubtful, scan_note): proven [{role, pid, start, by}], doubtful [{role, pid, by,
+    why}] (alive but not proven: never signalled), why the scan could not be made (None when it was), and the guard."""
+    work = intent['work']
+    guard = {'ancestors': ancestors(host), 'jobs': job_pids(host)}
+    proposals = []
+    launcher = intent['launcher']
+    if launcher is not None:
+        proposals.append(('launcher', launcher['pid'], launcher['start'], 'the intent'))
+    try:
+        identity = json.loads((Path(work) / 'builder' / IDENTITY_FILE).read_text())
+    except (OSError, ValueError):
+        identity = None
+    if isinstance(identity, dict) and 'pid' in identity:
+        proposals.append(('observer', identity.get('pid'), identity['start'] if type(identity.get('start')) is str else None,
+                          'the identity file'))
+    scan_note = None
+    try:
+        pids = [p for p in host.proc_scan() if type(p) is int]
+    except Exception as e:
+        pids = []; scan_note = 'THE PROCESS SCAN COULD NOT BE MADE (%s)' % type(e).__name__
+    proposed = {p[1] for p in proposals if type(p[1]) is int}
+    for pid in pids:
+        if pid in proposed or pid in guard['ancestors']:
+            continue
+        for role in ('launcher', 'observer'):
+            names = command_names(host, pid, work, role)
+            if names is None:
+                scan_note = scan_note or 'THE PROCESS SCAN COULD NOT BE MADE (A COMMAND COULD NOT BE READ)'
+            elif names:
+                proposals.append((role, pid, None, 'the scan'))
+    proven, doubtful = [], []
+    for role, pid, start, by in proposals:
+        why = proof_failure(host, pid, start, role, work, guard)
+        if why is None:
+            seen = observed_identity(host, pid)
+            proven.append({'role': role, 'pid': pid, 'start': seen and seen['start'], 'by': by})
+        elif why != 'gone':
+            doubtful.append({'role': role, 'pid': pid if type(pid) is int else repr(pid)[:40], 'by': by, 'why': why})
+    return proven, doubtful, scan_note, guard
+
+
 def cmd_recover(host, args):
-    """Addendum 3, item 2: after a run or load test that ended before its restore and its row (a KILL, a crash, a power
-    cut). Reads the intent file; puts the pick reader back from the recorded plist when it was loaded before and is not
-    now; reports whether the recorded launcher and its observer are alive (pid and start match) and, only with --stop,
-    stops the run the documented way (TERM to the observer when its identity is usable and it is the launcher's child,
-    else SIGINT to the launcher when its pid and start match); reports leftover mf-native instances (unloads nothing);
-    appends a row `recovered after an unfinished run`; removes the intent file. --dry-run changes nothing."""
-    say = host.out; t = host.now(); dry = args.dry_run
+    """Addendum 3, item 2, and addendum 4, A to F: after a run or load test that ended before its restore and its row (a
+    KILL, a crash, a power cut). It holds the operator lock (a live writer holds it: refused). The intent file is parsed
+    against its typed shape and checked against the constants (else refused whole, the file kept). Every process proposed
+    as the run's launcher or observer is put to the proof; a proven survivor is reported in capitals and, only with
+    --stop, stopped the documented way (TERM to a proven observer, else SIGINT to a proven launcher). While a proven
+    survivor lives, the scan could not be made, or a proposed process is alive but not proven, the pick reader is not put
+    back and the intent file is kept. Otherwise the pick reader is bootstrapped from its own plist when it was loaded
+    before and is not now; leftover mf-native instances are reported (nothing is unloaded); a row `recovered after an
+    unfinished run` is appended; the intent file is removed. --dry-run changes nothing."""
+    say = host.out
+    lock = OperatorLock(host)
+    if not lock.take():
+        say('refused: ' + lock.refusal()); return 2
+    try:
+        return _recover(host, args, say)
+    finally:
+        lock.release()
+
+
+def _recover(host, args, say):
+    dry = args.dry_run; t = host.now()
     if not host.intent.exists():
         say('recover: no intent file at %s: no unfinished run to recover; nothing was changed' % host.intent)
         return 0
     try:
         intent = json.loads(host.intent.read_text())
-        if not isinstance(intent, dict):
-            raise ValueError('not a JSON object')
     except (OSError, ValueError) as e:
         say('THE INTENT FILE %s IS NOT READABLE (%s): NOTHING WAS CHANGED; READ IT BY HAND' % (host.intent, type(e).__name__))
         return 3
-    tool = intent.get('tool') if isinstance(intent.get('tool'), dict) else {}
-    if type(tool.get('pid')) is int and tool['pid'] != host.self_pid and tool.get('start'):
-        seen = observed_identity(host, tool['pid'])
-        if seen is not None and seen['start'] == tool['start']:
-            say('refused: THE TOOL THAT WROTE THE INTENT FILE (pid %d) IS STILL RUNNING: ITS OWN CLEANUP RESTORES; nothing '
-                'was changed' % tool['pid'])
-            return 2
+    wrong = intent_shape_errors(intent)
+    if wrong:
+        say('refused: THE INTENT FILE %s HAS THE WRONG SHAPE in %s: NOTHING WAS DONE AND THE FILE IS KEPT' % (
+            host.intent, ', '.join(wrong)))
+        return 2
+    mismatch = intent_mismatch(host, intent)
+    if mismatch:
+        say('refused: MISMATCH: %s: NOTHING WAS DONE AND THE FILE IS KEPT' % '; '.join(mismatch))
+        return 2
     row = {'command': 'recover', 'utc_start': utc(t), 'utc_end': None, 'recovered': RECOVERED, 'dry_run': dry,
-           'intent': intent, 'pick_reader': None, 'launcher_alive': None, 'observer_alive': None, 'stop': None,
-           'launcher_alive_after': None, 'observer_alive_after': None, 'native_loaded': None, 'post': None,
-           'counts': False, 'alerts': []}
-    would = []
-    # the pick reader
-    before = ((intent.get('pick_reader') or {}).get('before') or {}) if isinstance(intent.get('pick_reader'), dict) else {}
+           'profile': intent['profile'], 'launched': intent['launch'] is not None or intent['launcher'] is not None,
+           'intent': intent, 'proven': [], 'doubtful': [], 'scan': None, 'pick_reader': None, 'launcher_alive': None,
+           'observer_alive': None, 'stop': None, 'launcher_alive_after': None, 'observer_alive_after': None,
+           'native_loaded': None, 'post': None, 'counts': False, 'alerts': []}
+    would = []; changed = False
+    try:
+        proven, doubtful, scan_note, guard = find_survivors(host, intent)
+    except Exception as e:
+        proven, doubtful, guard = [], [], None
+        scan_note = 'THE PROCESS SCAN COULD NOT BE MADE (%s)' % type(e).__name__
+    row['proven'], row['doubtful'], row['scan'] = proven, doubtful, scan_note or 'made'
+    for d in doubtful:
+        row['alerts'].append(('NOT SIGNALLED: pid %s proposed as the %s by %s failed a test: %s' % (
+            d['pid'], d['role'], d['by'], d['why'])).upper())
+    if scan_note:
+        row['alerts'].append(scan_note)
+    row['launcher_alive'] = any(p['role'] == 'launcher' for p in proven)
+    row['observer_alive'] = any(p['role'] == 'observer' for p in proven)
+
+    def still(p):
+        try:
+            return proof_failure(host, p['pid'], p['start'], p['role'], intent['work'], guard) is None
+        except Exception:
+            return True                    # cannot tell: treated as alive
+    if args.stop and proven:
+        stop = row['stop'] = {'by': None, 'sent': []}
+        for role, sig, by in (('observer', signal.SIGTERM, 'observer'), ('launcher', LAUNCHER_STOP_SIGNAL, 'launcher interrupt')):
+            targets = [p for p in proven if p['role'] == role and still(p)]      # proven again just before the signal
+            if not targets:
+                continue
+            for p in targets:
+                if dry:
+                    would.append('send %s to pid %d (the %s)' % (signal.Signals(sig).name, p['pid'], role))
+                    continue
+                host.send_signal(p['pid'], sig); changed = True
+                stop['sent'].append({'role': role, 'pid': p['pid'], 'signal': signal.Signals(sig).name, 'utc': utc(host.now())})
+                stop['by'] = stop['by'] or by
+            if dry:
+                break
+            sent = host.now()
+            while host.now() < sent + STOP_WAIT_S and any(still(p) for p in proven):
+                host.sleep(WATCH_S)
+            if not any(still(p) for p in proven):
+                break
+    alive = [p for p in proven if still(p)] if not dry else list(proven)
+    row['launcher_alive_after'] = any(p['role'] == 'launcher' for p in alive)
+    row['observer_alive_after'] = any(p['role'] == 'observer' for p in alive)
+    for p in alive:
+        row['alerts'].append('%s STILL RUNNING: pid %d (proven by its pid, start and command)%s' % (
+            p['role'].upper(), p['pid'], '' if args.stop else '; `recover --stop` stops it the documented way'))
+    blocked = bool(alive or doubtful or scan_note)
+    # the pick reader: its own plist only, and never beside a run that may still be going on
+    before = intent['pick_reader']['before']
     now = pick_reader_state(host)
     pr = row['pick_reader'] = {'label': PICKS_LABEL, 'before': before, 'found': now, 'bootstrap_exit': None, 'after': now}
-    if before.get('listed') and not now['listed']:
-        if not before.get('plist'):
-            row['alerts'].append('PICK READER NOT RESTORED: THE INTENT RECORDS NO PLIST; BOOTSTRAP %s BY HAND' % PICKS_LABEL)
+    if before['listed'] and not now['listed']:
+        if blocked:
+            row['alerts'].append('PICK READER LEFT OFF: A RUN MAY STILL BE GOING ON (SEE ABOVE); THE INTENT FILE IS KEPT')
         elif dry:
-            would.append('bootstrap %s from %s' % (PICKS_LABEL, before['plist']))
+            would.append('bootstrap %s from %s' % (PICKS_LABEL, host.picks_plist))
         else:
-            r = host.run(['/bin/launchctl', 'bootstrap', 'gui/%d' % host.uid, before['plist']], timeout=CMD_S)
+            r = host.run(['/bin/launchctl', 'bootstrap', 'gui/%d' % host.uid, host.picks_plist], timeout=CMD_S)
+            changed = True
             pr['bootstrap_exit'] = r.returncode; pr['after'] = pick_reader_state(host)
             if not pr['after']['listed']:
                 row['alerts'].append('PICK READER NOT RESTORED: %s IS NOT LOADED AGAIN FROM %s; BOOTSTRAP IT BY HAND' % (
-                    PICKS_LABEL, before['plist']))
-    reader_ok = not before.get('listed') or bool(pr['after'] and pr['after']['listed'])
-    # the launcher and its observer
-    launcher = intent.get('launcher') if isinstance(intent.get('launcher'), dict) else None
-
-    def alive():
-        why_l = launcher_mismatch(host, launcher) if launcher else 'the intent records no launcher'
-        identity = None
-        if intent.get('work'):
-            try:
-                identity = json.loads((Path(intent['work']) / 'builder' / IDENTITY_FILE).read_text())
-            except (OSError, ValueError, TypeError):
-                identity = None
-        why_o = identity_mismatch(host, identity)
-        return why_l, identity, why_o
-    why_l, identity, why_o = alive()
-    row['launcher_alive'], row['observer_alive'] = why_l is None, why_o is None
-    if launcher and not launcher.get('start') and type(launcher.get('pid')) is int and observed_identity(host, launcher['pid']):
-        row['alerts'].append('PID %d (THE RECORDED LAUNCHER) IS ALIVE BUT ITS START WAS NEVER READ: THE TOOL CANNOT TELL '
-                             'WHETHER IT IS THE LAUNCHER; CHECK IT BY HAND' % launcher['pid'])
-    if args.stop and (why_l is None or why_o is None):
-        stop = row['stop'] = {'by': None, 'pid': None, 'utc': None, 'not_signalled': None}
-        unusable = observer_unusable(host, identity, launcher['pid'] if launcher else None, why_l) if why_o is None else why_o
-        if unusable is None:
-            target, sig, by = identity['pid'], signal.SIGTERM, 'observer'
-        elif why_l is None and launcher['pid'] > 1 and launcher['pid'] not in (host.self_pid, host.parent_pid):
-            target, sig, by = launcher['pid'], LAUNCHER_STOP_SIGNAL, 'launcher interrupt'
-        else:
-            target = None; stop['not_signalled'] = unusable
-        if target is not None and dry:
-            would.append('send %s to %d (%s)' % (signal.Signals(sig).name, target, by))
-        elif target is not None:
-            host.send_signal(target, sig); sent = host.now()
-            stop.update(by=by, pid=target, signal=signal.Signals(sig).name, utc=utc(sent))
-            while host.now() < sent + STOP_WAIT_S:
-                host.sleep(WATCH_S)
-                a_l, _, a_o = alive()
-                if a_l is not None and a_o is not None:
-                    break
-    if row['stop'] is not None and row['stop']['by'] is not None:
-        a_l, _, a_o = alive()
-        row['launcher_alive_after'], row['observer_alive_after'] = a_l is None, a_o is None
-    else:
-        row['launcher_alive_after'], row['observer_alive_after'] = row['launcher_alive'], row['observer_alive']
-    if row['launcher_alive_after']:
-        row['alerts'].append('LAUNCHER STILL RUNNING: pid %d (started %s)%s' % (
-            launcher['pid'], launcher['start'], '' if args.stop else '; `recover --stop` stops it the documented way'))
-    if row['observer_alive_after']:
-        row['alerts'].append('OBSERVER STILL RUNNING: pid %d%s' % (
-            identity['pid'], '' if args.stop else '; `recover --stop` stops it the documented way'))
-    # leftover instances: reported, never unloaded
-    post_state(host, row)
+                    PICKS_LABEL, host.picks_plist))
+    reader_ok = not before['listed'] or bool(pr['after'] and pr['after']['listed'])
+    post_state(host, row)                  # leftover instances: reported, never unloaded
     row['native_loaded'] = row['post']['native_loaded']
     row['utc_end'] = utc(host.now())
-    say('recover: intent %s from %s (%s), work %s' % (host.intent, intent.get('utc'), intent.get('command'), intent.get('work')))
-    say('  pick reader: before %s, found %s, after %s' % (before.get('listed'), now['listed'], (pr['after'] or {}).get('listed')))
-    say('  launcher alive %s, observer alive %s; after: %s, %s; stop %s' % (
-        row['launcher_alive'], row['observer_alive'], row['launcher_alive_after'], row['observer_alive_after'], row['stop']))
-    say('  mf-native loaded %s; models unloaded by the run, %s: %s' % (
-        row['native_loaded'], NOT_RELOADED, ', '.join(intent.get('models_to_unload') or []) or 'none'))
+    say('recover: intent %s from %s (%s, %s), work %s' % (host.intent, intent['utc'], intent['command'], intent['profile'],
+                                                           intent['work']))
+    say('  proven survivors %s; not proven %d; scan %s' % (
+        ['%s %d' % (p['role'], p['pid']) for p in proven] or 'none', len(doubtful), row['scan']))
+    say('  pick reader: before %s, found %s, after %s' % (before['listed'], now['listed'], (pr['after'] or {}).get('listed')))
+    say('  stop %s; mf-native loaded %s; models unloaded by the run, %s: %s' % (
+        row['stop'], row['native_loaded'], NOT_RELOADED, ', '.join(intent['models_to_unload']) or 'none'))
     for alert in row['alerts']:
         say(alert)
     if dry:
-        say('dry run: would %s, append the row %r and remove the intent file. Nothing was changed.' % (
-            '; '.join(would) or 'change nothing else', RECOVERED))
+        say('dry run: would %s. Nothing was changed.' % ('; '.join(would) or 'change nothing'))
         return 0
+    complete = not blocked and reader_ok
+    if not (changed or complete):
+        say('nothing was changed; THE INTENT FILE %s IS KEPT' % host.intent)
+        return 3
     try:
         append_record(host.record, row, host.fsync); written = True
     except Exception as e:
-        say('THE RECOVER ROW WAS NOT WRITTEN TO %s: %s: %s; THE INTENT FILE IS KEPT' % (host.record, type(e).__name__, e))
+        say('THE RECOVER ROW WAS NOT WRITTEN TO %s: %s; THE INTENT FILE IS KEPT' % (host.record, type(e).__name__))
         written = False
-    if written and reader_ok:
-        intent_file = IntentFile(host)
+    if written and complete:
         try:
-            intent_file.remove()
+            IntentFile(host).remove()
             say('the intent file %s was removed' % host.intent)
         except OSError as e:
-            say('THE INTENT FILE %s COULD NOT BE REMOVED: %s' % (host.intent, e)); return 3
+            say('THE INTENT FILE %s COULD NOT BE REMOVED: %s' % (host.intent, type(e).__name__)); return 3
     elif written:
-        say('THE INTENT FILE %s IS KEPT: THE PICK READER IS NOT RESTORED' % host.intent)
-    return 0 if written and reader_ok and not row['alerts'] else 3
+        say('THE INTENT FILE %s IS KEPT: %s' % (host.intent, 'A RUN MAY STILL BE GOING ON' if blocked else 'THE PICK READER IS NOT RESTORED'))
+    return 0 if written and complete and not row['alerts'] else 3
 
 
 def cmd_check(host, args):
@@ -1808,8 +2114,12 @@ def cmd_record(host, args):
             damaged, '' if damaged == 1 else 's', host.record))
     for r in rows:
         if r.get('command') == 'recover':
-            host.out('%s recover: %s; launcher alive %s; mf-native loaded %s' % (
-                r.get('utc_start'), r.get('recovered'), r.get('launcher_alive'), r.get('native_loaded')))
+            host.out('%s recover %s: %s; launched %s (a run that does not count); launcher alive %s; mf-native loaded %s' % (
+                r.get('utc_start'), r.get('profile'), r.get('recovered'), r.get('launched'), r.get('launcher_alive'),
+                r.get('native_loaded')))
+            continue
+        if r.get('command') == 'signal-note':
+            host.out('%s signal-note: %s' % (r.get('utc_start'), r.get('signals_received')))
             continue
         host.out('%s %s %s %s: %s; verdicts %s; counts %s' % (
             r.get('utc_start'), r.get('command'), r.get('profile'), plan_label(r.get('plan')),

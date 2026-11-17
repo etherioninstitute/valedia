@@ -970,7 +970,7 @@ class RunRecipe(Base):
     def test_no_identity_file_and_no_breach_only_alerts(self):
         self.w.write_identity = False
         rc = self.main(RUN)
-        self.assertEqual(rc, 3)
+        self.assertEqual(rc, 0)          # addendum 4, F: a counting run with a restore that succeeded is 0, alerts or not
         self.assertEqual(self.w.signals, [])
         self.assertTrue(any('OBSERVER IDENTITY FILE NOT WRITTEN' in a for a in self.w.rows()[-1]['alerts']))
 
@@ -997,7 +997,7 @@ class RunRecipe(Base):
     def run_with(self, statuses, run_s=180):
         self.w.per_minute = 1; self.w.run_s = run_s
         self.w.status = lambda t: statuses.get(int(t - START), 'ok')    # keyed by seconds after START, one decision a minute
-        self.assertIn(self.main(RUN), (0, 3), self.w.text())
+        self.assertIn(self.main(RUN), (0, 1, 3), self.w.text())     # addendum 4, F: 1 when the run does not count
         return self.w.rows()[-1]
 
     def test_b_one_error_in_the_run_leaves_the_collector_unharmed(self):
@@ -1902,7 +1902,7 @@ class Addendum4(Base):
                     self.w.receipt['events'] = events
                 if calls is not None:
                     self.w.ledger = {'calls': calls}
-                self.main(['run', '--profile', 'swarm8', '--setup-model', 'qwen3-8b', '--turns-model', 'qwen3-8b',
+                self.main(['run', '--profile', 'swarm8', '--setup-model', 'ternary-bonsai-2-27b', '--turns-model', 'qwen3-8b',
                            '--announced', 'told'])
                 row = self.w.rows()[-1]
                 self.assertIsNone(row['error']); self.assertFalse(row['verdicts']['pipeline_clean'])
@@ -1917,6 +1917,9 @@ class Addendum4(Base):
     POOL = (None, True, False, 0, -1, 7, 1.5, '', 'x', 'B1', [], [1], [None], ['B1', 2], {}, {'a': 1}, [[1]], [{'boundary': [1]}],
             [{'event': 'model_swap', 'boundary': {'x': 1}}], {'calls': 'x'})
 
+    def pick(self, rng):
+        return copy.deepcopy(rng.choice(self.POOL))
+
     def test_E_property_random_mistyped_receipts_never_raise(self):
         rng = random.Random(4); work = self.w.tmp / 'prop'; (work / 'builder').mkdir(parents=True)
         fields = ('complete', 'cleanup_proven', 'paper_handoff', 'failure', 'events', 'resource_failures',
@@ -1930,14 +1933,14 @@ class Addendum4(Base):
                     head, key = target.split('.')
                     node = receipt.get(head)
                     if isinstance(node, list) and node:
-                        node[0] = {'event': rng.choice(self.POOL), 'boundary': rng.choice(self.POOL)}
+                        node[0] = {'event': self.pick(rng), 'boundary': self.pick(rng)}
                     elif isinstance(node, dict):
-                        node[key] = rng.choice(self.POOL)
+                        node[key] = self.pick(rng)
                 else:
-                    receipt[target] = rng.choice(self.POOL)
+                    receipt[target] = self.pick(rng)
             (work / 'builder/native-run-receipt.json').write_text(json.dumps(receipt))
             (work / 'builder/gateway-ledger.json').write_text(json.dumps(rng.choice(
-                [self.w.ledger, {'calls': [{'state': rng.choice(self.POOL)}]}, rng.choice(self.POOL)])))
+                [self.w.ledger, {'calls': [{'state': self.pick(rng)}]}, self.pick(rng)])))
             plan = rng.choice([None, {'model': 'm'}, {'setup': 'a', 'turns': 'b'}])
             p, r = OP.pipeline_outcome(work, plan, rng.choice([0, 1, None]))
             m = OP.memory_outcome(r, 1, 2, {'lowest': None, 'max_pressure': None})
@@ -1960,7 +1963,7 @@ class Addendum4(Base):
                 try:
                     for k in path[:-1]:
                         node = node[k]
-                    node[path[-1]] = rng.choice(self.POOL)
+                    node[path[-1]] = self.pick(rng)
                 except (KeyError, TypeError):
                     pass
             self.intent.write_text(json.dumps(bad) if rng.random() < 0.97 else rng.choice(['', '[', '[1]', '"x"']))
