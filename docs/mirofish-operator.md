@@ -10,6 +10,7 @@ $PY -B tools/mirofish_operator.py check --profile swarm8 --model qwen3-8b       
 $PY -B tools/mirofish_operator.py run --profile swarm8 --model qwen3-8b --announced "Told Burton 14:05: swarm8 on the 8B, ..."
 $PY -B tools/mirofish_operator.py load-test --model qwen3-8b --hold-minutes 5 --announced "Told Burton 14:05: 8B load test"
 $PY -B tools/mirofish_operator.py record
+$PY -B tools/mirofish_operator.py recover [--stop]                                  # after a run that was killed
 ```
 
 Every subcommand takes `--dry-run`: it prints what it would do and changes nothing (`check --dry-run` reads nothing either;
@@ -40,6 +41,11 @@ Read-only. It prints, and with `--json-out FILE` (or `--json`) returns as JSON:
 - The ANNOUNCEMENT: start time, expected duration and wall clock for the chosen profile and model (from
   `tools/mirofish_swarm_limits.py` through the stage tool's `swarm_numbers`), and by name everything that will be switched off
   and for how long. The lead gives this text to the owner before a run.
+- The durations line: `expected N s, wall M s` from `tools/mirofish_swarm_limits.py` for the chosen profile AND plan (through
+  the stage tool's `swarm_numbers`). The watch itself uses the deadline read from the staged folder after staging (see the
+  watch deadline below); `run` prints both before it switches anything off.
+- An intent file of an unfinished run (`artifacts/mirofish/operator-intent.json`): `AN UNFINISHED RUN'S INTENT FILE EXISTS`
+  in capitals, and `check`, `run` and `load-test` refuse until `recover` has run.
 
 ## The announcement and `--announced`
 
@@ -90,7 +96,7 @@ is a few times that lag and about 1% of the window; no unload, no wait); under t
 models were unloaded and that LM Studio loads them again on demand; (e) the twin's preflight; (f) the gate and the launch. A
 refusal in (a) or (b) has made no change at all.
 
-LM Link not disabled; the decision instance not loaded and right; an `mf-native-*` instance already loaded; the collector
+An intent file of an unfinished run (in capitals: run `recover` first); LM Link not disabled; the decision instance not loaded and right; an `mf-native-*` instance already loaded; the collector
 already in breach (the breach rule below over the decisions of the last 15 minutes, its last heartbeat and its job), or too
 quiet to judge (fewer than 5 decisions in those 15 minutes: a run must not start blind); the hourly pick reader running, or
 due within 2 minutes, or due and not yet seen running and then idle after its start; a second decision-model instance; the
@@ -102,7 +108,9 @@ runs do not refuse; unreadable gate or identity files do (fail closed).
 
 A run that cannot be stopped is not started: before the gate is written, the staged `owned-source/observer-entry/
 mirofish_native_run.py` must contain the code that writes `builder/observer-identity.json` (searched by that file name). A
-revision without it refuses with "the staged pipeline revision is too old"; no gate is written.
+revision without it refuses with "the staged pipeline revision is too old"; no gate is written. A staged folder without
+exactly one readable run deadline in its startup script, or whose manifest says a different wall, refuses in step (b) as
+well (see the watch deadline below).
 
 ## Breach (checked every 30 s during `load-test` and `run`)
 
@@ -123,24 +131,82 @@ started, whose own pid and start still match what was recorded at spawn; and the
 parent, not 1 or below. Nothing else is ever sent TERM; never on a pid alone, and at most once. It then waits for the pipeline's own cleanup (the launcher
 ending, at most 180 s after the signal), verifies that no `mf-native-*` instance is loaded and that the decision instance is still
 loaded and right, restores, and records `stopped: collector breach` with the figures. `load-test` unloads its test model
-through the pipeline's own unload instead. Ctrl-C stops the run the same way before restoring.
+through the pipeline's own unload instead. Ctrl-C, a TERM, a hang-up, an exception or an exit stops the run the same way
+before restoring (one path, below).
 
-The launcher is started by this tool in its own session and process group, and its pid, start and group are recorded at
-launch. If the identity file has not appeared 60 s after the launch, the summary says so in capitals and the watch goes on.
-An identity that fails the rule above for ANY reason (missing, unreadable, malformed, a reused pid, not our launcher's child)
-is "no usable identity": from 60 s after the launch, at the first breach, the stop signal is then SIGINT to the launcher this tool started, never TERM and never a group signal, and only
-when the launcher is still the process that was started (pid, start and group all match); the record says
-`stop.by: "launcher interrupt"`. SIGINT raises KeyboardInterrupt in the launcher, whose own handler stops the observer group
-the pipeline's way (`src/mirofish_native_startup.py`, lines 169 to 190); a TERM would kill the launcher without that cleanup.
-After it the tool waits the same 180 s as for the normal stop, counted from the signal, then reads the model list: an
-`mf-native-*` instance still loaded is said as `MF-NATIVE INSTANCE STILL LOADED AFTER THE LAUNCHER INTERRUPT` in capitals in the
-summary and the record (`stop.after_check`); the tool unloads nothing it did not load. A launcher that is not in a group of its
-own, or whose start or group has changed, is never signalled; that is said in capitals as well.
+The launcher is started by this tool in its own session and process group. Its handle is bound to the stop path's state in
+the very statement that spawns it (`stopper.proc = host.spawn(...)` in `launch`, `tools/mirofish_operator.py`), with every
+signal held for that one statement and raised just after it, so nothing runs between the spawn and the binding: from then on
+the launcher is this tool's own unreaped child, and its pid is the handle's own (such a pid cannot belong to another process
+until the tool reaps it). Its start and group are then read with `ps`, up to 3 times 0.5 s apart; a start that cannot be
+read is recorded as `null` and does NOT disarm the stop. If the identity file has not appeared 60 s after the launch, the
+summary says so in capitals and the watch goes on. An identity that fails the rule above for ANY reason (missing,
+unreadable, malformed, a reused pid, not our launcher's child) is "no usable identity": from 60 s after the launch, at the
+first breach, the stop signal is then SIGINT sent THROUGH THE LAUNCHER'S HANDLE (`Popen.send_signal`, which never signals a
+child already reaped), never TERM and never a group signal; when a start was read, only while the launcher's pid, start and
+group still match. The record says `stop.by: "launcher interrupt"`. SIGINT raises KeyboardInterrupt in the launcher, whose
+own handler stops the observer group the pipeline's way (`src/mirofish_native_startup.py`, lines 169 to 190); a TERM would
+kill the launcher without that cleanup. After it the tool waits the same 180 s as for the normal stop, counted from the
+signal, then reads the model list: an `mf-native-*` instance still loaded is said as `MF-NATIVE INSTANCE STILL LOADED AFTER
+THE LAUNCHER INTERRUPT` in capitals in the summary and the record (`stop.after_check`); the tool unloads nothing it did not
+load. A launcher whose recorded start or group has changed is never signalled; that is said in capitals.
 
-The watch has a hard deadline: the profile's wall time (from `tools/mirofish_swarm_limits.py`, through the stage tool's
-`swarm_numbers`) plus the 120 s cleanup after the launch. Past it the run is stopped the same way and the record says
-`stopped: wall exceeded`. A run that cannot be signalled at all still ends the watch 180 s after the deadline, with
+From the spawn on, ANY way out (an exception, Ctrl-C, a TERM or a hang-up, a SystemExit, before or during the watch) goes
+through one path: stop the run (the observer by its identity when usable, else the launcher through its handle), wait for
+its cleanup, check for leftover `mf-native-*` instances, restore, write the row with what happened. Once the spawn has
+returned the row never says `launched: false`. A SystemExit is raised again after the row and the summary.
+
+The watch deadline comes from the STAGED folder, not from the repository: the stager writes the profile's wall into the
+staged `owned-source/observer-entry/mirofish_native_startup.py` as `deadline=time.monotonic()+(30 if preflight else N)`
+(line 145 of `src/mirofish_native_startup.py`, edited by `swarm_startup_bytes` in `tools/mirofish_native_stage.py`) and into
+`builder/candidate-manifest.json` as `uniform_policy.wall_seconds`. The startup script's N (the launcher's own deadline) is
+used; the manifest must say the same, or the run is refused before any switch-off. The row records it as `deadline`
+(`staged_wall_s`, `source`, `manifest_wall_seconds`, `watch_deadline_s`), and `run` prints both the expected duration from
+`tools/mirofish_swarm_limits.py` and the staged deadline before it switches anything off. Past N plus the 120 s cleanup after
+the launch the run is stopped the same way and the record says `stopped: wall exceeded`. A run that cannot be signalled at all still ends the watch 180 s after the deadline, with
 `THE LAUNCHER WAS LEFT RUNNING` in capitals: the watch never runs on without end.
+
+## Signals, the intent file and `recover`
+
+`run` and `load-test` install handlers for TERM, HUP and INT before the first switch-off. A TERM or a hang-up (a closed
+terminal, an ended session, a caller's timeout) takes the same controlled path as a Ctrl-C: stop the run, restore, record
+`stopped: operator signalled (SIGTERM)` (or `SIGHUP`), exit 1. At most one signal ever raises: one that arrives during the
+stop, the restore or the recording is only listed in the row's `signals_received`, and never aborts that path. A hang-up
+that is already ignored when the tool starts (it was started under `nohup`) stays ignored, and the row says
+`hup_ignored: true`. The old handlers are put back at the end.
+
+What no handler can catch (a KILL, a crash, a power cut) is caught by the intent file
+`artifacts/mirofish/operator-intent.json`, written and synced (a temporary file synced, renamed into place, the folder synced)
+before the first switch-off. It holds: the command; the time; this tool's own pid and start; the pick reader's label and
+before-state (`listed`, `plist`, `state`); the instance ids about to be unloaded (and that they are not reloaded); the staged
+folder and its twin; the record path; and, rewritten as soon as they are known, the launcher's pid, start and group (for a
+load test, its `mf-native-*` identifier). It is removed only after the restore and the row are done; if either did not
+complete it stays, with a capitals line saying so and exit 3, so that no path ends with neither a row nor the intent file
+(an interrupt while the minimal row is being synced included). While it exists, `check`, `run` and `load-test` refuse in
+capitals.
+
+`recover` is for after such an end. It reads the intent file (none: "no intent file", exit 0); refuses if the tool that wrote
+it is still running (its pid and start match); bootstraps the pick reader from the recorded plist when it was loaded before
+and is not now; reports whether the recorded launcher and its observer are alive (pid and start match) as `LAUNCHER STILL
+RUNNING` / `OBSERVER STILL RUNNING`, and only with `--stop` stops the run the documented way (TERM to the observer when its
+identity is usable and it is the recorded launcher's child, else SIGINT to the launcher when its pid and start match;
+nothing on a pid alone) and waits up to 180 s for it to end; reports any `mf-native-*` instance still loaded (it unloads
+nothing) and the decision instance's state; appends a row `{"command": "recover", "recovered": "recovered after an unfinished
+run", ...}`; and removes the intent file (kept if the reader could not be restored or the row not written). Exit 0 with no
+alert, else 3. `recover --dry-run` reads and prints, and changes nothing.
+
+A long run should not depend on the terminal that started it. Start it detached from the terminal, so that closing the
+window or ending the session neither hangs it up nor kills it, and read its output from the log:
+
+```bash
+cd /Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader
+nohup $PY -B tools/mirofish_operator.py run --profile swarm48 --model qwen3-8b --announced "..." \
+  > artifacts/mirofish/operator-logs/run-$(date -u +%Y%m%dT%H%M%SZ).out 2>&1 < /dev/null &
+```
+
+or inside `tmux new -s mirofish` (detach with Ctrl-B D, reattach with `tmux attach -t mirofish`). To stop such a run, send
+it TERM (`kill <pid of the operator>`): it stops, restores and records as for Ctrl-C. Never KILL it; if it was killed anyway,
+run `recover` (then `recover --stop` if a run survives).
 
 ## What a breach costs
 
@@ -151,12 +217,12 @@ minutes after the first bad decision. If the observer cannot be named, add up to
 
 ## run
 
-check; stage (`tools/mirofish_native_stage.py --stage --profile P [--model ...] --work <crew>/valedia-native-
-<date>-<profile>-op<hhmmss>`) and stage a twin (`...-twin`); switch-offs; 15 s for the unloads to settle; free reading against
+check; the signal handlers; stage (`tools/mirofish_native_stage.py --stage --profile P [--model ...] --work <crew>/valedia-native-
+<date>-<profile>-op<hhmmss>`) and stage a twin (`...-twin`); the staged deadline; the intent file; switch-offs; 15 s for the unloads to settle; free reading against
 the staged threshold; preflight the twin
 (`mirofish_native_startup.py --preflight`, which loads no model); the gate (`root-one-native-attempt.json`: outcome, action,
 candidate hash, an expiry 30 minutes ahead, and the announcement); launch from the observer entry; watch; restore; append the
-record row; a ten-line summary. Exit 0 ran to its end with no alert, 1 stopped or failed, 2 refused, 3 a restore failed, the
+record row; remove the intent file; a ten-line summary. Exit 0 ran to its end with no alert, 1 stopped or failed, 2 refused, 3 a restore failed, the
 record was not written, or an alert in capitals. A Ctrl-C or SystemExit inside the restore or the recording is raised again
 after the row and the summary are written (the shell then shows it).
 
@@ -183,7 +249,7 @@ highest latency). These two numbers feed the start threshold's table.
 not end with a newline (a torn last line) gets one, so a new row is never glued to it; reading never raises on a damaged
 line: it is skipped and counted, `record` prints the count, and a damaged line never counts as a run in either direction
 (neither a counted run nor a reset). Every `run` that got past its arguments writes a row (a refusal too, with
-`launched: false`); an interrupt while the row is being finished still appends a minimal row (`recording: "interrupted while
+`launched: false`; once the spawn has returned, always `launched: true`); an interrupt while the row is being finished still appends a minimal row (`recording: "interrupted while
 recording: ..."`, with what is known, never counting) before the interrupt is raised again. A row holds the start and end, profile, plan, staged folder,
 the announcement, the switch-offs with before and after states, the pipeline outcome (receipt `complete`, its reason, calls,
 failed and refused calls, both swaps, cleanup proven, `report_usable`), memory (`resource.lowest_sustained_free_percent_10s`,
@@ -193,7 +259,9 @@ swap at the start and end; the tool's own 30 s readings), the collector during t
 - `collector_unharmed`: false when there was a breach, or any decision over 8 s, or any `model_unavailable`, `tag_mismatch` or
   `late`, or two or more `error` during the run. A single `error` does not fail it. The row's `collector.statuses` carries the
   count of each status, so a person can read it;
-- `pipeline_clean`: a receipt exists and is readable; no failed or refused call; cleanup proven; both swaps clean (one
+- `pipeline_clean`: a receipt exists and is readable (a JSON object whose `complete`, `cleanup_proven` and `paper_handoff`
+  are booleans, `failure` an object, `events` a list of objects, `resource_failures` and `resource_failure_samples` lists and
+  `resource` an object, each where present: any other type makes it unreadable, not clean, never an exception); no failed or refused call; cleanup proven; both swaps clean (one
   model: not applicable); no stop on the memory rule; and EITHER `complete` is true with no failure and the launcher's exit
   0, OR `complete` is false for exactly the near-neutral reason with the launcher's exit 1. That reason is the string
   `derived report not usable evidence`, raised as `Refused` at `src/mirofish_provenance.py:437` when the report's signal is
@@ -206,4 +274,5 @@ swap at the start and end; the tool's own 30 s readings), the collector during t
 
 A run COUNTS only when all three are true. `record` prints the rows and the current streak of counted runs at 9 participants
 (`swarm8`, target 10 in a row) and at 48 (`swarm48`, target 3 in a row); one launched run that does not count resets its
-streak; refusals do not touch it. The word "reliable" waits for those targets.
+streak; refusals do not touch it. `recover` rows are listed apart and never touch a streak. The word "reliable" waits for
+those targets.
