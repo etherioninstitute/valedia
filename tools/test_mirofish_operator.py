@@ -1803,7 +1803,8 @@ class Addendum4(Base):
                     if how == 'identity':
                         self.identity_names(pid, start, pid)
                     # addendum 8, D: its command names the staged folder, so it is "could not be decided": held back
-                    self.assertNothingSignalledAndKept(self.main(['recover', '--stop'])); self.assertFalse(self.w.picks_loaded)
+                    before = self.w.picks_loaded                  # nothing is changed for the reader
+                    self.assertNothingSignalledAndKept(self.main(['recover', '--stop'])); self.assertEqual(self.w.picks_loaded, before)
                     self.assertIn('JOB', self.w.text())
 
     def test_A_pids_not_above_1_never_signalled_and_mistyped_pids_refused_whole(self):
@@ -2680,7 +2681,7 @@ class Addendum8(Base):
         self.assertTrue(row['launched']); self.assertFalse(row['counts']); self.assertNotEqual(rc, 0)
         self.assertTrue(row['verdicts']['pipeline_clean'] and row['verdicts']['collector_unharmed'])   # it would have counted
         self.assertTrue(row['model_check_failures'], row)
-        self.assertTrue(any(word in a for a in row['alerts'] if a.upper() == a), row['alerts'])
+        self.assertTrue(any(word in a for a in row['alerts'] if a.startswith('THE LOADED MODELS DO NOT HOLD')), row['alerts'])
 
     def test_A_a_listing_that_leaves_the_announced_set_after_the_spawn_and_stays_never_counts(self):
         for name, edit in self.breakers().items():

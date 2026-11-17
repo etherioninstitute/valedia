@@ -343,8 +343,13 @@ PROTECTED_REFUSAL = 'the model list cannot be judged: %s; the tool does not gues
 def protected_wrong(loaded):
     """Addendum 7, D: an instance is the decision or the embedding instance only as its expected pair, id and model key
     both. Every way a listing breaks that: a protected id under another key, a protected key under another id, a loaded
-    instance whose id or key is not a plain string. The tool does not guess which one is meant."""
+    instance whose id or key is not a plain string (non-empty, no outer blank), a protected pair loaded more than once
+    (addendum 8, C). The tool does not guess which one is meant."""
     out = []
+    for p_id, p_key, what in ((DM.INSTANCE, DM.KEY, 'decision'), (EMBEDDING_INSTANCE, EMBEDDING_KEY, 'embedding')):
+        n = sum(1 for key, iid in loaded if key == p_key and iid == p_id)
+        if n > 1:
+            out.append('the %s pair %s (%s) is loaded %d times' % (what, p_id, p_key, n))
     for key, iid in loaded:
         if not (plain_string(key) and plain_string(iid)):
             out.append('a loaded instance has an id or a model key that is not a plain string (id %s, key %s)' % (
@@ -364,7 +369,7 @@ def models_state(host):
     (addendum 7, D) names every way the list breaks the protected pairs; `reachable` False when it could not be read."""
     def unknown(why):
         return {'reachable': False, 'decision_instance': {'loaded_and_right': False, 'why': why}, 'embedding_loaded': False,
-                'others': [], 'native_loaded': [], 'protected_wrong': [], 'unread_why': why}
+                'others': [], 'native_loaded': [], 'protected_wrong': [], 'unread_why': why, 'loaded': []}
     try:
         status, listing = host.http('GET', LMSTUDIO + '/api/v1/models', None, HTTP_S)
     except Exception as e:
@@ -390,15 +395,23 @@ def models_state(host):
               and key not in (DM.KEY, EMBEDDING_KEY) and not iid.startswith(NATIVE_PREFIX) and not decision_model(key, iid)]
     return {'reachable': True, 'decision_instance': {'loaded_and_right': why is None, 'why': why},
             'embedding_loaded': any(iid == EMBEDDING_INSTANCE and key == EMBEDDING_KEY for key, iid in loaded),
-            'others': others, 'native_loaded': native, 'protected_wrong': protected_wrong(loaded), 'unread_why': None}
+            'others': others, 'native_loaded': native, 'protected_wrong': protected_wrong(loaded), 'unread_why': None,
+            'loaded': [{'instance_id': iid, 'key': key} for key, iid in loaded]}     # every loaded instance, as listed
+
+
+PS_ENV = {'PATH': '/usr/bin:/bin'}     # no TZ, no LANG, no LC_*: every process start is read in this one form
 
 
 def read_identity(host, pid):
     """ps of one pid: (its pid, parent pid, process group and start (lstart), 'ok'), never its command line; (None,
     'gone') only for ps's own answer for a pid that does not exist (exit 1, nothing on either stream, measured
     2026-11-17); (None, 'unreadable') for any other answer (addendum 7, B: a start that could not be read is never
-    "gone"). An exception from the read goes to the caller."""
-    r = host.run(['/bin/ps', '-p', str(pid), '-o', 'pid=,ppid=,pgid=,lstart='], timeout=CMD_S)
+    "gone"). An exception from the read goes to the caller.
+    Addendum 8, B: ps runs in one fixed environment, PS_ENV, never the caller's, so the start it prints does not depend
+    on the caller's TZ or locale: the machine's own time zone and the C locale, the very form in which the pipeline's
+    observer writes its start into builder/observer-identity.json (it runs ps with no TZ and no locale in its
+    environment: src/mirofish_native_startup.py:161, src/mirofish_native_run.py:69)."""
+    r = host.run(['/bin/ps', '-p', str(pid), '-o', 'pid=,ppid=,pgid=,lstart='], env=dict(PS_ENV), timeout=CMD_S)
     out, err = r.stdout if isinstance(r.stdout, str) else '', r.stderr if isinstance(r.stderr, str) else ''
     if r.returncode == 1 and not out.strip() and not err.strip():
         return None, 'gone'
@@ -695,6 +708,10 @@ class SwitchOffs:
 
     def apply(self, summary):
         host = self.host
+        bad = [o for o in summary['models']['others'] if not (plain_string(o.get('instance_id')) and plain_string(o.get('key')))]
+        if bad:                    # addendum 8, C: before anything is switched off
+            raise OperatorError('refused: an instance to unload has an id or key that is not a plain string (%s)' % ', '.join(
+                'id %s, key %s' % (repr(o.get('instance_id'))[:60], repr(o.get('key'))[:60]) for o in bad))
         before = pick_reader_state(host)
         pr = self.rec['pick_reader'] = {'label': PICKS_LABEL, 'before': before, 'booted_out': False, 'after': None, 'restored': None}
         if before['running']:      # it may have started since the check: never boot out a reader mid-run (ruling 4)
@@ -714,6 +731,9 @@ class SwitchOffs:
                 raise OperatorError('the pick reader bootout failed (exit %d); it is still loaded' % r.returncode)
         for other in summary['models']['others']:
             iid = other['instance_id']
+            if not (plain_string(iid) and plain_string(other['key'])):      # addendum 8, C: never such an unload
+                raise OperatorError('refused to unload an instance whose id or key is not a plain string (id %s, key %s)' % (
+                    repr(iid)[:60], repr(other['key'])[:60]))
             if (iid in (DM.INSTANCE, EMBEDDING_INSTANCE) or iid.startswith(NATIVE_PREFIX) or iid.startswith(DM.INSTANCE)
                     or other['key'] == DM.KEY):             # never, whatever the list says
                 raise OperatorError('refused to unload the protected instance %s' % iid)
@@ -1053,26 +1073,64 @@ def late_models(host, row, now=None):
     return new
 
 
-def alert_late(host, row, state=None):
-    """After the spawn (or the load call): one read of the list (or `state`, a models_state already read). A list that
-    could not be read (addendum 7, C) is a capitals alert at the first such check of a stretch, and the row's
-    `model_list_unread` stays True until a later check reads the list: the run counts only if the last check, the one at
-    its end, read it."""
+def remaining_set(models):
+    """Addendum 8, A: at the announcement, the exact loaded instances (id and key) that stay for the run: every loaded
+    instance but those announced for unloading. Sorted [id, key] pairs, recorded in the row."""
+    gone = {o['instance_id'] for o in models['others']}
+    return sorted([i['instance_id'], i['key']] for i in models['loaded'] if i['instance_id'] not in gone)
+
+
+def instance_name(i):
+    show = lambda v: v if plain_string(v) else repr(v)[:60]
+    return '%s (%s)' % (show(i['instance_id']), show(i['key']))
+
+
+def models_hold(host, row, extra_ok=None, state=None):
+    """Addendum 8, A: one check after the spawn (each watch check, each check of a load test's hold, and the one at the
+    end), of a fresh read of the list or of `state`. It holds only when the list was read, the loaded instances are
+    EXACTLY the announced set (`row['remaining']`; while the run or the hold goes on, also instances `extra_ok` accepts:
+    the pipeline's own mf-native-* ones, or the load test's own identifier), no protected pair is broken and the
+    decision instance is loaded and right. Anything else is recorded in `model_check_failures` (the time and every
+    problem; an unannounced instance is also named in `loaded_after_announcement`) and said in capitals at the first
+    check of each bad stretch, or when what is wrong changes. Returns the problems (none when it held)."""
     state = models_state(host) if state is None else state
+    row['model_checks'] = row.get('model_checks', 0) + 1
+    problems = []
     if not state['reachable']:
-        if not row.get('model_list_unread'):
-            row['alerts'].append('THE MODEL LIST COULD NOT BE READ AT %s (%s): A MODEL LOADED NOW WOULD NOT BE SEEN; THE %s '
-                                 'COUNTS ONLY IF A LATER CHECK READS IT' % (
-                                     utc(host.now()), state.get('unread_why'), 'RUN' if row['command'] == 'run' else 'TEST'))
         row['model_list_unread'] = True
-        row.setdefault('model_list_unread_at', []).append(utc(host.now()))
-        return []
-    row['model_list_unread'] = False
-    new = late_models(host, row, state['others'])
-    if new:
-        row['alerts'].append('MODEL LOADED AFTER THE ANNOUNCEMENT, LEFT ALONE (NOT UNLOADED): %s; THE %s DOES NOT COUNT' % (
-            ', '.join('%s (%s)' % (m['instance_id'], m['key']) for m in new), 'RUN' if row['command'] == 'run' else 'TEST'))
-    return new
+        problems.append('THE MODEL LIST COULD NOT BE READ (%s)' % state.get('unread_why'))
+    else:
+        want = Counter(tuple(p) for p in (row.get('remaining') or []))
+        extra = []
+        for i in state['loaded']:
+            pair = (i['instance_id'], i['key']) if plain_string(i['instance_id']) and plain_string(i['key']) else None
+            if pair is not None and want[pair] > 0:
+                want[pair] -= 1
+                continue
+            if pair is not None and extra_ok is not None and extra_ok(*pair):
+                continue
+            extra.append(i)
+        missing = ['%s (%s)' % p for p, n in sorted(want.items()) for _ in range(n)]
+        for i in extra:
+            entry = {'instance_id': i['instance_id'], 'key': i['key']}
+            if entry not in row['loaded_after_announcement']:
+                row['loaded_after_announcement'].append(entry)
+        if extra:
+            problems.append('MODEL LOADED AFTER THE ANNOUNCEMENT, NOT IN THE ANNOUNCED SET, LEFT ALONE (NOT UNLOADED): %s'
+                            % ', '.join(instance_name(i) for i in extra))
+        if missing:
+            problems.append('ANNOUNCED INSTANCE NO LONGER LOADED: %s' % ', '.join(missing))
+        if state['protected_wrong']:
+            problems.append('PROTECTED PAIR BROKEN: %s' % '; '.join(state['protected_wrong']))
+        if not state['decision_instance']['loaded_and_right']:
+            problems.append('DECISION INSTANCE NOT LOADED AND RIGHT: %s' % state['decision_instance']['why'])
+    if problems:
+        row['model_check_failures'].append({'utc': utc(host.now()), 'problems': problems})
+        if problems != row.get('model_last_problems'):
+            row['alerts'].append('THE LOADED MODELS DO NOT HOLD AT %s: %s; THE %s DOES NOT COUNT' % (
+                utc(host.now()), '; '.join(problems), 'RUN' if row['command'] == 'run' else 'TEST'))
+    row['model_last_problems'] = problems
+    return problems
 
 
 def read_before_spawn(host, row):
@@ -1491,7 +1549,8 @@ def new_row(command, args, plan, t):
             'announced': args.announced, 'announced_note': 'the lead\'s statement that the owner was told; the tool cannot check it',
             'launched': False, 'refused': None, 'error': None, 'stopped': None, 'staged_folder': None, 'twin_folder': None,
             'switch_offs': None, 'deadline': None, 'pipeline': None, 'memory': None, 'collector': None, 'stop': None, 'post': None,
-            'verdicts': None, 'counts': False, 'loaded_after_announcement': [], 'model_list_unread': False, 'alerts': []}
+            'verdicts': None, 'counts': False, 'loaded_after_announcement': [], 'model_list_unread': False,
+            'remaining': None, 'model_checks': 0, 'model_check_failures': [], 'alerts': []}
 
 
 def watch(host, row, stopper, t_start, t_launch, wall_s, own):
@@ -1502,7 +1561,8 @@ def watch(host, row, stopper, t_start, t_launch, wall_s, own):
         host.sleep(WATCH_S)
         if proc.poll() is not None:
             break
-        alert_late(host, row)                    # addendum 6: after the spawn, an alert at once; the stop rule unchanged
+        # addendum 8, A: the announced set, the pipeline's own mf-native-* instances besides it; the stop rule unchanged
+        models_hold(host, row, extra_ok=lambda iid, key: iid.startswith(NATIVE_PREFIX))
         m = memory(host)
         if m['free_percent'] is not None:
             own['lowest'] = m['free_percent'] if own['lowest'] is None else min(own['lowest'], m['free_percent'])
@@ -1606,6 +1666,7 @@ def cmd_run(host, args):
         guard.install()
         if s['refusals']:
             raise Refused('; '.join(s['refusals']))
+        row['remaining'] = remaining_set(s['models'])          # addendum 8, A: recorded at the announcement
         work = fresh_folder(host, args.profile); twin = Path(str(work) + '-twin')
         row['staged_folder'], row['twin_folder'] = str(work), str(twin)
         candidate = stage(host, args.profile, flags, work)
@@ -1746,7 +1807,7 @@ def minimal_row(row, host, exc):
     """Addendum 2, item 8: what is known, for a row whose finishing was interrupted; it never counts."""
     keep = ('command', 'utc_start', 'profile', 'plan', 'announced', 'announced_note', 'launched', 'refused', 'error', 'stopped',
             'staged_folder', 'twin_folder', 'utc_launch', 'launcher', 'stop', 'switch_offs', 'deadline', 'signals_received',
-            'loaded_after_announcement', 'model_list_unread', 'alerts')
+            'loaded_after_announcement', 'model_list_unread', 'remaining', 'model_checks', 'model_check_failures', 'alerts')
     out = {k: row.get(k) for k in keep}
     out.update(utc_end=utc(host.now()), recording='interrupted while recording: %s' % type(exc).__name__, counts=False,
                verdicts=None, pipeline=None, memory=None, collector=None, post=None)
@@ -1774,12 +1835,12 @@ def finish_run_row(host, row, work, plan, t_start, swap_start, own):
     row['memory'] = memory_outcome(receipt, swap_start, memory(host)['swap_used_bytes'], own)
     final = post_state(host, row)
     if row['launched']:
-        alert_late(host, row, state=final)        # the last check: the list must be read here for the run to count
+        models_hold(host, row, state=final)       # the check at the end: exactly the announced set, nothing besides
         row['verdicts'] = verdicts(row['collector'], row['pipeline'], row['memory'])
-        # addendum 6: a model loaded after the announcement means the run does not count, whatever else it shows;
-        # addendum 7, C: nor does a run whose last check could not read the model list
-        row['counts'] = (all(v is True for v in row['verdicts'].values()) and not row['loaded_after_announcement']
-                         and not row['model_list_unread'])
+        row['models_held'] = row['model_checks'] > 0 and not row['model_check_failures']
+        # THE one place a run's count is decided (addendum 8, A): every verdict true, and every check of the loaded
+        # models after the spawn and at the end held
+        row['counts'] = all(v is True for v in row['verdicts'].values()) and row['models_held']
 
 
 # ============================================================================ load-test
@@ -1832,8 +1893,9 @@ class PipelineLoadPath:
         return self.sdk.group.stop(self.deadline + 60) if hasattr(self.sdk, 'group') else None
 
 
-def sample_phase(host, seconds, t_since, late_row=None):
-    """Memory samples SAMPLE_S apart for `seconds`, the collector checked every WATCH_S; (samples, breach or None)."""
+def sample_phase(host, seconds, t_since, on_check=None):
+    """Memory samples SAMPLE_S apart for `seconds`, the collector checked every WATCH_S (and `on_check()` called there:
+    the load test's check of the loaded models during the hold); (samples, breach or None)."""
     samples = []; start = host.now(); next_check = start + WATCH_S
     while host.now() - start < seconds:
         t = host.now()
@@ -1841,8 +1903,8 @@ def sample_phase(host, seconds, t_since, late_row=None):
         if t >= next_check:
             next_check += WATCH_S
             breach = collector_health(host, since=t_since)['breach']
-            if late_row is not None:
-                alert_late(host, late_row)               # addendum 6: during the hold, at every collector check
+            if on_check is not None:
+                on_check()                               # addendum 8, A: during the hold, at every collector check
             if breach:
                 return samples, breach
         host.sleep(max(0.0, start + len(samples) * SAMPLE_S - host.now()))
@@ -1895,6 +1957,7 @@ def cmd_load_test(host, args):
         guard.install()                                          # addendum 3, item 2: before the first switch-off
         if s['refusals']:
             raise Refused('; '.join(s['refusals']))
+        result['remaining'] = remaining_set(s['models'])       # addendum 8, A: recorded at the announcement
         work = fresh_folder(host, 'loadtest-' + re.sub(r'[^a-z0-9.-]', '-', model.lower()))
         result['staged_folder'] = str(work)
         stage(host, 'swarm8', ['--model', model], work)          # addendum 2, item 5: staging before any switch-off
@@ -1919,13 +1982,16 @@ def cmd_load_test(host, args):
                 result['load']['refusal'] = '%s: %s' % (type(e).__name__, e)
                 result['error'] = 'the load failed: ' + result['load']['refusal']
             if result['load']['ok']:
-                alert_late(host, result)                          # addendum 6: after the load, an alert at once
+                own = getattr(lp, 'identifier', None)
+                def held():              # addendum 8, A: the announced set and the test's own instance, nothing else
+                    models_hold(host, result, extra_ok=lambda iid, key: own is not None and iid == own)
+                held()                                            # at once after the load
                 # addendum 2, item 11: the collector at once when the load call returns, as well as during the hold
                 after = collector_health(host, since=t0)
                 result['collector_after_load'] = collector_figures(after)
                 breach = after['breach']
                 if not breach:
-                    hold, breach = sample_phase(host, hold_s, t0, result)
+                    hold, breach = sample_phase(host, hold_s, t0, held)
                 if breach:
                     result['stopped'] = 'collector breach'; result['first_breach'] = breach
     except Refused as e:
@@ -1965,7 +2031,8 @@ def cmd_load_test(host, args):
                 result['collector']['breach'] = result['first_breach']
             final = post_state(host, result)
             if asked:
-                alert_late(host, result, state=final)
+                models_hold(host, result, state=final)            # at the end, after the unload: the announced set only
+                result['models_held'] = result['model_checks'] > 0 and not result['model_check_failures']
         steps.run('finishing the result', finish)
 
         def write():
@@ -2001,8 +2068,9 @@ def cmd_load_test(host, args):
 
 # ============================================================================ check, record, main
 def plain_string(v):
-    """A str that encodes as UTF-8 (no lone surrogate, which a JSON file can carry as an escape)."""
-    if type(v) is not str:
+    """A str that is not empty, has no leading or trailing blank (addendum 8, C) and encodes as UTF-8 (no lone
+    surrogate, which a JSON file can carry as an escape)."""
+    if type(v) is not str or not v or v != v.strip():
         return False
     try:
         v.encode('utf-8')
@@ -2129,9 +2197,10 @@ def find_survivors(host, intent):
                                      'why': UNREADABLE + 'pid %d: its command could not be read' % pid})
                 continue
             named = [r for r in ROLES if names_role(tokens, work, r)]
+            mentions = any(str(work) in t for t in tokens)       # addendum 8, D: the staged folder in any token
             tokens = None
-            if not named and pid not in hinted:
-                continue                   # its command names neither role: not a candidate
+            if not named and pid not in hinted and not mentions:
+                continue                   # its command names neither role nor the folder: not a candidate
             results = [(r,) + proof(host, pid, held.get(pid) if r == 'launcher' else None, r, work, guard)
                        for r in (named or ROLES)]
         except Exception as e:             # a read that raised: the proof could not be made
@@ -2145,6 +2214,12 @@ def find_survivors(host, intent):
             proven += [{'role': r, 'pid': pid, 'start': seen['start'], 'by': by} for r, seen in good]
         elif unread:
             doubtful.append({'role': unread[0][0], 'pid': pid, 'by': by, 'why': unread[0][1]})
+        elif no and mentions and pid not in guard['ancestors']:
+            # addendum 8, D: it names this run's folder, yet is proven in neither role (a garbled command, a start that
+            # differs): could not be decided, never "not ours". This tool and its ancestors are never the run.
+            doubtful.append({'role': 'launcher or observer', 'pid': pid, 'by': by,
+                             'why': UNREADABLE + 'pid %d: its command names the staged folder but it is proven in neither role '
+                                                 '(could not be decided): %s' % (pid, no[0][1])})
         elif no:
             not_ours.append({'role': no[0][0], 'pid': pid, 'by': by, 'why': no[0][1]})   # addendum 5: never signalled
     if scan_note is None:
