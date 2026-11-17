@@ -36,8 +36,9 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   (prices), then the first-stage test. Lead's locked expectation: it fails. Roadmap 1.26.
 - **NOW** T47c (the analysis in bounded memory): passed its blind check and is on main (`0172b3f`,
   2026-11-17 15:21 PST).
-- **NEXT** T52 live record of ten leaders' positions (all-time top five of Sports and of Crypto): the record
-  only (reader additions, store, fixed leaders, one `pass` command). Dispatch once T47c is on main.
+- **NOW** T52 live record of ten leaders' positions (all-time top five of Sports and of Crypto): the record
+  only (reader additions, store, fixed leaders, one `pass` command). Build dispatched 2026-11-17 15:27 PST on
+  `cand/t52`; a blind check follows.
 - **WATCH** the order-book collector (roadmap 1.16): clean since 05:48 today. From 2026-11-19 00:00 UTC its
   scored period runs: at most ONE test-running agent beside it.
 
