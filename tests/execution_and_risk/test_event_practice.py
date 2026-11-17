@@ -175,7 +175,7 @@ class World:
             raise kd.HttpError(404, "u")
         if isinstance(rec, Exception):
             raise rec
-        return dict(rec)
+        return dict(rec) if isinstance(rec, dict) else rec
 
     def quote(self, name, bid, ask):
         self.exchange.bids[name], self.exchange.asks[name] = Decimal(str(bid)), Decimal(str(ask))

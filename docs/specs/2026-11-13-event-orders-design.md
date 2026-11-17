@@ -57,10 +57,55 @@ No strategy is wired to it: none has passed a test. The path is driven by one pr
 
 ### 3. Settlement
 
-A contract held to the result leaves the account without an order. Until that has been seen, the reconcile
-treats a vanished event holding as not clean and blocks: a person looks. After tonight's observation this
-section is rewritten with what Webull shows, and settlement becomes a journaled closing entry at 1 or 0
-dollars, checked against Kalshi's public result for the ticker.
+**What was seen (2026-11-17, paper Events account).** A contract held to its result leaves the account with no
+order and no fill. The hand-bought yes contract of `KXNBAGAME-26NOV13ATLCHI-ATL`, which lost, vanished at 0.
+The reconcile then stopped, because it expected 1 and the account showed 0. Kalshi's public record:
+`market_type` "binary", `status` "finalized", `result` "no", `settlement_value_dollars` "0.0000",
+`settlement_ts` "2026-11-14T03:49:44.800032Z". A winning settlement has not been seen. Neither has a void, a
+fraction, or a holding that vanishes before Kalshi says `finalized`.
+
+**What is built (T45-1, `event_practice.py`, `KalshiData.market`).**
+
+- *What counts.* An expected event holding (baseline or bought here) that the account shows at exactly 0 is
+  settled only when every one of the following holds:
+  - Kalshi's record for exactly that ticker (`/markets/<ticker>`, or `/historical/markets/<ticker>` on a 404
+    only) has, as plain strings, `ticker` the same, `market_type` "binary", `status` "finalized", `result` "yes"
+    or "no", and `settlement_value_dollars` exactly "1.0000" for yes or "0.0000" for no.
+  - Its `settlement_ts` is a well-formed UTC time in the past and later than every fill of the program on that
+    name.
+  - No order of the ledger on the holding is open or of unknown outcome, and no fill on it is unapplied.
+  - No other name differs from baseline plus fills.
+
+  Anything else is not a settlement, and the run stops as before, naming the fact. A partial disappearance is
+  never a settlement.
+- *The entry.* A `settlement` journal entry, once per name: the whole expected holding closed at 1.00 a contract
+  when its outcome won (yes holding: Kalshi's YES value; no holding: one minus it), else 0.00. The entry carries
+  the baseline and program parts, the fields read, and `fee` null with `fee_seen` "none seen". Order of writes: a
+  row with an integer id in the state file, then the journal entry keyed by that `settlement_id` and synced, then
+  the row marked journaled. A crash at any point journals it exactly once. The expected book becomes baseline
+  plus applied fills minus settled units. Settlement runs between the first reconcile and the cancels, so the next
+  reconcile is clean. Any later order on a settled ticker is refused, and the sale check subtracts settled
+  units, so the baseline is never sold.
+- *Cash.* The Events account gives buying power only. Buying power is read and journaled at every run, after the
+  cancels and the second reconcile, so no order of the ledger is open. A reading that fails, or is not a finite
+  number from 0, is journaled as unread and never guessed. For a settlement at 1.00 the command compares this
+  reading against the last one taken while the holding was shown. With no fill, no order and no other
+  settlement between the two, the rise must equal the payout exactly, to the cent. If it does not, the command
+  opens a hold in the state file, and nothing is sent until a person runs `--clear-hold ID --who NAME --note
+  TEXT`. That clearing is journaled with who, note and time. If a win cannot be compared, the journal says why;
+  there is no hold and the run goes on. The flag `win_cash_observed` stays false until a comparable win has
+  matched exactly, and every summary shows it. A win's cash effect is unobserved until the first one.
+- *State file.* Layout 2 adds the `settlements`, `readings` and `holds` tables. A layout-1 file is migrated in
+  place, and its `meta`, `baseline` and `sends` are left byte for byte. Any other layout is refused.
+
+**Limits.**
+
+- A correction by Kalshi after `finalized` is not handled and would show only as a cash difference.
+- A holding Webull drops before Kalshi finalizes (for example while `determined`) stops the run. That blocks the
+  whole Events path until Kalshi finalizes. A multi-market strategy will need a pending-settlement state per name
+  next.
+- Settlement entries are read by no page and no tax figure yet (`research_loop/owner_page.py`,
+  `execution_and_risk/tax.py`).
 
 ## What is not in this step
 

@@ -2,6 +2,7 @@
 
     python -m valedia_trader.execution_and_risk.event_practice --ticker T --outcome yes|no --contracts N --side buy|sell [--limit P]
     python -m valedia_trader.execution_and_risk.event_practice --reconcile-only
+    python -m valedia_trader.execution_and_risk.event_practice --clear-hold ID --who NAME --note TEXT
 
 Design: docs/specs/2026-11-13-event-orders-design.md, part 2 (roadmap 4.7). No strategy is wired to it: it proves the
 order path for event contracts with the guarantees the order step gives stocks (an order is sent at most once, an
@@ -28,8 +29,19 @@ One run, in order. A failure at any step sends nothing; the reason is returned (
  3. reconcile    reconcile (positions given: baseline plus the fills applied), ask Webull to cancel every order of this
                  ledger still open, reconcile again; each new fill journaled once (keyed by its fill id), the
                  journal file synced to disk, then marked applied. A blocked ledger, an order still open, or a holding
-                 that differs from baseline plus fills stops the run; an event holding the ledger expects that is gone
-                 from the account (settled?) is not guessed: settlement is not built, and a person must look.
+                 that differs from baseline plus fills stops the run.
+    settle       (T45-1, between the first reconcile and the cancels) an expected event holding the account shows at
+                 exactly 0 is settled only when Kalshi's record (KalshiData.market) shows exactly a settlement
+                 (judge_settlement), no ledger order on it is open or unknown, no fill on it is unapplied and no other
+                 name differs; else nothing is settled and the stop names the fact. A settlement is a row with an
+                 integer id in the state file, then a journal entry keyed by it (synced), then the row marked
+                 journaled; the expected book is baseline plus fills less settled units; no order is sent on a settled
+                 ticker.
+    cash         after the second reconcile (no order of this ledger open) the buying power is read and journaled
+                 (unread when it is not a finite number from 0). A settlement at 1.00 is compared with the last reading
+                 taken while the holding was shown: with no fill, order or other settlement between, the rise must be
+                 exactly the payout, else a hold (nothing is sent until a person clears it with --clear-hold); one that
+                 cannot be compared is journaled as such. `win_cash_observed` stays false until a win has matched.
  4. cap          at most MAX_ORDERS_PER_DAY orders handed to the ledger in one New York day, across runs.
  5. sale         a sale is only of contracts this program bought (the ledger's fills of that name), never the baseline;
                  the adapter checks the account's holdings of that ticker and outcome less its open sales as well.
@@ -60,7 +72,9 @@ import os
 import re
 import sqlite3
 import sys
+import unicodedata
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable
@@ -71,11 +85,12 @@ from valedia_trader.execution_and_risk.order_step import (CANCEL_WORDS, NOT_SENT
                                                           _sandbox_host, _sync_file, _venue_error, ledger_path_for,
                                                           open_ledger, wall_clock)
 from valedia_trader.execution_and_risk.orders import STATES, OrderError, OrderLedger, OrdersBlocked
+from valedia_trader.venues.kalshi_data import MARKET_RECORD_KEYS
 from valedia_trader.venues.webull import EVENTS_CLASS, parse_event_name
 
 __all__ = ["MAX_CONTRACTS", "MAX_ORDER_DOLLARS", "MAX_ORDERS_PER_DAY", "QUOTE_MAX_AGE_SECONDS", "MAX_SPREAD", "MAX_CROSS",
-           "PracticeState", "PracticeError", "run_event_practice", "quote_from_book", "choose_limit", "kalshi_book",
-           "build_events_venue", "state_path_for", "main"]
+           "PracticeState", "PracticeError", "NotSettled", "run_event_practice", "quote_from_book", "choose_limit",
+           "kalshi_book", "kalshi_market", "judge_settlement", "clear_hold", "build_events_venue", "state_path_for", "main"]
 
 MAX_CONTRACTS = 5
 MAX_ORDER_DOLLARS = Decimal("5.00")
@@ -95,10 +110,21 @@ _NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 _TAG = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 _LIMIT_TEXT = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,2})?")
 _ABSENT = object()
+# settlement (T45-1): only these exact values of Kalshi's record are a settlement
+SETTLED_VALUES = {"0.0000": Decimal("0.00"), "1.0000": Decimal("1.00")}      # settlement_value_dollars: the YES value
+RESULT_VALUE = {"yes": "1.0000", "no": "0.0000"}
+_STATUS_WORD = re.compile(r"[a-z_]{1,32}")
+_KALSHI_TIME = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,6}))?Z")
+TIERS = ("live", "historical")
+WHO_MAX, NOTE_MAX = 100, 1000
 
 
 class PracticeError(RuntimeError):
     pass
+
+
+class NotSettled(ValueError):
+    """Kalshi's record does not show exactly a settlement; the message names the fact, in this module's own words."""
 
 
 class _Stop(Exception):
@@ -224,6 +250,79 @@ def kalshi_book(ticker: str) -> dict:
     return KalshiData().orderbook(ticker, depth=1)
 
 
+def kalshi_market(ticker: str) -> dict:
+    """Kalshi's public record of one market (KalshiData.market: keyless; reaches the network). No test calls this."""
+    from valedia_trader.venues.kalshi_data import KalshiData
+    return KalshiData().market(ticker)
+
+
+def _kalshi_time(text) -> float | None:
+    """A UTC time exactly as Kalshi writes it ("2026-11-14T03:49:44.800032Z": a plain str, ASCII digits, a capital T
+    and Z, at most six decimals of a second) in epoch seconds, else None."""
+    if type(text) is not str:
+        return None
+    m = _KALSHI_TIME.fullmatch(text)
+    if m is None:
+        return None
+    try:
+        y, mo, d, h, mi, s = (int(g) for g in m.groups()[:6])
+        micro = int(m.group(7).ljust(6, "0")) if m.group(7) else 0
+        return datetime(y, mo, d, h, mi, s, micro, tzinfo=timezone.utc).timestamp()
+    except (ValueError, OverflowError):
+        return None
+
+
+def judge_settlement(record, ticker: str, now: float, after: float | None = None) -> Decimal:
+    """The YES value (Decimal 1.00 or 0.00) of `ticker`'s settlement when Kalshi's record (KalshiData.market's
+    shape) shows exactly one, else NotSettled naming the fact that is missing. Every field must be a plain str of
+    exactly the safe value: `ticker` equal to the one asked, `market_type` "binary", `status` "finalized", `result`
+    "yes" or "no", `settlement_value_dollars` "1.0000" for yes and "0.0000" for no, `settlement_ts` a well-formed UTC
+    time before `now` and, when `after` is given (the latest fill of this program on that name), later than it.
+    Nothing is inferred: another spelling, a padded or empty string, a number, a bool or None is not a settlement."""
+    if not isinstance(record, dict):
+        raise NotSettled("Kalshi's record is not an object")
+
+    def exact(key):
+        v = record.get(key)
+        return v if type(v) is str else None
+    if exact("ticker") != ticker:
+        raise NotSettled("Kalshi's record names another ticker, or none")
+    if exact("market_type") != "binary":
+        raise NotSettled("Kalshi's market type is not exactly binary")
+    status = exact("status")
+    if status != "finalized":
+        seen = ("missing or not text" if status is None else status if _STATUS_WORD.fullmatch(status)
+                else "not a plain word")
+        raise NotSettled(f"Kalshi's status is {seen}, not finalized")
+    result = exact("result")
+    if result not in RESULT_VALUE:
+        raise NotSettled("Kalshi's result is not exactly yes or no")
+    value = exact("settlement_value_dollars")
+    if value not in SETTLED_VALUES:
+        raise NotSettled("Kalshi's settlement value is not exactly 0.0000 or 1.0000")
+    if value != RESULT_VALUE[result]:
+        raise NotSettled(f"Kalshi's settlement value {value} does not match its result {result}")
+    ts = _kalshi_time(record.get("settlement_ts"))
+    if ts is None:
+        raise NotSettled("Kalshi's settlement time is missing or not a well-formed UTC time")
+    if not ts < now:
+        raise NotSettled("Kalshi's settlement time is not in the past")
+    if after is not None and not ts > after:
+        raise NotSettled("Kalshi's settlement time is not later than every fill of this program on that name")
+    return SETTLED_VALUES[value]
+
+
+def _person_words(x, most: int) -> str | None:
+    """A person's words for clearing a hold: a plain str, trimmed, not empty, at most `most` characters, and no
+    control or format character (Unicode category C) anywhere; else None."""
+    if type(x) is not str:
+        return None
+    t = x.strip()
+    if not t or len(t) > most or any(unicodedata.category(c).startswith("C") for c in t):
+        return None
+    return t
+
+
 def state_path_for(ledger_path: str | Path, venue_name: str) -> Path:
     """The practice command's state file: beside the order ledger, named for the venue."""
     return Path(ledger_path).with_name(f"event_practice-{re.sub(r'[^A-Za-z0-9_.-]', '_', str(venue_name))}.sqlite")
@@ -231,17 +330,31 @@ def state_path_for(ledger_path: str | Path, venue_name: str) -> Path:
 
 # ---- the state file
 
-STATE_LAYOUT = 1
-STATE_SCHEMA = [
+STATE_LAYOUT = 2
+LAYOUT_1_SCHEMA = [                                      # layout 1 (T19), kept as it was
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS baseline (symbol TEXT PRIMARY KEY, units REAL NOT NULL)",
     "CREATE TABLE IF NOT EXISTS sends (tag TEXT PRIMARY KEY, day TEXT NOT NULL, time REAL NOT NULL, outcome TEXT)",
 ]
+LAYOUT_2_ADDED = [                                       # layout 2 (T45-1): settlements, buying-power readings, holds
+    "CREATE TABLE IF NOT EXISTS settlements (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL UNIQUE, units REAL NOT NULL, "
+    "baseline_units REAL NOT NULL, program_units REAL NOT NULL, price TEXT NOT NULL, kalshi TEXT NOT NULL, "
+    "time REAL NOT NULL, batch TEXT, journaled INTEGER NOT NULL DEFAULT 0, cash_check TEXT)",
+    "CREATE TABLE IF NOT EXISTS readings (id INTEGER PRIMARY KEY, time REAL NOT NULL, batch TEXT, buying_power REAL, "
+    "unread TEXT, book TEXT NOT NULL, fills INTEGER NOT NULL, orders INTEGER NOT NULL, last_settlement INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS holds (id INTEGER PRIMARY KEY, time REAL NOT NULL, settlement_id INTEGER, "
+    "reason TEXT NOT NULL, cleared_by TEXT, cleared_note TEXT, cleared_time REAL)",
+]
+STATE_SCHEMA = LAYOUT_1_SCHEMA + LAYOUT_2_ADDED
+LAYOUT_1_TABLES = frozenset({"meta", "baseline", "sends"})
+LAYOUT_2_TABLES = LAYOUT_1_TABLES | {"settlements", "readings", "holds"}
 
 
 class PracticeState:
-    """The command's own small file: the baseline (recorded once) and each order handed to the ledger, with its New
-    York day and outcome. Every write is one IMMEDIATE transaction."""
+    """The command's own small file: the baseline (recorded once), each order handed to the ledger with its New York
+    day and outcome, and (layout 2) each settlement, each buying-power reading and each hold. Every write is one
+    IMMEDIATE transaction. A layout-1 file is migrated in place to layout 2 by adding the three new tables only (its
+    meta, baseline and sends are not touched); any other layout is not opened."""
 
     def __init__(self, path: str | Path, clock: Callable[[], float] = wall_clock) -> None:
         self.path, self.clock = str(path), clock
@@ -253,14 +366,18 @@ class PracticeState:
             with self._write():
                 version = self._db.execute("PRAGMA user_version").fetchone()[0]
                 tables = {r[0] for r in self._db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-                if tables and (version != STATE_LAYOUT or not tables <= {"meta", "baseline", "sends"}):
-                    raise PracticeError(f"{path} is not an event-practice state file of layout {STATE_LAYOUT}; it is not opened")
                 if not tables:
                     if version != 0:
                         raise PracticeError(f"{path} is a database of another kind; it is not opened")
                     for statement in STATE_SCHEMA:
                         self._db.execute(statement)
                     self._db.execute(f"PRAGMA user_version = {STATE_LAYOUT}")
+                elif version == 1 and tables <= LAYOUT_1_TABLES:          # layout 1 -> 2: the new tables only
+                    for statement in LAYOUT_2_ADDED:
+                        self._db.execute(statement)
+                    self._db.execute(f"PRAGMA user_version = {STATE_LAYOUT}")
+                elif not (version == STATE_LAYOUT and tables == LAYOUT_2_TABLES):
+                    raise PracticeError(f"{path} is not an event-practice state file of layout {STATE_LAYOUT}; it is not opened")
         except BaseException:
             self._db.close()
             raise
@@ -315,6 +432,98 @@ class PracticeState:
         with self._write():
             self._db.execute("UPDATE sends SET outcome = ? WHERE tag = ?", (outcome, tag))
 
+    def _rows(self, sql: str, args: tuple = ()) -> list[dict]:
+        cur = self._db.execute(sql, args)
+        names = [d[0] for d in cur.description]
+        return [dict(zip(names, r)) for r in cur.fetchall()]
+
+    # -- settlements (T45-1)
+    def settlements(self) -> list[dict]:
+        """Every settlement row, oldest first; `kalshi` is the dict of Kalshi's fields read."""
+        rows = self._rows("SELECT * FROM settlements ORDER BY id")
+        for r in rows:
+            r["kalshi"] = json.loads(r["kalshi"])
+        return rows
+
+    def settled_tickers(self) -> set[str]:
+        return {parse_event_name(r["symbol"])[0] for r in self._rows("SELECT symbol FROM settlements")
+                if parse_event_name(r["symbol"]) is not None}
+
+    def add_settlement(self, symbol: str, units: float, baseline_units: float, program_units: float, price: str,
+                       kalshi: dict, batch: str | None) -> int:
+        """Record a settlement, not yet journaled; its integer id keys the journal entry. Once per name."""
+        if parse_event_name(symbol) is None or price not in ("1.00", "0.00"):
+            raise PracticeError("a settlement is of an event name at 1.00 or 0.00")
+        with self._write():
+            if self._db.execute("SELECT 1 FROM settlements WHERE symbol = ?", (symbol,)).fetchone():
+                raise PracticeError("that name is already settled; a settlement is recorded once")
+            cur = self._db.execute("INSERT INTO settlements (symbol, units, baseline_units, program_units, price, kalshi, time, "
+                                   "batch, journaled) VALUES (?,?,?,?,?,?,?,?,0)",
+                                   (symbol, float(units), float(baseline_units), float(program_units), price,
+                                    json.dumps(kalshi, sort_keys=True), float(self.clock()), batch))
+            return int(cur.lastrowid)
+
+    def mark_settlement_journaled(self, sid: int) -> None:
+        with self._write():
+            self._db.execute("UPDATE settlements SET journaled = 1 WHERE id = ?", (sid,))
+
+    def pending_cash_checks(self) -> list[dict]:
+        """Journaled settlements whose cash effect has not been looked at yet."""
+        return [r for r in self.settlements() if r["journaled"] and r["cash_check"] is None]
+
+    def record_cash_check(self, sid: int, words: str, observed: bool = False, hold_reason: str | None = None) -> int | None:
+        """Write what the cash check found, and in the same write set the flag (a comparable win that matched) or
+        open a hold (one that did not). Returns the hold's id when one was opened."""
+        hid = None
+        with self._write():
+            self._db.execute("UPDATE settlements SET cash_check = ? WHERE id = ? AND cash_check IS NULL", (words, sid))
+            if observed:
+                self._db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('win_cash_observed', 'true')")
+            if hold_reason is not None:
+                cur = self._db.execute("INSERT INTO holds (time, settlement_id, reason) VALUES (?,?,?)",
+                                       (float(self.clock()), sid, hold_reason))
+                hid = int(cur.lastrowid)
+        return hid
+
+    def win_cash_observed(self) -> bool:
+        """False until a comparable win has shown exactly its payout in the buying power."""
+        row = self._db.execute("SELECT value FROM meta WHERE key = 'win_cash_observed'").fetchone()
+        return row is not None and row[0] == "true"
+
+    # -- buying-power readings
+    def add_reading(self, batch: str | None, buying_power: float | None, unread: str | None, book: dict, fills: int,
+                    orders: int, last_settlement: int) -> int:
+        with self._write():
+            cur = self._db.execute("INSERT INTO readings (time, batch, buying_power, unread, book, fills, orders, "
+                                   "last_settlement) VALUES (?,?,?,?,?,?,?,?)",
+                                   (float(self.clock()), batch, buying_power, unread, json.dumps(book, sort_keys=True),
+                                    int(fills), int(orders), int(last_settlement)))
+            return int(cur.lastrowid)
+
+    def last_reading_showing(self, symbol: str, before: int) -> dict | None:
+        """The latest reading before id `before` whose book held `symbol` (more than nothing)."""
+        for r in self._rows("SELECT * FROM readings WHERE id < ? ORDER BY id DESC", (before,)):
+            book = json.loads(r["book"])
+            if (_as_float(book.get(symbol)) or 0.0) > 0:
+                r["book"] = book
+                return r
+        return None
+
+    # -- holds
+    def hold(self, hid: int) -> dict | None:
+        rows = self._rows("SELECT * FROM holds WHERE id = ?", (hid,))
+        return rows[0] if rows else None
+
+    def open_holds(self) -> list[dict]:
+        return self._rows("SELECT * FROM holds WHERE cleared_time IS NULL ORDER BY id")
+
+    def clear_hold(self, hid: int, who: str, note: str, when: float) -> None:
+        with self._write():
+            changed = self._db.execute("UPDATE holds SET cleared_by = ?, cleared_note = ?, cleared_time = ? "
+                                       "WHERE id = ? AND cleared_time IS NULL", (who, note, float(when), hid)).rowcount
+            if changed != 1:
+                raise PracticeError(f"hold {hid} is not open")
+
     def settle_sends(self, ledger: OrderLedger) -> None:
         """A send whose outcome was never written gets the ledger's state now; one still `intended` was never sent."""
         for (tag,) in list(self._db.execute("SELECT tag FROM sends WHERE outcome IS NULL")):
@@ -365,18 +574,27 @@ class _LedgerVenue:
 
 def run_event_practice(*, ledger: OrderLedger, venue, journal, state, ticker=None, outcome=None, contracts=None, side=None,
                        limit=None, reconcile_only: bool = False, book: Callable | None = None,
-                       clock: Callable[[], float] = wall_clock) -> dict:
+                       clock: Callable[[], float] = wall_clock, market: Callable | None = None) -> dict:
     """One practice run (see the module notes). `state` is a PracticeState or the path of its file; `book(ticker)` gives
-    Kalshi's book in KalshiData.orderbook's shape (default kalshi_book). Returns the summary, also journaled once the
-    lock is held. Never raises because of the venue, the book or the request."""
+    Kalshi's book in KalshiData.orderbook's shape (default kalshi_book); `market(ticker)` Kalshi's record of one
+    market in KalshiData.market's shape (default kalshi_market), asked only for a holding that is gone. Returns the
+    summary, also journaled once the lock is held. Never raises because of the venue, the book, the record or the
+    request."""
     return _Run(ledger, venue, journal, state, dict(ticker=ticker, outcome=outcome, contracts=contracts, side=side, limit=limit),
-                reconcile_only is True, book if book is not None else kalshi_book, clock).go()
+                reconcile_only is True, book if book is not None else kalshi_book, clock,
+                market if market is not None else kalshi_market).go()
 
 
 class _Run:
-    def __init__(self, ledger, venue, journal, state, request, reconcile_only, book, clock) -> None:
+    def __init__(self, ledger, venue, journal, state, request, reconcile_only, book, clock, market=None) -> None:
         self.ledger, self.venue, self.journal, self.state_arg = ledger, venue, journal, state
         self.request, self.reconcile_only, self.book, self.clock = request, reconcile_only, book, clock
+        self.market = market
+        self.settled_now: list[dict] = []
+        self.settlements_journaled = 0
+        self.buying_power: float | None = None
+        self._settled_seen: set = set()
+        self._settle_why: dict[str, str] = {}
         self.view = _LedgerVenue(venue, ledger)
         self.name, self.batch, self.day = "?", None, None
         self.state: PracticeState | None = None
@@ -457,6 +675,8 @@ class _Run:
             baseline = self._baseline()
             self.stage = "reconcile"
             self._reconcile_and_cancel(baseline)
+            self.stage = "cash"
+            self._cash(baseline)
             if req is None:
                 return self._finish("done", None, None)
             self._send(req)
@@ -560,6 +780,9 @@ class _Run:
         # happens to look like a remembered secret, and a key holding text would then never match again
         self._seen = {e.get("fill_id") for e in entries
                       if e.get("type") == JOURNAL_TYPE and e.get("event") == "fill" and e.get("venue") == self.name}
+        self._settled_seen = {e.get("settlement_id") for e in entries
+                              if e.get("type") == JOURNAL_TYPE and e.get("event") == "settlement" and e.get("venue") == self.name
+                              and type(e.get("settlement_id")) is int}
 
     # -- 2
     def _baseline(self) -> dict[str, float]:
@@ -582,10 +805,13 @@ class _Run:
 
     # -- 3
     def _applied_positions(self, baseline: dict) -> dict[str, float]:
+        """What the account should hold: the baseline plus the applied fills, less each settled holding."""
         out = dict(baseline)
         for f in self.ledger.fills():
             if f["applied"]:
                 out[f["symbol"]] = math.fsum((out.get(f["symbol"], 0.0), float(f["units"])))
+        for r in self.state.settlements():
+            out[r["symbol"]] = math.fsum((out.get(r["symbol"], 0.0), -float(r["units"])))
         return out
 
     def _reconcile(self, baseline: dict) -> dict:
@@ -610,7 +836,9 @@ class _Run:
 
     def _reconcile_and_cancel(self, baseline: dict) -> None:
         self.state.settle_sends(self.ledger)
-        self._reconcile(baseline)
+        self._journal_settlements()                      # a settlement on file but not journaled (a crash): first
+        result = self._reconcile(baseline)
+        self._settle(baseline, result)                   # before the cancels, so the next reconcile can be clean
         for o in self.ledger.orders(OPEN_STATES):
             tag = self._tag_word(o["tag"]) or "an order"
             try:
@@ -648,9 +876,10 @@ class _Run:
                     plain[sym] = {k: _as_float(d.get(k)) for k in ("book", "venue", "unapplied")}
             vanished = sorted(sym for sym, d in plain.items()
                               if (d["book"] or 0.0) + (d["unapplied"] or 0.0) > 0 and not (d["venue"] or 0.0) > 0)
-            if vanished:
-                reasons.append(f"an event holding the ledger expects is not in the account ({', '.join(vanished)}); it may have "
-                               "settled, and settlement is not built, so it is not guessed: a person must look")
+            for sym in vanished:
+                why = self._settle_why.get(sym, "no settlement was looked for")
+                reasons.append(f"an event holding the ledger expects is not in the account ({sym}); it is not taken as a "
+                               f"settlement: {why}; a person must look")
             reasons.append(f"positions differ from baseline plus fills: {json.dumps(plain, sort_keys=True)}"
                            + (f" and {len(diffs) - len(plain)} more" if len(diffs) > len(plain) else "") + "; a person must look")
         if result.get("positions_error"):
@@ -661,6 +890,158 @@ class _Run:
             reasons.append(f"{len(result['anomalies'])} anomaly(ies) in the reconcile; a person must look")
         return reasons or ["the order ledger is blocked"]
 
+    # -- 3b settlement (T45-1)
+    def _settlement_entry(self, r: dict) -> dict:
+        return {"event": "settlement", "settlement_id": r["id"], "symbol": r["symbol"], "units": -float(r["units"]),
+                "baseline_units": float(r["baseline_units"]), "program_units": float(r["program_units"]),
+                "price": float(Decimal(r["price"])), "fee": None, "fee_seen": "none seen", "kalshi": r["kalshi"]}
+
+    def _journal_settlements(self) -> None:
+        """Each settlement row not yet journaled: its entry, keyed by its integer id, written once (not again when the
+        journal already has it), the journal file synced to disk, then the row marked journaled."""
+        for r in self.state.settlements():
+            if r["journaled"]:
+                continue
+            if r["id"] not in self._settled_seen:
+                self._write(self._settlement_entry(r))
+                path = self._journal_file()
+                if path is not None:
+                    _sync_file(path)
+                self._settled_seen.add(r["id"])
+                self.settlements_journaled += 1
+            self.state.mark_settlement_journaled(r["id"])
+
+    def _settle(self, baseline: dict, result: dict) -> None:
+        """A holding the ledger expects that the account shows at exactly 0 is settled when Kalshi's record says so
+        exactly (judge_settlement), no order of this ledger on it is open or of unknown outcome, no fill on it is
+        unapplied, and no other name differs. Anything else settles nothing; the reason is kept for the stop."""
+        diffs = result.get("position_differences") or {}
+        if not diffs:
+            return
+        expected = self._applied_positions(baseline)
+        candidates, others = [], []
+        for sym, d in diffs.items():
+            venue = _as_float(d.get("venue")) if isinstance(d, dict) else None
+            exp = _as_float(expected.get(sym))
+            if parse_event_name(sym) is not None and venue == 0.0 and exp is not None and exp > 0:
+                candidates.append(sym)
+            else:
+                others.append(sym)
+        if not candidates:
+            return
+        unclean = [w for w, k in (("the venue's positions could not be read", "positions_error"),
+                                  ("an order's status could not be read", "unresolved"),
+                                  ("the reconcile found an anomaly", "anomalies")) if result.get(k)]
+        if others or unclean:
+            why = unclean[0] if unclean else "another holding also differs from baseline plus fills"
+            for sym in candidates:
+                self._settle_why[sym] = f"{why}, so none is taken as settled"
+            return
+        unapplied = {f["symbol"] for f in self.ledger.unapplied_fills()}
+        busy = {o["symbol"] for o in self.ledger.orders(OPEN_STATES)}
+        now = self._now()
+        for sym in candidates:
+            try:
+                self._settle_one(sym, expected[sym], baseline, unapplied, busy, now)
+            except NotSettled as why:
+                self._settle_why[sym] = str(why)
+
+    def _settle_one(self, sym: str, units: float, baseline: dict, unapplied: set, busy: set, now: float) -> None:
+        ticker, outcome = parse_event_name(sym)
+        if sym in unapplied:
+            raise NotSettled("a fill of this program on it is not yet applied")
+        if sym in busy:
+            raise NotSettled("an order of this ledger on it is open or its outcome is not known; the next run looks again")
+        fills = [f for f in self.ledger.fills() if f["symbol"] == sym]
+        times = [_as_float(f["time"]) for f in fills]
+        if any(t is None for t in times):
+            raise NotSettled("a fill of this program on it has no readable time")
+        try:
+            record = self.market(ticker)
+        except Exception as exc:
+            raise NotSettled(f"Kalshi's record could not be read ({_venue_error(exc)})") from None
+        yes_value = judge_settlement(record, ticker, now, max(times) if times else None)
+        price = yes_value if outcome == "yes" else Decimal("1.00") - yes_value
+        program = math.fsum(float(f["units"]) for f in fills)
+        base = float(baseline.get(sym, 0.0))
+        tier = record.get("tier")
+        kalshi = {**{k: record[k] for k in MARKET_RECORD_KEYS}, "tier": tier if type(tier) is str and tier in TIERS else None}
+        sid = self.state.add_settlement(sym, units, base, program, f"{price:.2f}", kalshi, self.batch)
+        self.settled_now.append({"settlement_id": sid, "symbol": sym, "units": -units, "price": float(price)})
+        self._journal_settlements()
+
+    # -- 3c buying power, after the cancels and the second reconcile (no order of this ledger open)
+    def _read_buying_power(self) -> tuple[float | None, str | None]:
+        """(buying power, None) when the venue gives a finite number from 0, else (None, the shape of the reason)."""
+        try:
+            cash = self.venue.cash()
+        except Exception as exc:
+            return None, f"the venue's cash() raised {_venue_error(exc)}"
+        if not isinstance(cash, dict):
+            return None, f"the venue's cash() gave a {type(cash).__name__}, not an object"
+        v = cash.get("buying_power")
+        f = _as_float(v)
+        if f is None:
+            return None, f"buying_power is a {type(v).__name__}, not a finite number"
+        if f < 0:
+            return None, "buying_power is below 0"
+        return f, None
+
+    def _cash(self, baseline: dict) -> None:
+        if self.ledger.orders(OPEN_STATES):
+            raise _Stop("cash", "an order of this ledger is open; buying power is read only with none open")
+        bp, unread = self._read_buying_power()
+        self.buying_power = bp
+        book = {s: u for s, u in self._applied_positions(baseline).items() if u > 1e-9}
+        settlements = self.state.settlements()
+        now = {"buying_power": bp, "fills": len(self.ledger.fills()), "orders": len(self.ledger.orders()),
+               "last_settlement": max((r["id"] for r in settlements), default=0)}
+        now["id"] = self.state.add_reading(self.batch, bp, unread, book, now["fills"], now["orders"], now["last_settlement"])
+        self._write({"event": "buying_power", "reading_id": now["id"], "buying_power": bp, "unread": unread})
+        for r in self.state.pending_cash_checks():
+            self._check_win(r, now, settlements)
+
+    def _check_win(self, r: dict, now: dict, settlements: list[dict]) -> None:
+        """A settlement at 1.00: buying power must have risen by exactly the payout since the last reading taken while
+        the holding was shown, with no fill, no order and no other settlement between; else a hold. When that cannot
+        be compared the settlement stands, and the journal says why (no hold)."""
+        sid, sym = r["id"], r["symbol"]
+        if r["price"] != "1.00":
+            self.state.record_cash_check(sid, "none needed: a settlement at 0.00")
+            return
+        prev = self.state.last_reading_showing(sym, now["id"])
+        why = None
+        if prev is None:
+            why = "no reading of buying power was taken while the holding was shown"
+        elif prev["buying_power"] is None:
+            why = "the last reading while the holding was shown is unread"
+        elif now["buying_power"] is None:
+            why = "this run's reading is unread"
+        elif prev["fills"] != now["fills"]:
+            why = "a fill was recorded between the two readings"
+        elif prev["orders"] != now["orders"]:
+            why = "an order was handed to the ledger between the two readings"
+        elif [x["id"] for x in settlements if x["id"] > prev["last_settlement"]] != [sid]:
+            why = "another settlement was recorded between the two readings"
+        if why is not None:
+            self.state.record_cash_check(sid, f"not comparable: {why}")
+            self._write({"event": "win_cash", "settlement_id": sid, "symbol": sym, "result": "not comparable",
+                         "reason": f"the win's cash effect could not be compared: {why}"})
+            return
+        rise = Decimal(repr(float(now["buying_power"]))) - Decimal(repr(float(prev["buying_power"])))
+        payout = Decimal(repr(float(r["units"]))) * Decimal(r["price"])
+        numbers = {"settlement_id": sid, "symbol": sym, "before": float(prev["buying_power"]),
+                   "after": float(now["buying_power"]), "rise": float(rise), "payout": float(payout)}
+        if rise == payout:
+            self.state.record_cash_check(sid, "matched", observed=True)
+            self._write({"event": "win_cash", "result": "matched", **numbers})
+            return
+        reason = (f"the winning settlement of {sym} did not show the expected cash (buying power rose by {rise}, the payout "
+                  f"is {payout}); a person must look")
+        hid = self.state.record_cash_check(sid, "differs: held", hold_reason=reason)
+        self._write({"event": "win_cash", "result": "differs", **numbers})
+        self._write({"event": "hold", "hold_id": hid, "settlement_id": sid, "reason": reason})
+
     # -- 4 to 9
     def _fresh(self, quote_at: float) -> None:
         age = self._now() - quote_at
@@ -669,12 +1050,21 @@ class _Run:
 
     def _send(self, req: dict) -> None:
         name, contracts, side = req["name"], req["contracts"], req["side"]
+        self.stage = "hold"
+        holds = self.state.open_holds()
+        if holds:
+            raise _Stop("hold", f"{len(holds)} hold(s) open (" + ", ".join(str(h["id"]) for h in holds) + "): nothing is sent "
+                                "until a person clears it with --clear-hold ID --who NAME --note TEXT")
+        self.stage = "settled"
+        if req["ticker"] in self.state.settled_tickers():
+            raise _Stop("settled", f"the market {req['ticker']} has settled; no order is sent on a settled ticker")
         self.stage = "cap"
         if self.state.sent_on(self.day) >= MAX_ORDERS_PER_DAY:
             raise _Stop("cap", f"the day's cap of {MAX_ORDERS_PER_DAY} practice orders ({self.day}, New York) is reached")
         if side == "sell":
             self.stage = "sale"
-            owned = math.fsum(float(f["units"]) for f in self.ledger.fills() if f["symbol"] == name)
+            owned = math.fsum([float(f["units"]) for f in self.ledger.fills() if f["symbol"] == name]
+                              + [-float(r["program_units"]) for r in self.state.settlements() if r["symbol"] == name])
             if owned < contracts - 1e-9:
                 raise _Stop("sale", f"a sale is only of contracts this program bought: the ledger holds {owned:g} of {name}; "
                                     "the baseline is never sold")
@@ -734,8 +1124,15 @@ class _Run:
                               "filled_units": _as_float(rec.get("filled_units")) if rec else None}
             except Exception:
                 pass
+        try:
+            holds_open = [h["id"] for h in self.state.open_holds()] if self.state is not None else None
+            observed = self.state.win_cash_observed() if self.state is not None else None
+        except Exception:
+            holds_open, observed = None, None
         summary = {"status": status, "stage": stage, "reason": reason, "venue": self.name, "batch": self.batch, "day": self.day,
                    "order": self.order, "quote": self.quote, "cancels": self.cancels, "fills_journaled": self.fills_journaled,
+                   "settlements": self.settled_now, "settlements_journaled": self.settlements_journaled,
+                   "buying_power": self.buying_power, "holds_open": holds_open, "win_cash_observed": observed,
                    "caps": {"contracts": MAX_CONTRACTS, "dollars": float(MAX_ORDER_DOLLARS), "orders_a_day": MAX_ORDERS_PER_DAY,
                             "quote_age_seconds": QUOTE_MAX_AGE_SECONDS, "spread": float(MAX_SPREAD), "cross": float(MAX_CROSS)}}
         try:
@@ -746,6 +1143,62 @@ class _Run:
         except Exception as exc:
             summary["journal_error"] = _venue_error(exc)
         return summary
+
+
+# ---- clearing a hold (a person's command)
+
+
+def clear_hold(*, journal, state, venue_name: str, hold_id, who, note, clock: Callable[[], float] = wall_clock) -> dict:
+    """Clear an open hold, saying who looked and what they found. `hold_id` a plain int from 1; `who` and `note` plain
+    text, not empty after trimming, without control or format characters (who at most WHO_MAX characters, the note at
+    most NOTE_MAX). Under the run's lock: the clearing is journaled (who, note, time) and synced, then the hold is
+    closed. A hold that does not exist or is already cleared, or anything malformed, is refused and nothing changes.
+    Asks nothing of the venue or of Kalshi."""
+    def refused(why: str) -> dict:
+        return {"status": "refused", "hold_id": hold_id if type(hold_id) is int else None, "reason": why}
+    if type(hold_id) is not int or hold_id < 1:
+        return refused("the hold id must be a whole number from 1")
+    w, n = _person_words(who, WHO_MAX), _person_words(note, NOTE_MAX)
+    if w is None or n is None:
+        return refused(f"--who and --note are both needed: plain text, not empty after trimming, without control "
+                       f"characters (who at most {WHO_MAX} characters, the note at most {NOTE_MAX})")
+    if not _plain(_NAME, venue_name) or not venue_name.endswith(EVENTS_SUFFIX):
+        return refused("the venue is not an Events venue")
+    path = state.path if isinstance(state, PracticeState) else str(state)
+    if not isinstance(state, PracticeState) and not Path(path).is_file():
+        return refused("there is no practice state file for this venue, so no hold")
+    lock = _RunLock(path)
+    try:
+        if not lock.acquire():
+            return refused("a practice run is running on this venue's state file")
+    except OSError as exc:
+        return refused(f"the lock file could not be taken: {_venue_error(exc)}")
+    st = None
+    try:
+        st = state if isinstance(state, PracticeState) else PracticeState(path, clock)
+        hold = st.hold(hold_id)
+        if hold is None:
+            return refused(f"no hold has id {hold_id}")
+        if hold["cleared_time"] is not None:
+            return refused(f"hold {hold_id} is already cleared")
+        now = float(clock())
+        if not math.isfinite(now):
+            return refused("the clock did not give a finite number of seconds")
+        stamp = pd.Timestamp(now, unit="s", tz="UTC").tz_convert(NEW_YORK)
+        day = str(stamp.date())
+        journal.write(day, {"type": JOURNAL_TYPE, "venue": venue_name, "batch": f"ep-{stamp:%Y%m%d-%H%M%S}-{os.urandom(3).hex()}",
+                            "event": "hold_cleared", "hold_id": hold_id, "who": w, "note": n, "time": now})
+        d = getattr(journal, "dir", None)
+        if d is not None:
+            _sync_file(Path(d) / f"{day}.jsonl")
+        st.clear_hold(hold_id, w, n, now)
+        return {"status": "cleared", "hold_id": hold_id, "who": w, "note": n, "time": now}
+    except (PracticeError, sqlite3.Error, OSError) as exc:
+        return refused(f"the state file or the journal failed: {_venue_error(exc)}")
+    finally:
+        if st is not None and not isinstance(state, PracticeState):
+            st.close()
+        lock.release()
 
 
 # ---- the command line
@@ -772,7 +1225,7 @@ def _loaded_environment():
 
 
 def main(argv: list[str] | None = None, *, environ=None, build_venue: Callable | None = None, root: str | Path | None = None,
-         book: Callable | None = None, clock: Callable[[], float] | None = None) -> int:
+         book: Callable | None = None, clock: Callable[[], float] | None = None, market: Callable | None = None) -> int:
     """The command line (see the module notes). Prints the summary; 0 when the run went through, 2 when it stopped or
     was refused. A configured environment other than the test environment is refused before the venue is built, and the
     venue's name, environment and host are checked before any folder or file is made."""
@@ -785,10 +1238,18 @@ def main(argv: list[str] | None = None, *, environ=None, build_venue: Callable |
     ap.add_argument("--limit", help="a price with at most two decimals, such as 0.45 (default: the ask plus a cent to buy, "
                                     "the bid less a cent to sell)")
     ap.add_argument("--reconcile-only", action="store_true", help="send nothing: reconcile, cancel this ledger's open "
-                                                                   "orders, journal the fills")
+                                                                   "orders, journal the fills and settlements")
+    ap.add_argument("--clear-hold", type=int, metavar="ID", help="clear hold ID (a person has looked); needs --who and --note")
+    ap.add_argument("--who", help="with --clear-hold: who looked")
+    ap.add_argument("--note", help="with --clear-hold: what they found")
     args = ap.parse_args(argv)
-    if not args.reconcile_only and None in (args.ticker, args.outcome, args.contracts, args.side):
+    if args.clear_hold is not None:
+        if args.reconcile_only or any(x is not None for x in (args.ticker, args.outcome, args.contracts, args.side, args.limit)):
+            ap.error("--clear-hold is given alone, with --who and --note")
+    elif not args.reconcile_only and None in (args.ticker, args.outcome, args.contracts, args.side):
         ap.error("--ticker, --outcome, --contracts and --side are needed unless --reconcile-only is given")
+    elif args.who is not None or args.note is not None:
+        ap.error("--who and --note go with --clear-hold")
     from valedia_trader.core.secrets import SecretError
     from valedia_trader.venues.webull import WebullError
     try:
@@ -818,12 +1279,17 @@ def main(argv: list[str] | None = None, *, environ=None, build_venue: Callable |
     paths = LoopPaths(Path(root)) if root is not None else LoopPaths()
     clock = clock or wall_clock
     ledger_path = ledger_path_for(paths.memory, venue.name)
+    if args.clear_hold is not None:
+        out = clear_hold(journal=Journal(paths.journal), state=state_path_for(ledger_path, venue.name), venue_name=venue.name,
+                         hold_id=args.clear_hold, who=args.who, note=args.note, clock=clock)
+        print(json.dumps(out, indent=2, default=str))
+        return 0 if out["status"] == "cleared" else 2
     ledger = open_ledger(ledger_path, clock=clock)
     try:
         out = run_event_practice(ledger=ledger, venue=venue, journal=Journal(paths.journal),
                                  state=state_path_for(ledger_path, venue.name), ticker=args.ticker, outcome=args.outcome,
                                  contracts=args.contracts, side=args.side, limit=args.limit,
-                                 reconcile_only=args.reconcile_only, book=book, clock=clock)
+                                 reconcile_only=args.reconcile_only, book=book, clock=clock, market=market)
     finally:
         ledger.close()
     print(json.dumps(out, indent=2, default=str))

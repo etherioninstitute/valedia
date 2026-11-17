@@ -14,6 +14,9 @@ Live data for the order-book loop (also GET only, through the same pacing and re
 open, non-combo markets; `orderbook` reads the best levels of a book (Kalshi sends bids only, ascending, best
 last; a yes ask is one minus the best no bid, see `best_quote`); `trades` reads a market's tape between two times
 in seconds, following the cursor; `series` gives a series' fee fields.
+
+Settlement (T45-1): `market` reads one market's record, the six fields a settlement is judged on, from the live
+tier and, on a 404 only, the historical tier; it never judges them (event_practice.judge_settlement does).
 """
 from __future__ import annotations
 
@@ -34,6 +37,7 @@ PRICE_KEYS = ("open", "high", "low", "close", "mean", "previous")
 BOOK_KEYS = ("open", "high", "low", "close")
 MARKET_KEYS = ("ticker", "event_ticker", "title", "subtitle", "yes_sub_title", "strike_type", "floor_strike", "cap_strike",
                "open_time", "close_time", "settlement_ts", "status", "result", "expiration_value")
+MARKET_RECORD_KEYS = ("ticker", "market_type", "status", "result", "settlement_value_dollars", "settlement_ts")
 
 
 class HttpError(Exception):
@@ -278,6 +282,35 @@ class KalshiData:
             params["max_ts"] = int(max_ts)
         params["limit"] = 1000
         return [normalize_trade(r) for r in self.pages("/markets/trades", params, "trades")]
+
+    def market(self, ticker: str) -> dict:
+        """One market's record for settlement: {ticker, market_type, status, result, settlement_value_dollars,
+        settlement_ts, tier}, each value exactly as Kalshi sent it (None when absent; never converted, never filled
+        in: the caller judges it). Asks the live tier (/markets/<ticker>); on a 404 from it, and only then, the
+        historical tier (/historical/markets/<ticker>). The fields `normalize_market` knows come through it, the
+        other two by their own keys only. The ticker must be in Kalshi's shape (the ticker part of
+        webull.parse_event_name) before it is put into a path: else ValueError, and nothing is asked.
+        HttpError when both tiers answer 404 or the live tier answers another 4xx; KalshiDataError when retries
+        run out (never then the other tier) or the answer is not an object holding a `market` object."""
+        from valedia_trader.venues.webull import parse_event_name
+        if type(ticker) is not str or parse_event_name(ticker + ":yes") != (ticker, "yes"):
+            raise ValueError("a market ticker must be in Kalshi's shape (a capital letter, then capitals, digits, dots "
+                             "and hyphens, at most 80)")
+        for tier, path in (("live", "/markets/%s"), ("historical", "/historical/markets/%s")):
+            try:
+                body = self.get_json(path % ticker)
+            except HttpError as e:
+                if e.status == 404 and tier == "live":
+                    continue
+                raise
+            row = body.get("market") if isinstance(body, dict) else None
+            if not isinstance(row, dict):
+                raise KalshiDataError("no 'market' object in the answer for %s from the %s tier" % (ticker, tier))
+            norm = normalize_market(row, tier)
+            out = {k: norm[k] for k in ("ticker", "status", "result", "settlement_ts")}
+            out.update({k: row.get(k) for k in ("market_type", "settlement_value_dollars")})
+            return {k: out[k] for k in MARKET_RECORD_KEYS} | {"tier": tier}
+        raise KalshiDataError("unreachable")                                   # the loop returns or raises
 
     def series(self, ticker: str) -> dict:
         """A series' ticker, title, `fee_type` and `fee_multiplier` (None when the series does not say)."""

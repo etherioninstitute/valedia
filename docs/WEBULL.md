@@ -219,6 +219,35 @@ journaled once with a fee of 0.01 dollars; a further run journaled nothing and s
 another game, bought by hand earlier, is in that ledger's starting position and is held to its result to see
 what settlement looks like.
 
+### Settlement (seen 2026-11-17, paper Events account; built in T45-1)
+
+- **A losing contract vanishes at 0.** The hand-bought yes contract of `KXNBAGAME-26NOV13ATLCHI-ATL` left the
+  account with no order and no fill. `--reconcile-only` then stopped: the ledger expected 1, the account showed
+  0. Kalshi's public record for that ticker showed `market_type` "binary", `status` "finalized", `result` "no",
+  `settlement_value_dollars` "0.0000" and `settlement_ts` "2026-11-14T03:49:44.800032Z" (close 03:47:58Z).
+- **What the command now does.** A holding the ledger expects that the account shows at exactly 0 is closed
+  when Kalshi's record for that ticker has exactly those safe values: `ticker` the same, `market_type`
+  "binary", `status` "finalized", `result` yes or no, a settlement value of exactly "1.0000" for yes or "0.0000"
+  for no, and `settlement_ts` in the past and later than every fill of the program on that name. The record is read
+  from `/markets/<ticker>`, and from `/historical/markets/<ticker>` only when the first answers 404. The holding
+  must also have no open order and no unapplied fill, and no other name may differ. The closing entry is
+  journaled once, at 1.00 a contract for a holding whose outcome won and 0.00 otherwise (a held `no` with result
+  "no" wins). The fee is recorded as "none seen", because no settlement fee has been seen, not because one is
+  known to be zero. After it, no order of either outcome is sent on that ticker.
+- **Anything else stops the run, which names the fact**: a partial disappearance, a status before `finalized`
+  (for example `determined`), a fraction, a void, another ticker, a missing or malformed field, or a read error.
+  Webull can drop a holding before Kalshi finalizes it, so the whole Events path waits until Kalshi does.
+- **Not yet seen: a win.** The Events balance gives buying power only. What a winning settlement does to it, and
+  whether Webull charges anything at settlement, is unobserved until the first win. The command reads buying power
+  at every run, and only with no order of its own open. For a win it compares the reading against the last one
+  taken while the holding was still shown. With no fill, order or other settlement between the two, the buying
+  power must have risen by exactly the payout, to the cent. If it did not, the command opens a hold and sends
+  nothing more until a person clears it:
+  `python -m valedia_trader.execution_and_risk.event_practice --clear-hold ID --who NAME --note TEXT`.
+  If a win cannot be compared, the journal says why and the run goes on. Every summary shows the flag
+  `win_cash_observed`, which stays false until one comparable win has matched.
+- **Not handled:** a correction Kalshi makes after `finalized` would show only as a cash difference.
+
 ## Not covered yet
 
 Options, futures and event-contract orders (the API supports them; the trader does not trade them), short selling,
