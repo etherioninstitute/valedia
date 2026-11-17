@@ -2264,3 +2264,86 @@ def test_a_long_phrase_the_guard_knows_from_elsewhere_slid_across_the_raw_bound_
     s.remember(KNOWN_PHRASE)
     assert s.redact(" ".join(KNOWN_PHRASE.split()[:4]))[1] == 1 and s.redact(" ".join(KNOWN_PHRASE.split()[:3]))[1] == 0
     assert slide_across_the_raw_bound(KNOWN_PHRASE) == []
+
+
+# ---- T50 addendum 4 (1): the alerts commands never open the live file and register nothing from a file naming a live
+#      name; they refuse in words
+
+T50_KEY, T50_SECRET = "ZqLiveKey7Rt4Kw9PmXv2Bn", "ZqLiveSecret3LbNHs4GdYp8"          # made up
+_T50_WATCHED: dict = {}
+_T50_OPENS: list = []
+
+
+def _t50_audit(event, args):
+    if event == "open" and args and _T50_WATCHED.get("inode"):
+        try:
+            st = os.stat(args[0]) if isinstance(args[0], (str, bytes, os.PathLike)) else None
+        except (OSError, ValueError, TypeError):
+            st = None
+        if st is not None and (st.st_dev, st.st_ino) == _T50_WATCHED["inode"]:
+            _T50_OPENS.append("opened")
+
+
+sys.addaudithook(_t50_audit)
+
+
+@pytest.fixture
+def t50_live(tmp_path, monkeypatch):
+    folder = tmp_path / "home" / ".hermes" / "secrets"
+    folder.mkdir(parents=True)
+    folder.chmod(0o700)
+    live = folder / "webull-live.env"
+    live.write_text(f"WEBULL_LIVE_APP_KEY={T50_KEY}\nWEBULL_LIVE_APP_SECRET={T50_SECRET}\n")
+    live.chmod(0o600)
+    monkeypatch.setattr(s, "LIVE_ENV_FILE", live)
+    monkeypatch.setattr(s, "read_live_pair", lambda *a, **k: pytest.fail("the live file was read by its reader"))
+    links = tmp_path / "links"
+    links.mkdir(mode=0o700)
+    (links / "trading.env").symlink_to(live)
+    copy = tmp_path / "copies" / "trading.env"
+    copy.parent.mkdir(mode=0o700)
+    copy.write_bytes(live.read_bytes())
+    copy.chmod(0o600)
+    st = os.stat(live)
+    _T50_OPENS.clear()
+    _T50_WATCHED["inode"] = (st.st_dev, st.st_ino)
+    yield {"live": live, "link": links / "trading.env", "spelling": folder / ".." / "secrets" / live.name, "copy": copy}
+    _T50_WATCHED.clear()
+    _T50_OPENS.clear()
+
+
+@pytest.mark.parametrize("argv", [["watch"], ["watch", "--notify"], ["list"]])
+@pytest.mark.parametrize("way", ["live", "link", "spelling", "copy"])
+def test_t50_a4_the_alerts_commands_refuse_the_live_file_however_named_and_register_nothing(world, t50_live, monkeypatch,
+                                                                                           capsys, way, argv):
+    monkeypatch.setenv("VALEDIA_ENV_FILE", str(t50_live[way]))
+    for name in ("WEBULL_LIVE_APP_KEY", "WEBULL_LIVE_APP_SECRET"):
+        monkeypatch.delenv(name, raising=False)
+    longest = al._registered["longest"]
+    env = world.env()
+    _T50_OPENS.clear()
+    assert al.main(argv, env=env) == 2
+    printed = capsys.readouterr()
+    clean = T50_KEY not in printed.out + printed.err and T50_SECRET not in printed.out + printed.err
+    assert clean and "trading file" in printed.err and "nothing was done" in printed.err
+    assert ("webull-live.env" if way != "copy" else "WEBULL_LIVE_APP_KEY") in printed.err, printed.err
+    assert _T50_OPENS == [] or way == "copy", (way, len(_T50_OPENS))   # the live file itself is never opened
+    assert "trading_values" not in env._cache and al._registered["longest"] == longest      # nothing registered
+    assert not world.alerts_file.exists()
+    assert "WEBULL_LIVE_APP_KEY" not in os.environ and "WEBULL_LIVE_APP_SECRET" not in os.environ
+
+
+def test_t50_a4_an_ordinary_file_naming_a_live_name_registers_none_of_its_values(world, tmp_path, monkeypatch, capsys):
+    f = tmp_path / "trading.env"
+    f.write_text("".join(f"{k}={v}\n" for k, v in TRADING.items()) + f"WEBULL_LIVE_APP_KEY={T50_KEY}\n")
+    f.chmod(0o600)
+    env = world.env()
+    env.trading_file = f
+    longest = al._registered["longest"]
+    with pytest.raises(al.TradingFileError) as exc:
+        al.register_trading_file(env)
+    why = str(exc.value)
+    clean = T50_KEY not in why and all(v not in why for v in TRADING.values())
+    assert clean and "WEBULL_LIVE_APP_KEY" in why and "nothing was done" in why
+    assert "trading_values" not in env._cache and al._registered["longest"] == longest
+    assert al.clean(f"a {TRADING['BROKER_API_KEY']} b") == f"a {TRADING['BROKER_API_KEY']} b"   # none of its values known

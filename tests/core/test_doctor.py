@@ -995,3 +995,46 @@ def test_t50_a3_a_property_list_launchd_cannot_parse_is_a_failure_that_names_it(
     target.write_text("<plist><dict><key>Label</key>")                # clean words, not a property list
     status, detail = _check_jobs(tmp_path, launchd, agents)
     assert status == D.FAIL and target.name in detail and "could not be read" in detail, detail
+
+
+# ---- T50 addendum 4 (2): in the LaunchAgents folder an unreadable or unparseable file fails the check only when its file
+#      name starts with com.valedia.; any other is listed as not examined
+
+@pytest.mark.parametrize("fault", ["unparseable", "unreadable"])
+def test_t50_a4_another_programs_unreadable_agent_file_is_listed_not_failed_and_ours_fails(tmp_path, fault):
+    launchd, agents, _ = _jobs(tmp_path)
+    other = agents / "com.other.vendor.plist"
+    other.write_text("<plist><dict><key>Label</key>")
+    if fault == "unreadable":
+        _plist(other, "com.other.vendor", ["/bin/echo", "ok"])
+        other.chmod(0o000)
+    try:
+        status, detail = _check_jobs(tmp_path, launchd, agents)
+        assert status == D.OK and "not examined" in detail and other.name in detail, detail
+        ours = agents / "com.valedia.mine.plist"
+        ours.write_text("<plist><dict><key>Label</key>")
+        if fault == "unreadable":
+            _plist(ours, "com.valedia.mine", ["/bin/echo", "ok"])
+            ours.chmod(0o000)
+        status, detail = _check_jobs(tmp_path, launchd, agents)
+        assert status == D.FAIL and ours.name in detail and "could not be read" in detail, detail
+    finally:
+        for p in agents.iterdir():
+            p.chmod(0o600)
+
+
+def test_t50_a4_an_unreadable_file_in_tools_launchd_or_named_by_our_job_still_fails(tmp_path):
+    launchd, agents, elsewhere = _jobs(tmp_path)
+    (launchd / "com.other.vendor.plist").write_text("<plist><dict>")            # in the repository's own folder
+    status, detail = _check_jobs(tmp_path, launchd, agents)
+    assert status == D.FAIL and "com.other.vendor.plist" in detail, detail
+    (launchd / "com.other.vendor.plist").unlink()
+    run = elsewhere / "run.sh"
+    run.write_text("#!/bin/bash\necho ok\n")
+    run.chmod(0o000)
+    _plist(agents / "com.valedia.hidden.plist", "com.valedia.hidden", ["/bin/bash", run])
+    try:
+        status, detail = _check_jobs(tmp_path, launchd, agents)
+    finally:
+        run.chmod(0o600)
+    assert status == D.FAIL and "run.sh" in detail, detail
