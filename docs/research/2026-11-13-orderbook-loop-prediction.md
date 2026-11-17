@@ -550,3 +550,18 @@ the restart's times.
 
 The replacement is one restart of the collector, the stop and the start both in the store; any decision slot
 lost in that minute is counted as lost like any other. The test period runs on this revision.
+
+## The restart's times, and the first decisions of the new revision (written at 04:03 UTC on 17 November, after the restart; no answer has been scored)
+
+The collector was stopped at 03:55:46.657 UTC and started again at 03:55:47.396 UTC on 17 November, both events in
+the store; the start event carries the tag `lmstudio:elephant-1@q8_0` and the same battery. Snapshots were not
+interrupted (22 a minute before, during and after). The outage that began when Ollama was quit ran from the first
+`model_unavailable` row at 00:39:10 UTC to the last at 03:55:18 UTC: 414 rows, and no row of any other status in
+that span. The first decision of the new revision was at 03:56:18 UTC and was ok. The model's instance was already
+loaded with the right settings, so the collector asked the server for no load and wrote no `model_load` row.
+
+A disturbance, not part of this test: from about 03:53 UTC another program on this Mac has been sending its own
+requests to the same model instance. The instance answers one request at a time, so the collector's calls wait
+behind them: its first eight decisions took 4.7 to 8.7 seconds (median 7.3) against 3.7 when the instance is
+otherwise idle; all eight are ok and none is late. The session that runs that program has been told. A call that
+passes the 10 second limit would be a `late` row like any other, and would be said here.
