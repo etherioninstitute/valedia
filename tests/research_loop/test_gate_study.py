@@ -6,6 +6,10 @@ Pass marks come from the builder's Step 0 measurements on the RISING universe `u
 the equal-weight basket rising; the shape of the real data), unless a comment names another. 30 prior attempts are
 drawn from N(0.005, 0.03) with seed 0, as in test_controls. Each mark has both numbers in its comment: what was
 measured, and the mark, set at about three times the margin seen.
+
+Addendum 1 (listing): `late_listing(prices)` is the same universe with BTC-USD and ETH-USD unpriced on its first
+1,500 rows, the shape of the real data; the marks of the listed-window, listing-regime and N4a/N4b tests were measured
+by the builder before the code was committed, both numbers in each comment.
 """
 import json
 import os
@@ -75,6 +79,16 @@ def cost_for(prices) -> CostModel:
 def market():
     prices, dollar = universe(7)
     return prices, dollar, cost_for(prices)
+
+
+LATE = ("BTC-USD", "ETH-USD")
+
+
+def late_listing(prices, rows=1500):
+    """The two coins unpriced on the first `rows` rows: they list late, as on the real data."""
+    late = prices.copy()
+    late.iloc[:rows, late.columns.get_indexer(list(LATE))] = np.nan
+    return late
 
 
 # ---- the anchor: R0 judged from the kept material is the real gate's verdict
@@ -245,27 +259,76 @@ def test_the_constructed_books_fail_where_they_were_built_to(anchor_rows):
 
 # ---- each rule's pure function on hand-built inputs
 
+_LISTED = {"timing_p": "timing_p_listed", "strict_p": "strict_p_listed", "active_moments": "active_moments_listed"}
+
+
 def material(**kw):
-    """A book that passes everything: per-period Sharpe 0.05 over 2000 bars (PSR 0.987), re-timing p 0.01."""
+    """A book that passes everything: per-period Sharpe 0.05 over 2000 bars (PSR 0.987), re-timing p 0.01. The
+    listed-window figures equal the gate's (no late listing) unless given."""
     m = {"refused": False, "own": [0.05], "timing_p": 0.01, "strict_p": {}, "development_sharpe": 0.8,
          "checks": dict.fromkeys(("prediction_failure_terms", "deflated_sharpe", "walk_forward", "double_costs",
                                   "delayed_fills", "worst_periods"), True),
          "moments": {"sharpe": 0.05, "n_obs": 2000, "skew": 0.0, "kurt": 3.0},
          "active_moments": {"sharpe": 0.05, "n_obs": 2000, "skew": 0.0, "kurt": 3.0},
-         "sealed": {"made_money": True, "prediction_failure_terms": True}}
+         "sealed": {"made_money": True, "prediction_failure_terms": True}, "listed_share": 1.0}
     m.update(kw)
+    for gate, listed in _LISTED.items():
+        if listed not in kw:
+            m[listed] = m[gate]
     return m
 
 
-def verdicts(m, others=()):
-    return {r: gs.develops(r, m, list(others), CRITERIA) for r in ("R0", "R1", "R2", "R4")}
+def verdicts(m, others=(), version="gate"):
+    """R0, R1, R2 and R4 (keyed by base name) with the gate's or the listed window's figures."""
+    return {r.split("_")[0]: gs.develops(r, m, list(others), CRITERIA)
+            for r in ("R0", f"R1_{version}", f"R2_{version}", f"R4_{version}")}
+
+
+STRICT = {"strict_p": {1: 0.001}, "strict_p_listed": {1: 0.001}}        # R3's strict p at one attempt, both versions
+
+
+def test_the_rules_come_as_gate_and_listed_versions():
+    assert gs.RULES == ("R0", "R1_gate", "R1_listed", "R2_gate", "R2_listed", "R3_gate", "R3_listed", "R4_gate",
+                        "R4_listed")
+    assert gs.TIMED == ("gate", "listed")
+    with pytest.raises(ValueError, match="unknown rule"):
+        gs.develops("R1", material(), [], CRITERIA)                       # the bare name is not a rule any more
 
 
 def test_a_book_that_passes_r0_and_fails_r1_on_its_re_timing_p_value():
     m = material(timing_p=0.2)
-    assert verdicts(m) == {"R0": True, "R1": False, "R2": False, "R4": True}
-    assert gs.passes("R0", m, [], CRITERIA) and not gs.passes("R1", m, [], CRITERIA)
-    assert not gs.develops("R1", material(timing_p=None), [], CRITERIA)          # no re-timing test: not timed
+    for version in gs.TIMED:
+        assert verdicts(m, version=version) == {"R0": True, "R1": False, "R2": False, "R4": True}
+    assert gs.passes("R0", m, [], CRITERIA) and not gs.passes("R1_gate", m, [], CRITERIA)
+    assert not gs.develops("R1_gate", material(timing_p=None), [], CRITERIA)     # no re-timing test: not timed
+
+
+def test_the_listed_figures_decide_the_listed_rules_only_and_unavailable_fails_closed():
+    # the gate's p passes and the listed window's does not (a late-listing book): only the _listed rules fail
+    m = material(timing_p=0.01, timing_p_listed=0.4, strict_p={1: 0.001}, strict_p_listed={1: 0.3},
+                 active_moments_listed={"sharpe": 0.0, "n_obs": 2000, "skew": 0.0, "kurt": 3.0})
+    assert {r: gs.develops(r, m, [], CRITERIA) for r in gs.RULES} == {r: not r.endswith("_listed") for r in gs.RULES}
+    # and the other way round: the listed figures pass and the gate's do not
+    m = material(timing_p=0.4, timing_p_listed=0.01, strict_p={1: 0.3}, strict_p_listed={1: 0.001},
+                 active_moments={"sharpe": 0.0, "n_obs": 2000, "skew": 0.0, "kurt": 3.0},
+                 active_moments_listed={"sharpe": 0.05, "n_obs": 2000, "skew": 0.0, "kurt": 3.0})
+    assert {r: gs.develops(r, m, [], CRITERIA) for r in gs.RULES} == {r: r == "R0" or r.endswith("_listed")
+                                                                      for r in gs.RULES}
+    # the listed window too short for the test: p_listed, its strict p and its active moments are None, and every
+    # _listed rule fails; the _gate rules and R0 are untouched
+    gone = material(timing_p_listed=None, strict_p={1: 0.001}, strict_p_listed={1: None}, active_moments_listed=None)
+    assert {r: gs.develops(r, gone, [], CRITERIA) for r in gs.RULES} == {r: not r.endswith("_listed") for r in gs.RULES}
+    with pytest.raises(KeyError):
+        gs.develops("R3_listed", material(strict_p={1: 0.001}, strict_p_listed={}), [], CRITERIA)   # needed
+    assert gs.develops("R3_gate", material(strict_p={1: 0.001}), [], CRITERIA)
+
+
+def test_a_cell_counts_the_books_whose_re_timing_test_was_unavailable():
+    v = [{1: dict.fromkeys(gs.RULES, False)} for _ in range(3)]
+    cell = gs._cell_report("N1", 0.5, v, [1], [0.1, 0.2, 0.3], 0, [None] * 3,
+                           timing=[(True, False, 0.4), (True, True, 1.0), (False, False, None)])
+    assert cell["timing_unavailable"] == {"gate": 1, "listed": 2} and cell["median_listed_share"] == 0.7
+    assert list(cell["by_attempts"]["1"]) == list(gs.RULES)
 
 
 def test_a_book_that_fails_r0_only_because_its_own_sharpe_is_in_the_variance_passes_r2():
@@ -274,7 +337,8 @@ def test_a_book_that_fails_r0_only_because_its_own_sharpe_is_in_the_variance_pas
     with_own = gs.deflated_value(m["moments"], m["own"], others)
     without = gs.deflated_value(m["moments"], m["own"], others, leave_own_out=True)
     assert with_own < CRITERIA.min_dsr <= without                        # measured 0.913 and 0.986
-    assert verdicts(m, others) == {"R0": False, "R1": False, "R2": True, "R4": True}
+    for version in gs.TIMED:
+        assert verdicts(m, others, version) == {"R0": False, "R1": False, "R2": True, "R4": True}
     # the variance is the only difference: R0 with the other attempts' variance would pass
     var_others = float(np.var(others, ddof=1))
     from valedia_trader.quant_engine import level10_ml_research as research
@@ -289,45 +353,49 @@ def test_thresholds_at_exact_equality():
     value = gs.deflated_value(m["moments"], m["own"], [])
     at = gt.Criteria(min_dsr=value)
     assert gs.develops("R0", m, [], at) and not gs.develops("R0", m, [], gt.Criteria(min_dsr=np.nextafter(value, 1)))
-    assert gs.develops("R1", material(timing_p=0.05), [], CRITERIA)
-    assert not gs.develops("R1", material(timing_p=float(np.nextafter(0.05, 1))), [], CRITERIA)
+    above, third = float(np.nextafter(0.05, 1)), float(np.nextafter(0.05 / 3, 1))
     others = [0.01, 0.02]                                                # N = 3 attempts counted: R3 needs p <= 0.05 / 3
-    assert gs.develops("R3", material(strict_p={3: 0.05 / 3}), others, CRITERIA)
-    assert not gs.develops("R3", material(strict_p={3: float(np.nextafter(0.05 / 3, 1))}), others, CRITERIA)
+    for v, p_key, s_key in (("gate", "timing_p", "strict_p"), ("listed", "timing_p_listed", "strict_p_listed")):
+        assert gs.develops(f"R1_{v}", material(**{p_key: 0.05}), [], CRITERIA)
+        assert not gs.develops(f"R1_{v}", material(**{p_key: above}), [], CRITERIA)
+        assert gs.develops(f"R3_{v}", material(**{s_key: {3: 0.05 / 3}}), others, CRITERIA)
+        assert not gs.develops(f"R3_{v}", material(**{s_key: {3: third}}), others, CRITERIA)
     assert gs.r3_shifts(1) == 400 and gs.r3_shifts(31) == 12400        # 20 times the reciprocal of 0.05 / N
     assert all(gs.r3_shifts(n) >= 20 / (0.05 / n) for n in range(1, 60))
 
 
 def test_r3_drops_the_deflation_and_needs_its_strict_p_only_when_the_rest_passes():
     spread = [0.04, -0.04, 0.03, -0.03, 0.0]                             # a wide spread of attempts: a high bar
-    m = material(strict_p={6: 0.001})
-    assert not gs.develops("R0", m, spread, CRITERIA)                     # deflated by 6 attempts
-    assert gs.develops("R3", m, spread, CRITERIA)                         # one trial, p 0.001 <= 0.05 / 6
-    assert not gs.develops("R3", material(strict_p={6: 0.01}), spread, CRITERIA)
-    with pytest.raises(KeyError):
-        gs.develops("R3", material(), spread, CRITERIA)                   # the rest passes: the strict p is needed
-    failing = material(checks=dict(material()["checks"], delayed_fills=False))
-    assert gs.develops("R3", failing, spread, CRITERIA) is False         # the rest fails: no p needed, no KeyError
+    for v in gs.TIMED:
+        m = material(strict_p={6: 0.001})
+        assert not gs.develops("R0", m, spread, CRITERIA)                 # deflated by 6 attempts
+        assert gs.develops(f"R3_{v}", m, spread, CRITERIA)                # one trial, p 0.001 <= 0.05 / 6
+        assert not gs.develops(f"R3_{v}", material(strict_p={6: 0.01}), spread, CRITERIA)
+        with pytest.raises(KeyError):
+            gs.develops(f"R3_{v}", material(), spread, CRITERIA)          # the rest passes: the strict p is needed
+        failing = material(checks=dict(material()["checks"], delayed_fills=False))
+        assert gs.develops(f"R3_{v}", failing, spread, CRITERIA) is False  # the rest fails: no p needed, no KeyError
 
 
 def test_r4_judges_the_active_returns_and_every_rule_keeps_the_gate_s_other_checks():
     m = material(active_moments={"sharpe": 0.0, "n_obs": 2000, "skew": 0.0, "kurt": 3.0})
-    assert verdicts(m) == {"R0": True, "R1": True, "R2": True, "R4": False}
-    assert verdicts(material(active_moments=None))["R4"] is False          # no usable active returns: value 0
+    for v in gs.TIMED:
+        assert verdicts(m, version=v) == {"R0": True, "R1": True, "R2": True, "R4": False}
+        assert verdicts(material(active_moments=None), version=v)["R4"] is False     # no usable active returns: value 0
     for check in ("prediction_failure_terms", "walk_forward", "double_costs", "delayed_fills", "worst_periods"):
-        bad = material(checks=dict(material()["checks"], **{check: False}), strict_p={1: 0.001})
+        bad = material(checks=dict(material()["checks"], **{check: False}), **STRICT)
         assert not any(gs.develops(r, bad, [], CRITERIA) for r in gs.RULES), check
     # the report's own deflated_sharpe boolean is not read: each rule computes its own Sharpe test
-    m = material(checks=dict(material()["checks"], deflated_sharpe=False), strict_p={1: 0.001})
+    m = material(checks=dict(material()["checks"], deflated_sharpe=False), **STRICT)
     assert all(gs.develops(r, m, [], CRITERIA) for r in gs.RULES)
 
 
 def test_the_sealed_checks_and_refused_books():
-    m = material(sealed={"made_money": False, "prediction_failure_terms": True}, strict_p={1: 0.001})
+    m = material(sealed={"made_money": False, "prediction_failure_terms": True}, **STRICT)
     assert all(gs.develops(r, m, [], CRITERIA) and not gs.passes(r, m, [], CRITERIA) for r in gs.RULES)
     with pytest.raises(KeyError):
         gs.passes("R0", material(sealed=None), [], CRITERIA)
-    refused = material(refused=True, strict_p={1: 0.001})
+    refused = material(refused=True, **STRICT)
     assert not any(gs.develops(r, refused, [], CRITERIA) for r in gs.RULES)
     with pytest.raises(ValueError, match="unknown rule"):
         gs.develops("R9", material(), [], CRITERIA)
@@ -394,25 +462,105 @@ def test_the_surrogate_is_deterministic_for_a_seed_and_different_for_another(mar
     assert abs(100_000 / breaks - 20) <= 0.3                             # mean block 20: measured 20.10, mark 0.3
 
 
-def test_the_surrogate_keeps_missing_prices_missing_and_resamples_complete_rows_only(market):
-    prices = market[0].copy()
-    prices.iloc[:800, prices.columns.get_loc("ETH-USD")] = np.nan         # listed later
-    prices.iloc[1500:1510, prices.columns.get_loc("GLD")] = np.nan       # a gap
-    sur = gs.surrogate_prices(prices, gs._rng(1, "surrogate", 0))
-    assert sur.isna().equals(prices.isna())
-    assert sur["ETH-USD"].iloc[800] == prices["ETH-USD"].iloc[800]        # rebuilt from its own first price
-    r = _simple(sur).to_numpy()
-    assert np.isfinite(r[800:1499]).all() and (np.nanmin(sur.to_numpy()) > 0)
-    # every surrogate bar is a complete row of the original: its cross-section appears there whole
+def test_the_surrogate_resamples_within_listing_regimes_and_keeps_the_priced_pattern(market):
+    prices = late_listing(market[0])
+    prices.iloc[2000:2010, prices.columns.get_loc("GLD")] = np.nan       # a gap inside a regime
+    assert gs.listing_regimes(prices) == [(0, 1500), (1500, len(prices))]   # a gap does not end a listing
     orig = _simple(prices)
-    complete = orig[orig.notna().all(axis=1)].to_numpy()
-    nearest = [float(np.abs(complete - x).max(axis=1).min()) for x in r[900:1400]]
-    assert max(nearest) <= 1e-9                                          # rebuilt prices: rounding only
-    short = prices.copy()
-    short.iloc[:, 0] = np.nan
-    short.iloc[-200:, 0] = 100.0
-    with pytest.raises(ValueError, match="at least 252"):
-        gs.surrogate_prices(short, gs._rng(1, "surrogate", 0))
+    for block in (1, 20):
+        sur = gs.surrogate_prices(prices, gs._rng(1, "surrogate", block), block)
+        assert sur.isna().equals(prices.isna())                          # the priced symbols of every bar: the original's
+        assert gs.listing_regimes(sur) == gs.listing_regimes(prices) and np.nanmin(sur.to_numpy()) > 0
+        assert all(sur[c].iloc[1500] == prices[c].iloc[1500] for c in LATE)   # rebuilt from its own first price
+        r = _simple(sur)                                                  # row k is bar k + 1
+        assert not np.allclose(r.iloc[1:1499, 2:].fillna(0), orig.iloc[1:1499, 2:].fillna(0))   # it did resample
+        # every bar of a regime is a return row of the SAME regime of the data (bars after its first; its symbols; a
+        # gap read as no move): rebuilt prices, so rounding only
+        for a, b in gs.listing_regimes(prices):
+            cols = [c for c in prices.columns if prices[c].iloc[a:b].notna().any()]
+            pool = orig.iloc[a:b - 1][cols].fillna(0.0).to_numpy()
+            got = r.iloc[max(a - 1, 0):b - 1][cols].dropna().to_numpy()[::4]
+            assert len(got) > 300 and max(float(np.abs(pool - x).max(axis=1).min()) for x in got) <= 1e-9, (block, a)
+
+
+def _early_and_late():
+    """The late-listing universe with the old symbols' early period (rows 1 to 1,499) given +0.2% a day: the
+    checker's contrast, a pre-listing period that behaves unlike the later one."""
+    prices = late_listing(universe(7)[0])
+    r = _simple(prices)
+    r.iloc[:1499] += 0.002
+    early = pd.concat([prices.iloc[:1].fillna(1.0), prices.iloc[:1].fillna(1.0).to_numpy() * (1 + r.fillna(0)).cumprod()])
+    early[prices.isna()] = np.nan
+    for c in LATE:                                                        # the coins as they were from their listing
+        early.loc[early.index[1500]:, c] = prices.loc[prices.index[1500]:, c]
+    return early
+
+
+def test_each_regime_keeps_its_own_moments_per_symbol():
+    data = _early_and_late()
+    a = _simple(data)
+    worst_z, worst_sd = {}, {}
+    for block in (1, 20):
+        zs, sds = [], []
+        for k in range(5):
+            b = _simple(gs.surrogate_prices(data, gs._rng(2, "surrogate", k), block))
+            for lo, hi in gs.listing_regimes(data):
+                cols = [c for c in data.columns if data[c].iloc[lo:hi].notna().all()]
+                x, y = a.iloc[lo:hi - 1][cols].dropna(), b.iloc[lo:hi - 1][cols].dropna()
+                zs.append(float(((y.mean() - x.mean()).abs() / (x.std() / np.sqrt(len(x)))).max()))
+                sds.append(float((y.std() / x.std() - 1).abs().max()))
+        worst_z[block], worst_sd[block] = max(zs), max(sds)
+    # Worst over 5 surrogates, both regimes and every symbol (up to 170 comparisons): the mean differs from the
+    # regime's by at most 2.77 (block 1) and 3.09 (block 20) of its standard errors; the sd by at most 7.0% and 17.9%
+    # (fat-tailed returns, a long block). Marks: 4.5 standard errors and 30%.
+    assert max(worst_z.values()) <= 4.5 and max(worst_sd.values()) <= 0.30, (worst_z, worst_sd)
+
+
+def test_a_pre_listing_period_with_a_different_mean_keeps_it():
+    data = _early_and_late()
+    old = [c for c in data.columns if c not in LATE]
+
+    def contrast(r):                                                       # early mean minus late mean, old symbols
+        return float((r.iloc[:1499][old].mean() - r.iloc[1500:][old].mean()).mean())
+    want = contrast(_simple(data))                                        # measured 0.00166 a day
+    got = [contrast(_simple(gs.surrogate_prices(data, gs._rng(2, "surrogate", k), b))) for b in (1, 20) for k in range(5)]
+    # measured 0.00130 to 0.00180 (block 1) and 0.00123 to 0.00208 (block 20); mark: within 0.0008 of the data's (the
+    # widest miss seen 0.00043), so the contrast is kept on every surrogate
+    assert all(abs(g - want) <= 0.0008 for g in got), (want, got)
+    # two-way: rows resampled from the WHOLE history, the old way, lose it (measured -0.00033 to 0.00013)
+    r = _simple(data)[old].to_numpy()
+    rng = np.random.default_rng(0)
+    pooled = [float(np.nanmean(r[gs.stationary_bootstrap_rows(1499, len(r), 1, rng)])
+                    - np.nanmean(r[gs.stationary_bootstrap_rows(len(r) - 1500, len(r), 1, rng)])) for _ in range(5)]
+    assert all(abs(p) <= 0.0005 for p in pooled) and min(got) > 0.0008 > max(pooled)
+
+
+def _one_bar_sharpe(px):
+    """A one-bar rule: hold each symbol the way its last return went, for one bar."""
+    x = _simple(px).to_numpy()
+    pnl = (np.sign(x[:-1]) * x[1:]).ravel()
+    return float(pnl.mean() / pnl.std(ddof=1) * np.sqrt(252))
+
+
+def test_a_one_bar_rule_s_edge_is_gone_in_n4a_and_kept_in_n4b():
+    assert gs.SURROGATE_BLOCK == {"N4a": 1, "N4b": 20}
+    assert "short-range dependence of the data kept: a rule that lives inside 20 bars keeps its edge here" in \
+        gs.FAMILIES["N4b"][3]
+    rng = np.random.default_rng(0)
+    e = rng.standard_normal((3528, 2)) * 0.01
+    x = np.zeros_like(e)
+    for t in range(1, len(x)):                                            # AR(1), lag-1 autocorrelation 0.3
+        x[t] = 0.3 * x[t - 1] + e[t]
+    ar = pd.DataFrame(100 * np.cumprod(1 + x, axis=0), index=pd.bdate_range(end="2026-11-13", periods=len(x)),
+                      columns=["A", "B"])
+    data = _one_bar_sharpe(ar)                                            # measured 4.19 (two symbols pooled)
+    got = {fam: [_one_bar_sharpe(gs.surrogate_prices(ar, gs._rng(1, "surrogate", fam, k), block)) for k in range(10)]
+           for fam, block in gs.SURROGATE_BLOCK.items()}
+    # N4a: mean -0.013 over 10 surrogates, range -0.25 to 0.23 (one 14-year Sharpe has sampling sd about 0.19 here);
+    # marks: the mean within 0.3 of zero and every surrogate below 0.75, against 4.19 on the data
+    assert data >= 3.0 and abs(np.mean(got["N4a"])) <= 0.3 and max(got["N4a"]) <= 0.75, (data, got)
+    # N4b: mean 3.89, range 3.50 to 4.21: the edge is kept; mark: every surrogate at least half the data's
+    assert min(got["N4b"]) >= 0.5 * data, (data, got)
 
 
 # ---- the books
@@ -487,6 +635,153 @@ def test_the_neutral_oracle_has_equal_gross_on_each_side_and_no_crypto(market):
     assert research.detect_lookahead(s.target_weights, prices.iloc[1500:2400]) == []     # carries its own future
 
 
+# ---- the re-timing test on the listed window, and R4's average book
+
+def _held_sharpe(series):
+    x = series.to_numpy(float)
+    return float(x.mean() / x.std(ddof=1) * np.sqrt(252.0))
+
+
+def test_r4_s_average_book_is_timing_null_s_exactly_with_its_first_bar_alignment(market):
+    prices, dollar, cost = market
+    s = controls.OracleCheat(prices, 0.6, 5, gs._rng(3, "E1", 6000, 0), name="study_oracle")
+    o = gs.oos_run(prices, dollar, cost, CRITERIA, s)
+    w, r, net = o["weights"], o["returns"], o["net"]
+    held = gs.held_average_book(w, r)
+    # direct: |w| averaged over the window times the sign of the summed weight, earning book[:-1] * r[1:]
+    cols = [c for c in w.columns if w[c].abs().sum() > 0]
+    book = w[cols].abs().mean() * np.sign(w[cols].sum())
+    direct = (r[cols].fillna(0.0).iloc[1:] * book).sum(axis=1)
+    assert held.index.equals(w.index[1:]) and np.allclose(held.to_numpy(), direct.to_numpy(), rtol=0, atol=1e-15)
+    assert _held_sharpe(held) == gt.timing_null(w, r)["average_book_held_throughout_sharpe"]       # exactly
+    active = gs.active_returns(net, w, r)
+    assert active.index.equals(w.index[1:]) and active.equals(net.iloc[1:] - held)
+    # two-way: the same book one bar earlier (r[:-1], the alignment fixed) is not timing_null's number
+    early = pd.Series((r[cols].fillna(0.0).iloc[:-1] * book).sum(axis=1).to_numpy(), index=w.index[1:])
+    assert _held_sharpe(early) != gt.timing_null(w, r)["average_book_held_throughout_sharpe"]
+
+
+def test_the_listed_window_starts_where_every_held_symbol_is_priced(market):
+    prices, dollar, cost = market
+    late = late_listing(prices)
+    s = controls.OracleCheat(late, 0.5, 5, gs._rng(3, "N1", 5000, 0), name="study_oracle")
+    o = gs.oos_run(late, dollar, cost, CRITERIA, s)
+    w, r, px = o["weights"], o["returns"], o["prices"]
+    assert set(LATE) <= {c for c in w.columns if w[c].abs().sum() > 0}   # the book holds the coins
+    s0 = int(px.index.get_loc(late.index[1500]))                          # the coins' first price, inside the window
+    assert gs.listed_start(w, px) == s0 > 0
+    t = gs.timing_listed(w, r, px)
+    # the same test as timing_null on the stretch, its average book from the stretch only
+    same = gt.timing_null(w.iloc[s0:], r.iloc[s0:])
+    assert {k: t[k] for k in same} == same and t["listed_start"] == s0
+    assert t["listed_share"] == (len(w) - s0) / len(w)
+    assert t["average_book_held_throughout_sharpe"] == _held_sharpe(gs.held_average_book(w.iloc[s0:], r.iloc[s0:]))
+    # a book holding only the funds: its listed window is the whole window, and the test is the gate's own
+    funds = w.copy()
+    funds[list(LATE)] = 0.0
+    assert gs.listed_start(funds, px) == 0 and gs.timing_listed(funds, r, px)["p_value"] == gt.timing_null(funds, r)["p_value"]
+    # too short a stretch (timing_null's own minimum, 84 bars) or never priced: unavailable
+    short = px.copy()
+    short.iloc[:-60, short.columns.get_loc("BTC-USD")] = np.nan
+    assert "unavailable" in gs.timing_listed(w, r, short) and gs.timing_listed(w, r, short)["listed_start"] == len(w) - 60
+    never = px.copy()
+    never["BTC-USD"] = np.nan
+    gone = gs.timing_listed(w, r, never)
+    assert "unavailable" in gone and gone["listed_start"] is None and gs.listed_start(w, never) is None
+    assert gs.listed_start(w * 0.0, px) == 0                              # holds nothing
+
+
+def _p_values(prices, dollar, cost, n):
+    """The gate's re-timing p and p_listed of `n` no-skill books (N1: the oracle at hit rate 0.50, 5-bar blocks)."""
+    gate, listed, shares = [], [], []
+    for k in range(n):
+        s = controls.OracleCheat(prices, 0.5, 5, gs._rng(9, "N1", 5000, k), name="study_oracle")
+        o = gs.oos_run(prices, dollar, cost, CRITERIA, s)
+        gate.append(gt.timing_null(o["weights"], o["returns"])["p_value"])
+        t = gs.timing_listed(o["weights"], o["returns"], o["prices"])
+        listed.append(t.get("p_value"))
+        shares.append(t["listed_share"])
+    return gate, listed, shares
+
+
+def test_p_listed_is_near_uniform_on_no_skill_books_where_the_gate_s_p_is_not(market):
+    prices, dollar, cost = market
+    n = 100
+    gate, listed, shares = _p_values(late_listing(prices), dollar, cost, n)
+    assert None not in listed
+    share = {"gate": sum(p <= 0.05 for p in gate) / n, "listed": sum(p <= 0.05 for p in listed) / n}
+    # Measured on these 100 no-skill books with the two coins listing 1,500 rows late: the gate's p <= 0.05 on 16 of
+    # 100 (median p 0.226), p_listed on 7 of 100 (median 0.535); median share of the window inside the listed window
+    # 0.479. Marks: p_listed's share within 0.065 of 0.05 (three binomial sds at n = 100: at most 0.115) and its median
+    # within 0.15 of 0.5; the gate's share at least 0.12 and its median at most 0.35.
+    assert share["listed"] <= 0.115 and abs(float(np.median(listed)) - 0.5) <= 0.15, share
+    assert share["gate"] >= 0.12 and float(np.median(gate)) <= 0.35, share
+    assert 0.3 <= float(np.median(shares)) <= 0.7
+
+
+def test_with_no_late_listing_p_listed_is_the_gate_s_p_for_every_book(market):
+    prices, dollar, cost = market
+    gate, listed, shares = _p_values(prices, dollar, cost, 100)
+    assert listed == gate and set(shares) == {1.0}                       # identical, all 100 books (measured 100 of 100)
+    # without late listing the gate's own p is near uniform too: measured 5 of 100 at most 0.05; mark as above
+    assert sum(p <= 0.05 for p in gate) / 100 <= 0.115
+
+
+# ---- the report's own anchor counter, two-way
+
+def _anchor_counts(book, frame, market, anchor_book, anchor_priors):
+    _, dollar, cost = market
+    v = {1: book.judge([]), 31: book.judge(PRIORS)}
+    a = {"books": 0, "development_disagreements": 0, "sealed_compared": 0, "sealed_disagreements": 0,
+         "material_mismatches": 0, "mismatch_kinds": {}, "at_prior_attempts_books": 0, "at_prior_attempts_disagreements": 0}
+    with tempfile.TemporaryDirectory() as tmp:
+        anchor_book(a, book, v)
+        anchor_priors(a, book, frame, dollar, cost, CRITERIA, Path(tmp) / "p", PRIORS, v[31])
+    return a
+
+
+def test_the_anchor_counter_catches_a_wrong_sealed_verdict(market, tmp_path, monkeypatch):
+    prices, dollar, cost = market
+    frame, s = _constructed(prices, cost)[0]                              # passes development, fails the sealed test
+    book = gs._Book(frame, dollar, cost, CRITERIA, tmp_path / "b", s)
+    assert book.gate["dev_pass"] and not book.gate["sealed_pass"]
+    ok = _anchor_counts(book, frame, market, gs._anchor_book, gs._anchor_priors)
+    assert ok["sealed_compared"] == 1 and ok["sealed_disagreements"] == ok["at_prior_attempts_disagreements"] == 0
+    # R0 made wrong in the sealed step (no sealed check): BOTH counters must see it
+    monkeypatch.setattr(gs, "_SEALED_CHECKS", ())
+    wrong = _anchor_counts(book, frame, market, gs._anchor_book, gs._anchor_priors)
+    assert wrong["sealed_disagreements"] == 1 and wrong["at_prior_attempts_disagreements"] == 1
+
+    # two-way: the two mutants of the counter the checker found surviving do NOT see it, so this test kills them
+    def no_sealed_comparison(anchor, book, verdicts):                     # `_anchor_book` without its sealed step
+        anchor["books"] += 1
+        anchor["development_disagreements"] += gs.develops("R0", book.material, (), book.criteria) != book.gate["dev_pass"]
+
+    def development_only(anchor, book, frame, dollar, cost, criteria, folder, priors, verdict):
+        g = gs._gate_run(frame, dollar, cost, criteria, folder, book.strategy, priors)
+        anchor["at_prior_attempts_books"] += 1
+        anchor["at_prior_attempts_disagreements"] += g["dev_pass"] != gs.develops("R0", book.material, priors, criteria)
+    mutant = _anchor_counts(book, frame, market, no_sealed_comparison, development_only)
+    assert mutant["sealed_disagreements"] == mutant["at_prior_attempts_disagreements"] == 0
+
+
+def test_two_specs_with_the_same_whole_history_book_are_counted_once(market, monkeypatch):
+    prices = market[0]
+    base = gs.draw_rule_spec(prices.columns, gs._rng(1, "spec", 0), 0)
+    never = 1000.0                                                        # a threshold no score reaches: never enters
+    specs = [dict(base, name="study_rule_0", entry={"rule": "momentum", "lookback": 20, "skip": 0, "enter": never,
+                                                    "exit": never - 1, "direction": "long"}),
+             dict(base, name="study_rule_1", entry={"rule": "ma_cross", "fast": 5, "slow": 20, "enter": never,
+                                                    "exit": never - 1, "direction": "long"}),
+             dict(base, name="study_rule_2", entry={"rule": "hold", "enter": 1, "exit": 0, "direction": "long"})]
+    books = [run_rules(RuleStrategy.from_spec(s), prices)[0] for s in specs]
+    assert not books[0].abs().to_numpy().any() and books[0].equals(books[1]) and books[2].abs().to_numpy().any()
+    monkeypatch.setattr(gs, "draw_rule_spec", lambda cols, rng, k: specs[k])
+    out = gs._surrogate_books(prices, False, 3, 0, 3)
+    assert out["duplicate_specs_dropped"] == 0 and out["duplicate_books_dropped"] == 1
+    assert [s.to_spec()["entry"]["rule"] for _, s in out["books"]] == ["momentum", "hold"]     # the first kept
+
+
 # ---- the study end to end
 
 def _guard(monkeypatch, parent: Path):
@@ -542,63 +837,87 @@ def test_the_report_is_strict_json_with_every_family_rule_and_attempt_count(smal
     books = 0
     for version in ("given", "detrended"):
         fams = rep["results"][version]
-        assert list(fams) == ["N1", "N2", "N3", "N4", "E1", "E2", "E3"]
+        assert list(fams) == ["N1", "N2", "N3", "N4a", "N4b", "E1", "E2", "E3"]
         for fam, cells in fams.items():
-            want = {"N1": 4, "N2": 4, "N3": 4, "N4": 4}.get(fam, 2)
-            assert [c["hit_rate"] for c in cells] == ([0.5] if fam in ("N1", "N2") else [None] if fam in ("N3", "N4")
+            want = {"N1": 4, "N2": 4, "N3": 4, "N4a": 4, "N4b": 4}.get(fam, 2)
+            sur = fam in ("N4a", "N4b")
+            assert [c["hit_rate"] for c in cells] == ([0.5] if fam in ("N1", "N2") else [None] if fam == "N3" or sur
                                                       else [0.52, 0.55, 0.60])
             for c in cells:
                 books += c["runs"]
-                if fam == "N4":                                          # identical books on a surrogate count once
+                if sur:                                                  # identical books on a surrogate count once
                     assert c["surrogates"] == 2 and c["runs"] + c["duplicate_specs_dropped"] + c["duplicate_books_dropped"] == want
                     want = c["runs"]
                 assert c["runs"] == want and set(c["by_attempts"]) == {"1", "31"}
+                # no late listing here: every book's re-timing tests ran and the listed window is the whole window
+                assert c["timing_unavailable"] == {"gate": 0, "listed": 0} and c["median_listed_share"] == 1.0
                 for n, row in c["by_attempts"].items():
                     assert list(row) == list(gs.RULES)
-                    for r in row.values():
+                    for rule, r in row.items():
                         assert r["runs"] == want and r["share"] == r["passes"] / want
                         assert r["wilson_95"] == gs.wilson(r["passes"], want)
-                        if fam == "N4":
+                        if rule.endswith("_listed"):                     # the same p-values, so the same verdicts
+                            assert r == row[rule.replace("_listed", "_gate")]
+                        if sur:
                             per = r["per_surrogate_share"]
                             assert 0 <= per["min"] <= per["median"] <= per["max"] <= 1
                             lo, hi = r["surrogate_bootstrap_95"]
                             assert per["min"] <= lo <= r["share"] <= hi <= per["max"]
-    n4 = sum(c["runs"] for v in rep["results"].values() for c in v["N4"])
+    n4 = sum(c["runs"] for v in rep["results"].values() for f in ("N4a", "N4b") for c in v[f])
     assert rep["books"] == books == 2 * (12 + 18) + n4
     a = rep["anchor"]
-    assert a["books"] == books and a["at_prior_attempts_books"] == 2 * 13     # the first book of every cell
+    assert a["books"] == books and a["at_prior_attempts_books"] == 2 * 14     # the first book of every cell
+    assert a["at_prior_attempts_scope"] == "the first book of every cell"
     assert a["development_disagreements"] == a["sealed_disagreements"] == a["material_mismatches"] == 0
     assert a["at_prior_attempts_disagreements"] == 0 and a["sealed_compared"] > 0
     assert rep["r3_re_timing"]["shifts"] == {"1": 400, "31": 12400}
+    assert rep["surrogates"]["mean_block"] == {"N4a": 1, "N4b": 20}
+    assert rep["surrogates"]["listing_regimes"] == [{"from": "2013-05-08", "to": "2026-11-13", "bars": 3528,
+                                                     "listed_symbols": 17}]
+    assert "keeps its edge here" in rep["families"]["N4b"]
 
 
 def test_the_reading_says_it_in_words(small):
     rep, reading = small["report"], small["report"]["reading"]
     # per rule: each no-skill family, version and attempt count, and each edge family likewise; one closing sentence
-    assert sum("false-pass share on" in s for s in reading) == 5 * 4 * 2 * 2
-    assert sum("smallest hit rate passing at least 80%" in s for s in reading) == 5 * 3 * 2 * 2
+    # 9 rules x 5 no-skill families x 2 versions x 2 counts; 9 x 3 edge families x 2 x 2; the gate's and the listed
+    # window's verdicts side by side for R1 to R4 on the 5 no-skill families, x 2 x 2; one N4b label; one closing
+    assert sum("false-pass share on" in s for s in reading) == 9 * 5 * 2 * 2
+    assert sum("smallest hit rate passing at least 80%" in s for s in reading) == 9 * 3 * 2 * 2
+    assert sum(" pass with the gate's " in s and " with the listed window's " in s for s in reading) == 4 * 5 * 2 * 2
     assert sum(s.startswith(("Rules whose false-pass interval", "No rule has a false-pass")) for s in reading) == 1
+    assert sum("short-range dependence of the data kept: a rule that lives inside 20 bars keeps its edge here" in s
+               for s in reading) == 1
     assert reading[-1].startswith(f"Anchor: R0 judged from the kept material agreed with the real gate on {rep['books']} books")
-    # N4 is read from the bootstrap over whole surrogates, and says so
-    r4 = rep["results"]["given"]["N4"][0]["by_attempts"]["1"]["R0"]
-    lo, hi = r4["surrogate_bootstrap_95"]
-    assert (f"R0 false-pass share on N4 (the data as given, 1 attempt): {r4['passes']} of {r4['runs']} ({r4['share']:.3f}, "
-            f"95% interval {lo:.3f} to {hi:.3f} from a bootstrap over 2 whole surrogates, not the Wilson interval).") in reading
+    side = rep["results"]["detrended"]["N2"][0]
+    g, li = side["by_attempts"]["31"]["R3_gate"], side["by_attempts"]["31"]["R3_listed"]
+    assert (f"R3 on N2 (the detrended data, 31 attempts): {g['passes']} of {g['runs']} pass with the gate's re-timing "
+            f"p-value, {li['passes']} of {li['runs']} with the listed window's (re-timing test unavailable: 0 and 0 "
+            "books).") in reading
+    # N4a and N4b are read from the bootstrap over whole surrogates, and say so
+    for fam in ("N4a", "N4b"):
+        r4 = rep["results"]["given"][fam][0]["by_attempts"]["1"]["R0"]
+        lo, hi = r4["surrogate_bootstrap_95"]
+        assert (f"R0 false-pass share on {fam} (the data as given, 1 attempt): {r4['passes']} of {r4['runs']} "
+                f"({r4['share']:.3f}, 95% interval {lo:.3f} to {hi:.3f} from a bootstrap over 2 whole surrogates, not "
+                "the Wilson interval).") in reading
     r = rep["results"]["given"]["N1"][0]["by_attempts"]["1"]["R0"]
     lo, hi = r["wilson_95"]
     assert (f"R0 false-pass share on N1 (the data as given, 1 attempt): {r['passes']} of {r['runs']} "
             f"({r['share']:.3f}, 95% interval {lo:.3f} to {hi:.3f}).") in reading
     named = [s for s in reading if s.startswith("Rules whose false-pass interval")]
     def lower(r, f):
-        return (r["surrogate_bootstrap_95"] or [0.0])[0] if f == "N4" else r["wilson_95"][0]
+        return (r["surrogate_bootstrap_95"] or [0.0])[0] if f in ("N4a", "N4b") else r["wilson_95"][0]
     above = {rule for rule in gs.RULES for v in ("given", "detrended") for n in ("1", "31") for f in gs.NO_SKILL
              if lower(rep["results"][v][f][0]["by_attempts"][n][rule], f) > 0.05}
     assert (named and all(f"{rule} (" in named[0] for rule in above)) or (not named and not above)
     # two-way: a report with a no-skill interval wholly above 0.05 names that rule
     risen = json.loads(json.dumps(rep))
-    risen["results"]["given"]["N3"][0]["by_attempts"]["1"]["R3"].update(passes=4, runs=4, share=1.0, wilson_95=gs.wilson(4, 4))
-    assert any(s.startswith("Rules whose false-pass interval") and "R3 (N3 given 1 attempt" in s for s in gs._reading(risen))
-    # for N4 the surrogate bootstrap decides, not Wilson: a Wilson interval above 0.05 alone does not name the rule ...
+    risen["results"]["given"]["N3"][0]["by_attempts"]["1"]["R3_listed"].update(passes=4, runs=4, share=1.0,
+                                                                               wilson_95=gs.wilson(4, 4))
+    assert any(s.startswith("Rules whose false-pass interval") and "R3_listed (N3 given 1 attempt" in s
+               for s in gs._reading(risen))
+    # for N4a/N4b the surrogate bootstrap decides, not Wilson: a Wilson interval above 0.05 alone does not name it ...
     import re
 
     def named_for(report, rule):
@@ -606,11 +925,12 @@ def test_the_reading_says_it_in_words(small):
         found = re.search(rf"{rule} \(([^)]*)\)", line)
         return found.group(1).split(", ") if found else []
     wide = json.loads(json.dumps(rep))
-    wide["results"]["given"]["N4"][0]["by_attempts"]["1"]["R4"].update(wilson_95=[0.2, 0.9], surrogate_bootstrap_95=[0.0, 0.9])
-    assert "N4 given 1 attempt" not in named_for(wide, "R4")
+    cell = wide["results"]["given"]["N4a"][0]["by_attempts"]["1"]["R4_gate"]
+    cell.update(wilson_95=[0.2, 0.9], surrogate_bootstrap_95=[0.0, 0.9])
+    assert "N4a given 1 attempt" not in named_for(wide, "R4_gate")
     # ... and a bootstrap interval above 0.05 does
-    wide["results"]["given"]["N4"][0]["by_attempts"]["1"]["R4"].update(wilson_95=[0.0, 0.9], surrogate_bootstrap_95=[0.2, 0.9])
-    assert "N4 given 1 attempt" in named_for(wide, "R4")
+    cell.update(wilson_95=[0.0, 0.9], surrogate_bootstrap_95=[0.2, 0.9])
+    assert "N4a given 1 attempt" in named_for(wide, "R4_gate")
 
 
 def test_the_small_study_s_numbers(small):
@@ -642,12 +962,24 @@ def test_the_same_seed_gives_the_same_report_and_another_seed_another(market, tm
     monkeypatch.setattr(gs, "PROGRESS_EVERY", 5)
     one = gs.study(prices, dollar, cost, **TINY)
     err = capsys.readouterr().err
-    assert sum(line.startswith("gate_study: ") and " books in " in line for line in err.splitlines()) == 26 // 5
+    assert one["books"] == 28                                             # 14 cells, one book each, two versions
+    assert sum(line.startswith("gate_study: ") and " books in " in line for line in err.splitlines()) == 28 // 5
     two, other = gs.study(prices, dollar, cost, **TINY), gs.study(prices, dollar, cost, seed=7, **TINY)
     text = json.dumps(one, allow_nan=False, sort_keys=True)
     assert text == json.dumps(two, allow_nan=False, sort_keys=True)
     assert json.dumps(other, allow_nan=False, sort_keys=True) != text      # two-way: the seed does change it
     assert one["attempt_counts"] == [1] and one["anchor"]["at_prior_attempts_books"] == 0
+    assert one["anchor"]["at_prior_attempts_scope"] == "no prior attempts"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_anchor_all_re_runs_every_book_at_the_prior_attempts(market, tmp_path, monkeypatch):
+    prices, dollar, cost = market
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    rep = gs.study(prices, dollar, cost, prior_attempt_sharpes=PRIORS[:5], anchor_all=True, **TINY)
+    a = rep["anchor"]
+    assert a["at_prior_attempts_books"] == a["books"] == rep["books"] and a["at_prior_attempts_scope"] == "every book"
+    assert a["at_prior_attempts_disagreements"] == a["development_disagreements"] == a["sealed_disagreements"] == 0
     assert list(tmp_path.iterdir()) == []
 
 
@@ -689,6 +1021,9 @@ def test_the_command_line_reads_the_data_the_research_way_and_passes_the_priors(
     assert json.loads(capsys.readouterr().out) == {"ok": None}
     assert list(seen["prior_attempt_sharpes"]) == [0.03, -0.01, 0.02] and ledger.read_bytes() == raw
     assert (seen["n_null"], seen["n_edge"], seen["n_surrogates"], seen["specs_per_surrogate"], seen["seed"]) == (7, 3, 2, 5, 9)
+    assert seen["anchor_all"] is False                                    # the default stays as it was
+    gs.main(["--data", str(data), "--anchor-all"])
+    assert seen["anchor_all"] is True
     from valedia_trader.research_loop import cli
     _, _, research_cost = cli._market(type("A", (), {"data": str(data)})())
     assert seen["cost"] == research_cost and seen["prices"].shape == prices.shape
