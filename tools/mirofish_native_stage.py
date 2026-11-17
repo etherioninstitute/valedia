@@ -139,10 +139,10 @@ METADATA_SHA='6d1d5dfee9518d8a2a8db88e0ed8fe8c6bc21a9481a2ceec56535b5eb347fe2c'
 DRIVER_SHA='09d41b57b476426726361c120acb2e83a4af535ecb6f307f3422757117b30844'
 EMPTY_SCAFFOLDS=['owned-source/producer/tmp','owned-source/producer/backend/uploads/reports','owned-source/producer/backend/log','owned-source/producer/backend/logs','owned-source/paper_app/state']
 REGENERATED={'builder/observer.sb','builder/worker.sb','builder/graph.sb','builder/graph/conf/neo4j.conf'}
-# Owner-acknowledged later revisions of original canonical files (2026-11-11). The list is pinned by its own hash,
+# Owner-acknowledged later revisions of original canonical files (2026-11-11, 2026-11-17). The list is pinned by its own hash,
 # so it cannot grow or change without this file changing too. See its "scope" for what it does and does not allow.
 ACKNOWLEDGED_FILE=Path(__file__).with_name('mirofish_acknowledged_revisions.json')
-ACKNOWLEDGED_SHA='67f8def55322b6ede1e99d17785f7195571325bd771b197affdd32613a923534'
+ACKNOWLEDGED_SHA='a066d68e33efea1bbf9be5d56ddc4d1cd5d63f652f9e56cee0a994191f3a496b'
 ACKNOWLEDGED_SCOPE=BASE/'valedia-trader/src'
 ACKNOWLEDGED_WITNESSES=[]  # filled by inputs(); written into the staged candidate's ancestry
 EXPECTED_CASES=['hash_matched_native_strict_tools','source_based_report_history_user_final','source_based_tool_cycle_tool_final']

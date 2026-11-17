@@ -5,9 +5,11 @@
 `tools/mirofish_native_stage.py` pins 318 original source files against the frozen 2026-11-06 review record. 69 of them
 changed in four overhaul commits, so the tool refused to stage anything. On 2026-11-11 the owner approved accepting
 exactly those 69: `tools/mirofish_acknowledged_revisions.json` names each path, its frozen hash, its current hash and
-the commits, and the tool pins that list by its own hash.
+the commits, and the tool pins that list by its own hash. On 2026-11-17 the owner accepted 22 further revisions (the
+legacy decision chain moved to the shared Elephant-1 instance, and two legacy tests kept from writing the real halt
+file): 17 files new to the list and 5 already on it, 86 entries in all.
 
-- None of the 69 is copied into a candidate. Staging still copies the reviewed bytes, so what a run executes is unchanged.
+- None of the 86 is copied into a candidate. Staging still copies the reviewed bytes, so what a run executes is unchanged.
 - Files a candidate does copy (713 of them) are never excused.
 - Any other difference, or a further change to a listed file, is refused as before. A new overhaul of `src/` needs a new
   decision and a new list.
