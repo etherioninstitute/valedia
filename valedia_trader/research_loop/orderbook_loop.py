@@ -1,4 +1,5 @@
-"""The collector for the order-book loop: Kalshi books and trades once a minute, Nimble v3's battery every five.
+"""The collector for the order-book loop: Kalshi books and trades once a minute, the decision model's battery
+every five (Nimble v3 until the amendment of 17 November, Elephant-1 since).
 
 The experiment is locked in docs/research/2026-11-13-orderbook-loop-prediction.md and every setting below comes
 from it. This program only collects: it sends no order anywhere and scores nothing (the evaluation is a later
@@ -134,16 +135,16 @@ minute makes exactly 4 calls, under the 5 allowed, in that minute and not only o
 after drops a phase holds at most 4, since a new market always takes the least-used phase). Measured on
 2026-11-13 with the final battery (rev 4): about 14,000 input tokens and 3.4 to 3.5 s a call when warm (5.7 s cold),
 so a minute takes about 14 s of reads plus 4 x 3.5 = 14 s of model time; at worst 14 s + 4 x 10 s = 54 s, still inside
-the minute. Those measurements were of the Ollama build; since the amendment of 17 November the model is LM
-Studio's instance MODEL_INSTANCE of the GGUF Q8_0 file (six slots, about 2.5 s a call when measured). Each call
-is preceded by one loopback GET (`/api/v1/models`, 2 s limit) to check the pin: the instance is loaded with its
-settings and its entry is the file, whose SHA-256 is verified once in a background thread when collecting starts
-and whose size and modification time are compared on every call. A keeper thread loads the instance when it is
-missing (`ModelKeeper`).
+the minute. Those measurements were of Nimble v3 on Ollama; since the amendment of 17 November the decision model
+is Elephant-1 (GGUF Q8_0) on LM Studio, one instance of it (`valedia_trader.core.decision_model`: one slot, its
+batches set at load; about 4.0 s and 4,200 input tokens a call when measured). Each call is preceded by one
+loopback GET (`/api/v1/models`, 2 s limit) to check the pin: the instance is loaded once, with its settings, and
+its entry is the file, whose SHA-256 is verified once in a background thread when collecting starts and whose
+size and modification time are compared on every call. A keeper thread loads the instance through LM Studio's
+REST load call when it is missing or wrong (`ModelKeeper`).
 
 Hosts: Kalshi only at https://api.elections.kalshi.com/trade-api/v2 through `KalshiData` (GET only, no key);
-the model only at http://127.0.0.1:1235 (`ModelClient` refuses any other address). No secrets. One kind of child
-process: the keeper's `lms load` and `lms unload` of the collector's own instance.
+the model only at http://127.0.0.1:1235 (`ModelClient` refuses any other address). No secrets, no child process.
 
 The record is one sqlite file, append-only: triggers refuse every UPDATE and DELETE. Times are kept as UTC ISO
 text and as epoch seconds. Two limits of that guarantee: an `INSERT OR REPLACE` (or `REPLACE`) from another
@@ -163,11 +164,9 @@ import json
 import math
 import os
 import re
-import shutil
 import signal
 import sqlite3
 import statistics
-import subprocess
 import sys
 import threading
 import time
@@ -179,7 +178,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from valedia_trader.core import decision_model as dm
 from valedia_trader.core import legacy
+from valedia_trader.core.decision_model import _instances, _the_file, _wrong_found
 from valedia_trader.research_loop import REPO
 from valedia_trader.venues import kalshi_data as kd
 
@@ -192,20 +193,19 @@ __all__ = ["BATTERY", "BATTERY_ID", "STATE_KEYS", "TABLES", "Selection", "select
 UTC = timezone.utc
 v3 = legacy.load("systemone_v3_candidate")
 KALSHI_BASE = kd.BASE_URL
-MODEL_URL = "http://127.0.0.1:1235"            # LM Studio
+MODEL_URL = dm.URL                             # LM Studio
 DEFAULT_DB = REPO / "memory" / "orderbook_loop.sqlite"
-# the model's file and the one instance of it the collector calls (the prediction's amendment of 17 November)
-MODEL_KEY_PREFIX = "bespoke-nimble-9b-v3"      # LM Studio's key for the file starts with this
-MODEL_FILE = "~/.lmstudio/models/ggml-org/Bespoke-Nimble-9B-v3-GGUF/Bespoke-Nimble-9B-v3-Q8_0.gguf"   # home expanded at use
-MODEL_FILE_SIZE = 9527503392
-MODEL_FILE_SHA256 = "ad484077ad28c1ba0644509b81e80268f8fd39e9d218415638a988caf3c6e66c"
-MODEL_QUANT = "Q8_0"
-MODEL_INSTANCE = "collector-nimble-9b-v3-q8"   # the name the instance is loaded under and the request names
-MODEL_SLOTS = 6                                # parallel slots: with one, a decision takes over the 10 s limit
-MODEL_CONTEXT = 32768
+# the model's file and the one instance of it the collector calls (the prediction's amendment of 17 November):
+# every value is the shared module's (valedia_trader.core.decision_model)
+MODEL_FILE = dm.FILE                           # home expanded at use
+MODEL_FILE_SIZE = dm.FILE_SIZE
+MODEL_FILE_SHA256 = dm.FILE_SHA256
+MODEL_INSTANCE = dm.INSTANCE                   # the instance's id, which the request names
 KEEPER_EVERY_S = 60.0                          # the keeper runs at most this often,
 KEEPER_TRIES, KEEPER_REST_S = 3, 1800.0        # and after this many replacements in a row rests this long
-LMS_LIMIT_S = 180.0                            # one `lms` command may take this long
+LOAD_LIMIT_S, UNLOAD_LIMIT_S = 180.0, 60.0     # the REST load and unload may take this long
+LIST_PATH, LOAD_PATH, UNLOAD_PATH = "/api/v1/models", "/api/v1/models/load", "/api/v1/models/unload"
+ONCE_FILE_WAIT_S = 120.0                       # `once` waits this long for the file's check (`collect` never waits)
 
 # ---- the prediction's settings (do not change: the experiment is locked)
 WATCH_COUNT = 20                  # twenty markets at a time
@@ -221,8 +221,8 @@ ONE_SIDED_MINUTES = 30            # or until its book has been one-sided for 30 
 DEPTH = 10                        # the ten best levels a side, once a minute
 SLOT_S = 300                      # a decision every five minutes per market
 PHASES = 5                        # each market decides on minutes where (minute of the hour) mod 5 == its phase
-TAG = "lmstudio:bespoke-nimble-9b-v3@q8_0"   # stored as model_tag (the amendment of 17 November); the typed
-                                  # contract is still the pinned module's own v3.TAG (nimble-v3:9b-mxfp8)
+TAG = dm.TAG                      # stored as model_tag (the amendment of 17 November); the typed contract is
+                                  # still the pinned module's own v3.TAG (nimble-v3:9b-mxfp8)
 
 # ---- the ticket's settings
 WARMUP_S = 1800                   # a market needs 30 minutes of snapshots before its first decision
@@ -1032,79 +1032,22 @@ def _file_stat(path: str):
     return os.stat(path)
 
 
-def _run_lms(argv: list[str], timeout: float) -> int:
-    """One `lms` command: the fixed argv, no shell, no input, its output discarded. Its exit code."""
-    return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                          timeout=timeout, check=False).returncode
-
-
-def _lms_path() -> str:
-    return shutil.which("lms") or os.path.expanduser("~/.lmstudio/bin/lms")
-
-
-def _int_is(x, v: int) -> bool:
-    return type(x) is int and x == v
-
-
-def _instances(listing) -> tuple[list[dict], list[tuple[dict, dict]]]:
-    """The entries of `GET /api/v1/models`, and (entry, instance) for every loaded instance named MODEL_INSTANCE.
-    ValueError for a list that is not of the expected shape."""
-    models = listing.get("models") if isinstance(listing, dict) else None
-    if not isinstance(models, list) or not all(isinstance(e, dict) for e in models):
-        raise ValueError("no list of model entries")
-    found = []
-    for e in models:
-        inst = e.get("loaded_instances", [])
-        if not isinstance(inst, list) or not all(isinstance(i, dict) for i in inst):
-            raise ValueError("loaded_instances of %r is not a list of objects" % e.get("key"))
-        found += [(e, i) for i in inst if i.get("id") == MODEL_INSTANCE]
-    return models, found
-
-
-def _the_file(e: dict) -> str | None:
-    """Why this entry is not the model's file (None when it is): its key starts with the prefix (any suffix: LM
-    Studio may rename it), and its size and quantisation are the file's."""
-    q = e.get("quantization")
-    if not isinstance(e.get("key"), str) or not e["key"].startswith(MODEL_KEY_PREFIX):
-        return "key %r does not start with %s" % (e.get("key"), MODEL_KEY_PREFIX)
-    if not _int_is(e.get("size_bytes"), MODEL_FILE_SIZE):
-        return "size_bytes %r, not %d" % (e.get("size_bytes"), MODEL_FILE_SIZE)
-    if not isinstance(q, dict) or q.get("name") != MODEL_QUANT:
-        return "quantisation %r, not %s" % (q.get("name") if isinstance(q, dict) else q, MODEL_QUANT)
-    return None
-
-
-def _wrong(e: dict, i: dict) -> str | None:
-    """Why this loaded instance is not the one the collector calls (None when it is)."""
-    if e.get("type") != "decision":
-        return "type %r, not 'decision'" % e.get("type")
-    why = _the_file(e)
-    if why:
-        return why
-    cfg = i.get("config") if isinstance(i.get("config"), dict) else {}
-    if not _int_is(cfg.get("context_length"), MODEL_CONTEXT):
-        return "context_length %r, not %d" % (cfg.get("context_length"), MODEL_CONTEXT)
-    if not _int_is(cfg.get("parallel"), MODEL_SLOTS):
-        return "parallel %r, not %d" % (cfg.get("parallel"), MODEL_SLOTS)
-    return None
-
-
 class ModelKeeper:
-    """Loads the collector's instance when it is missing or wrong; nothing else loads it. Asked (`ask`) when
-    collecting starts and whenever the pin finds the instance missing or wrong; each run is a daemon thread, one at
-    a time, at most one every KEEPER_EVERY_S (from the start of the previous one), so it never holds up a cycle or
-    a decision. A run reads the model list; an instance under MODEL_INSTANCE that is right: nothing; one that is
-    wrong (settings, or under another entry): `lms unload MODEL_INSTANCE` first (at most KEEPER_TRIES runs in a
-    row, then KEEPER_REST_S of leaving it alone); then `lms load <key of the entry that is the file> --identifier
-    MODEL_INSTANCE --context-length 32768 --parallel 6 -y`. No entry that is the file: nothing is run. It runs
-    nothing else, never names another instance and never sends a body to the server. Each command run is one row
-    for the `events` table (kind `model_load`), held here until the collecting thread writes it (`pending`,
-    `written`): the store's sqlite connection belongs to that thread. `runner(argv, timeout) -> exit code` and
-    `clock` are for tests."""
+    """Loads the collector's instance of Elephant-1 when it is missing or wrong; nothing else loads it. Asked (`ask`)
+    when collecting starts and whenever the pin finds the instance missing or wrong; each run is a daemon thread,
+    one at a time, at most one every KEEPER_EVERY_S (from the start of the previous one), so it never holds up a
+    cycle or a decision. A run reads the model list; one instance named MODEL_INSTANCE that is right: nothing; one
+    that is wrong (settings, entry, or more than one with the name): LM Studio's REST unload of MODEL_INSTANCE first
+    (at most KEEPER_TRIES runs in a row, then KEEPER_REST_S of leaving it alone); then the REST load of the model's
+    key with the shared module's context, slots and batches (the instance takes the key as its id). No entry that
+    is the file: nothing is sent. Both go through the client's own loopback transport; a call that does not answer
+    with the expected `instance_id` has failed and waits for the next ask. It sends nothing else and never names
+    another instance. Each call is one row for the `events` table (kind `model_load`), held here until the
+    collecting thread writes it (`pending`, `written`): the store's sqlite connection belongs to that thread.
+    `clock` is for tests."""
 
-    def __init__(self, client: "ModelClient", runner: Callable[[list[str], float], int] | None = None,
-                 clock: Callable[[], float] = time.monotonic, lms: str | None = None):
-        self.client, self.runner, self.clock, self.lms = client, runner, clock, lms
+    def __init__(self, client: "ModelClient", clock: Callable[[], float] = time.monotonic):
+        self.client, self.clock = client, clock
         self._lock = threading.Lock()
         self._busy = False
         self._last: float | None = None              # when the latest run started
@@ -1128,22 +1071,19 @@ class ModelKeeper:
     def _run(self) -> None:
         try:
             self._once()
-        except Exception:                            # an unreadable list or a refused command: the next ask
+        except Exception:                            # an unreadable list: the next ask
             pass
         finally:
             with self._lock:
                 self._busy = False
 
     def _once(self) -> None:
-        models, found = _instances(json.loads(self.client.http(self.client.base + "/api/v1/models", None,
-                                                               PIN_TIMEOUT_S)))
-        if found and _wrong(*found[0]) is None:
+        models, found = _instances(json.loads(self.client.http(self.client.base + LIST_PATH, None, PIN_TIMEOUT_S)))
+        if found and _wrong_found(found) is None:
             self._replaced = 0
             return
-        target = next((e for e in models if _the_file(e) is None), None)
-        if target is None:
+        if next((e for e in models if _the_file(e) is None), None) is None:
             return
-        lms = self.lms or _lms_path()
         if found:                                    # loaded, but wrong: replaced
             if self._replaced >= KEEPER_TRIES:
                 if self.clock() - self._rest_from < KEEPER_REST_S:
@@ -1152,22 +1092,30 @@ class ModelKeeper:
             self._replaced += 1
             if self._replaced == KEEPER_TRIES:
                 self._rest_from = self.clock()
-            if self._exec([lms, "unload", MODEL_INSTANCE]) != 0:
+            if not self._post(UNLOAD_PATH, {"instance_id": MODEL_INSTANCE}, UNLOAD_LIMIT_S):
                 return
-        self._exec([lms, "load", target["key"], "--identifier", MODEL_INSTANCE, "--context-length",
-                    str(MODEL_CONTEXT), "--parallel", str(MODEL_SLOTS), "-y"])
+        self._post(LOAD_PATH, {"model": dm.KEY, "context_length": dm.CONTEXT, "parallel": dm.SLOTS,
+                               "physical_batch_size": dm.PHYSICAL_BATCH, "eval_batch_size": dm.EVAL_BATCH},
+                   LOAD_LIMIT_S)
 
-    def _exec(self, argv: list[str]) -> int | None:
+    def _post(self, path: str, body: dict, limit: float) -> bool:
+        """One REST call; whether it answered (an HTTP 2xx: the transport raises on any other) with the expected
+        `instance_id`. Its row: what was sent, `http` or the error, the instance it named, the seconds."""
         t0 = self.clock()
-        row: dict = {"argv": argv}
+        row: dict = {"request": "POST " + path, "body": body, "ok": False}
         try:
-            row["exit_code"] = (self.runner or _run_lms)(argv, LMS_LIMIT_S)
-        except Exception as e:                       # not found, refused, over the limit
-            row.update(exit_code=None, error="%s: %s" % (type(e).__name__, e))
+            answer = json.loads(self.client.http(self.client.base + path, json.dumps(body).encode("utf-8"), limit))
+            row["http"] = "2xx"
+            row["instance_id"] = answer.get("instance_id") if isinstance(answer, dict) else None
+            row["ok"] = row["instance_id"] == MODEL_INSTANCE
+            if not row["ok"]:
+                row["error"] = "the answer names instance %r, not %s" % (row["instance_id"], MODEL_INSTANCE)
+        except Exception as e:                       # an HTTP error, a time-out, refused, unreadable
+            row["error"] = "%s: %s" % (type(e).__name__, e)
         row["seconds"] = round(self.clock() - t0, 3)
         with self._lock:
             self._rows.append(row)
-        return row["exit_code"]
+        return row["ok"]
 
     def pending(self) -> list[dict]:
         with self._lock:
@@ -1179,15 +1127,14 @@ class ModelKeeper:
 
 
 class ModelClient:
-    """Nimble v3's typed endpoint on the local LM Studio, called with the pinned module's `make_request` and
+    """Elephant-1's typed endpoint on the local LM Studio, called with the pinned module's `make_request` and
     `parse_response` (`SystemOneMember`'s contract), on the one instance MODEL_INSTANCE. `transport(url, body or
-    None, timeout) -> bytes`; `hasher`, `stat`, `runner`, `keeper_clock` and `lms` are for tests."""
+    None, timeout) -> bytes`; `hasher`, `stat` and `keeper_clock` are for tests."""
 
     def __init__(self, transport: Callable[[str, bytes | None, float], bytes] | None = None,
                  base_url: str = MODEL_URL, clock: Callable[[], float] = time.time, *,
                  hasher: Callable[[str], str] | None = None, stat: Callable[[str], Any] | None = None,
-                 runner: Callable[[list[str], float], int] | None = None,
-                 keeper_clock: Callable[[], float] = time.monotonic, lms: str | None = None):
+                 keeper_clock: Callable[[], float] = time.monotonic):
         if not _loopback(base_url):
             raise ValueError("the model is loopback-only")
         self.base, self.http, self.clock = base_url.rstrip("/"), transport or loopback_http, clock
@@ -1197,7 +1144,17 @@ class ModelClient:
         self._checked = threading.Event()            # set when the file's check has ended, well or not
         self._seen: tuple[int, int] | None = None    # (size, st_mtime_ns) of the file as verified
         self._failed: str | None = None              # why the check failed
-        self.keeper = ModelKeeper(self, runner, keeper_clock, lms)
+        self.keeper = ModelKeeper(self, keeper_clock)
+
+    def wait_file(self, timeout: float) -> str | None:
+        """Wait up to `timeout` for the file's check (started by `begin`); None when it ended and passed, else one
+        line saying why not."""
+        if not self._checked.wait(timeout):
+            return "the model file's check did not end within %g s: the instance is not called until it does" % (
+                timeout)
+        if self._failed is not None:
+            return "the model file's check failed: " + self._failed
+        return None
 
     def begin(self) -> None:
         """When collecting starts: the file's check (once) and one ask of the keeper. Never waits."""
@@ -1242,7 +1199,7 @@ class ModelClient:
         and unchanged and the instance is loaded right; else (status, digest, why). The digest is the file's SHA-256
         whenever the file is verified and unchanged, else None."""
         try:
-            listing = json.loads(self.http(self.base + "/api/v1/models", None, PIN_TIMEOUT_S))
+            listing = json.loads(self.http(self.base + LIST_PATH, None, PIN_TIMEOUT_S))
         except _UNREACHABLE as e:
             return "model_unavailable", None, "tag check: %s: %s" % (type(e).__name__, e)
         except Exception as e:                           # anything else still gives the slot its row
@@ -1265,7 +1222,7 @@ class ModelClient:
             self.keeper.ask()
             return "model_unavailable", MODEL_FILE_SHA256, "instance not loaded: no %s in the model list" % (
                 MODEL_INSTANCE)
-        why = _wrong(*found[0])
+        why = _wrong_found(found)
         if why:
             self.keeper.ask()
             return "tag_mismatch", MODEL_FILE_SHA256, "instance %s: %s" % (MODEL_INSTANCE, why)
@@ -1655,7 +1612,12 @@ class Collector:
             self._go_off(str(e))
 
     def finish(self, kind: str = "stop") -> None:
+        """The keeper's pending `model_load` rows (one the store cannot take is dropped here), then the stop row."""
         if self.synced:
+            try:
+                self._model_loads()
+            except Exception:                            # dropped, as the stop row itself would be
+                pass
             self.event(kind, None)
 
     def run(self, wait: Callable[[float], Any] | None = None) -> None:
@@ -2350,7 +2312,7 @@ def _print_selection(sel: Selection, out=None) -> None:
 
 def main(argv=None, *, kalshi: kd.KalshiData | None = None, model: ModelClient | None = None,
          clock: Callable[[], float] | None = None, monotonic: Callable[[], float] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="orderbook_loop", description="Collect Kalshi books and Nimble v3's battery.")
+    ap = argparse.ArgumentParser(prog="orderbook_loop", description="Collect Kalshi books and Elephant-1's battery.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("collect", "once", "select", "status"):
         p = sub.add_parser(name)
@@ -2386,6 +2348,9 @@ def main(argv=None, *, kalshi: kd.KalshiData | None = None, model: ModelClient |
             sel = col.select(max_pages=a.max_pages)
             if sel is not None:
                 _print_selection(sel)
+        why = model.wait_file(ONCE_FILE_WAIT_S)          # `once` only: its one decision waits for the file's check
+        if why:
+            print(why)
         made = col.cycle(force_decision=True, allow_select=False)
         col.finish("once")
         print("clock less Kalshi's Date header: %s s" % (None if col.clock_offset is None else
