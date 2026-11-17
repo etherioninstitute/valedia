@@ -125,7 +125,7 @@ class World:
         self.procs = {TOOL_PID: {'start': TOOL_START, 'pgid': TOOL_PARENT, 'ppid': TOOL_PARENT},
                       TOOL_PARENT: {'start': 'Mon Nov 16 09:00:00 2026', 'pgid': TOOL_PARENT, 'ppid': 1}}
         self.calls = []; self.http_calls = []; self.signals = []; self.out = []
-        self.spawned = []; self.spawn_error = None; self.stage_rc = 0; self.preflight_rc = 0; self.threshold = 56
+        self.launcher = None; self.spawned = []; self.spawn_error = None; self.stage_rc = 0; self.preflight_rc = 0; self.threshold = 56
         self.on_sleep = []; self.run_s = 180; self.cleanup_s = 5; self.identity_start = OBSERVER_START
         self.loads = []; self.unloads_via_pipeline = []; self.load_error = None; self.load_t = None
         self.receipt = {'complete': True, 'cleanup_proven': True, 'paper_handoff': True, 'resource_failures': [],
@@ -395,7 +395,8 @@ class Pure(unittest.TestCase):
     def test_verdicts(self):
         base = dict(collector={'breach': None, 'over_8s': 0, 'model_failures': 0, 'statuses': {'ok': 40}},
                     pipeline={'failed_calls': 0, 'refused_calls': 0, 'memory_stop': False, 'swaps_clean': True,
-                              'cleanup_proven': True, 'failure': None, 'report_usable': True},
+                              'cleanup_proven': True, 'failure': None, 'report_usable': True,
+                              'receipt_found': True, 'receipt_readable': True, 'complete': True, 'launcher_exit': 0},
                     memory={'lowest_sustained_free_percent_10s': 40})
         v = OP.verdicts(**copy.deepcopy(base))
         self.assertEqual(v, {'collector_unharmed': True, 'pipeline_clean': True, 'room_to_spare': True})
@@ -615,7 +616,7 @@ class Refusals(Base):
         self.w.beating = False; self.w.sleep(180); self.assertRefused('heartbeat')
 
     def test_collector_slow_heartbeat_under_150_s_does_not_refuse(self):
-        self.w.beating = False; self.w.sleep(120)                                # the last heartbeat 120 s ago
+        self.w.beating = False; self.w.sleep(100)                                # the last heartbeat 100 s ago
         self.w.on_sleep.append(lambda world: setattr(world, 'beating', True))    # it writes again at its next minute
         self.assertEqual(self.main(RUN), 0, self.w.text())
 

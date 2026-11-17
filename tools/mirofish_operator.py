@@ -95,7 +95,10 @@ IDENTITY_FILE = 'observer-identity.json'
 LINK_DISABLED_LINE = 'You have disabled LM Link.'   # the real wording of `lms link status`, read 2026-11-17 (ruling 6)
 LAUNCHER_STOP_SIGNAL = signal.SIGINT   # correction A: the launcher's KeyboardInterrupt path stops the observer group itself
 PICKS_BEFORE_S = 120            # correction C: no switch-off from 2 minutes before the pick reader's scheduled start ...
-PICKS_AFTER_S = 5               # ... until it is seen idle at least this long after that start (launchd starts it at once)
+PICKS_MISSED_S = 180            # ... until it is seen running and then idle, or idle this long after its start (addendum 2, 10)
+SETTLE_S = 15                   # addendum 2, item 5: after the unloads, before the free reading (see settle_after_unloads)
+NEAR_NEUTRAL_REASON = 'derived report not usable evidence'   # src/mirofish_provenance.py:437, stored as receipt failure.reason
+NEAR_NEUTRAL_TYPE = 'Refused'                                 # by src/mirofish_native_run.py:806 (str(exc), type name)
 HARMFUL_STATUSES = ('model_unavailable', 'tag_mismatch', 'late')   # correction B: any one fails collector_unharmed
 HARMFUL_ERRORS = 2              # correction B: this many `error` during the run fail it; a single one does not
 SAMPLE_S = 0.5                  # load-test memory samples
@@ -149,7 +152,7 @@ def _http(method, url, body=None, timeout=HTTP_S):
 
 class Host:
     def __init__(self, *, run=None, spawn=None, http=None, now=None, sleep=None, send_signal=None, disk_free=None, uid=None, store=STORE, crew=CREW, record=RECORD, load_tests=LOAD_TESTS, load_path=None, out=None,
-                 lms=LMS):
+                 lms=LMS, self_pid=None, parent_pid=None, fsync=None):
         self.run, self.spawn, self.http = run or _run, spawn or _spawn, http or _http   # _spawn: its own session and group
         self.now, self.sleep, self.send_signal = now or time.time, sleep or time.sleep, send_signal or os.kill
         self.disk_free = disk_free or (lambda path: shutil.disk_usage(path).free)
@@ -158,6 +161,9 @@ class Host:
         self.load_path = load_path or PipelineLoadPath
         self.out = out or (lambda line: print(line, flush=True))
         self.lms = str(lms)
+        self.self_pid = os.getpid() if self_pid is None else self_pid          # never a stop target (addendum 2, item 2)
+        self.parent_pid = os.getppid() if parent_pid is None else parent_pid
+        self.fsync = fsync or os.fsync
 
 
 def utc(t):
@@ -266,16 +272,19 @@ def memory(host):
             'swap_used_bytes': int(round(float(used.group(1)) * scale[used.group(2)])) if used and s.returncode == 0 else None}
 
 
-def link_disabled(text, returncode):
-    """LM Link counts as disabled only when `lms link status` exits 0 and the first non-empty line of its output, with
-    surrounding blanks removed, begins with exactly LINK_DISABLED_LINE. Anything else is not known to be disabled."""
+def link_disabled(stdout, stderr, returncode):
+    """LM Link counts as disabled only when `lms link status` exits 0 and the first non-empty line of its standard output,
+    or of its standard error when standard output is empty (where the status line goes, measured 2026-11-17: 0 bytes on
+    standard output), with surrounding blanks removed, begins with exactly LINK_DISABLED_LINE. Anything else is not known
+    to be disabled."""
+    text = stdout if (stdout or '').strip() else stderr
     lines = [line.strip() for line in (text or '').splitlines() if line.strip()]
     return returncode == 0 and bool(lines) and lines[0].startswith(LINK_DISABLED_LINE)
 
 
 def lm_link(host):
     r = host.run([host.lms, 'link', 'status'], timeout=CMD_S)
-    disabled = link_disabled(r.stdout, r.returncode)
+    disabled = link_disabled(r.stdout, r.stderr, r.returncode)
     return {'disabled': disabled, 'state': 'disabled' if disabled else 'not known to be disabled', 'exit': r.returncode}
 
 
@@ -297,26 +306,35 @@ def models_state(host):
         return unknown('LM Studio list not of the expected shape: %s' % e)
     why = DM._wrong_found(found) if found else 'instance %s not loaded' % DM.INSTANCE
     loaded = [(e.get('key'), i.get('id')) for e in entries for i in e.get('loaded_instances', [])]
+    # Addendum 2, item 9: any further instance of the decision model (its key, or an id that starts with its name) makes
+    # it "not right" (the collector needs exactly one right instance) and is never an "other" model to unload.
+    def decision_model(key, iid):
+        return key == DM.KEY or (isinstance(iid, str) and iid.startswith(DM.INSTANCE))
+    extra = [iid for key, iid in loaded if decision_model(key, iid) and iid != DM.INSTANCE]
+    if why is None and extra:
+        why = 'a second instance of the decision model is loaded: %s' % ', '.join(str(x) for x in extra)
     native = [iid for _, iid in loaded if isinstance(iid, str) and iid.startswith(NATIVE_PREFIX)]
     others = [{'instance_id': iid, 'key': key} for key, iid in loaded
-              if isinstance(iid, str) and iid not in (DM.INSTANCE, EMBEDDING_INSTANCE) and not iid.startswith(NATIVE_PREFIX)]
+              if isinstance(iid, str) and iid not in (DM.INSTANCE, EMBEDDING_INSTANCE) and not iid.startswith(NATIVE_PREFIX)
+              and not decision_model(key, iid)]
     return {'reachable': True, 'decision_instance': {'loaded_and_right': why is None, 'why': why},
             'embedding_loaded': any(iid == EMBEDDING_INSTANCE for _, iid in loaded), 'others': others, 'native_loaded': native}
 
 
 def observed_identity(host, pid):
-    r = host.run(['/bin/ps', '-p', str(pid), '-o', 'pid=,pgid=,lstart='], timeout=CMD_S)
+    """ps of one pid: its pid, parent pid, process group and start (lstart). Never its command line."""
+    r = host.run(['/bin/ps', '-p', str(pid), '-o', 'pid=,ppid=,pgid=,lstart='], timeout=CMD_S)
     fields = (r.stdout or '').split()
-    if r.returncode or len(fields) < 7 or not fields[0].isdigit() or not fields[1].isdigit():
+    if r.returncode or len(fields) < 8 or not all(f.isdigit() for f in fields[:3]) or int(fields[0]) != pid:
         return None
-    return {'pid': int(fields[0]), 'pgid': int(fields[1]), 'start': ' '.join(fields[2:])}
+    return {'pid': int(fields[0]), 'ppid': int(fields[1]), 'pgid': int(fields[2]), 'start': ' '.join(fields[3:])}
 
 
 def identity_mismatch(host, identity):
-    """None when the recorded observer {pid, start, pgid} is the live process now; else why it is not (never signal then)."""
-    if not (isinstance(identity, dict) and type(identity.get('pid')) is int and identity['pid'] > 1
-            and isinstance(identity.get('start'), str) and type(identity.get('pgid')) is int):
-        return 'the observer identity file is not {"pid", "start", "pgid", ...}'
+    """None when a recorded observer {pid, start, pgid} is well formed and the live process now; else why it is not."""
+    if not (isinstance(identity, dict) and type(identity.get('pid')) is int
+            and isinstance(identity.get('start'), str) and identity['start'] and type(identity.get('pgid')) is int):
+        return 'the observer identity file is not {"pid": int, "start": str, "pgid": int, ...}'
     seen = observed_identity(host, identity['pid'])
     if seen is None:
         return 'pid %d is not running' % identity['pid']
@@ -324,6 +342,36 @@ def identity_mismatch(host, identity):
         return 'pid %d started %r, not %r as the identity file says' % (identity['pid'], seen['start'], identity['start'])
     if seen['pgid'] != identity['pgid']:
         return 'pid %d is in process group %d, not %d' % (identity['pid'], seen['pgid'], identity['pgid'])
+    return None
+
+
+def launcher_mismatch(host, launcher):
+    """None when the launcher this tool started is still that process (pid, start and group as recorded at spawn)."""
+    if not (launcher and type(launcher.get('pid')) is int and launcher.get('start')):
+        return 'the launcher was not recorded at spawn'
+    seen = observed_identity(host, launcher['pid'])
+    if seen is None or seen['start'] != launcher['start'] or seen['pgid'] != launcher['pgid']:
+        return 'the launcher pid %s is no longer the process started (%s)' % (
+            launcher['pid'], 'gone' if seen is None else 'start or group differs')
+    return None
+
+
+def observer_unusable(host, identity, launcher):
+    """Addendum 2, item 2. None only when ALL hold: the identity is well formed; its pid is alive with exactly that start
+    (and group); its PARENT pid is the launcher this tool started, whose own pid and start still match the spawn record;
+    the pid is not this tool's own, not this tool's parent, not 0 or 1. Else why not: then it is never sent TERM."""
+    why = identity_mismatch(host, identity)
+    if why:
+        return why
+    pid = identity['pid']
+    if pid <= 1 or pid in (host.self_pid, host.parent_pid):         # the one guard (0, 1 and below; kill(-1) is everyone)
+        return 'pid %d is this tool, its parent, or not above 1' % pid
+    why = launcher_mismatch(host, launcher)
+    if why:
+        return why
+    seen = observed_identity(host, pid)
+    if seen is None or seen['ppid'] != launcher['pid']:
+        return 'pid %d is not a child of the launcher %s (parent %s)' % (pid, launcher['pid'], seen and seen['ppid'])
     return None
 
 
@@ -356,15 +404,32 @@ def pick_reader_state(host):
     if s['running'] and s['pid'] is not None:
         seen = observed_identity(host, s['pid'])
         s['started'] = seen['start'] if seen else None
+    s['read_t'] = host.now()
     s['due'] = picks_due(host, s)
     return s
 
 
+def running_readings(host):
+    """The times at which earlier `run` and `load-test` invocations read the pick reader RUNNING, from the record rows (a
+    damaged row is skipped). `check` writes no row, so what it saw is not among them."""
+    rows, _ = read_rows(host.record)
+    out = []
+    for r in rows:
+        so = r.get('switch_offs') if isinstance(r.get('switch_offs'), dict) else {}
+        pr = so.get('pick_reader') if isinstance(so.get('pick_reader'), dict) else {}
+        check = r.get('check') if isinstance(r.get('check'), dict) else {}
+        for seen in (check.get('pick_reader'), pr.get('before'), pr.get('after')):
+            if isinstance(seen, dict) and seen.get('running') is True and isinstance(seen.get('read_t'), (int, float)):
+                out.append(seen['read_t'])
+    return out
+
+
 def picks_due(host, reader):
-    """Correction C. Why the switch-offs may not begin now, or None: from PICKS_BEFORE_S before the reader's scheduled start
-    (its calendar minute from launchd, the full hour when none is read; local clock, injected) until it has been read listed
-    and idle at least PICKS_AFTER_S after that start, so that it cannot start between this read and the bootout. A reader
-    that is not loaded is left alone and has no window. A running reader is refused by its own rule."""
+    """Corrections C and addendum 2, item 10. Why the switch-offs may not begin now, or None. The window opens PICKS_BEFORE_S
+    before the reader's scheduled start (its calendar minute from launchd, the full hour when none is read; local clock,
+    injected) and closes only when the reader has been read RUNNING after that start and is read idle now, or when
+    PICKS_MISSED_S have passed since that start with it idle at every reading (a missed start). A reader that is not loaded
+    is left alone and has no window; a reader read running now is refused by its own rule."""
     if not reader['listed']:
         return None
     minute = reader.get('minute') or 0
@@ -372,10 +437,12 @@ def picks_due(host, reader):
     since = (lt.tm_min * 60 + lt.tm_sec + (t % 1) - minute * 60) % 3600     # seconds since its last scheduled start
     if 3600 - since <= PICKS_BEFORE_S:
         return ('the hourly pick reader %s is due at :%02d in %d s; no switch-off begins from %d minutes before it until it '
-                'is seen idle after it' % (PICKS_LABEL, minute, round(3600 - since), PICKS_BEFORE_S // 60))
-    if since < PICKS_AFTER_S:
-        return ('the hourly pick reader %s was due at :%02d, %d s ago, and is not yet seen idle after it (%d s needed)' % (
-            PICKS_LABEL, minute, int(since), PICKS_AFTER_S))
+                'has been seen running and then idle after it' % (PICKS_LABEL, minute, round(3600 - since), PICKS_BEFORE_S // 60))
+    if since < PICKS_MISSED_S and not reader['running']:
+        start = t - since
+        if not any(start <= x <= t for x in running_readings(host)):
+            return ('the hourly pick reader %s was due at :%02d, %d s ago, and is not yet seen running and then idle after it '
+                    '(or idle for %d minutes after it: a missed start)' % (PICKS_LABEL, minute, int(since), PICKS_MISSED_S // 60))
     return None
 
 
@@ -534,13 +601,15 @@ class SwitchOffs:
         if before['listed']:
             if not before['plist']:
                 raise OperatorError('the pick reader\'s plist path is unknown, so it could not be bootstrapped back; not booted out')
+            pr['restore_intent'] = True       # addendum 2, item 7: before the bootout is issued, so no interrupt can skip it
             r = host.run(['/bin/launchctl', 'bootout', 'gui/%d/%s' % (host.uid, PICKS_LABEL)], timeout=CMD_S)
             pr['booted_out'] = not pick_reader_state(host)['listed']
             if not pr['booted_out']:
                 raise OperatorError('the pick reader bootout failed (exit %d); it is still loaded' % r.returncode)
         for other in summary['models']['others']:
             iid = other['instance_id']
-            if iid in (DM.INSTANCE, EMBEDDING_INSTANCE) or iid.startswith(NATIVE_PREFIX):   # never, whatever the list says
+            if (iid in (DM.INSTANCE, EMBEDDING_INSTANCE) or iid.startswith(NATIVE_PREFIX) or iid.startswith(DM.INSTANCE)
+                    or other['key'] == DM.KEY):             # never, whatever the list says
                 raise OperatorError('refused to unload the protected instance %s' % iid)
             item = {'instance_id': iid, 'key': other['key'], 'unloaded': False}
             self.rec['models_unloaded'].append(item)
@@ -556,20 +625,45 @@ class SwitchOffs:
             if still:
                 raise OperatorError('still loaded after the unload: %s' % ', '.join(still))
 
-    def restore(self):
-        """True when the pick reader is as it was; never raises."""
+    def restore(self, steps):
+        """True when the pick reader is as it was. Every step runs (addendum 2, item 1): a BaseException from one, Ctrl-C
+        and SystemExit included, is kept by `steps` and the next step still runs; the caller raises it again only after
+        the record row and the summary are written. Whether to bootstrap is decided by the job's real state (item 7)."""
         pr = self.rec['pick_reader']
         if pr is None:
             return True
-        try:
-            if pr['booted_out']:
-                r = self.host.run(['/bin/launchctl', 'bootstrap', 'gui/%d' % self.host.uid, pr['before']['plist']], timeout=CMD_S)
-                pr['bootstrap_exit'] = r.returncode
-            pr['after'] = pick_reader_state(self.host)
-            pr['restored'] = pr['after']['listed'] == pr['before']['listed']
-        except Exception as e:
-            pr['restored'] = False; pr['restore_failure'] = '%s: %s' % (type(e).__name__, e)
+        if pr.get('restore_intent'):
+            now = steps.run('reading the pick reader before its restore', pick_reader_state, self.host)
+            if now is None or not now['listed']:          # not listed (or unknown): bootstrap from the same plist
+                r = steps.run('the pick reader bootstrap', self.host.run,
+                              ['/bin/launchctl', 'bootstrap', 'gui/%d' % self.host.uid, pr['before']['plist']], timeout=CMD_S)
+                pr['bootstrap_exit'] = getattr(r, 'returncode', None)
+        pr['after'] = steps.run('reading the pick reader after its restore', pick_reader_state, self.host)
+        pr['restored'] = pr['after'] is not None and pr['after']['listed'] == pr['before']['listed']
         return pr['restored']
+
+
+class Steps:
+    """Runs cleanup steps to their end: a BaseException from any step is named in the row's alerts and the following steps
+    still run; the first one that is not an ordinary Exception (KeyboardInterrupt, SystemExit) is kept and `reraise` raises
+    it again at the very end (addendum 2, item 1). An ordinary Exception stays an alert in capitals and exit 3, as before."""
+
+    def __init__(self, row):
+        self.row, self.kept = row, None
+
+    def run(self, name, fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except BaseException as e:
+            if self.kept is None and not isinstance(e, Exception):
+                self.kept = e
+            self.row['alerts'].append('%s DID NOT COMPLETE: %s%s' % (
+                name.upper(), type(e).__name__, '' if isinstance(e, (KeyboardInterrupt, SystemExit)) else ': %s' % e))
+            return None
+
+    def reraise(self):
+        if self.kept is not None:
+            raise self.kept
 
 
 # ============================================================================ the pipeline's own steps
@@ -616,10 +710,21 @@ def staged_threshold(work):
     return value if type(value) is int else LIMITS.REVIEWED_START_THRESHOLD
 
 
-def require_free(host, work):
+def settle_after_unloads(host, row):
+    """Addendum 2, item 5 (d): after models were unloaded, wait SETTLE_S before the free reading. LM Studio answers the
+    unload once it has released the instance, but the kernel's free figure follows as the pages are reclaimed, over a few
+    seconds; read at once, it under-reads and refuses a start that would pass. 15 s is a few times that lag and about 1%
+    of the run's window. Nothing unloaded: nothing to wait for."""
+    if any(m.get('unloaded') for m in row['switch_offs']['models_unloaded']):
+        host.sleep(SETTLE_S)
+
+
+def require_free(host, work, row=None):
     threshold = staged_threshold(work); free = memory(host)['free_percent']
     if free is None or free < threshold:
-        raise Refused('%s%% free is under the staged start threshold %d%% (the pipeline would refuse at its start)' % (free, threshold))
+        unloaded = [m['instance_id'] for m in ((row or {}).get('switch_offs') or {}).get('models_unloaded', []) if m.get('unloaded')]
+        raise Refused('%s%% free is under the staged start threshold %d%% (the pipeline would refuse at its start); %s' % (
+            free, threshold, ('unloaded %s, %s' % (', '.join(unloaded), NOT_RELOADED)) if unloaded else 'no model was unloaded'))
     return threshold, free
 
 
@@ -665,11 +770,13 @@ def launch(host, work, gate, row):
 
 
 class Stopper:
-    """At most one stop signal. TERM to the observer named in <work>/builder/observer-identity.json, only when its pid, start
-    and process group all match the live process. When that file has not appeared IDENTITY_WAIT_S after the launch: SIGINT to
-    the launcher this tool started (correction A), only when it was started in its own group and its pid, start and group
-    still match what was recorded at launch. The launcher's KeyboardInterrupt path then stops the observer group the
-    pipeline's own way; a TERM would kill it without that cleanup. Never a group signal, never on a pid alone."""
+    """At most one stop signal. TERM to the observer named in <work>/builder/observer-identity.json, only when it passes
+    observer_unusable (well formed, alive with that start and group, a CHILD of the launcher this tool started, not this
+    tool, its parent, 0 or 1). An identity that fails for ANY reason, or no file, is "no usable identity": from
+    IDENTITY_WAIT_S after the launch, SIGINT to the launcher this tool started (correction A, addendum 2 item 3), only when it
+    was started in its own group and its pid, start and group still match what was recorded at launch. The launcher's
+    KeyboardInterrupt path then stops the observer group the pipeline's own way; a TERM would kill it without that cleanup.
+    Never a group signal, never on a pid alone."""
 
     def __init__(self, host, work, row, t_launch):
         self.host, self.path, self.row, self.t_launch = host, work / 'builder' / IDENTITY_FILE, row, t_launch
@@ -685,9 +792,9 @@ class Stopper:
             identity = json.loads(self.path.read_text())
         except (OSError, ValueError) as e:
             return self._by_launcher('no readable observer identity (%s)' % type(e).__name__)
-        why = identity_mismatch(self.host, identity)
+        why = observer_unusable(self.host, identity, self.row.get('launcher'))
         if why:
-            self.rec['not_signalled'] = why; return False
+            return self._by_launcher('no usable observer identity: ' + why)
         self.host.send_signal(identity['pid'], signal.SIGTERM)
         self.sent_t = self.host.now()
         self.rec.update(signalled=True, by='observer', pid=identity['pid'], utc=utc(self.sent_t), not_signalled=None)
@@ -699,10 +806,10 @@ class Stopper:
         launcher = self.row.get('launcher') or {}
         if not launcher.get('own_group'):
             self.rec['not_signalled'] = why + ', and the launcher is not in a process group of its own'; return False
-        seen = observed_identity(self.host, launcher['pid'])
-        if seen is None or seen['start'] != launcher['start'] or seen['pgid'] != launcher['pgid']:
-            self.rec['not_signalled'] = why + ', and the launcher pid %s is no longer the process started (%s)' % (
-                launcher['pid'], 'gone' if seen is None else 'start or group differs'); return False
+        moved = launcher_mismatch(self.host, launcher)
+        if moved or launcher['pid'] <= 1 or launcher['pid'] in (self.host.self_pid, self.host.parent_pid):
+            self.rec['not_signalled'] = why + ', and ' + (moved or 'the launcher pid is this tool, its parent or not above 1')
+            return False
         self.host.send_signal(launcher['pid'], LAUNCHER_STOP_SIGNAL)
         self.sent_t = self.host.now()
         self.rec.update(signalled=True, by='launcher interrupt', signal='SIGINT', pid=launcher['pid'], pgid=launcher['pgid'],
@@ -724,10 +831,15 @@ def after_interrupt_check(host, stopper, row):
 
 
 def wait_after_stop(host, proc, stopper, row):
-    """After a stop is wanted: wait for the launcher to end (the pipeline's own cleanup), STOP_WAIT_S after the signal at most."""
+    """After a stop is wanted: wait for the launcher to end (the pipeline's own cleanup), STOP_WAIT_S after the signal at most;
+    with no signal possible, IDENTITY_WAIT_S + STOP_WAIT_S at most (never an endless wait)."""
+    t0 = host.now()
     while proc.poll() is None:
         if stopper.sent_t is not None and host.now() > stopper.sent_t + STOP_WAIT_S:
             row['alerts'].append('PIPELINE CLEANUP NOT SEEN WITHIN %d S OF THE STOP SIGNAL: THE LAUNCHER WAS LEFT RUNNING' % STOP_WAIT_S)
+            return None
+        if stopper.sent_t is None and host.now() > t0 + IDENTITY_WAIT_S + STOP_WAIT_S:
+            row['alerts'].append('THE RUN COULD NOT BE SIGNALLED: THE LAUNCHER WAS LEFT RUNNING')
             return None
         host.sleep(WATCH_S)
         if not stopper.rec['signalled']:
@@ -735,22 +847,41 @@ def wait_after_stop(host, proc, stopper, row):
     return proc.poll()
 
 
-def pipeline_outcome(work, plan):
-    out = {'receipt_found': False, 'complete': None, 'failure': None, 'calls': None, 'failed_calls': None, 'refused_calls': None,
-           'swaps': None, 'swaps_clean': None, 'cleanup_proven': None, 'report_usable': None, 'memory_stop': None}
+def pipeline_outcome(work, plan, launcher_exit=None):
+    out = {'receipt_found': False, 'receipt_readable': False, 'complete': None, 'failure': None, 'near_neutral': False,
+           'calls': None, 'failed_calls': None, 'refused_calls': None, 'swaps': None, 'swaps_clean': None, 'cleanup_proven': None,
+           'report_usable': None, 'memory_stop': None, 'launcher_exit': launcher_exit}
     path = work / 'builder/native-run-receipt.json'
     if not path.is_file():
         return out, {}
-    receipt = json.loads(path.read_text())
-    failure = receipt.get('failure') if isinstance(receipt.get('failure'), dict) else None
-    out.update(receipt_found=True, complete=receipt.get('complete'), cleanup_proven=receipt.get('cleanup_proven'),
-               failure=None if failure is None else str(failure.get('reason'))[:500], report_usable=receipt.get('paper_handoff') is True)
+    out['receipt_found'] = True
+    try:
+        receipt = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        out['failure'] = 'the receipt is not readable: %s' % type(e).__name__
+        return out, {}
+    if not isinstance(receipt, dict):
+        out['failure'] = 'the receipt is not a JSON object'
+        return out, {}
+    raw = receipt.get('failure')
+    failure = raw if isinstance(raw, dict) else None
+    # Addendum 2, item 4: the one failure that is a result, not a fault: the derived report too close to neutral
+    # (src/mirofish_provenance.py:437 raises Refused("derived report not usable evidence"); mirofish_native_run.py:806
+    # stores {'type': type name, 'reason': str(exc)}). Exactly that type and that reason string, nothing else.
+    near = (failure is not None and failure.get('type') == NEAR_NEUTRAL_TYPE and type(failure.get('reason')) is str
+            and failure['reason'] == NEAR_NEUTRAL_REASON)
+    out.update(receipt_readable=True, complete=receipt.get('complete'), cleanup_proven=receipt.get('cleanup_proven'),
+               failure=None if raw is None else str(failure.get('reason') if failure else raw)[:500], near_neutral=near,
+               report_usable=receipt.get('paper_handoff') is True)
     reason = out['failure'] or ''
     out['memory_stop'] = bool(receipt.get('resource_failures') or receipt.get('resource_failure_samples')
                               or 'memory free threshold' in reason or 'RSS upper bound' in reason)
     ledger = work / 'builder/gateway-ledger.json'
-    if ledger.is_file():
-        calls = (json.loads(ledger.read_text()) or {}).get('calls') or []
+    try:
+        calls = (json.loads(ledger.read_text()) or {}).get('calls') if ledger.is_file() else None
+    except (OSError, ValueError, AttributeError):
+        calls = None                       # an unreadable ledger leaves the call counts null: not clean
+    if isinstance(calls, list) and all(isinstance(c, dict) for c in calls):
         states = Counter(c.get('state') for c in calls)
         out.update(calls=len(calls), refused_calls=states.get('refused_before_forward', 0),
                    failed_calls=sum(n for s, n in states.items() if s not in ('complete', 'refused_before_forward')))
@@ -776,14 +907,25 @@ def memory_outcome(receipt, swap_start, swap_end, own):
     return out
 
 
+def pipeline_clean(p):
+    """Addendum 2, item 4: a readable receipt; no failed and no refused call; cleanup proven; both swaps clean; no stop on
+    the memory rule; and EITHER complete with no failure and the launcher's exit 0, OR not complete for exactly the
+    near-neutral reason with the launcher's exit 1 (the observer's `return 0 if complete else 1`, passed on by the
+    launcher). A missing receipt, a zero exit with complete false, any other reason: not clean."""
+    base = (p.get('receipt_found') is True and p.get('receipt_readable') is True and p.get('failed_calls') == 0
+            and p.get('refused_calls') == 0 and p.get('memory_stop') is False and p.get('swaps_clean') is True
+            and p.get('cleanup_proven') is True)
+    done = p.get('complete') is True and p.get('failure') is None and p.get('launcher_exit') == 0
+    neutral = p.get('complete') is False and p.get('near_neutral') is True and p.get('launcher_exit') == 1
+    return bool(base and (done or neutral))
+
+
 def verdicts(collector, pipeline, memory):
     low = memory.get('lowest_sustained_free_percent_10s')
     st = collector.get('statuses') or {}       # correction B: by the count of each status, which the record carries
     return {'collector_unharmed': (collector['breach'] is None and collector['over_8s'] == 0
                                    and not any(st.get(k, 0) for k in HARMFUL_STATUSES) and st.get('error', 0) < HARMFUL_ERRORS),
-            'pipeline_clean': (pipeline.get('failed_calls') == 0 and pipeline.get('refused_calls') == 0
-                               and pipeline.get('memory_stop') is False and pipeline.get('swaps_clean') is True
-                               and pipeline.get('cleanup_proven') is True and pipeline.get('failure') is None),
+            'pipeline_clean': pipeline_clean(pipeline),
             'room_to_spare': None if not isinstance(low, (int, float)) else low >= STOP_FLOOR + ROOM_POINTS}
 
 
@@ -799,16 +941,22 @@ def post_state(host, row):
 
 
 # ============================================================================ the record
-def append_record(path, row):
+def append_record(path, row, fsync=os.fsync):
+    """One JSON line appended and synced. A file that does not end with a newline (a torn last line) gets one first, so
+    the new row is never glued to it (addendum 2, item 6)."""
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
     new = not path.exists()
+    torn = False
+    if not new and path.stat().st_size > 0:
+        with path.open('rb') as f:
+            f.seek(-1, os.SEEK_END); torn = f.read(1) != b'\n'
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     with os.fdopen(fd, 'a') as f:
-        f.write(json.dumps(row, sort_keys=True) + '\n'); f.flush(); os.fsync(f.fileno())
+        f.write(('\n' if torn else '') + json.dumps(row, sort_keys=True) + '\n'); f.flush(); fsync(f.fileno())
     if new:
         dfd = os.open(path.parent, os.O_RDONLY)
         try:
-            os.fsync(dfd)
+            fsync(dfd)
         finally:
             os.close(dfd)
 
@@ -821,8 +969,26 @@ def write_json(path, value):
 
 
 def read_rows(path):
+    """(rows, damaged): every line that is a JSON object, and the count of lines that are not (skipped; never raises on
+    one). A damaged line is never a run: it neither counts nor resets a streak (addendum 2, item 6)."""
     path = Path(path)
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.is_file() else []
+    rows, damaged = [], 0
+    try:
+        text = path.read_text(errors='replace') if path.is_file() else ''
+    except OSError:
+        return rows, damaged
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            value = None
+        if isinstance(value, dict):
+            rows.append(value)
+        else:
+            damaged += 1
+    return rows, damaged
 
 
 def streaks(rows):
@@ -870,18 +1036,25 @@ def watch(host, row, proc, stopper, t_start, t_launch, wall_s, own):
                 IDENTITY_WAIT_S, 'A BREACH WILL INTERRUPT THE LAUNCHER (SIGINT) INSTEAD'
                 if (row.get('launcher') or {}).get('own_group')
                 else 'A BREACH CANNOT INTERRUPT THE LAUNCHER: IT IS NOT IN ITS OWN GROUP'))
+        deadline = t_launch + wall_s + CLEANUP_S         # addendum 2, item 3: the profile's wall time plus the cleanup
         if first is None:
             h = collector_health(host, since=t_start)
             if h['breach']:
                 first = h['breach']; row['stopped'] = 'collector breach'; row['first_breach'] = first
-            elif host.now() > t_launch + wall_s + CLEANUP_S + 2 * WATCH_S:
-                first = 'overran its wall clock'; row['stopped'] = 'overran its wall clock'
+            elif host.now() >= deadline:
+                first = 'wall exceeded'; row['stopped'] = 'wall exceeded'
         if first is not None:
             if not stopper.rec['signalled']:
                 stopper.attempt()
             if stopper.sent_t is not None and host.now() > stopper.sent_t + STOP_WAIT_S:
                 row['alerts'].append('PIPELINE CLEANUP NOT SEEN WITHIN %d S OF THE STOP SIGNAL: THE LAUNCHER WAS LEFT RUNNING' % STOP_WAIT_S)
                 return None
+        # the hard end of the watch, whatever could or could not be signalled: never an endless watch
+        if stopper.sent_t is None and host.now() >= max(deadline, t_launch + IDENTITY_WAIT_S) + STOP_WAIT_S:
+            if row['stopped'] is None:
+                row['stopped'] = 'wall exceeded'
+            row['alerts'].append('THE RUN COULD NOT BE SIGNALLED: THE LAUNCHER WAS LEFT RUNNING')
+            return None
     return proc.poll()
 
 
@@ -941,16 +1114,20 @@ def cmd_run(host, args):
     switch = SwitchOffs(host, row); proc = None; stopper = None; work = None; own = {'lowest': None, 'max_pressure': None}
     swap_start = None
     try:
+        # Addendum 2, item 5: (a) every refusal that needs no switch-off; (b) staging, which switches nothing off, and the
+        # old-pipeline refusal; (c) only then the switch-offs; (d) the free reading after the unloads settled; (e) the
+        # twin's preflight; (f) the gate and the launch.
         if s['refusals']:
             raise Refused('; '.join(s['refusals']))
-        say('check passed; switching off: ' + s['announcement'])
-        switch.apply(s)
         work = fresh_folder(host, args.profile); twin = Path(str(work) + '-twin')
         row['staged_folder'], row['twin_folder'] = str(work), str(twin)
         candidate = stage(host, args.profile, flags, work)
         stage(host, args.profile, flags, twin)
         require_stoppable(work)
-        threshold, free = require_free(host, work)
+        say('check passed and staged; switching off: ' + s['announcement'])
+        switch.apply(s)
+        settle_after_unloads(host, row)
+        threshold, free = require_free(host, work, row)
         row['start_threshold'], row['free_at_start'] = threshold, free
         preflight(host, twin)
         gate = write_gate(host, work, candidate, args.announced)
@@ -968,36 +1145,44 @@ def cmd_run(host, args):
     except Exception as e:
         row['error'] = '%s: %s' % (type(e).__name__, e)
     finally:
-        try:
-            # Still running after Ctrl-C or an exception (the watch itself returns only once the launcher has ended, or
-            # after it gave up waiting for the cleanup, which is alerted): stop it the documented way and wait.
+        # Addendum 2, item 1: every step below runs to its end; the first BaseException of any of them is kept and raised
+        # again only after the record row and the summary are written.
+        steps = Steps(row)
+
+        def stop_if_running():
+            # Still running after Ctrl-C or an exception (the watch returns only once the launcher has ended, or after it
+            # gave up waiting, which is alerted): stop it the documented way and wait, boundedly.
             if proc is not None and proc.poll() is None and not any('LEFT RUNNING' in a for a in row['alerts']):
                 stopper.attempt(); wait_after_stop(host, proc, stopper, row)
-        except BaseException as e:     # a second Ctrl-C while waiting: the restore below still runs
-            row['alerts'].append('THE STOP WAS INTERRUPTED: %s' % type(e).__name__)
-        try:
-            if stopper is not None and stopper.rec['by'] == 'launcher interrupt':
-                after_interrupt_check(host, stopper, row)
-        except BaseException as e:
-            row['alerts'].append('THE CHECK AFTER THE LAUNCHER INTERRUPT DID NOT COMPLETE: %s' % type(e).__name__)
+        steps.run('the stop', stop_if_running)
+        if stopper is not None and stopper.rec['by'] == 'launcher interrupt':
+            steps.run('the check after the launcher interrupt', after_interrupt_check, host, stopper, row)
         if stopper is not None and stopper.rec['wanted'] and not stopper.rec['signalled']:
             row['alerts'].append('RUN NOT STOPPED: OBSERVER NOT SIGNALLED: %s' % stopper.rec['not_signalled'])
-        restored = switch.restore()
+        if proc is not None:
+            row['launcher']['exit'] = steps.run('reading the launcher\'s exit', proc.poll)
+        restored = switch.restore(steps)
         if not restored:
             row['alerts'].append('PICK READER NOT RESTORED: %s IS NOT LOADED AGAIN FROM %s; BOOTSTRAP IT BY HAND' % (
                 PICKS_LABEL, (row['switch_offs']['pick_reader'] or {}).get('before', {}).get('plist')))
         try:
             finish_run_row(host, row, work, plan, t_start, swap_start, own)
-        except Exception as e:
-            row['alerts'].append('THE RUN ROW COULD NOT BE COMPLETED: %s: %s' % (type(e).__name__, e))
-        written = True
-        try:
-            append_record(host.record, row)
-        except Exception as e:
-            written = False; row['alerts'].append('RECORD NOT WRITTEN to %s: %s: %s' % (host.record, type(e).__name__, e))
-        say('RUN SUMMARY')
-        for line in summary_lines(row):
-            say(line)
+        except BaseException as e:
+            if isinstance(e, Exception):
+                row['alerts'].append('THE RUN ROW COULD NOT BE COMPLETED: %s: %s' % (type(e).__name__, e))
+            else:                  # addendum 2, item 8: interrupted while recording: a minimal row, then raised again
+                steps.kept = steps.kept or e
+                row = steps.row = minimal_row(row, host, e)
+        def append():
+            append_record(host.record, row, host.fsync); return True
+        written = steps.run('the record append (RECORD NOT WRITTEN to %s)' % host.record, append) is True
+
+        def summary():
+            say('RUN SUMMARY')
+            for line in summary_lines(row):
+                say(line)
+        steps.run('the summary', summary)
+        steps.reraise()
     if not restored or not written:
         return 3
     if row['refused']:
@@ -1007,13 +1192,25 @@ def cmd_run(host, args):
     return 3 if row['alerts'] else 0
 
 
+def minimal_row(row, host, exc):
+    """Addendum 2, item 8: what is known, for a row whose finishing was interrupted; it never counts."""
+    keep = ('command', 'utc_start', 'profile', 'plan', 'announced', 'announced_note', 'launched', 'refused', 'error', 'stopped',
+            'staged_folder', 'twin_folder', 'utc_launch', 'launcher', 'stop', 'switch_offs', 'alerts')
+    out = {k: row.get(k) for k in keep}
+    out.update(utc_end=utc(host.now()), recording='interrupted while recording: %s' % type(exc).__name__, counts=False,
+               verdicts=None, pipeline=None, memory=None, collector=None, post=None)
+    out['alerts'] = list(row.get('alerts') or []) + ['INTERRUPTED WHILE RECORDING (%s): A MINIMAL ROW WAS WRITTEN' % type(exc).__name__]
+    return out
+
+
 def finish_run_row(host, row, work, plan, t_start, swap_start, own):
     row['utc_end'] = utc(host.now())
     receipt = {}
+    exit_code = (row.get('launcher') or {}).get('exit')
     if work is not None and row['launched']:
-        row['pipeline'], receipt = pipeline_outcome(work, plan)
+        row['pipeline'], receipt = pipeline_outcome(work, plan, exit_code)
     else:
-        row['pipeline'] = pipeline_outcome(Path('/nonexistent'), plan)[0]
+        row['pipeline'] = pipeline_outcome(Path('/nonexistent'), plan, exit_code)[0]
     health = collector_health(host, since=t_start)
     row['collector'] = collector_figures(health)
     if row.get('first_breach'):
@@ -1130,12 +1327,13 @@ def cmd_load_test(host, args):
     try:
         if s['refusals']:
             raise Refused('; '.join(s['refusals']))
-        say('check passed; switching off: ' + s['announcement'])
-        switch.apply(s)
         work = fresh_folder(host, 'loadtest-' + re.sub(r'[^a-z0-9.-]', '-', model.lower()))
         result['staged_folder'] = str(work)
-        stage(host, 'swarm8', ['--model', model], work)
-        result['start_threshold'], result['free_at_start'] = require_free(host, work)
+        stage(host, 'swarm8', ['--model', model], work)          # addendum 2, item 5: staging before any switch-off
+        say('check passed and staged; switching off: ' + s['announcement'])
+        switch.apply(s)
+        settle_after_unloads(host, result)
+        result['start_threshold'], result['free_at_start'] = require_free(host, work, result)
         lp = host.load_path(work, Path(str(work) + '-out'), model, hold_s)
         lp.baseline()
         base, breach = sample_phase(host, BASELINE_S, t0)
@@ -1149,7 +1347,12 @@ def cmd_load_test(host, args):
                 result['load']['refusal'] = '%s: %s' % (type(e).__name__, e)
                 result['error'] = 'the load failed: ' + result['load']['refusal']
             if result['load']['ok']:
-                hold, breach = sample_phase(host, hold_s, t0)
+                # addendum 2, item 11: the collector at once when the load call returns, as well as during the hold
+                after = collector_health(host, since=t0)
+                result['collector_after_load'] = collector_figures(after)
+                breach = after['breach']
+                if not breach:
+                    hold, breach = sample_phase(host, hold_s, t0)
                 if breach:
                     result['stopped'] = 'collector breach'; result['first_breach'] = breach
     except Refused as e:
@@ -1159,23 +1362,21 @@ def cmd_load_test(host, args):
     except Exception as e:
         result['error'] = '%s: %s' % (type(e).__name__, e)
     finally:
+        steps = Steps(result)            # addendum 2, item 1: every step to its end, a Ctrl-C kept and raised at the end
         if lp is not None and asked:
-            try:
+            def unload():
                 proven, detail = lp.unload(); result['unload'] = {'proven': bool(proven), 'detail': detail}
-            except BaseException as e:
-                result['unload'] = {'proven': False, 'failure': '%s: %s' % (type(e).__name__, e)}
+            if steps.run('the test model\'s unload', unload) is None and result['unload'].get('proven') is None:
+                result['unload'] = {'proven': False, 'failure': 'the unload did not complete'}
             if not result['unload']['proven']:
                 result['alerts'].append('THE TEST MODEL\'S UNLOAD IS NOT PROVEN: %s' % result['unload'])
         if lp is not None:
-            try:
-                lp.close()
-            except BaseException as e:
-                result['alerts'].append('THE LOAD PATH\'S HELPER DID NOT STOP CLEANLY: %s' % type(e).__name__)
-        restored = switch.restore()
+            steps.run('the load path\'s helper stop', lp.close)
+        restored = switch.restore(steps)
         if not restored:
             result['alerts'].append('PICK READER NOT RESTORED: %s IS NOT LOADED AGAIN; BOOTSTRAP IT BY HAND' % PICKS_LABEL)
-        written = True
-        try:
+
+        def finish():
             result['utc_end'] = utc(host.now())
             load_test_figures(result, base, hold, hold_s)
             health = collector_health(host, since=t0)
@@ -1183,17 +1384,23 @@ def cmd_load_test(host, args):
             if result.get('first_breach'):
                 result['collector']['breach'] = result['first_breach']
             post_state(host, result)
+        steps.run('finishing the result', finish)
+
+        def write():
             path = host.load_tests / ('%s-%s.json' % (result['utc_start'].replace(':', '').replace('+0000', 'Z'),
                                                       re.sub(r'[^A-Za-z0-9.-]', '-', model)))
-            write_json(path, result); say('result: %s' % path)
-        except Exception as e:
-            written = False; result['alerts'].append('RESULT NOT WRITTEN: %s: %s' % (type(e).__name__, e))
-        say('LOAD TEST %s: %s; baseline %s; after load %s; setup cost %s points; fall %s points; highest pressure %s; swap change %s; '
-            'collector %s; unload proven %s; %s' % (
-                model, result['refused'] or result['error'] or result['stopped'] or 'held to its end', result['baseline'],
-                result['after_load'], result['setup_cost_points'], result['fall_points'], result['highest_pressure_level'],
-                result['swap_change_bytes'], result.get('collector'), result['unload'].get('proven'),
-                '; '.join(result['alerts']) or 'no alerts'))
+            write_json(path, result); say('result: %s' % path); return True
+        written = steps.run('the result write (RESULT NOT WRITTEN)', write) is True
+
+        def summary():
+            say('LOAD TEST %s: %s; baseline %s; after load %s; setup cost %s points; fall %s points; highest pressure %s; '
+                'swap change %s; collector %s; unload proven %s; %s' % (
+                    model, result['refused'] or result['error'] or result['stopped'] or 'held to its end', result.get('baseline'),
+                    result.get('after_load'), result.get('setup_cost_points'), result.get('fall_points'),
+                    result.get('highest_pressure_level'), result.get('swap_change_bytes'), result.get('collector'),
+                    result['unload'].get('proven'), '; '.join(result['alerts']) or 'no alerts'))
+        steps.run('the summary', summary)
+        steps.reraise()
     if not restored or not written:
         return 3
     if result['refused']:
@@ -1223,7 +1430,10 @@ def cmd_check(host, args):
 
 
 def cmd_record(host, args):
-    rows = read_rows(host.record)
+    rows, damaged = read_rows(host.record)
+    if damaged:
+        host.out('%d damaged line%s in %s skipped: never counted as a run, never a reset' % (
+            damaged, '' if damaged == 1 else 's', host.record))
     for r in rows:
         host.out('%s %s %s %s: %s; verdicts %s; counts %s' % (
             r.get('utc_start'), r.get('command'), r.get('profile'), plan_label(r.get('plan')),
