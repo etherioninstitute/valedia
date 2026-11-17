@@ -2165,6 +2165,7 @@ def test_phase_2_prints_a_counter_only_never_a_position(tmp_path, monkeypatch):
     finished = [int(m.split()[2]) for m in counters]
     assert finished[0] == 5 and all(b > a for a, b in zip(finished, finished[1:]))
     assert sum(m.startswith("phase 2: ") and "price windows finished" in m for m in said) == len(counters)
+    assert all(m.startswith(("phase 2: ", "phase 2 ended: ")) for m in said), [m for m in said if "phase 2" not in m]
 
 
 def test_a_failed_price_window_is_named_by_its_number_only(tmp_path, monkeypatch):
@@ -2248,3 +2249,16 @@ def test_the_end_of_walk_numbering_is_done_in_bounded_chunks(tmp_path, monkeypat
     db = real(str(store))
     assert db.execute("SELECT MIN(seq), MAX(seq), COUNT(*) FROM trades").fetchone() == (0, 49, 50)
     db.close()
+    monkeypatch.setattr(cl, "RENUMBER_CHUNK", 2)       # price windows (at most 4 points here): 2 points a statement
+    again = tmp_path / "again0.sqlite"
+    c0 = _paged_client(PagedWorld(_small_world(0), 0))
+    cl.pull(again, c0, phase=1, say=lambda m: None)
+    statements.clear()
+    cl.pull(again, c0, phase=2, say=lambda m: None)
+    assert _tables(again) == _tables(tmp_path / "old0.sqlite")
+    db = real(str(again))
+    rows = [r for (r,) in db.execute("SELECT rows FROM walks WHERE kind='prices' AND status='finished'")]
+    db.close()
+    assert max(rows) >= 3
+    assert len([st for st in statements if st.startswith("UPDATE price_points SET seq")]) == sum(r // 2 + 1
+                                                                                               for r in rows)
