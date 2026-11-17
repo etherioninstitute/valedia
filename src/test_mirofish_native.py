@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 
 from mirofish_native_gateway import Gateway, Limits, NativeRefused, encoded
 from mirofish_native_run import OwnedGroup, PYTHON, worker_policy, verify_launch, graph_environment, strict_probe_success
@@ -519,7 +520,7 @@ class FixedHostChildrenTests(unittest.TestCase):
 class HostResourceCapsuleTests(unittest.TestCase):
     def sample(self):
         from mirofish_native_startup import FIELDS,EXPECTED_PS_SHA
-        value={'schema':1,'outcome':'VALEDIA-MIROFISH-FRESH-1','nonce':'b'*32,'host_pid':123,'host_started':'fixed own host start','source_sha256':'c'*64,'sequence':1,'monotonic':100.0,'utc':'2026-11-07T00:00:00+00:00','free_percent':80,'all_process_rss_bytes':34*1024**3,'rss_rows':1000,'rss_positive_rows':1000,'ps_sha256':EXPECTED_PS_SHA,'ps_mode':0o4755,'host_deadline':200.0,'owned_scope_rss_bytes':4*1024**3,'scope_rows':100,'excluded_rows':900,'baseline_source_sha256':'a'*64,'scope_roots_sha256':'b'*64,'tracked_identities_sha256':'c'*64};value['prompt_cache_route']={'source':'/Users/burtonchatelain/.lmstudio/.internal/prompt-cache','target':'/Volumes/NIMROD_SSD/Qwen-Weight-Space/cache/bionic/prompt-cache','device':16777246,'ssd_device':16777246,'source_symlink':True,'target_directory':True};assert set(value)==FIELDS;return value
+        value={'schema':1,'outcome':'VALEDIA-MIROFISH-FRESH-1','nonce':'b'*32,'host_pid':123,'host_started':'fixed own host start','source_sha256':'c'*64,'sequence':1,'monotonic':100.0,'utc':'2026-11-07T00:00:00+00:00','free_percent':80,'all_process_rss_bytes':34*1024**3,'rss_rows':1000,'rss_positive_rows':1000,'ps_sha256':EXPECTED_PS_SHA,'ps_mode':0o4755,'host_deadline':200.0,'owned_scope_rss_bytes':4*1024**3,'scope_rows':100,'excluded_rows':900,'baseline_source_sha256':'a'*64,'scope_roots_sha256':'b'*64,'tracked_identities_sha256':'c'*64,'pressure_level':1,'swap_used_bytes':0,'co_resident_rss_bytes':0,'co_resident_rows':0};value['prompt_cache_route']={'source':'/Users/burtonchatelain/.lmstudio/.internal/prompt-cache','target':'/Volumes/NIMROD_SSD/Qwen-Weight-Space/cache/bionic/prompt-cache','device':16777246,'ssd_device':16777246,'source_symlink':True,'target_directory':True};assert set(value)==FIELDS;return value
     def test_strict_fresh_signed_host_binding_and_rejections(self):
         import hashlib,hmac
         from datetime import datetime,timezone
@@ -591,7 +592,7 @@ class ResourceObservabilityTests(unittest.TestCase):
         import mirofish_native_startup as startup
         import mirofish_native_run as native
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
-            root=Path(tmp);sample=HostResourceCapsuleTests().sample();sample.update(free_percent=29,monotonic=time.monotonic(),utc=datetime.now(timezone.utc).isoformat(),host_deadline=time.monotonic()+20,source_sha256=startup.digest(startup.__file__))
+            root=Path(tmp);sample=HostResourceCapsuleTests().sample();sample.update(pressure_level=4,monotonic=time.monotonic(),utc=datetime.now(timezone.utc).isoformat(),host_deadline=time.monotonic()+20,source_sha256=startup.digest(startup.__file__))
             key='k'*64;envelope={'sample':sample,'mac':hmac.new(key.encode(),encoded(sample),hashlib.sha256).hexdigest()}
             history=startup.ResourceHistory(root)
             try:history.publish(envelope)
@@ -603,13 +604,18 @@ class ResourceObservabilityTests(unittest.TestCase):
                 def cancel(inner):
                     self.assertTrue(aborted.is_set())
                     actual=decode(target.read_bytes())['resource_failure_samples'][0]['sample']
-                    self.assertEqual(actual,sample);self.assertEqual(actual['free_percent'],29)
+                    self.assertEqual(actual,sample);self.assertEqual(actual['pressure_level'],4)
                     observed.append('cancel-after-durable-measurement')
             env={'MIROFISH_RESOURCE_CAPSULE':str(root/'sample.json'),'MIROFISH_RESOURCE_KEY':key,'MIROFISH_RESOURCE_NONCE':sample['nonce'],'MIROFISH_RESOURCE_HOST':json.dumps({'pid':sample['host_pid'],'started':sample['host_started']})}
             startup._LAST.clear()
+            # TMF5 (d): one level-4 sample stops at once; the exact signed measurement is durable before the cancel.
             with patch.dict(os.environ,env):
-                self.assertFalse(native.monitor_resource_once(receipt,target,aborted,Gateway(),errors))
-            self.assertEqual(observed,['cancel-after-durable-measurement']);self.assertEqual(errors,['NativeRefused:memory free threshold'])
+                self.assertFalse(native.monitor_resource_once(receipt,target,aborted,Gateway(),errors,native.ResourceRule(time.monotonic()-1),threading.Lock()))
+            self.assertEqual(observed,['cancel-after-durable-measurement']);self.assertEqual(errors,['NativeRefused:kernel memory pressure critical (level 4)'])
+            # The other side: one sample at 29% free (the old single-sample stop) no longer stops the running phase.
+            low=dict(sample,pressure_level=1,free_percent=29,sequence=2);atomic(root/'sample.json',{'sample':low,'mac':hmac.new(key.encode(),encoded(low),hashlib.sha256).hexdigest()})
+            with patch.dict(os.environ,env):
+                self.assertTrue(native.monitor_resource_once({},root/'receipt-2.json',threading.Event(),None,[],native.ResourceRule(time.monotonic()-1),threading.Lock()))
             stale=dict(sample);stale['monotonic']=time.monotonic()-4
             bad={'sample':stale,'mac':hmac.new(key.encode(),encoded(stale),hashlib.sha256).hexdigest()};atomic(root/'sample.json',bad)
             with patch.dict(os.environ,env),self.assertRaises(NativeRefused):native.resource_sample(False)
@@ -693,6 +699,352 @@ class NativeBoundaries(unittest.TestCase):
                 self.assertEqual(readonly.read_text(), "source sentinel")
                 self.assertEqual((producer / "backend/uploads/positive.txt").read_text(), "owned write allowed")
             finally: listener.close()
+
+
+# ---- TMF5 addendum 1 (2026-11-17): MiroFish beside the live collector ------------------------------------------------------
+RECORDED = Path("/Volumes/NIMROD_SSD/Qwen-Weight-Space/project/work/sol-foreman-qwen")
+CO_GIB = int(9.84 * 1024**3)
+MADE_UP_KEY = "made-up-test-key-TMF5-0000000000000000"   # a made-up key: no real key is ever in a fixture
+
+
+def recorded_series(run):
+    paths = sorted((RECORDED / ("valedia-native-20261115-" + run) / "host-resource").glob("*/samples.jsonl"))
+    if len(paths) != 1:
+        raise unittest.SkipTest("recorded run not present: " + run)
+    return [json.loads(line)["sample"] for line in paths[0].read_bytes().splitlines() if line]
+
+
+def reading(stamp, free=80, level=1, sequence=None, owned=4 * 1024**3, co_rows=0, co_bytes=0):
+    return {"monotonic": stamp, "free_percent": free, "pressure_level": level, "sequence": sequence if sequence is not None else int(stamp * 10),
+            "owned_scope_rss_bytes": owned, "co_resident_rows": co_rows, "co_resident_rss_bytes": co_bytes}
+
+
+def feed(rule, samples):
+    for sample in samples:
+        reason = rule.observe(sample) or rule.gap(sample["monotonic"])
+        if reason:
+            return reason, sample["monotonic"]
+    return None, None
+
+
+class TMF5StopRuleTests(unittest.TestCase):
+    """(d): stop on level 4 once, level >= 2 for 10 s, free < 30 for 10 s, or no fresh valid reading for 3 s."""
+    def series(self, seconds, value, start=1000.0, step=0.4, **kw):
+        return [reading(start + i * step, **dict(kw, **value(i * step))) for i in range(int(seconds / step) + 1)]
+    def test_d_recorded_series_none_stops_and_lowest_ten_second_levels(self):
+        from mirofish_native_run import ResourceRule
+        for run, lowest in [("swarm8-b2q8-b", 37), ("swarm8-b2q8-c", 38), ("swarm8-b2q8-d", 69), ("swarm48-b2q8-a", 68)]:
+            with self.subTest(run=run):
+                rows = recorded_series(run)
+                # The recorded runs predate the pressure-level field: each is given level 1 (normal), stated here.
+                samples = [reading(r["monotonic"], free=r["free_percent"], sequence=r["sequence"], owned=r["owned_scope_rss_bytes"]) for r in rows]
+                rule = ResourceRule(samples[0]["monotonic"])
+                self.assertEqual(feed(rule, samples), (None, None))
+                self.assertEqual(rule.summary()["lowest_sustained_free_percent_10s"], lowest)
+                self.assertEqual(rule.summary()["max_pressure_level"], 1)
+    def test_d_synthetic_series_both_ways(self):
+        from mirofish_native_run import ResourceRule
+        dip = self.series(30, lambda t: {"free": 27 if 5 <= t < 11.1 else 80})       # a 6.1 s dip to 27
+        self.assertEqual(feed(ResourceRule(1000.0), dip), (None, None))
+        low = self.series(30, lambda t: {"free": 27 if 5 <= t < 15.5 else 80})       # 10.5 s below 30
+        reason, when = feed(ResourceRule(1000.0), low)
+        self.assertEqual(reason, "memory free below 30 for 10 s"); self.assertTrue(1015.0 <= when <= 1015.7, when)   # low from 1005.2
+        spike = self.series(30, lambda t: {"level": 4 if abs(t - 7.2) < 1e-9 else 1})  # one level-4 sample
+        self.assertEqual(feed(ResourceRule(1000.0), spike)[0], "kernel memory pressure critical (level 4)")
+        warn = self.series(30, lambda t: {"level": 2 if 5 <= t < 15.5 else 1})       # 10.5 s at level 2
+        self.assertEqual(feed(ResourceRule(1000.0), warn)[0], "kernel memory pressure warning or worse for 10 s")
+        short = self.series(30, lambda t: {"level": 2 if 5 <= t < 11.1 else 1})      # 6.1 s at level 2 does not stop
+        self.assertEqual(feed(ResourceRule(1000.0), short), (None, None))
+        rule = ResourceRule(1000.0); self.assertEqual(feed(rule, self.series(5, lambda t: {})), (None, None))
+        last = rule.last_valid; self.assertIsNone(rule.gap(last + 2.9)); self.assertEqual(rule.gap(last + 3.5), "no fresh valid resource reading for 3 s")
+        rule = ResourceRule(1000.0); self.assertEqual(rule.gap(1003.5), "no fresh valid resource reading for 3 s")   # never a reading at all
+    def test_d_invalid_level_is_not_a_reading_never_normal(self):
+        from mirofish_native_run import ResourceRule, valid_reading
+        self.assertTrue(valid_reading(reading(1.0, level=1))); self.assertTrue(valid_reading(reading(1.0, level=2))); self.assertTrue(valid_reading(reading(1.0, level=4)))
+        for bad in [True, False, "1", None, float("nan"), -1, 3, 0, 1.0]:
+            with self.subTest(level=bad):
+                self.assertFalse(valid_reading(reading(1.0, level=bad)))
+                rule = ResourceRule(1000.0)
+                samples = [reading(1000.0 + i * 0.4, level=bad) for i in range(10)]   # 3.6 s of samples, none valid
+                for sample in samples: self.assertIsNone(rule.observe(sample))
+                self.assertEqual(rule.gap(samples[-1]["monotonic"]), "no fresh valid resource reading for 3 s")
+                self.assertIsNone(rule.summary()["max_pressure_level"])
+        for field, bad in [("free_percent", None), ("free_percent", "80"), ("free_percent", 101), ("monotonic", float("nan")), ("monotonic", None)]:
+            with self.subTest(field=field):
+                sample = reading(1.0); sample[field] = bad; self.assertFalse(valid_reading(sample))
+        self.assertFalse(valid_reading(None))
+    def test_d_repeated_capsule_is_not_fresh_and_the_start_check_stays_one_reading(self):
+        from mirofish_native_run import ResourceRule, START_FREE_PERCENT, STOP_FREE_PERCENT
+        rule = ResourceRule(1000.0); sample = reading(1000.4)
+        for _ in range(20): self.assertIsNone(rule.observe(sample))    # the same capsule read again and again
+        self.assertEqual(rule.gap(1003.5), "no fresh valid resource reading for 3 s")
+        self.assertEqual((START_FREE_PERCENT, STOP_FREE_PERCENT), (65, 30))   # staging sets the start from the table (74 now)
+        import inspect, mirofish_native_run as native
+        source = inspect.getsource(native.resource_sample)
+        self.assertIn("sample['free_percent']<START_FREE_PERCENT", source)
+        self.assertNotIn("(65 if pre else 30)", inspect.getsource(native))
+    def test_d_receipt_resource_fields_for_the_operator_command(self):
+        from mirofish_native_run import ResourceRule
+        rule = ResourceRule(1000.0)
+        feed(rule, self.series(12, lambda t: {"free": 60 if t < 6 else 50, "level": 2 if t > 11 else 1, "co_rows": 1, "co_bytes": CO_GIB}))
+        self.assertEqual(rule.summary(), {"lowest_sustained_free_percent_10s": 60, "max_pressure_level": 2, "co_resident_rss_bytes_max": CO_GIB})
+        import inspect, mirofish_native_run as native
+        source = inspect.getsource(native.execute)
+        self.assertEqual(source.count("receipt['resource']=rule.summary()"), 2)
+        for phase in ["'preparation'", "'the simulation'", "'the report'"]:
+            self.assertIn("require_clean_gateway(gateway," + phase + ")", source)
+
+
+class TMF5CoResidentTests(unittest.TestCase):
+    """(b): the co-resident leaves the owned scope by identity: llama-server with a --model that resolves to the declared file."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT); self.root = Path(os.path.realpath(self.temp.name))
+        self.model = self.root / "models/debackerl/elephant-1.Q8_0.gguf"; self.model.parent.mkdir(parents=True); self.model.write_bytes(b"GGUF")
+    def tearDown(self): self.temp.cleanup()
+    def test_b_declared_file_is_the_decision_model_file(self):
+        import ast as syntax, mirofish_native_startup as startup
+        source = Path(__file__).absolute().parents[1] / "valedia_trader/core/decision_model.py"
+        values = [node.value.value for node in syntax.parse(source.read_text()).body if isinstance(node, syntax.Assign) and [getattr(t, "id", None) for t in node.targets] == ["FILE"]]
+        self.assertEqual(values, [startup.CO_RESIDENT_FILE])
+        self.assertEqual(startup.CO_RESIDENT_FILE, "~/.lmstudio/models/debackerl/elephant-1-Q8_0-GGUF/elephant-1.Q8_0.gguf")
+        with unittest.mock.patch.dict(os.environ, {"HOME": str(self.root)}):
+            self.assertEqual(startup.declared_co_resident("~/models/debackerl/elephant-1.Q8_0.gguf"), str(self.model))
+        with self.assertRaises(NativeRefused): startup.declared_co_resident("relative/elephant-1.Q8_0.gguf")
+    def test_b_path_cases_judged_by_resolved_equality_only(self):
+        import mirofish_native_startup as startup
+        declared = startup.declared_co_resident(str(self.model)); elsewhere = self.root / "other"; elsewhere.mkdir()
+        (elsewhere / "elephant-1.Q8_0.gguf").write_bytes(b"GGUF"); (self.root / "models/debackerl/elephant-1.Q8_0.gguf.part").write_bytes(b"x")
+        (self.root / "link").symlink_to(self.root / "models"); (self.root / "wrong-link").symlink_to(elsewhere)
+        mirror = Path(str(self.root) + "/mirror" + str(self.model)); mirror.parent.mkdir(parents=True); mirror.write_bytes(b"GGUF")
+        cases = {
+            "exact": (str(self.model), True),
+            "symlinked folder to the same file": (str(self.root / "link/debackerl/elephant-1.Q8_0.gguf"), True),
+            "dot segments to the same file": (str(self.root / "models/debackerl/../debackerl/elephant-1.Q8_0.gguf"), True),
+            "only starts with the declared file": (str(self.model) + ".part", False),
+            "the declared file's folder (a prefix)": (str(self.model.parent), False),
+            "contains the declared file": (str(mirror), False),
+            "differs by case": (str(self.model.parent / "ELEPHANT-1.Q8_0.GGUF"), False),
+            "trailing slash": (str(self.model) + "/", False),
+            "symlinked folder to another file of the same name": (str(self.root / "wrong-link/elephant-1.Q8_0.gguf"), False),
+            "relative path": ("models/debackerl/elephant-1.Q8_0.gguf", False),
+        }
+        for name, (value, expected) in cases.items():
+            with self.subTest(case=name):
+                argv = ["/x/.lmstudio/bin/llama-server", "--port", "5555", "--model", value, "--api-key", MADE_UP_KEY]
+                resolved = startup.resolved_model(1, arguments=lambda pid, argv=argv: argv)
+                self.assertEqual(resolved == declared, expected)
+                self.assertNotIn(MADE_UP_KEY, str(resolved))
+                row = {"pid": 1, "start": "s", "comm": "/Users/x/.lmstudio/extensions/backends/b/llama-server"}
+                self.assertEqual(bool(startup.co_resident_identities([row], declared, resolve=lambda pid, value=resolved: value)), expected)
+        self.assertEqual(startup.model_argument(["llama-server", "--model=" + str(self.model)]), str(self.model))
+        self.assertIsNone(startup.model_argument(["llama-server", "--model", "a", "--model", "b"]))   # ambiguous: not the co-resident
+        self.assertIsNone(startup.model_argument(["llama-server", "--model"])); self.assertIsNone(startup.model_argument(None))
+        for comm in ["/Users/x/.lmstudio/bin/llama-server-other", "/usr/local/bin/llama-server", "/Users/x/.lmstudio/bin/python", "llama-server"]:
+            with self.subTest(comm=comm):
+                self.assertEqual(startup.co_resident_identities([{"pid": 1, "start": "s", "comm": comm}], declared, resolve=lambda pid: declared), frozenset())
+    def scope_and_rows(self, owned, co_pid, other=None):
+        from mirofish_native_startup import OwnedResourceScope
+        def row(pid, ppid, start, rss, comm): return {"pid": pid, "ppid": ppid, "pgid": pid, "start": start, "rss": rss, "comm": comm}
+        app = "/Applications/LM Studio.app/Contents/MacOS/LM Studio"; server = "/Users/x/.lmstudio/extensions/backends/b/llama-server"
+        baseline = [row(1, 0, "boot", 100, "/sbin/launchd"), row(10, 1, "app", 1, app), row(47343, 10, "elephant", CO_GIB, server)]
+        scope = OwnedResourceScope(baseline, {10})
+        rows = [row(1, 0, "boot", 100, "/sbin/launchd"), row(10, 1, "app", owned, app)]
+        if co_pid is not None: rows.append(row(co_pid, 10, "elephant-%d" % co_pid, CO_GIB, server))
+        return scope, rows
+    def test_b_recorded_runs_with_the_co_resident_added_both_ways(self):
+        import mirofish_native_startup as startup
+        from mirofish_native_run import ResourceRule, OWNED_RSS_BOUND
+        declared = str(self.model); other = str(self.root / "other.gguf")
+        for run in ["swarm8-b2q8-d", "swarm48-b2q8-a"]:
+            with self.subTest(run=run):
+                recorded = recorded_series(run); peak = max(r["owned_scope_rss_bytes"] for r in recorded)
+                kept, counted = ResourceRule(recorded[0]["monotonic"]), ResourceRule(recorded[0]["monotonic"]); trip = None
+                for i, r in enumerate(recorded):
+                    pid = None if i % 500 == 250 else 47343 + (i // 1000)    # it comes and goes, and returns under a new pid
+                    scope, rows = self.scope_and_rows(r["owned_scope_rss_bytes"], pid)
+                    co = startup.co_resident_identities(rows, declared, resolve=lambda p: declared)
+                    m = scope.measure(rows, co)
+                    self.assertEqual(m["owned_scope_rss_bytes"], r["owned_scope_rss_bytes"]); self.assertLess(m["owned_scope_rss_bytes"], OWNED_RSS_BOUND)
+                    self.assertEqual((m["co_resident_rows"], m["co_resident_rss_bytes"]), (0, 0) if pid is None else (1, CO_GIB))
+                    self.assertIsNone(kept.observe(reading(r["monotonic"], free=r["free_percent"], sequence=r["sequence"], owned=m["owned_scope_rss_bytes"], co_rows=m["co_resident_rows"], co_bytes=m["co_resident_rss_bytes"])))
+                    # The same 9.84 GiB as a llama-server serving ANOTHER file still counts.
+                    n = scope.measure(rows, startup.co_resident_identities(rows, declared, resolve=lambda p: other))
+                    self.assertEqual(n["owned_scope_rss_bytes"], r["owned_scope_rss_bytes"] + (0 if pid is None else CO_GIB)); self.assertEqual(n["co_resident_rows"], 0)
+                    trip = trip or counted.observe(reading(r["monotonic"], free=r["free_percent"], sequence=r["sequence"], owned=n["owned_scope_rss_bytes"]))
+                self.assertGreater(peak + CO_GIB, OWNED_RSS_BOUND)
+                self.assertEqual(trip, "conservative owned-model RSS upper bound exceeded")
+                self.assertEqual(kept.summary()["co_resident_rss_bytes_max"], CO_GIB)
+        synthetic = [reading(1000 + i * .4, owned=31 * 1024**3 + CO_GIB) for i in range(5)]
+        self.assertEqual(feed(ResourceRule(1000.0), synthetic)[0], "conservative owned-model RSS upper bound exceeded")
+        self.assertEqual(feed(ResourceRule(1000.0), [dict(s, owned_scope_rss_bytes=31 * 1024**3, co_resident_rows=1, co_resident_rss_bytes=CO_GIB) for s in synthetic]), (None, None))
+    def test_b_two_processes_serving_the_file_stop_the_run(self):
+        import mirofish_native_startup as startup
+        from mirofish_native_run import ResourceRule, TWO_CO_RESIDENTS
+        scope, rows = self.scope_and_rows(4 * 1024**3, 47343)
+        rows.append(dict(rows[-1], pid=50000, start="second"))
+        m = scope.measure(rows, startup.co_resident_identities(rows, str(self.model), resolve=lambda p: str(self.model)))
+        self.assertEqual((m["co_resident_rows"], m["co_resident_rss_bytes"], m["owned_scope_rss_bytes"]), (2, 2 * CO_GIB, 4 * 1024**3))
+        self.assertEqual(TWO_CO_RESIDENTS, "two processes serve the co-resident's file")
+        self.assertEqual(ResourceRule(1000.0).observe(reading(1000.4, co_rows=2, co_bytes=2 * CO_GIB)), TWO_CO_RESIDENTS)
+        self.assertIsNone(ResourceRule(1000.0).observe(reading(1000.4, co_rows=1, co_bytes=CO_GIB)))
+        self.assertIsNone(ResourceRule(1000.0).observe(reading(1000.4, co_rows=0, co_bytes=0)))   # absence is recorded, never an error
+    def test_b_capsule_shape_of_the_new_fields(self):
+        import hashlib, hmac
+        from datetime import datetime, timezone
+        from mirofish_native_startup import validate_capsule, _LAST
+        key = "k" * 64; host = {"pid": 123, "started": "fixed own host start"}; utc = datetime(2026, 11, 7, tzinfo=timezone.utc)
+        def envelope(sample): return {"sample": sample, "mac": hmac.new(key.encode(), encoded(sample), hashlib.sha256).hexdigest()}
+        good = HostResourceCapsuleTests().sample()
+        for field, value in [("co_resident_rows", 1), ("swap_used_bytes", None), ("pressure_level", None), ("pressure_level", 3)]:
+            with self.subTest(field=field, value=value):
+                _LAST.clear(); sample = dict(good, **{field: value})
+                if field == "co_resident_rows": sample["co_resident_rss_bytes"] = CO_GIB
+                validate_capsule(envelope(sample), key, "b" * 32, host, "c" * 64, now=100, utc=utc)   # the level is judged by the rule
+        for field, value in [("co_resident_rows", -1), ("co_resident_rss_bytes", 5), ("co_resident_rows", True), ("swap_used_bytes", -1), ("swap_used_bytes", "0")]:
+            with self.subTest(field=field, value=value), self.assertRaises(NativeRefused):
+                _LAST.clear(); validate_capsule(envelope(dict(good, **{field: value})), key, "b" * 32, host, "c" * 64, now=100, utc=utc)
+    def test_b_secret_hygiene_fake_run_writes_no_argument_text(self):
+        """Two live processes of this test carry --model and a made-up --api-key; ps rows are relabelled as llama-server so the real
+        argument reader runs on them. No file the fake run writes contains '--api-key' or the key."""
+        import mirofish_native_startup as startup, mirofish_native_run as native
+        from unittest.mock import patch
+        command = [sys.executable, "-B", "-c", "import time;time.sleep(60)", "--model", str(self.model), "--api-key", MADE_UP_KEY]
+        children = [subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for _ in range(2)]
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not all(startup.model_argument(startup._process_arguments(c.pid)) == str(self.model) for c in children): time.sleep(.05)
+            self.assertTrue(MADE_UP_KEY in (startup._process_arguments(children[0].pid) or []))   # the key really is there to leak
+            label = "/Users/test/.lmstudio/extensions/backends/fake/llama-server"; live = {children[0].pid}; real = startup.process_rows
+            def rows(): return [dict(r, comm=label) if r["pid"] in live else r for r in real()]
+            work = self.root / "fake-run"; (work / "builder").mkdir(parents=True); hostdir = work / "host-resource"; hostdir.mkdir()
+            started = subprocess.run(["/bin/ps", "-p", str(os.getpid()), "-o", "lstart="], capture_output=True, text=True, check=True).stdout.strip()
+            host = {"pid": os.getpid(), "started": started}; key = "e" * 64; declared = startup.declared_co_resident(str(self.model))
+            receipt = {}; history = startup.ResourceHistory(hostdir); rule = native.ResourceRule(time.monotonic() - 1)
+            try:
+                # The SSD keeps the device number it was given at its last mount (staging writes the live one the same way).
+                with patch.object(startup, "process_rows", rows), patch.object(startup, "CACHE_DEVICE", startup.CACHE_TARGET.stat().st_dev):
+                    baseline = startup.process_rows(); scope = startup.OwnedResourceScope(baseline, set())
+                    startup.atomic(hostdir / "baseline.json", {"rows": baseline, "co_resident_file": startup.CO_RESIDENT_FILE})
+                    startup.write_observer_identity(work, {"pid": children[1].pid, "start": "Mon Nov 16 10:00:00 2026", "pgid": children[1].pid})
+                    for sequence, which in [(1, {children[0].pid}), (2, {children[0].pid, children[1].pid})]:
+                        live.clear(); live.update(which)
+                        sample = startup.sample_host("f" * 32, host, sequence, time.monotonic() + 60, scope, declared)
+                        history.publish({"sample": sample, "mac": "0" * 64})
+                        self.assertEqual(sample["co_resident_rows"], len(which)); self.assertGreater(sample["co_resident_rss_bytes"], 0)
+                        self.assertIn(sample["pressure_level"], (1, 2, 4)); self.assertIsInstance(sample["swap_used_bytes"], int)
+                        reason = rule.observe(sample)
+                        if reason:
+                            failure = NativeRefused(reason); failure.resource_sample = sample
+                            native.record_resource_failure(receipt, work / "builder/native-run-receipt.json", failure)
+                    self.assertEqual(reason, native.TWO_CO_RESIDENTS)
+                    receipt["resource"] = rule.summary(); startup.atomic(work / "builder/native-run-receipt.json", receipt)
+            finally:
+                history.close()
+            written = [p for p in work.rglob("*") if p.is_file()]
+            self.assertGreaterEqual(len(written), 5)
+            for path in written:
+                raw = path.read_bytes()
+                self.assertFalse(b"--api-key" in raw, path.name); self.assertFalse(MADE_UP_KEY.encode() in raw, path.name)
+            identity = json.loads((work / "builder/observer-identity.json").read_text())
+            self.assertEqual(set(identity), {"pid", "start", "pgid", "written_utc"})
+        finally:
+            for child in children: child.kill(); child.wait(5)
+    def test_operator_observer_identity_written_right_after_spawn(self):
+        import inspect, mirofish_native_startup as startup
+        work = self.root / "w"; (work / "builder").mkdir(parents=True)
+        value = startup.write_observer_identity(work, {"pid": 4242, "start": "Mon Nov 16 10:00:00 2026", "pgid": 4242})
+        self.assertEqual(json.loads((work / "builder/observer-identity.json").read_text()), value)
+        self.assertEqual((value["pid"], value["pgid"], value["start"]), (4242, 4242, "Mon Nov 16 10:00:00 2026"))
+        for bad in [{"pid": "1", "start": "s", "pgid": 1}, {"pid": 1, "start": "", "pgid": 1}, {"pid": 1, "start": "s"}, None]:
+            with self.subTest(bad=bad), self.assertRaises(NativeRefused): startup.write_observer_identity(work, bad)
+        source = inspect.getsource(startup.launch)
+        spawn, identity, after = source.index("subprocess.Popen(command"), source.index("write_observer_identity(work,group.owner)"), source.index("children.after_observer_spawn()")
+        self.assertLess(spawn, identity); self.assertLess(identity, after)
+        self.assertEqual(source[spawn:identity].count("\n"), 3)   # the Popen line, two comment lines, then the identity
+
+
+class TMF5QueryCutTests(unittest.TestCase):
+    """(c): a search query over the text limit is cut at a character boundary, recorded, and served; a refusal fails the run."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT); self.root = Path(self.temp.name); self.secret = "a" * 64
+    def tearDown(self): self.temp.cleanup()
+    def query(self):
+        text = ("Was ist die Wirkung von Zöllen auf Halbleiter — 半導体の関税 — and the shipping lanes? " * 60)
+        raw = text.encode()[:4328]; text = raw.decode("utf-8", "ignore")
+        while len(text.encode()) < 4328: text += "x"
+        self.assertEqual(len(text.encode()), 4328); return text
+    def gateway(self, dispatch=None):
+        admit = lambda kind, body, timeout: {"verified": True, "model": body["model"], "tokens": 10, "proof": "offline-test-only"}
+        vector = lambda *args: (200, encoded({"data": [{"index": 0, "embedding": [0.5] * 768}]}))
+        return Gateway(Limits("owned-test-model"), self.secret, self.root / (str(time.time_ns()) + ".json"), admit, dispatch=dispatch or vector, calls_path=None)
+    def test_c_cut_at_a_character_boundary(self):
+        from mirofish_native_run import native_query_cut
+        text = self.query(); cut, original = native_query_cut(text, 1536)
+        self.assertEqual(original, 4328); self.assertLessEqual(len(cut.encode()), 1536); self.assertTrue(text.startswith(cut))
+        self.assertGreater(len(cut.encode()), 1536 - 4)
+        for size in range(1530, 1540):
+            wide = "é" * 400 + "漢" * 600; part, whole = native_query_cut(wide, size)
+            self.assertEqual(whole, len(wide.encode())); self.assertTrue(wide.startswith(part)); self.assertLessEqual(len(part.encode()), size); part.encode().decode()
+        self.assertEqual(native_query_cut("short query", 1536), ("short query", None))
+        self.assertEqual(native_query_cut("é" * 768, 1536), ("é" * 768, None))
+    def test_c_the_4328_byte_scenario_is_served_and_recorded_as_cut(self):
+        from mirofish_native_run import native_query_cut, require_clean_gateway
+        gateway = self.gateway(); cut, original = native_query_cut(self.query(), Limits("x").embedding_text_bytes)
+        gateway.handle("/v1/embeddings", {"model": "ym-research-embedding", "input": [cut]}, "Bearer " + self.secret, query_cut_from=original)
+        call = gateway.state["calls"][-1]
+        self.assertEqual((call["state"], call["query_truncated_from_bytes"]), ("complete", 4328))
+        require_clean_gateway(gateway, "the report")
+        with self.assertRaises(NativeRefused):   # uncut, the same query is refused by size, as in the recorded run
+            gateway.handle("/v1/embeddings", {"model": "ym-research-embedding", "input": [self.query()]}, "Bearer " + self.secret)
+        for bad in [1536, 100, "4328", True]:   # a cut record must be a real cut of one embedding text
+            with self.subTest(bad=bad), self.assertRaises(NativeRefused):
+                gateway.handle("/v1/embeddings", {"model": "ym-research-embedding", "input": [cut]}, "Bearer " + self.secret, query_cut_from=bad)
+        with self.assertRaises(NativeRefused):
+            gateway.handle("/v1/chat/completions", dict(model="owned-test-model", messages=[{"role": "user", "content": "q"}], max_tokens=8), "Bearer " + self.secret, query_cut_from=4328)
+    def http(self, gateway, body, cut=None):
+        from mirofish_native_gateway import make_server
+        server = make_server(gateway); thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01}); thread.start()
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10); raw = json.dumps(body).encode()
+            headers = {"Content-Type": "application/json", "Content-Length": str(len(raw)), "Authorization": "Bearer " + self.secret}
+            if cut is not None: headers["X-Native-Query-Cut-From"] = cut
+            connection.request("POST", "/v1/embeddings", raw, headers); response = connection.getresponse(); response.read(); connection.close()
+            return response.status
+        finally:
+            server.shutdown(); server.server_close(); thread.join(5)
+    def test_c_http_path_served_with_cut_record_and_forced_refusal_fails_the_run(self):
+        from mirofish_native_run import native_query_cut, require_clean_gateway
+        cut, original = native_query_cut(self.query(), 1536)
+        gateway = self.gateway(); self.assertEqual(self.http(gateway, {"model": "ym-research-embedding", "input": [cut]}, str(original)), 200)
+        self.assertEqual(gateway.state["calls"][-1]["query_truncated_from_bytes"], 4328); self.assertEqual(gateway.state["refusal_count"], 0)
+        require_clean_gateway(gateway, "the report")
+        def refuse(*args): raise NativeRefused("forced upstream refusal")
+        forced = self.gateway(dispatch=refuse); self.assertEqual(self.http(forced, {"model": "ym-research-embedding", "input": [cut]}, str(original)), 409)
+        self.assertEqual(forced.state["refusal_count"], 1); self.assertEqual(forced.state["refusals"][0]["route"], "/v1/embeddings")
+        with self.assertRaises(NativeRefused) as caught: require_clean_gateway(forced, "the report")
+        self.assertIn("during the report", str(caught.exception))
+        refused = self.gateway(); self.assertEqual(self.http(refused, {"model": "ym-research-embedding", "input": [cut]}, "12x"), 409)
+        self.assertEqual(refused.state["refusal_count"], 1); self.assertEqual(refused.state["calls"], [])   # refused before any reservation
+        with self.assertRaises(NativeRefused): require_clean_gateway(refused, "preparation")
+        cancelled = self.gateway(); cancelled.cancel()
+        with self.assertRaises(NativeRefused): require_clean_gateway(cancelled, "the simulation")
+    def test_c_and_fallback_producer_patches_apply_once_each_and_re_raise(self):
+        import ast as syntax
+        from mirofish_native_run import tmf5_producer_patches, native_query_cut, NATIVE_GUARD
+        backend = Path("/Volumes/NIMROD_SSD/Qwen-Weight-Space/project/work/sol-foreman-qwen/valedia-mirofish-fresh-20261106-caller-budget/owned-source/producer/backend")
+        if not backend.is_dir(): self.skipTest("reviewed producer copy not present")
+        texts = {}; rows = tmf5_producer_patches()
+        self.assertEqual([r[0].rsplit("/", 1)[1] for r in rows], ["simulation_config_generator.py"] * 3 + ["oasis_profile_generator.py"] + ["embedding_service.py"] * 4 + ["graph_tools.py"])
+        for relative, old, new in rows:
+            text = texts.get(relative) or (backend / relative).read_text()
+            self.assertEqual(text.count(old), 1, relative); texts[relative] = text.replace(old, new)
+        for relative, text in texts.items(): syntax.parse(text)
+        self.assertEqual(sum(t.count("raise RuntimeError('native-local: ") for t in texts.values()), 4)
+        self.assertEqual(sum(t.count("if " + NATIVE_GUARD) for t in texts.values()), 6)
+        namespace = {}; exec(compile(syntax.Module(body=[n for n in syntax.parse(texts["app/storage/embedding_service.py"]).body if isinstance(n, syntax.FunctionDef) and n.name == "_native_query_cut"], type_ignores=[]), "cut", "exec"), namespace)
+        for value in ["short", self.query(), "漢" * 1000]: self.assertEqual(namespace["_native_query_cut"](value, 1536), native_query_cut(value, 1536))
+        self.assertIn("raise\n            logger.warning(f\"Graph search failed, degrading to local search", texts["app/services/graph_tools.py"])
+        self.assertIn("'X-Native-Query-Cut-From': str(native_cut_from)", texts["app/storage/embedding_service.py"])
 
 
 if __name__ == "__main__": unittest.main()

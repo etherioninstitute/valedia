@@ -16,11 +16,11 @@ def setUpModule():
     """A scratch staged plan folder: the observer entry's three modules and selector, the helper the module generates, and a
     manifest that pins them and the members' tokenizer origins, as the staging tool writes them."""
     entry=WORK/'owned-source/observer-entry';entry.mkdir(parents=True);(WORK/'builder').mkdir()
-    for name in ('mirofish_native_model.py','mirofish_native_run.py','mirofish_native_gateway.py'):shutil.copy2(SRC/name,entry/name)
+    for name in ('mirofish_native_model.py','mirofish_native_run.py','mirofish_native_gateway.py','mirofish_native_startup.py'):shutil.copy2(SRC/name,entry/name)
     (entry/'mirofish_model_profile.json').write_bytes(b'{"plan": {"setup": "ternary-bonsai-2-27b", "turns": "qwen3-8b"}}\n')
     modules=Q.staged_modules(WORK)
     (WORK/'builder/sdk_native.mjs').write_text(modules.model.SDK_SCRIPT)
-    files=[{'path':str(p),'sha256':sha(p)} for p in [entry/'mirofish_native_model.py',entry/'mirofish_native_run.py',entry/'mirofish_native_gateway.py',entry/'mirofish_model_profile.json',WORK/'builder/sdk_native.mjs']]
+    files=[{'path':str(p),'sha256':sha(p)} for p in [entry/'mirofish_native_model.py',entry/'mirofish_native_run.py',entry/'mirofish_native_gateway.py',entry/'mirofish_native_startup.py',entry/'mirofish_model_profile.json',WORK/'builder/sdk_native.mjs']]
     by_profile={name:tokenizer_pins(modules.model.MODEL_PROFILES[name]['tokenizer_root']) for name in PLAN.values()}
     manifest={'files':files,'model_plan':PLAN,'model_tokenizer_by_profile':by_profile,'model_tokenizer':by_profile[PLAN['setup']],'launch_authorized':False}
     (WORK/'builder/candidate-manifest.json').write_text(json.dumps(manifest))
@@ -61,6 +61,19 @@ class FormatQualify(unittest.TestCase):
         self.out=Path(self.out_root.name)/('out-%d'%len(list(Path(self.out_root.name).iterdir())))   # a fresh output folder per run
         result=Q.qualify(WORK,self.out,profile,sdk_factory=factory,recorded=[])
         return result,made[0]
+    def test_TMF5_startup_is_the_fourth_module_imported_from_the_entry_and_pin_checked(self):
+        self.assertEqual(Q.ENTRY_MODULES[-1],'mirofish_native_startup.py');self.assertEqual(len(Q.ENTRY_MODULES),4)
+        entry=WORK/'owned-source/observer-entry'
+        self.assertEqual(Path(self.modules.startup.__file__).absolute().parent,entry.absolute())
+        self.assertIs(sys.modules['mirofish_native_startup'],self.modules.startup)   # what the run module's import by name finds
+        self.assertTrue(hasattr(self.modules.startup,'CO_RESIDENT_FILE'))
+        manifest=WORK/'builder/candidate-manifest.json';saved=manifest.read_text()
+        try:
+            changed=json.loads(saved);changed['files']=[row for row in changed['files'] if not row['path'].endswith('mirofish_native_startup.py')];manifest.write_text(json.dumps(changed))
+            with self.assertRaises(RuntimeError) as caught:Q.check_folder(WORK,self.modules,'qwen3-8b')
+            self.assertIn('mirofish_native_startup.py',str(caught.exception))
+        finally:manifest.write_text(saved)
+        Q.check_folder(WORK,self.modules,'qwen3-8b')
     def test_canned_bodies_are_the_kinds_the_brief_names_and_pass_the_gateway_checks(self):
         names=[name for name,_ in Q.canned_bodies('mf-native-'+'0'*32)]
         self.assertEqual(names,['plain_chat','system_and_user','assistant_tool_call_then_tool_result','assistant_empty_content','assistant_null_content_tool_call'])

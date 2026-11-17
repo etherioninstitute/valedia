@@ -135,17 +135,33 @@ class SwarmLimits(unittest.TestCase):
         try:self.assertIn('the chosen model needs no more real tokens than the 27B the window was measured on',L.violations(S.SWARM['swarm8'],model='qwen3-8b'))
         finally:L.MODELS['qwen3-8b']=original
     # ---- TMF4 (2026-11-15): two models by phase; addendum 1 rulings (c) and (d) -----------------------------------------------
-    def test_TMF4_start_threshold_is_ruling_c_for_every_model_named(self):
+    def test_TMF5_start_threshold_is_the_named_table_ruling_e(self):
         self.assertEqual(L.INSTALLED_MEMORY_BYTES,68719476736);self.assertEqual((L.STOP_FLOOR_PERCENT,L.REVIEWED_START_THRESHOLD),(30,65))
         self.assertEqual({m:L.kv_cache_bytes(m) for m in L.MODELS},{'qwen3.8-27b':2147483648,'ternary-bonsai-2-27b':2147483648,'qwen3-8b':4831838208})
-        # 30 + ceil(100 x (serving files + context cache at 32,768 in 16-bit floats + 4 GiB) / 64 GiB) + 5
-        self.assertEqual(L.start_threshold('qwen3-8b',5225374496),56)                                       # (5,225,374,496 + 4,831,838,208 + 4 GiB): 20.9% -> 21
-        self.assertEqual(L.start_threshold('ternary-bonsai-2-27b',8255255904),57)                           # weights + projector 8,255,255,904: 21.4% -> 22
-        self.assertEqual(L.start_threshold('qwen3.8-27b',18973870528),72)                                   # 37.0% -> 37; the default path keeps 65
-        self.assertEqual(L.plan_start_threshold({'ternary-bonsai-2-27b':8255255904,'qwen3-8b':5225374496}),57)   # the larger member's
-        self.assertEqual(L.plan_start_threshold({'qwen3.8-27b':18973870528,'ternary-bonsai-2-27b':8255255904}),72)
-        self.assertFalse(hasattr(L,'MODEL_HEADROOM_BYTES'))                                                  # TMF3's weights + 6 GiB rule is gone
+        # start = floor + margin + setup_cost + fall = 30 + 10 + 24 + 10, each named with its source (file and date)
+        self.assertEqual(tuple(L.START_TERMS),('floor','margin','setup_cost','fall'))
+        self.assertEqual({k:v['value'] for k,v in L.START_TERMS.items()},{'floor':30,'margin':10,'setup_cost':24,'fall':10})
+        for name,term in L.START_TERMS.items():
+            self.assertEqual(set(term),{'value','source'},name);self.assertRegex(term['source'],r'2026-11-1[67]',name)
+        self.assertEqual(L.start_terms()['total'],74);self.assertEqual(L.start_terms()['arithmetic'],'floor 30 + margin 10 + setup_cost 24 + fall 10 = 74')
+        for model,serving in [('qwen3-8b',5225374496),('ternary-bonsai-2-27b',8255255904),('qwen3.8-27b',18973870528)]:
+            self.assertEqual(L.start_threshold(model,serving),74)
+        self.assertEqual(L.plan_start_threshold({'ternary-bonsai-2-27b':8255255904,'qwen3-8b':5225374496}),74)
+        for gone in ['MODEL_HEADROOM_BYTES','GRAPH_AND_WORKERS_BYTES','START_MARGIN_POINTS']:self.assertFalse(hasattr(L,gone),gone)   # TMF3's and TMF4's rules are gone
+        import inspect;self.assertNotIn('1e-12',inspect.getsource(L.start_threshold)+inspect.getsource(L.start_terms))
         with self.assertRaises(ValueError):L.start_threshold('another',18973870528)
+    def test_TMF5_the_table_alone_moves_the_threshold_and_is_checked(self):
+        saved={k:dict(v) for k,v in L.START_TERMS.items()}
+        try:
+            L.START_TERMS['setup_cost']['value']=31;L.START_TERMS['fall']['value']=6
+            self.assertEqual(L.start_threshold('qwen3-8b'),77);self.assertEqual(L.plan_start_threshold({'qwen3-8b':1,'ternary-bonsai-2-27b':2}),77)
+            for key,field,bad in [('fall','value',-1),('fall','value',2.5),('margin','source',''),('floor','value',29),('setup_cost','value',61)]:
+                for k,v in saved.items():L.START_TERMS[k]=dict(v)
+                L.START_TERMS[key][field]=bad
+                with self.subTest(key=key,bad=bad),self.assertRaises(ValueError):L.start_threshold('qwen3-8b')
+        finally:
+            for k,v in saved.items():L.START_TERMS[k]=v
+        self.assertEqual(L.start_threshold('qwen3-8b'),74)
     def test_TMF4_context_cache_counts_are_each_models_own(self):
         root=Path('/Volumes/NIMROD_SSD/Qwen-Weight-Space/models')
         big=json.loads((root/'Qwen3.8-27B-MLX-4bit/config.json').read_text())['text_config']

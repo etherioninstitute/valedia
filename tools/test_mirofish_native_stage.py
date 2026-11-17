@@ -468,9 +468,9 @@ class ModelStaging(unittest.TestCase):
         src_lines={l for l in difflib.ndiff(w16.decode().splitlines(),src.decode().splitlines()) if l[:2] in ('- ','+ ')}
         plan={'setup':'ternary-bonsai-2-27b','turns':'qwen3-8b'}
         for name in s.SWARM:
-            for model,threshold in (('qwen3.8-27b',72),('qwen3-8b',56),('ternary-bonsai-2-27b',57),(plan,57)):   # TMF4 addendum 1, ruling (c)
+            for model,threshold in (('qwen3.8-27b',74),('qwen3-8b',74),('ternary-bonsai-2-27b',74),(plan,74)):   # TMF5 addendum 1, ruling (e): the table, for every model
                 n=s.swarm_numbers(name,model);changed=s.swarm_run_bytes(src,name,model,s.RUN_SRC_SHA,threshold).decode()
-                self.assertEqual(changed.count(f'({threshold} if pre else 30)'),1);self.assertEqual(changed.count('if pre else 30)'),1)
+                self.assertEqual(changed.count(f'START_FREE_PERCENT={threshold} '),1);self.assertEqual(changed.count('START_FREE_PERCENT='),1);self.assertNotIn('if pre else 30)',changed)
                 # TMF2's 11 and the threshold; a one-hour wall leaves the reviewed one-hour freshness cap as it is (a presence check)
                 self.assertEqual(sum(a!=b for a,b in zip(s.integer_literals(src),s.integer_literals(changed.encode()))),12-(n['wall']==3600),(name,str(model)))
                 for text in [f'time.monotonic() + {n["worker_deadline_s"]}',f'deadline=start+{n["wall"]};active=deadline-120',f"receipt['wall_seconds']<={n['wall']}",f'research_only=False,max_age_seconds={n["wall"]})',f'"max_rounds": {n["rounds"]},',
@@ -483,9 +483,9 @@ class ModelStaging(unittest.TestCase):
         moved=s.sdk_port_bytes((s.SRC/'mirofish_native_model.py').read_bytes(),59671,s.MODEL_SRC_SHA);self.assertIn(b'SDK_PORT = 59671',moved);self.assertNotIn(b'SDK_PORT = 62298',moved)
         with self.assertRaisesRegex(RuntimeError,'original source drift'):s.sdk_port_bytes((s.SRC/'mirofish_native_model.py').read_bytes(),59671)   # against the W16 pin
     def test_outcome5_start_threshold_per_model_and_the_unchanged_fragment_is_a_presence_check(self):
-        # TMF4 addendum 1, ruling (c): the formula for whatever is staged through the model path, the 27B included.
-        self.assertEqual(s.model_choice('qwen3-8b',self.base)['start_threshold'],56);self.assertEqual(s.model_choice('qwen3.8-27b',self.base)['start_threshold'],72)
-        self.assertEqual(s.model_choice('ternary-bonsai-2-27b',self.base)['start_threshold'],57)
+        # TMF5 addendum 1, ruling (e) (it replaces TMF4's per-model formula): the table's total for whatever is staged through the model path.
+        self.assertEqual(s.model_choice('qwen3-8b',self.base)['start_threshold'],74);self.assertEqual(s.model_choice('qwen3.8-27b',self.base)['start_threshold'],74)
+        self.assertEqual(s.model_choice('ternary-bonsai-2-27b',self.base)['start_threshold'],74)
         raw=b"x = (65 if pre else 30)\nwall = 3600\n";digest=hashlib.sha256(raw).hexdigest()
         self.assertEqual(s.closed_integer_delta(raw,digest,s.closed([('(65 if pre else 30)','(65 if pre else 30)',1,1),('wall = 3600','wall = 3600',1,1)])),raw)
         with self.assertRaisesRegex(RuntimeError,'fragment missing'):s.closed_integer_delta(raw,digest,s.closed([('(66 if pre else 30)','(66 if pre else 30)',1,1)]))   # still must be present
@@ -528,10 +528,10 @@ class PlanStaging(unittest.TestCase):
         s.storage_guard();cls.temp_root=s.RESUME/'build/staging-test-tmp';cls.temp_root.mkdir(exist_ok=True);cls.base=base_manifest()
     def test_tmf4b_src_pins_moved_to_the_tmf4a_revisions_of_this_repository(self):
         self.assertEqual(s.SRC,Path(s.__file__).absolute().parents[1]/'src')                       # the tool's own repository, never another tree
-        self.assertEqual((s.MODEL_SRC_SHA,s.RUN_SRC_SHA),('e1cd97e15a990a8418fca22e044520eb19b5bf76edb7b227a4e471e431792115','0426dd5a52ad363f92d02149258507f80bf5f9d8fe51f4a1fa066733f0816b50'))
+        self.assertEqual((s.MODEL_SRC_SHA,s.RUN_SRC_SHA),('e1cd97e15a990a8418fca22e044520eb19b5bf76edb7b227a4e471e431792115','f09d4870835fd0074ab97f4d78bf43b5dca39201051c423a7a778a4cc55707cf'))   # TMF5 moved the run pin (was 0426dd5a)
         self.assertEqual((s.sha(s.SRC/'mirofish_native_model.py'),s.sha(s.SRC/'mirofish_native_run.py')),(s.MODEL_SRC_SHA,s.RUN_SRC_SHA))
         for text in ['fc99603','38bce8a','TMF4a','addendum 3',SRC_REVIEW]:self.assertIn(text,s.SRC_REVISION_NOTE)
-        self.assertEqual(s.SRC_REVIEW_STATUS,SRC_REVIEW)
+        self.assertTrue(s.SRC_REVIEW_STATUS.startswith(SRC_REVIEW+'; the TMF5 revisions'))   # TMF5 appends its own open review
         self.assertEqual(s.BUILTIN_MODELS,('qwen3.8-27b','qwen3-8b','ternary-bonsai-2-27b'))
     def test_tmf4b_bonsai_choice_pins_its_projector_and_its_selection_size(self):
         b=s.model_choice('ternary-bonsai-2-27b',self.base);root=s.BASE/'models/Qwen3.8-27B-MLX-4bit';files=b['tokenizer_files']
@@ -539,7 +539,7 @@ class PlanStaging(unittest.TestCase):
         self.assertEqual([r['path'] for r in b['model_files']],[str(root/f) for f in files]+[str(gguf),str(mmproj)])
         self.assertEqual([(r['bytes'],r['sha256']) for r in b['model_files'][-2:]],[(7626008928,'4f99aed01b8a877e153f9aa6569a4440fe17c59701cc0953e36d7f460549e70e'),(629246976,'6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903')])
         self.assertEqual(b['model_tokenizer'],self.base['model_tokenizer'])                         # the 27B's tokenizer origin, its reviewed pins
-        self.assertEqual((b['serving_bytes'],b['start_threshold'],b['default'],b['plan'],b['active'],b['limits_key']),(8255255904,57,False,None,'ternary-bonsai-2-27b','ternary-bonsai-2-27b'))
+        self.assertEqual((b['serving_bytes'],b['start_threshold'],b['default'],b['plan'],b['active'],b['limits_key']),(8255255904,74,False,None,'ternary-bonsai-2-27b','ternary-bonsai-2-27b'))
         self.assertEqual(b['model_files'][-2]['role'],'sole serving GGUF Q2_0 weight; size and SHA-256 checked at staging')
         self.assertEqual(b['model_files'][-1]['role'],'second file LM Studio loads with the weights (vision projector); loaded and unused; size and SHA-256 checked at staging')
         self.assertEqual(s.selector_bytes('ternary-bonsai-2-27b'),b'{"profile": "ternary-bonsai-2-27b"}\n')
@@ -558,10 +558,10 @@ class PlanStaging(unittest.TestCase):
         self.assertTrue(roles[5].startswith('setup and report model ternary-bonsai-2-27b: sole serving GGUF Q2_0 weight') and roles[6].startswith('setup and report model ternary-bonsai-2-27b: second file'))
         self.assertTrue(roles[12].startswith('turns model qwen3-8b: sole serving GGUF Q4_K_M weight'))
         self.assertEqual(p['model_tokenizer'],self.base['model_tokenizer']);self.assertEqual(p['tokenizer_by_profile'],{'ternary-bonsai-2-27b':self.base['model_tokenizer'],'qwen3-8b':s.TOKENIZER_PINS['qwen3-8b']})
-        self.assertEqual(p['paths'],b['paths']|q['paths']);self.assertEqual(p['start_threshold'],57);self.assertEqual(p['members_threshold'],{'ternary-bonsai-2-27b':57,'qwen3-8b':56})
+        self.assertEqual(p['paths'],b['paths']|q['paths']);self.assertEqual(p['start_threshold'],74);self.assertEqual(p['members_threshold'],{'ternary-bonsai-2-27b':74,'qwen3-8b':74})
         self.assertEqual(p['selector'],b'{"plan": {"setup": "ternary-bonsai-2-27b", "turns": "qwen3-8b"}}\n');self.assertEqual(s.selector_bytes(plan=PLAN),p['selector'])
         shared=s.plan_choice('qwen3.8-27b','ternary-bonsai-2-27b',self.base)                       # a tokenizer origin two members share is listed once
-        self.assertEqual(len(shared['model_files']),5+1+2);self.assertEqual(shared['start_threshold'],72)
+        self.assertEqual(len(shared['model_files']),5+1+2);self.assertEqual(shared['start_threshold'],74)
         for args,why in [(('qwen3-8b','qwen3-8b'),'two different'),(('qwen9-1b','qwen3-8b'),'unknown model profile'),(('qwen3-8b','qwen3.8-27b-mlx'),'HTTP backends only')]:
             with self.assertRaisesRegex(RuntimeError,why):s.plan_choice(*args,self.base)
         with tempfile.TemporaryDirectory(dir=self.temp_root) as folder:
@@ -621,17 +621,21 @@ class PlanStaging(unittest.TestCase):
         self.assertEqual((m['model_plan'],m['model_tokenizer_by_profile'],m['model_tokenizer']),(PLAN,plan['tokenizer_by_profile'],self.base['model_tokenizer']))
         self.assertEqual(m['model_files'],plan['model_files'])
         self.assertIn(PLAN_PREDICATE,(s.SRC/'mirofish_native_run.py').read_text());self.assertIn(PLAN_PREDICATE,m['runtime_predicates'])   # the words prepare_candidate writes
-        self.assertFalse([x for x in m['runtime_predicates'] if '65pre' in x]);self.assertEqual(len([x for x in m['runtime_predicates'] if x.startswith('57pre/30floor/40GiB owned caps')]),1)
-        self.assertEqual(m['startup_recovery']['start_threshold_staged']['percent_free'],57);self.assertIn('65pre',m['startup_recovery']['caps'])   # the W16 record, labelled
+        self.assertFalse([x for x in m['runtime_predicates'] if '65pre' in x]);self.assertEqual(len([x for x in m['runtime_predicates'] if x.startswith('74pre/30floor/40GiB owned caps')]),1)
+        self.assertEqual(m['startup_recovery']['start_threshold_staged']['percent_free'],74);self.assertIn('65pre',m['startup_recovery']['caps'])   # the W16 record, labelled
         for block in ['GGUF_qualification','mlx_profile_recovery']:self.assertTrue(m[block]['applies_to'].startswith('qwen3.8-27b only'),block)
         self.assertIn('NOT REUSED for ternary-bonsai-2-27b and qwen3-8b',m['metadata_reuse_impact']['scope']);self.assertNotIn('same roles, tools, schemas, LLMClient, SDK/model/tokenizer',m['metadata_reuse_impact']['scope'])
         self.assertTrue(m['derived_from']['removed_metadata_prerequisite'].startswith('NOT_SHOWN_FOR_TERNARY-BONSAI-2-27B_AND_QWEN3-8B'))
-        mp=m['model_profile'];self.assertEqual((mp['plan'],mp['src_revisions_review']),(PLAN,SRC_REVIEW))
+        mp=m['model_profile'];self.assertEqual((mp['plan'],mp['src_revisions_review']),(PLAN,s.SRC_REVIEW_STATUS));self.assertTrue(s.SRC_REVIEW_STATUS.startswith(SRC_REVIEW))
         for member in PLAN.values():
             self.assertIn('NOT been shown',mp['members'][member]['format_conformance']);self.assertIn('first run',mp['members'][member]['format_conformance'])
         self.assertIn('loaded and unused',mp['members']['ternary-bonsai-2-27b']['second_file']['note']);self.assertNotIn('second_file',mp['members']['qwen3-8b'])
-        st=mp['start_threshold'];self.assertEqual((st['percent_free'],st['by_member'],st['reviewed'],st['stop_floor'],st['rss_bound_gib']),(57,{'ternary-bonsai-2-27b':57,'qwen3-8b':56},65,30,40))
-        self.assertIn('ceil(100 x (serving files + context cache at 32,768 in 16-bit floats + 4 GiB) / installed memory 68719476736) + 5',st['rule'])
+        st=mp['start_threshold'];self.assertEqual((st['percent_free'],st['by_member'],st['reviewed'],st['stop_floor'],st['rss_bound_gib']),(74,{'ternary-bonsai-2-27b':74,'qwen3-8b':74},65,30,40))
+        self.assertIn('floor + margin + setup_cost + fall',st['rule']);self.assertEqual(st['arithmetic'],{m:'floor 30 + margin 10 + setup_cost 24 + fall 10 = 74' for m in PLAN.values()})
+        self.assertEqual({k:v['value'] for k,v in st['terms'].items()},{'floor':30,'margin':10,'setup_cost':24,'fall':10})
+        self.assertEqual(mp['co_resident']['file'],'~/.lmstudio/models/debackerl/elephant-1-Q8_0-GGUF/elephant-1.Q8_0.gguf');self.assertEqual(mp['producer_patches']['files'],s.TMF5_PRODUCER_FILES)
+        self.assertEqual({k:v['sha256'] for k,v in mp['src_revisions'].items()},{'mirofish_native_model.py':s.MODEL_SRC_SHA,'mirofish_native_run.py':s.RUN_SRC_SHA,'mirofish_native_startup.py':s.STARTUP_SRC_SHA,'mirofish_native_gateway.py':s.GATEWAY_SRC_SHA})
+        self.assertEqual(len([x for x in m['runtime_predicates'] if x.startswith('TMF5 stop rule:')]),1)
         budget=mp['budgets'];self.assertEqual((budget['post_swap_probe_chats'],budget['post_swap_probe_output']),(4,2048));self.assertIn('(2 + 4) x 512 + (192 - 6) x 4096 = 764928',budget['output'])
         phases=mp['expected_by_phase'];self.assertEqual((phases['setup_s'],phases['simulation_s'],phases['swaps_s'],phases['report_s'],phases['total_s'],phases['wall_s']),(p['setup_s'],sum(p['expected_round_s']),30,p['report_s'],3044,5400))
         self.assertIn('ternary-bonsai-2-27b',phases['setup_model']);self.assertIn('qwen3-8b',phases['turns_model'])
@@ -644,11 +648,11 @@ class PlanStaging(unittest.TestCase):
             self.assertIn('writes no 27B revision identifiers for it',prov['recorded_by_run']);self.assertEqual(prov['correct_source']['gguf_sha256'],s.model_choice(member,self.base)['entry']['weight_sha256'])
     def test_tmf4b_manifest_for_one_named_model(self):
         m,_=self.manifest_for(s.model_choice('qwen3.8-27b',self.base))                               # the 27B named: its own evidence, the formula's 72
-        self.assertNotIn('applies_to',m['GGUF_qualification']);self.assertNotIn('model_plan',m);self.assertTrue([x for x in m['runtime_predicates'] if x.startswith('72pre/30floor/40GiB')])
+        self.assertNotIn('applies_to',m['GGUF_qualification']);self.assertNotIn('model_plan',m);self.assertTrue([x for x in m['runtime_predicates'] if x.startswith('74pre/30floor/40GiB')])
         self.assertIn('same roles, tools, schemas',m['metadata_reuse_impact']['scope'])
         m,_=self.manifest_for(s.model_choice('qwen3-8b',self.base))
-        self.assertTrue(m['GGUF_qualification']['applies_to'].startswith('qwen3.8-27b only'));self.assertTrue([x for x in m['runtime_predicates'] if x.startswith('56pre/30floor/40GiB')])
-        self.assertIn('NOT REUSED for qwen3-8b',m['metadata_reuse_impact']['scope']);self.assertEqual(m['model_profile']['start_threshold']['percent_free'],56)
+        self.assertTrue(m['GGUF_qualification']['applies_to'].startswith('qwen3.8-27b only'));self.assertTrue([x for x in m['runtime_predicates'] if x.startswith('74pre/30floor/40GiB')])
+        self.assertIn('NOT REUSED for qwen3-8b',m['metadata_reuse_impact']['scope']);self.assertEqual(m['model_profile']['start_threshold']['percent_free'],74)
     def test_tmf4b_staged_plan_folder_is_the_plan_candidate_unlaunched(self):
         work=PLAN_WORK
         if not (work/'builder/candidate-manifest.json').exists():self.skipTest('the proof folder is staged after the tests')
@@ -658,9 +662,11 @@ class PlanStaging(unittest.TestCase):
         self.assertFalse(list(work.rglob(s.REGISTRY_NAME)))
         port=manifest['sdk_port_revision']['staged'];src_model=(s.SRC/'mirofish_native_model.py').read_bytes();expected=src_model if port==s.ORIGINAL_SDK_PORT else s.sdk_port_bytes(src_model,port,s.MODEL_SRC_SHA)
         for relative in s.MODEL_COPIES:self.assertEqual((work/relative).read_bytes(),expected)
-        run=s.swarm_run_bytes((s.SRC/'mirofish_native_run.py').read_bytes(),'swarm8',PLAN,s.RUN_SRC_SHA,57)
-        for relative in s.RUN_COPIES:self.assertEqual((work/relative).read_bytes(),run)
-        self.assertIn(b'(57 if pre else 30)',run)
+        # TMF5 moved the run pin: this TMF4 folder is the proof of TMF4's plan staging and carries TMF4's run revision (0426dd5a).
+        ancestry={row['target']:row for row in json.loads((work/'builder/staging-ancestry.json').read_text())['source_copies']} if (work/'builder/staging-ancestry.json').exists() else {}
+        for relative in s.RUN_COPIES:
+            run=(work/relative).read_bytes();self.assertIn(b'(57 if pre else 30)',run);self.assertEqual(pins[str(work/relative)],s.sha(work/relative))
+            if ancestry:self.assertEqual(ancestry[str(work/relative)]['src_sha256'],'0426dd5a52ad363f92d02149258507f80bf5f9d8fe51f4a1fa066733f0816b50')
         self.assertEqual(manifest['model_files'],[dict(r,bytes=Path(r['path']).stat().st_size) for r in plan['model_files']])
         self.assertEqual((manifest['model_plan'],manifest['model_tokenizer_by_profile'],manifest['model_tokenizer']),(PLAN,plan['tokenizer_by_profile'],plan['model_tokenizer']))
         self.assertEqual((manifest['swarm_profile']['wall'],manifest['swarm_profile']['chats'],manifest['swarm_profile']['output']),(5400,192,800000))
@@ -668,6 +674,91 @@ class PlanStaging(unittest.TestCase):
         policy=(work/'builder/observer.sb').read_text();self.assertNotIn('Qwen3.8-27B-Q4_K_M.gguf',policy);self.assertIn(str(BONSAI_DIR/'Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf'),policy)
         module=s.staged_helper_matches_model(work,port,plan);self.assertEqual(module.MODEL_PLAN,PLAN)
         s.assert_staged(work,manifest)
+
+# ---- TMF5 addendum 1 (2026-11-17): the four src/ revisions, the start table, the co-resident, the producer patches -----------
+TMF5_PLAN={'setup':'ternary-bonsai-2-27b','turns':'qwen3-8b'}
+def tmf5_temp():
+    import os
+    return tempfile.TemporaryDirectory(dir=os.environ.get('NATIVE_TEST_ROOT') or None)
+class TMF5Staging(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):cls.base=base_manifest()
+    def test_TMF5_src_pins_are_this_repository_s_four_revisions(self):
+        for name,pin in [('mirofish_native_model.py',s.MODEL_SRC_SHA),('mirofish_native_run.py',s.RUN_SRC_SHA),('mirofish_native_startup.py',s.STARTUP_SRC_SHA),('mirofish_native_gateway.py',s.GATEWAY_SRC_SHA)]:
+            self.assertEqual(s.sha(s.SRC/name),pin,name);self.assertEqual(s.src_revision(name,pin),(s.SRC/name).read_bytes())
+        self.assertNotEqual(s.STARTUP_SRC_SHA,s.STARTUP_ORIGINAL_SHA);self.assertNotEqual(s.GATEWAY_SRC_SHA,s.GATEWAY_ORIGINAL_SHA)
+        self.assertEqual(s.MODEL_SRC_SHA,'e1cd97e15a990a8418fca22e044520eb19b5bf76edb7b227a4e471e431792115')   # the model module is not changed (ruling a)
+    def test_TMF5_startup_and_gateway_deltas_are_reproved_against_the_src_revisions(self):
+        startup,gateway=(s.SRC/'mirofish_native_startup.py').read_bytes(),(s.SRC/'mirofish_native_gateway.py').read_bytes()
+        w16_startup,w16_gateway=(s.W16/sorted(s.STARTUP_COPIES)[0]).read_bytes(),(s.W16/sorted(s.GATEWAY_COPIES)[0]).read_bytes()
+        for name in ['swarm8','swarm48']:
+            with self.subTest(profile=name):
+                n=s.swarm_numbers(name,TMF5_PLAN)
+                new,old=s.swarm_startup_bytes(startup,name,TMF5_PLAN,s.STARTUP_SRC_SHA),s.swarm_startup_bytes(w16_startup,name,TMF5_PLAN)
+                for fragment in [f'MAX_RECORDS={n["history_records"]}',f'MAX_BYTES={n["history_mib"]}*1024*1024',f'(30 if preflight else {n["wall"]})']:
+                    self.assertEqual((new.count(fragment.encode()),old.count(fragment.encode())),(1,1),fragment)
+                new,old=s.swarm_gateway_bytes(gateway,name,TMF5_PLAN,s.GATEWAY_SRC_SHA),s.swarm_gateway_bytes(w16_gateway,name,TMF5_PLAN)
+                for fragment in [f'"wall_seconds": {n["wall"]},',f'chat_attempts: int = {n["chats"]}',f'request_bytes: int = {n["request_bytes"]}']:
+                    self.assertEqual((new.count(fragment.encode()),old.count(fragment.encode())),(1,1),fragment)
+                with self.assertRaisesRegex(RuntimeError,'original source drift'):s.swarm_startup_bytes(startup,name,TMF5_PLAN)          # the W16 pin does not admit the src bytes
+                with self.assertRaisesRegex(RuntimeError,'original source drift'):s.swarm_gateway_bytes(gateway+b'\n',name,TMF5_PLAN,s.GATEWAY_SRC_SHA)
+    def test_TMF5_staged_start_threshold_follows_the_table(self):
+        src=(s.SRC/'mirofish_native_run.py').read_bytes();self.assertEqual(s.START_FRAGMENT,'START_FREE_PERCENT=65');self.assertEqual(src.count(b'START_FREE_PERCENT=65 '),1)
+        choice=s.plan_choice(TMF5_PLAN['setup'],TMF5_PLAN['turns'],self.base)
+        self.assertEqual((choice['start_threshold'],choice['members_threshold']),(74,{'ternary-bonsai-2-27b':74,'qwen3-8b':74}))
+        staged=s.swarm_run_bytes(src,'swarm8',choice['limits_key'],s.RUN_SRC_SHA,choice['start_threshold'])
+        self.assertEqual(staged.count(b'START_FREE_PERCENT=74 '),1);self.assertNotIn(b'START_FREE_PERCENT=65',staged);self.assertIn(b'STOP_FREE_PERCENT=30 ',staged)
+        saved={k:dict(v) for k,v in s.LIMITS.START_TERMS.items()}
+        try:
+            s.LIMITS.START_TERMS['setup_cost'].update(value=29,source='a load-only test beside the collector, 2026-11-18');s.LIMITS.START_TERMS['fall'].update(value=7,source='same test, 2026-11-18')
+            moved=s.plan_choice(TMF5_PLAN['setup'],TMF5_PLAN['turns'],self.base);self.assertEqual(moved['start_threshold'],76)
+            self.assertEqual(s.swarm_run_bytes(src,'swarm8',moved['limits_key'],s.RUN_SRC_SHA,moved['start_threshold']).count(b'START_FREE_PERCENT=76 '),1)
+            self.assertEqual(s.model_choice('qwen3-8b',self.base)['start_threshold'],76)
+        finally:
+            for k,v in saved.items():s.LIMITS.START_TERMS[k]=v
+        self.assertEqual(s.plan_choice(TMF5_PLAN['setup'],TMF5_PLAN['turns'],self.base)['start_threshold'],74)
+    def test_TMF5_co_resident_file_is_written_from_decision_model_and_checked(self):
+        raw=(s.SRC/'mirofish_native_startup.py').read_bytes();file=s.decision_model_file()
+        self.assertEqual(file,'~/.lmstudio/models/debackerl/elephant-1-Q8_0-GGUF/elephant-1.Q8_0.gguf');self.assertEqual(s.DECISION_MODEL,s.SRC.parent/'valedia_trader/core/decision_model.py')
+        self.assertEqual(s.co_resident_bytes(raw,file),raw)                                                   # the pinned src/ revision already carries it
+        other=s.co_resident_bytes(raw,'~/.lmstudio/models/x/other.gguf');self.assertEqual(other.count(b"CO_RESIDENT_FILE='~/.lmstudio/models/x/other.gguf'"),1)
+        self.assertEqual(other.replace(b'~/.lmstudio/models/x/other.gguf',file.encode()),raw)
+        for bad in ["a'b","a\\b",'',None]:
+            with self.subTest(bad=bad),self.assertRaises(RuntimeError):s.co_resident_bytes(raw,bad)
+        with self.assertRaises(RuntimeError):s.co_resident_bytes(raw.replace(b'CO_RESIDENT_FILE=',b'CO_RESIDENT_NAME=',1),file)
+        with tmf5_temp() as tmp:
+            path=Path(tmp)/'decision_model.py';path.write_text('FILE = "~/other.gguf"   # home expanded at use\n');self.assertEqual(s.decision_model_file(path),'~/other.gguf')
+            path.write_text('FILE = "a"\nFILE = "b"\n')
+            with self.assertRaises(RuntimeError):s.decision_model_file(path)
+    def test_TMF5_a_plan_whose_serving_file_is_the_co_resident_is_refused(self):
+        import os
+        with tmf5_temp() as tmp:
+            root=Path(os.path.realpath(tmp));f=root/'m/e.gguf';f.parent.mkdir();f.write_bytes(b'G');(root/'l').symlink_to(root/'m');(root/'m/e.gguf.part').write_bytes(b'x')
+            for path in [f,root/'l/e.gguf',root/'m/../m/e.gguf']:
+                with self.subTest(path=str(path)),self.assertRaisesRegex(RuntimeError,"co-resident's file"):s.refuse_co_resident([path],str(f))
+            s.refuse_co_resident([root/'m/e.gguf.part',root/'m',Path(str(root/'M/E.GGUF'))],str(f))      # prefix, folder, case: not equal
+        self.assertEqual(s.co_resident_declared(),os.path.realpath(os.path.expanduser(s.decision_model_file())))
+        weight=s.model_profiles()[0]['qwen3-8b']['weight_file'];original=s.co_resident_declared
+        s.co_resident_declared=lambda path=None:os.path.realpath(str(weight))   # as if the collector served the 8B's own file
+        try:
+            with self.assertRaisesRegex(RuntimeError,"co-resident's file"):s.plan_choice(TMF5_PLAN['setup'],TMF5_PLAN['turns'],self.base)
+            with self.assertRaisesRegex(RuntimeError,"co-resident's file"):s.model_choice('qwen3-8b',self.base)
+            self.assertEqual(s.model_choice('ternary-bonsai-2-27b',self.base)['name'],'ternary-bonsai-2-27b')
+        finally:s.co_resident_declared=original
+        self.assertEqual(s.plan_choice(TMF5_PLAN['setup'],TMF5_PLAN['turns'],self.base)['members'],['ternary-bonsai-2-27b','qwen3-8b'])
+    def test_TMF5_producer_patches_from_the_src_run_script_apply_once_to_the_staged_producer(self):
+        with tmf5_temp() as tmp:
+            entry=scratch_entry(tmp);patches=s.src_producer_patches(entry.parents[1])
+        by_file={}
+        for relative,old,new in patches:by_file.setdefault('owned-source/producer/backend/'+relative,[]).append((old,new))
+        self.assertEqual({k:len(v) for k,v in by_file.items()},s.TMF5_PRODUCER_FILES)
+        for relative,rows in by_file.items():
+            with self.subTest(file=relative):
+                raw=(s.W16/relative).read_bytes()
+                if relative in s.SWARM_PRODUCER:raw=s.swarm_producer_bytes(relative,raw,'swarm8',TMF5_PLAN)   # after the integer deltas, as staging does
+                changed=s.tmf5_producer_bytes(raw,rows);ast.parse(changed)
+                for old,new in rows:self.assertEqual(changed.decode().count(new),1)
+                with self.assertRaisesRegex(RuntimeError,'TMF5 producer patch site missing'):s.tmf5_producer_bytes(raw.replace(rows[0][0].encode(),b'# gone',1),rows)
 if __name__=='__main__':unittest.main()
 
 
