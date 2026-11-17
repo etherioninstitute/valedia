@@ -248,6 +248,20 @@ what settlement looks like.
   `win_cash_observed`, which stays false until one comparable win has matched.
 - **Not handled:** a correction Kalshi makes after `finalized` would show only as a cash difference.
 
+### Fees and settlement in a real account (Webull's help pages, read by the lead 2026-11-17)
+
+- **Fees** ("Event Contract Fees", help/faq/11174). Every opening and every closing trade costs 0.01 dollars
+  commission plus 0.01 dollars exchange fee a contract. Holding to settlement costs nothing, and neither does a
+  cancelled or unfilled order. The paper account's 0.01 a contract is therefore not the real charge. The code
+  journals whatever fee the venue reports and assumes none.
+- **Settlement** ("Event Contract Settlement and Payouts", help/faq/11172; "Event Contract Funding and Buying
+  Power", help/faq/11052). Winning proceeds go to the balance of the *linked brokerage account*, and losing
+  positions are simply removed. Event buying power is derived from that linked account's settled cash.
+- **What this means for the cash check.** The exact buying-power comparison above holds only where nothing else
+  moves that cash, as in the paper Events account. Before any live use, the comparison must account for activity
+  in the linked cash account (trades, deposits, withdrawals, settling stock proceeds). A `win_cash_observed` set
+  in the paper account does not prove the live cash path.
+
 ## Not covered yet
 
 Options, futures and event-contract orders (the API supports them; the trader does not trade them), short selling,

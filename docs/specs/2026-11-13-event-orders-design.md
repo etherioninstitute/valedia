@@ -98,8 +98,18 @@ fraction, or a holding that vanishes before Kalshi says `finalized`.
 - *State file.* Layout 2 adds the `settlements`, `readings` and `holds` tables. A layout-1 file is migrated in
   place, and its `meta`, `baseline` and `sends` are left byte for byte. Any other layout is refused.
 
+**What Webull's help pages say (read by the lead 2026-11-17).** Every opening and every closing trade costs 0.01
+dollars commission plus 0.01 dollars exchange fee a contract. Holding to settlement costs nothing, and neither
+does a cancelled or unfilled order ("Event Contract Fees", help/faq/11174). The paper account's 0.01 a contract
+is therefore not the real charge, and the code keeps journaling whatever fee the venue reports. In a real
+account, winning proceeds go to the balance of the linked brokerage account and losing positions are simply
+removed. Event buying power is derived from that linked account's settled cash (help/faq/11172 and 11052).
+
 **Limits.**
 
+- The exact buying-power comparison is meaningful as built only where nothing else moves that cash, as in the
+  paper Events account. Before any live use it must account for activity in the linked cash account. A
+  `win_cash_observed` set in the paper account does not prove the live cash path.
 - A correction by Kalshi after `finalized` is not handled and would show only as a cash difference.
 - A holding Webull drops before Kalshi finalizes (for example while `determined`) stops the run. That blocks the
   whole Events path until Kalshi finalizes. A multi-market strategy will need a pending-settlement state per name
