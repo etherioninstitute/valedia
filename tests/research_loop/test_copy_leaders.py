@@ -1685,7 +1685,7 @@ def test_the_stored_shape_is_unchanged():
 
 def _limit_world(tmp_path, monkeypatch):
     monkeypatch.setattr(cl, "_now", lambda: FIXED)
-    w = _small_world(11)
+    w = World(11, edge=0.3, move=0.0, pros=5, per_month=11, months=SMALL_MONTHS)     # pros good enough to lead
     store = tmp_path / "s.sqlite"
     said = []
     out = cl.pull(store, _paged_client(PagedWorld(w, 11, size=50)), phase=1, say=said.append, page_cap=10)
@@ -1868,3 +1868,61 @@ def test_the_phase_2_estimate_uses_the_pace_measured_in_phase_1(tmp_path, monkey
     assert "%d price windows" % n in line and "1.50 seconds a request" in line, line
     assert "at least %s" % cl._seconds(math.ceil(1.5 * n)) in line, line
     assert "three a second" not in " ".join(said)
+
+
+def _big_fetch(pages, per, kill=None, title=200):
+    """A stand-in service of one wallet, "0xbig", `pages` pages of `per` trades each; `kill`: the page at which the
+    process ends at once (os._exit), as a kill."""
+    def fetch(url):
+        p = urllib.parse.urlsplit(url)
+        q = dict(urllib.parse.parse_qsl(p.query))
+        if p.path == "/v2/leaderboard":
+            u = ["0xbig"] if q["time_period"] == "all" else []
+            return json.dumps({"data": [{"rank": 1, "user_id": x, "pnl": 1.0, "volume": 1.0} for x in u],
+                               "pagination": {"has_more": False, "next_cursor": None}}).encode()
+        if p.path == "/v2/trades":
+            off = int(q.get("cursor", "0"))
+            if kill is not None and off // per + 1 == kill:
+                os._exit(9)
+            rows = [{"proxy_wallet": "0xbig", "side": "BUY", "token_id": "t%d" % i, "condition_id": "c%d" % (i % 50),
+                     "size": 10.0, "price": 0.5, "timestamp": 1_780_000_000 - i, "event_slug": "e",
+                     "outcome_index": 0, "transaction_hash": "0x%x" % i, "title": "x" * title}
+                    for i in range(off, off + per)]
+            more = off + per < pages * per
+            return json.dumps({"data": rows, "pagination": {"has_more": more,
+                                                            "next_cursor": str(off + per) if more else None}}).encode()
+        return json.dumps({"data": []}).encode()
+    return fetch
+
+
+BIG_KILL_CHILD = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+import test_copy_leaders as T
+from valedia_trader.research_loop import copy_leaders as cl
+from valedia_trader.venues import polymarket_data as pd
+fetch = T._big_fetch(40, 1000, kill=30)
+cl.pull(sys.argv[2], pd.PolymarketData(fetch, sleep=lambda s: None, clock=lambda: 0.0), phase=1, say=lambda m: None)
+"""
+
+
+def test_a_kill_after_the_walk_spilled_to_the_file_leaves_no_readable_row_and_the_next_pull_undoes_it(tmp_path):
+    script = tmp_path / "big.py"
+    script.write_text(BIG_KILL_CHILD)
+    store = tmp_path / "s.sqlite"
+    r = _run_child(script, Path(__file__).resolve().parent, store)
+    assert r.returncode == 9, r.stderr[-1500:]
+    journal = Path(str(store) + "-journal")
+    assert journal.exists() and store.stat().st_size > 5 * 2 ** 20      # 29 pages written into the file, uncommitted
+    for run in (lambda: cl.run_develop(store=store, out_dir=tmp_path / "o"),
+                lambda: cl.run_sealed(store=store, out_dir=tmp_path / "o", flag=True)):
+        with pytest.raises(cl.Refused, match="left unfinished by a stopped pull"):
+            run()
+    assert journal.exists() and not (tmp_path / "o").exists()           # refused read-only: nothing undone or read
+    cl.pull(store, pd.PolymarketData(_big_fetch(40, 1000), sleep=lambda s: None, clock=lambda: 0.0), phase=1,
+            say=lambda m: None)
+    cl.check_own_shape(store)
+    db = sqlite3.connect(str(store))
+    assert db.execute("SELECT status, pages, rows FROM walks WHERE kind='trades'").fetchone() == ("finished", 40, 40_000)
+    assert db.execute("SELECT MIN(seq), MAX(seq), COUNT(*) FROM trades").fetchone() == (0, 39_999, 40_000)
+    db.close()
