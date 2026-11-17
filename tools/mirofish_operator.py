@@ -72,6 +72,11 @@ GATE_NAME = 'root-one-native-attempt.json'
 # at the 10 s model limit (:2072) or not called for lack of time in the minute (:2050); error: HTTP error from the model
 # (:2075), unreadable answer (:2091), any other call failure (:2082). Not model failures: ok, stale_data (the Kalshi book).
 MODEL_FAILURE_STATUSES = ('model_unavailable', 'tag_mismatch', 'late', 'error')
+# Addendum 1, ruling 1: these two can only mean the decision model is gone or wrong, a breach at once; the other two happen
+# alone on an ordinary day (a per-market exception writes `error` at :2055 with the model untouched), a breach only when two
+# of three consecutive decisions carry one of them.
+IMMEDIATE_STATUSES = ('model_unavailable', 'tag_mismatch')
+PAIRED_STATUSES = ('late', 'error')
 
 # ---- the only statements the tool can issue against the store (read-only; never a locked column)
 SQL_LAST_DECISIONS = 'SELECT status, latency_s, decision_ts FROM decisions ORDER BY decision_ts DESC LIMIT 10'
@@ -82,7 +87,13 @@ SQL = (SQL_LAST_DECISIONS, SQL_DECISIONS_SINCE, SQL_LAST_HEARTBEAT)
 # ---- the rules' numbers
 WATCH_S = 30                    # collector checked this often during load-test and run
 SLOW_S = 8.0                    # two decisions in a row slower than this is a breach
-HEARTBEAT_S = 90                # no heartbeat this long is a breach
+HEARTBEAT_S = 150               # no heartbeat this long is a breach (addendum 1, ruling 3: one is written about every 60 s)
+START_WINDOW_S = 900            # the start check judges the decisions of the last 15 minutes (ruling 2)
+START_MIN_DECISIONS = 5         # fewer than this in the window: too quiet to judge, refuse
+IDENTITY_WAIT_S = 60            # the observer identity file must appear this soon after launch (ruling 5)
+IDENTITY_FILE = 'observer-identity.json'
+LINK_DISABLED_LINE = 'You have disabled LM Link.'   # the real wording of `lms link status`, read 2026-11-17 (ruling 6)
+GROUP_STOP_SIGNAL = signal.SIGTERM                  # what the launcher's own group gets when the observer cannot be named
 SAMPLE_S = 0.5                  # load-test memory samples
 BASELINE_S = 60                 # load-test baseline
 STOP_FLOOR = LIMITS.STOP_FLOOR_PERCENT     # 30: the run stops itself under this much free memory
@@ -133,10 +144,12 @@ def _http(method, url, body=None, timeout=HTTP_S):
 
 
 class Host:
-    def __init__(self, *, run=None, spawn=None, http=None, now=None, sleep=None, send_signal=None, disk_free=None, uid=None,
-                 store=STORE, crew=CREW, record=RECORD, load_tests=LOAD_TESTS, load_path=None, out=None, lms=LMS):
-        self.run, self.spawn, self.http = run or _run, spawn or _spawn, http or _http
+    def __init__(self, *, run=None, spawn=None, http=None, now=None, sleep=None, send_signal=None, send_group_signal=None,
+                 disk_free=None, uid=None, store=STORE, crew=CREW, record=RECORD, load_tests=LOAD_TESTS, load_path=None, out=None,
+                 lms=LMS):
+        self.run, self.spawn, self.http = run or _run, spawn or _spawn, http or _http   # _spawn: its own session and group
         self.now, self.sleep, self.send_signal = now or time.time, sleep or time.sleep, send_signal or os.kill
+        self.send_group_signal = send_group_signal or os.killpg
         self.disk_free = disk_free or (lambda path: shutil.disk_usage(path).free)
         self.uid = os.getuid() if uid is None else uid
         self.store, self.crew, self.record, self.load_tests = Path(store), Path(crew), Path(record), Path(load_tests)
@@ -175,8 +188,15 @@ def breach_of(decisions, heartbeat_age, listed):
     if heartbeat_age is None or heartbeat_age > HEARTBEAT_S:
         return 'no heartbeat for %s s (limit %d s)' % ('ever' if heartbeat_age is None else '%.0f' % heartbeat_age, HEARTBEAT_S)
     for d in decisions:
-        if d['status'] in MODEL_FAILURE_STATUSES:
+        if d['status'] in IMMEDIATE_STATUSES:
             return 'a decision with the model-failure status %s (at %s)' % (d['status'], d['decision_ts'])
+    # Two of the last three: checked after every decision, so over every three consecutive decisions in time order.
+    for i in range(len(decisions)):
+        last3 = decisions[max(0, i - 2):i + 1]
+        hits = [d['status'] for d in last3 if d['status'] in PAIRED_STATUSES]
+        if len(hits) >= 2:
+            return 'two of three consecutive decisions with a model-failure status (%s, at %s)' % (
+                ', '.join(hits), decisions[i]['decision_ts'])
     previous = None
     for d in decisions:
         latency = d['latency_s']
@@ -188,14 +208,16 @@ def breach_of(decisions, heartbeat_age, listed):
 
 
 def launchd_print(host, label):
-    """`launchctl print` of a gui job: only the exit code and the `path` and `state` lines are kept (the rest carries the
-    job's command line, which is never kept or printed)."""
+    """`launchctl print` of a gui job: only the exit code and the `path`, `state` and `pid` lines are kept (the rest carries
+    the job's command line, which is never kept or printed)."""
     r = host.run(['/bin/launchctl', 'print', 'gui/%d/%s' % (host.uid, label)], timeout=CMD_S)
     if r.returncode != 0:
-        return {'listed': False, 'plist': None, 'state': None}
+        return {'listed': False, 'plist': None, 'state': None, 'pid': None}
     path = re.search(r'^\s*path = (.+?)\s*$', r.stdout or '', re.M)
     state = re.search(r'^\s*state = (.+?)\s*$', r.stdout or '', re.M)
-    return {'listed': True, 'plist': path.group(1) if path else None, 'state': state.group(1) if state else None}
+    pid = re.search(r'^\s*pid = (\d+)\s*$', r.stdout or '', re.M)
+    return {'listed': True, 'plist': path.group(1) if path else None, 'state': state.group(1) if state else None,
+            'pid': int(pid.group(1)) if pid else None}
 
 
 def collector_health(host, since=None):
@@ -241,17 +263,17 @@ def memory(host):
             'swap_used_bytes': int(round(float(used.group(1)) * scale[used.group(2)])) if used and s.returncode == 0 else None}
 
 
-def link_disabled(text):
-    """LM Link counts as disabled only when the status says `disabled` and nowhere says `enabled`."""
-    t = (text or '').lower()
-    return bool(re.search(r'\bdisabled\b', t)) and not re.search(r'\benabled\b', t)
+def link_disabled(text, returncode):
+    """LM Link counts as disabled only when `lms link status` exits 0 and the first non-empty line of its output, with
+    surrounding blanks removed, begins with exactly LINK_DISABLED_LINE. Anything else is not known to be disabled."""
+    lines = [line.strip() for line in (text or '').splitlines() if line.strip()]
+    return returncode == 0 and bool(lines) and lines[0].startswith(LINK_DISABLED_LINE)
 
 
 def lm_link(host):
     r = host.run([host.lms, 'link', 'status'], timeout=CMD_S)
-    disabled = r.returncode == 0 and link_disabled(r.stdout)
-    state = 'disabled' if disabled else ('enabled' if re.search(r'\benabled\b', (r.stdout or '').lower()) else 'unknown')
-    return {'disabled': disabled, 'state': state, 'exit': r.returncode}
+    disabled = link_disabled(r.stdout, r.returncode)
+    return {'disabled': disabled, 'state': 'disabled' if disabled else 'not known to be disabled', 'exit': r.returncode}
 
 
 def models_state(host):
@@ -324,7 +346,14 @@ def earlier_runs(host):
 
 
 def pick_reader_state(host):
-    return launchd_print(host, PICKS_LABEL)
+    """Its launchd state; when it is running, also its pid and when it was started (ps lstart; no command line)."""
+    s = launchd_print(host, PICKS_LABEL)
+    s['running'] = s['state'] == 'running'
+    s['started'] = None
+    if s['running'] and s['pid'] is not None:
+        seen = observed_identity(host, s['pid'])
+        s['started'] = seen['start'] if seen else None
+    return s
 
 
 # ============================================================================ profiles, durations, the announcement
@@ -391,8 +420,15 @@ def refusals(s):
         out.append('the decision instance %s is not loaded and right: %s' % (DM.INSTANCE, d['why']))
     if s['models']['native_loaded']:
         out.append('an mf-native instance is already loaded: %s' % ', '.join(s['models']['native_loaded']))
+    if s['collector']['window_decisions'] < START_MIN_DECISIONS:
+        out.append('the collector is too quiet to judge: %d decisions in the last %d minutes (at least %d needed)' % (
+            s['collector']['window_decisions'], START_WINDOW_S // 60, START_MIN_DECISIONS))
     if s['collector']['breach']:
         out.append('the collector is already in breach: %s' % s['collector']['breach'])
+    if s['pick_reader']['running']:
+        out.append('the hourly pick reader %s is running (pid %s, started %s); it runs a few minutes at the top of the hour '
+                   'and is never booted out mid-run: start after it ends' % (
+                       PICKS_LABEL, s['pick_reader']['pid'], s['pick_reader']['started'] or 'at an unknown time'))
     level = s['memory']['pressure_level']
     if level != 1:
         out.append('the kernel memory pressure level %s is not 1' % level)
@@ -409,11 +445,13 @@ def do_check(host, profile, plan, kind='run', hold_minutes=None):
     t = host.now()
     s = {'utc': utc(t), 'kind': kind, 'profile': profile, 'plan': plan,
          'lm_link': lm_link(host), 'models': models_state(host)}
-    health = collector_health(host)
-    s['collector'] = {'job_listed': health['job_listed'], 'heartbeat_age_s': health['heartbeat_age_s'], 'breach': health['breach'],
+    last = collector_health(host)                                  # the last 10, shown
+    window = collector_health(host, since=t - START_WINDOW_S)     # the last 15 minutes, judged (addendum 1, ruling 2)
+    s['collector'] = {'job_listed': window['job_listed'], 'heartbeat_age_s': window['heartbeat_age_s'], 'breach': window['breach'],
+                      'window_s': START_WINDOW_S, 'window_decisions': window['decisions'], 'window_statuses': window['statuses'],
                       'last_decisions': [{'status': d['status'], 'latency_s': d['latency_s'],
                                           'age_s': None if d['decision_ts'] is None else round(t - d['decision_ts'], 1)}
-                                         for d in health['rows'][-10:]]}
+                                         for d in last['rows'][-10:]]}
     s['memory'] = memory(host)
     s['pick_reader'] = pick_reader_state(host)
     s['disk'] = {'path': str(WORK_VOLUME), 'free_bytes': host.disk_free(WORK_VOLUME)}
@@ -431,13 +469,16 @@ def check_lines(s):
                                              else 'DECISION INSTANCE NOT LOADED AND RIGHT: ' + str(d['decision_instance']['why'])),
              '- embedding instance %s: %s' % (EMBEDDING_INSTANCE, 'loaded' if d['embedding_loaded'] else 'NOT loaded'),
              '- other loaded models (a run unloads these): %s' % (', '.join(o['instance_id'] for o in d['others']) or 'none'),
-             '- collector: job %s; last %d decisions %s; highest latency %s s; heartbeat %s s ago; breach: %s' % (
+             '- collector: job %s; last %d decisions %s; highest latency %s s; heartbeat %s s ago; last %d min: %d decisions %s; '
+             'breach: %s' % (
                  'listed' if c['job_listed'] else 'NOT listed', len(c['last_decisions']),
                  dict(Counter(x['status'] for x in c['last_decisions'])),
                  max([x['latency_s'] for x in c['last_decisions'] if isinstance(x['latency_s'], (int, float))], default=None),
-                 c['heartbeat_age_s'], c['breach'] or 'none'),
+                 c['heartbeat_age_s'], c['window_s'] // 60, c['window_decisions'], c['window_statuses'], c['breach'] or 'none'),
              '- memory: %s%% free, pressure level %s, swap used %s bytes' % (m['free_percent'], m['pressure_level'], m['swap_used_bytes']),
-             '- pick reader %s: %s' % (PICKS_LABEL, ('loaded (%s), from %s' % (s['pick_reader']['state'], s['pick_reader']['plist']))
+             '- pick reader %s: %s' % (PICKS_LABEL, ('loaded (%s%s), from %s' % (
+                 s['pick_reader']['state'], ', started %s' % s['pick_reader']['started'] if s['pick_reader']['running'] else '',
+                 s['pick_reader']['plist']))
                                        if s['pick_reader']['listed'] else 'not loaded'),
              '- free disk on %s: %.1f GB' % (s['disk']['path'], s['disk']['free_bytes'] / 1e9),
              '- earlier runs: %d unexpired gate(s), %d live observer(s)' % (len(s['earlier_runs']['unexpired_gates']),
@@ -460,6 +501,9 @@ class SwitchOffs:
         host = self.host
         before = pick_reader_state(host)
         pr = self.rec['pick_reader'] = {'label': PICKS_LABEL, 'before': before, 'booted_out': False, 'after': None, 'restored': None}
+        if before['running']:      # it may have started since the check: never boot out a reader mid-run (ruling 4)
+            raise Refused('the hourly pick reader %s is running (pid %s, started %s); it is never booted out mid-run: start '
+                          'after it ends' % (PICKS_LABEL, before['pid'], before['started'] or 'at an unknown time'))
         if before['listed']:
             if not before['plist']:
                 raise OperatorError('the pick reader\'s plist path is unknown, so it could not be bootstrapped back; not booted out')
@@ -569,18 +613,40 @@ def write_gate(host, work, candidate, announced):
     return gate
 
 
-def launch(host, work, gate):
+def require_stoppable(work):
+    """Addendum 1, ruling 5: a run that cannot be stopped is not started. The staged observer's run module must contain the
+    code that writes builder/observer-identity.json (searched by that file name)."""
+    run = work / 'owned-source/observer-entry/mirofish_native_run.py'
+    try:
+        text = run.read_text()
+    except OSError as e:
+        raise Refused('the staged pipeline has no readable %s (%s): not launched' % (run, type(e).__name__))
+    if IDENTITY_FILE not in text:
+        raise Refused('the staged pipeline revision is too old: its mirofish_native_run.py never writes builder/%s, so the '
+                      'run could not be stopped the documented way; not launched' % IDENTITY_FILE)
+
+
+def launch(host, work, gate, row):
+    """The launcher, started by this tool in its own session and process group (Host.spawn); its pid, start and group are
+    recorded at once, so that a stop by group can be checked against them."""
     argv = [str(PIPELINE_PY), '-B', 'mirofish_native_startup.py', '--work', str(work), '--gate', str(gate)]
-    return host.spawn(argv, cwd=str(work / 'owned-source/observer-entry'), env=pipeline_env())
+    proc = host.spawn(argv, cwd=str(work / 'owned-source/observer-entry'), env=pipeline_env())
+    seen = observed_identity(host, proc.pid)
+    row['launcher'] = {'pid': proc.pid, 'start': seen and seen['start'], 'pgid': seen and seen['pgid'],
+                       'own_group': bool(seen) and seen['pgid'] == proc.pid}
+    return proc
 
 
 class Stopper:
-    """TERM to the observer named in <work>/builder/observer-identity.json, at most once, and only when its pid, start and
-    process group all match the live process."""
+    """At most one stop signal. To the observer named in <work>/builder/observer-identity.json, only when its pid, start and
+    process group all match the live process. When that file has not appeared IDENTITY_WAIT_S after the launch: to the
+    launcher's own process group, only when the launcher was started by this tool in its own group and its pid, start and
+    group still match what was recorded at launch (addendum 1, ruling 5). Never on a pid alone."""
 
-    def __init__(self, host, work, row):
-        self.host, self.path = host, work / 'builder/observer-identity.json'
-        self.rec = row['stop'] = {'wanted': False, 'signalled': False, 'pid': None, 'utc': None, 'not_signalled': None}
+    def __init__(self, host, work, row, t_launch):
+        self.host, self.path, self.row, self.t_launch = host, work / 'builder' / IDENTITY_FILE, row, t_launch
+        self.rec = row['stop'] = {'wanted': False, 'signalled': False, 'by': None, 'pid': None, 'pgid': None, 'utc': None,
+                                  'not_signalled': None}
         self.sent_t = None
 
     def attempt(self):
@@ -590,13 +656,29 @@ class Stopper:
         try:
             identity = json.loads(self.path.read_text())
         except (OSError, ValueError) as e:
-            self.rec['not_signalled'] = 'no readable observer identity (%s)' % type(e).__name__; return False
+            return self._by_group('no readable observer identity (%s)' % type(e).__name__)
         why = identity_mismatch(self.host, identity)
         if why:
             self.rec['not_signalled'] = why; return False
         self.host.send_signal(identity['pid'], signal.SIGTERM)
         self.sent_t = self.host.now()
-        self.rec.update(signalled=True, pid=identity['pid'], utc=utc(self.sent_t), not_signalled=None)
+        self.rec.update(signalled=True, by='observer', pid=identity['pid'], utc=utc(self.sent_t), not_signalled=None)
+        return True
+
+    def _by_group(self, why):
+        if self.host.now() < self.t_launch + IDENTITY_WAIT_S:
+            self.rec['not_signalled'] = why + '; waiting up to %d s after the launch for it' % IDENTITY_WAIT_S; return False
+        launcher = self.row.get('launcher') or {}
+        if not launcher.get('own_group'):
+            self.rec['not_signalled'] = why + ', and the launcher is not in a process group of its own'; return False
+        seen = observed_identity(self.host, launcher['pid'])
+        if seen is None or seen['start'] != launcher['start'] or seen['pgid'] != launcher['pgid']:
+            self.rec['not_signalled'] = why + ', and the launcher pid %s is no longer the process started (%s)' % (
+                launcher['pid'], 'gone' if seen is None else 'start or group differs'); return False
+        self.host.send_group_signal(launcher['pgid'], GROUP_STOP_SIGNAL)
+        self.sent_t = self.host.now()
+        self.rec.update(signalled=True, by='group', pid=launcher['pid'], pgid=launcher['pgid'], utc=utc(self.sent_t),
+                        not_signalled=None, why_group=why)
         return True
 
 
@@ -738,6 +820,12 @@ def watch(host, row, proc, stopper, t_start, t_launch, wall_s, own):
             own['lowest'] = m['free_percent'] if own['lowest'] is None else min(own['lowest'], m['free_percent'])
         if m['pressure_level'] is not None:
             own['max_pressure'] = max(own['max_pressure'] or 0, m['pressure_level'])
+        if (not row.get('identity_alerted') and host.now() >= t_launch + IDENTITY_WAIT_S
+                and not (stopper.path.is_file() or stopper.rec['signalled'])):
+            row['identity_alerted'] = True
+            row['alerts'].append('OBSERVER IDENTITY FILE NOT WRITTEN WITHIN %d S OF LAUNCH: A BREACH WILL STOP THE LAUNCHER\'S '
+                                 'PROCESS GROUP %s' % (IDENTITY_WAIT_S, 'INSTEAD' if (row.get('launcher') or {}).get('own_group')
+                                                        else 'IS NOT POSSIBLE: THE LAUNCHER IS NOT IN ITS OWN GROUP'))
         if first is None:
             h = collector_health(host, since=t_start)
             if h['breach']:
@@ -817,14 +905,15 @@ def cmd_run(host, args):
         row['staged_folder'], row['twin_folder'] = str(work), str(twin)
         candidate = stage(host, args.profile, flags, work)
         stage(host, args.profile, flags, twin)
+        require_stoppable(work)
         threshold, free = require_free(host, work)
         row['start_threshold'], row['free_at_start'] = threshold, free
         preflight(host, twin)
         gate = write_gate(host, work, candidate, args.announced)
         swap_start = memory(host)['swap_used_bytes']
-        stopper = Stopper(host, work, row)
         t_launch = host.now()
-        proc = launch(host, work, gate)
+        stopper = Stopper(host, work, row, t_launch)
+        proc = launch(host, work, gate, row)
         row['launched'] = True; row['utc_launch'] = utc(t_launch)
         say('launched %s; watching every %d s' % (work.name, WATCH_S))
         watch(host, row, proc, stopper, t_start, t_launch, s['durations']['wall_s'], own)

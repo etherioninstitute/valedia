@@ -20,17 +20,19 @@ instead of `--model`; without either, the reviewed 27B bytes are staged.
 
 Read-only. It prints, and with `--json-out FILE` (or `--json`) returns as JSON:
 
-- LM Link's state (`lms link status`): it must read `disabled` and nowhere `enabled`; the tool never changes it.
+- LM Link's state (`lms link status`): disabled only when the command exits 0 and the first non-empty line of its output,
+  blanks removed, begins with exactly `You have disabled LM Link.` (the real wording, read 2026-11-17). Anything else is "not
+  known to be disabled" and refuses. The tool never changes it.
 - LM Studio's model list (`GET /api/v1/models`), judged with the pure functions of `valedia_trader/core/decision_model.py`:
   the decision instance `elephant-1` loaded and right (file and the four settings); the embedding instance
   `ym-research-embedding` loaded; every other loaded instance by name (what a run would unload); any `mf-native-*` instance.
-- The collector: its launchd job `com.valedia.orderbook-collector` listed; the last 10 decisions' status and latency; the age
-  of the last heartbeat. The store is opened read-only (`file:<path>?mode=ro`) and only `decisions.status`,
+- The collector: its launchd job `com.valedia.orderbook-collector` listed; the last 10 decisions' status and latency (shown);
+  the decisions of the last 15 minutes (judged by the breach rule below); the age of the last heartbeat. The store is opened read-only (`file:<path>?mode=ro`) and only `decisions.status`,
   `decisions.latency_s`, `decisions.decision_ts` and `heartbeats.ts` are ever read; the three statements are the module's
   `SQL` tuple and a test checks that nothing else can be issued.
 - Memory: the free reading (`memory_pressure`), the kernel pressure level (`kern.memorystatus_vm_pressure_level`: 1 normal,
   2 warn, 4 critical) and swap used (`vm.swapusage`).
-- The hourly pick reader's launchd state and the plist it was loaded from; free disk on `/Volumes/NIMROD_SSD`; unexpired gate
+- The hourly pick reader's launchd state, the plist it was loaded from and, when it is running, its pid and start; free disk on `/Volumes/NIMROD_SSD`; unexpired gate
   files and live observers of earlier runs under the crew folder.
 - The ANNOUNCEMENT: start time, expected duration and wall clock for the chosen profile and model (from
   `tools/mirofish_swarm_limits.py` through the stage tool's `swarm_numbers`), and by name everything that will be switched off
@@ -48,6 +50,8 @@ For the whole window (the wall clock plus the 120 s cleanup), each named in the 
 - the hourly pick reader `com.valedia.picks.hourly`: booted out (`launchctl bootout gui/<uid>/...`), and in a `finally` that
   also runs on Ctrl-C and on any exception, bootstrapped back from the same plist it was loaded from. A failed restore is exit
   3, `PICK READER NOT RESTORED` in capitals in the summary, and the record row says so. If it was not loaded, it is left alone.
+  If it is RUNNING (it runs a few minutes at the top of the hour), the start is refused with its start time: a reader is never
+  booted out mid-run. Its state is read again just before the bootout, so one that started after the check also refuses.
 - every loaded model that is neither the decision instance nor the embedding instance: unloaded by REST
   (`POST /api/v1/models/unload {"instance_id": ...}`) and named in the record. They are NOT reloaded: LM Studio loads each again
   on demand.
@@ -62,20 +66,29 @@ summary and the record say `DECISION INSTANCE NOT LOADED AND RIGHT` and the tool
 ## Start rules (each refuses with exit 2)
 
 LM Link not disabled; the decision instance not loaded and right; an `mf-native-*` instance already loaded; the collector
-already in breach (over its last 10 decisions, its last heartbeat and its job); the kernel pressure level not 1; no free
-reading; an unexpired gate file (`root-one-native-attempt.json` whose `expires_at_utc` is still ahead) or a live observer
+already in breach (the breach rule below over the decisions of the last 15 minutes, its last heartbeat and its job), or too
+quiet to judge (fewer than 5 decisions in those 15 minutes: a run must not start blind); the hourly pick reader running; the
+kernel pressure level not 1; no free reading; an unexpired gate file (`root-one-native-attempt.json` whose `expires_at_utc` is still ahead) or a live observer
 (`builder/observer-identity.json` whose pid, start and process group all match a running process) of an earlier run under the
 crew folder; and, after staging, a free reading under the staged folder's own start threshold (the manifest's
 `model_profile.start_threshold.percent_free`, the reviewed 65 without a model), said with both numbers. Expired gates of past
 runs do not refuse; unreadable gate or identity files do (fail closed).
 
+A run that cannot be stopped is not started: before the gate is written, the staged `owned-source/observer-entry/
+mirofish_native_run.py` must contain the code that writes `builder/observer-identity.json` (searched by that file name). A
+revision without it refuses with "the staged pipeline revision is too old"; no gate is written.
+
 ## Breach (checked every 30 s during `load-test` and `run`)
 
 - two decisions in a row (in decision time, across all markets) slower than 8 s;
-- a decision with a model-failure status: `model_unavailable`, `tag_mismatch`, `late`, `error` (every status the collector's
-  model path writes; `ok` and `stale_data` are not model failures);
-- no heartbeat for 90 s;
+- a decision with the status `model_unavailable` or `tag_mismatch`: at once (they can only mean the decision model is gone or
+  wrong);
+- `late` or `error`: only when two of three consecutive decisions carry one of them (a single one happens on an ordinary day:
+  a per-market exception writes `error` with the model untouched). The tool reads only the status, never the error text;
+- no heartbeat for 150 s (the collector writes one about every 60 s);
 - the collector's launchd job no longer listed.
+
+`ok` and `stale_data` are never a breach.
 
 On a breach `run` stops the run the documented way: TERM to the observer named in `<work>/builder/observer-identity.json`
 (`{"pid", "start", "pgid", "written_utc"}`, written by the pipeline at spawn), only after its pid, start time and process group
@@ -83,6 +96,19 @@ all match the live process; never on a pid alone, and at most once. It then wait
 ending, at most 180 s after the TERM), verifies that no `mf-native-*` instance is loaded and that the decision instance is still
 loaded and right, restores, and records `stopped: collector breach` with the figures. `load-test` unloads its test model
 through the pipeline's own unload instead. Ctrl-C stops the run the same way before restoring.
+
+The launcher is started by this tool in its own session and process group, and its pid, start and group are recorded at
+launch. If the identity file has not appeared 60 s after the launch, the summary says so in capitals and the watch goes on; at
+the first breach the stop signal then goes to the launcher's process group, only when the launcher is still the process that
+was started (pid, start and group all match), and the record says `stop.by: group`. A launcher that is not in a group of its
+own is never signalled; that is said in capitals as well.
+
+## What a breach costs
+
+Measured from the rules above, the worst case: up to about 30 s before the breach is seen (the check runs every 30 s), then the
+stop signal, then up to 180 s for the pipeline's own cleanup (its 120 s cleanup headroom and two more checks) before the
+launcher has ended and the switch-offs are restored. So the collector can run beside a harmful load for about three and a half
+minutes after the first bad decision. If the observer cannot be named, add up to the 60 s wait for its identity file.
 
 ## run
 
