@@ -695,3 +695,119 @@ def test_a_whole_number_too_large_for_the_store_is_a_malformed_row_with_its_own_
     assert pd.validate_board_row({"rank": big, "user_id": "u", "pnl": 1.0, "volume": 1.0}) == \
         (None, "number_too_large_for_store")
     assert pd.validate_trade(dict(trade(3), size=2 ** 63 - 1), "0xabc")[1] is None    # the largest that fits
+
+
+# ------------------------------------------------------------------ T52: the leaders' record (ruling R2)
+def test_board_categories_are_a_closed_set_sent_as_the_category_parameter():
+    assert pd.BOARD_CATEGORIES == ("sports", "crypto")
+    seen = []
+
+    def h(p, q):
+        seen.append(q)
+        return page([board_row(i + 1, "0x%02d" % i) for i in range(5)])
+    c, t, clock = client(h)
+    for cat in pd.BOARD_CATEGORIES:
+        w = c.leaderboard("all", rows=5, category=cat)
+        assert len(w.rows) == 5
+    c.leaderboard("all", rows=5)                                    # None: the overall board, as before
+    assert seen == [{"time_period": "all", "sort_by": "PNL", "category": "sports", "limit": "5"},
+                    {"time_period": "all", "sort_by": "PNL", "category": "crypto", "limit": "5"},
+                    {"time_period": "all", "sort_by": "PNL", "limit": "5"}]
+
+
+@pytest.mark.parametrize("cat", ["overall", "Sports", "SPORTS", "esports", "politics", "", "sports&x=1", 1, True])
+def test_any_other_category_is_refused_before_a_request(cat):
+    c, t, clock = client(lambda p, q: page([]))
+    with pytest.raises(ValueError):
+        c.leaderboard("all", rows=5, category=cat)
+    assert t.urls == []
+
+
+@pytest.mark.parametrize("cat", ["sports", "crypto"])
+def test_a_category_board_address_matches_the_unchanged_allow_list(monkeypatch, cat):
+    seen = []
+    c, t, clock = client(lambda p, q: page([board_row(1, "0xa")]))
+    c.leaderboard("all", rows=5, category=cat)
+    assert len(t.urls) == 1 and pd._allowed(t.urls[0]) and "category=" + cat in t.urls[0]
+    fake = fake_network(monkeypatch, body=json.dumps(page([])).encode())
+    pd.urllib_get(t.urls[0])                                          # the real transport sends it unchanged
+    assert [r[2] for r in fake.requests] == t.urls
+    for other in (t.urls[0].replace("data-api.polymarket.com", "data-api.polymarket.co"),
+                  t.urls[0].replace("/v2/leaderboard", "/v1/leaderboard"),
+                  t.urls[0].replace("/v2/leaderboard", "/v2/leaderboard.json"),
+                  t.urls[0] + "#x", t.urls[0].replace("https://", "http://")):
+        assert not pd._allowed(other)
+        with pytest.raises(pd.PolymarketDataError):
+            pd.urllib_get(other)
+    assert len(fake.requests) == 1
+
+
+def test_a_position_keeps_title_outcome_end_date_and_current_price_for_information():
+    good, why = pd.validate_position(position(0, title="Who wins?", outcome="Yes", end_date="2026-12-01",
+                                              current_price=0.42), "0xabc")
+    assert why is None
+    assert (good["title"], good["outcome"], good["end_date"], good["current_price"]) == \
+        ("Who wins?", "Yes", "2026-12-01", 0.42)
+    assert good["unread"] == ()
+
+
+@pytest.mark.parametrize("field,value", [("title", None), ("title", ""), ("title", 5), ("title", "x" * 501),
+                                         ("outcome", None), ("outcome", ""), ("outcome", "y" * 201),
+                                         ("end_date", None), ("end_date", "2026-13-01"), ("end_date", "2026-1-01"),
+                                         ("end_date", "1970-01-01"), ("end_date", "2026-12-01T00:00:00Z"),
+                                         ("current_price", None), ("current_price", "0.5"), ("current_price", True),
+                                         ("current_price", 1.5), ("current_price", -0.1),
+                                         ("current_price", float("nan")), ("current_price", float("inf"))])
+def test_a_missing_or_malformed_information_field_is_none_and_counted_never_a_reject(field, value):
+    row = position(0)
+    if value is None:
+        del row[field]
+    else:
+        row[field] = value
+    good, why = pd.validate_position(row, "0xabc")
+    assert why is None and good[field] is None and good["unread"] == (field,)
+    c, t, clock = client(lambda p, q: page([row, position(1)]))
+    w = c.positions("0xabc")
+    assert len(w.rows) == 2 and sum(w.rejects.values()) == 0 and dict(w.unread) == {field: 1}
+
+
+def test_the_longest_bounded_strings_and_the_price_ends_are_kept():
+    good, why = pd.validate_position(position(0, title="x" * 500, outcome="y" * 200, current_price=0), "0xabc")
+    assert why is None and good["unread"] == () and good["current_price"] == 0.0
+    assert pd.validate_position(position(0, current_price=1), "0xabc")[0]["current_price"] == 1.0
+
+
+def test_a_first_entry_of_zero_is_none():
+    assert pd.validate_position(position(0, first_entry_at=0), "0xabc")[0]["first_entry_at"] is None
+    assert pd.validate_position(position(0, first_entry_at=1_700_000_000), "0xabc")[0]["first_entry_at"] == \
+        1_700_000_000
+
+
+def test_the_money_fields_and_ids_still_decide_a_reject():
+    c, t, clock = client(lambda p, q: page([position(0, current_size="1"), position(1, token_id=""), position(2)]))
+    w = c.positions("0xabc")
+    assert [r["token_id"] for r in w.rows] == ["t2"] and dict(w.rejects) == {"bad_current_size": 1, "bad_token_id": 1}
+
+
+def test_positions_drop_exact_repeats_and_conflicts_by_wallet_and_token_counted():
+    rows = [position(0), position(0), position(1), position(1, current_size=2.0), position(2, proxy_wallet="0xABC"),
+            position(2, proxy_wallet="0xabc")]
+    c, t, clock = client(lambda p, q: page(rows[:3], True, "c1") if "cursor" not in q else page(rows[3:]))
+    w = c.positions("0xabc")
+    assert [r["token_id"] for r in w.rows] == ["t0"]                 # t1 in conflict across pages, t2 alike folded
+    assert dict(w.rejects) == {"repeated_row": 1, "conflicting_row": 4}
+    assert pd.position_identity(pd.validate_position(position(5, proxy_wallet="0xAbC"))[0]) == ("0xabc", "t5")
+
+
+def test_position_pages_hand_one_page_at_a_time_with_identity_across_pages():
+    rows = [position(0), position(1), position(1), position(2, current_size=3.0), position(2)]
+    c, t, clock = client(lambda p, q: page(rows[:2], True, "c1") if "cursor" not in q else page(rows[2:]))
+    ids, conflicted = {}, set()
+    got = list(c.position_pages("0xabc", page_cap=20, ids=ids, conflicted=conflicted))
+    assert [len(w.raw) for w in got] == [2, 3] and conflicted == {("0xabc", "t2")}
+    assert sum(w.rejects["repeated_row"] for w in got) == 1
+    assert t.queries()[0] == {"user": "0xabc", "limit": "1000"}
+    c, t, clock = client(lambda p, q: page([position(0)], True, "c%d" % len(t.urls)))
+    with pytest.raises(pd.PageCapHit):
+        list(c.position_pages("0xabc", page_cap=3, ids={}, conflicted=set()))
+    assert len(t.urls) == 3
