@@ -234,7 +234,10 @@ what settlement looks like.
     first answers 404.
   - *The account's own cash.* Every run reads buying power once, only with no order of its own open, together
     with the cash the ledger knows: every fill's cost or proceeds less its fee, plus every settlement's payout.
-    A holding gone now is confirmed only against the latest earlier reading taken after a clean reconcile.
+    A holding gone now is confirmed only against the latest earlier reading taken after a clean reconcile with
+    both figures read; a reading taken while a holding is missing never counts. That reading need not have shown
+    the holding: one bought after it is sound, because every fill between the two readings is inside the known
+    cash.
     Exactly, in whole cents, the buying power must have moved by the change in known cash plus the payouts of
     every holding gone now.
 
@@ -252,17 +255,23 @@ what settlement looks like.
   that cannot be computed, or an equation off by even a cent (for example a contract sold by hand for 0.60). The
   stop gives the figures, and one pending record per name waits; nothing is sent until a person runs
   `python -m valedia_trader.execution_and_risk.event_practice --confirm-settlement ID --who NAME --note TEXT`.
-  That command reads Kalshi's record again and requires the same safe values, journals the settlement with
-  `witnesses` "kalshi_record+person", who and the note, then reconciles and takes a fresh reading. A later run
-  never settles a pending record by itself. The 17 November holding has no earlier reading, so it waits for that
-  command.
+  That command first checks the environment, as every run does. It then refuses while anything of the ledger is
+  open or not yet journaled, and runs the same reconcile `--reconcile-only` makes. That reconcile must show the
+  pending name at exactly 0 and nothing else different (other names pending with it, also at 0, aside). Only then
+  does it read Kalshi's record again and require the same safe values. It journals the settlement with
+  `witnesses` "kalshi_record+person", who and the note, then reconciles and takes a fresh reading. Any refusal
+  journals nothing, changes no practice state and says why. If the holding is back in the account in full, no one
+  settles it: `--withdraw-pending ID --who NAME --note TEXT` closes the record without a settlement, only on a
+  clean reconcile. A later run never settles a pending record by itself. The 17 November holding has no earlier
+  reading, so it waits for a person.
 - **What a loss is confirmed as.** A loss is confirmed by three facts: Kalshi's record says the contract lost, the
   account shows none of it, and the account's cash moved by exactly what the ledger knows, no more and no less.
   A contract transferred out, or sold by hand for a price that nets exactly zero after fees, would be recorded
   the same way. The money would still be right; only the word "settlement" would be wrong. The account's own
   order history is the third witness a later ticket adds. For a win, the cash rising by exactly the payout is
   real evidence, and the flag `win_cash_observed`, shown in every summary, turns true on the first one.
-- **Not handled:** a correction Kalshi makes after `finalized` would show only as a cash difference.
+- **Not handled:** a correction Kalshi makes after `finalized` would show only as a cash difference. Any cash
+  move from outside the ledger that exactly cancels a difference passes the equation.
 
 ### Fees and settlement in a real account (Webull's help pages, read by the lead 2026-11-17)
 

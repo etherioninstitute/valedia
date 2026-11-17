@@ -81,9 +81,10 @@ fraction, or a holding that vanishes before Kalshi says `finalized`.
 - *Second witness: the account's cash.* Each run reads buying power once, only with no order of the ledger open,
   and stores it with the ledger's known cash in whole cents: each fill's cost (a purchase) or proceeds (a sale)
   less its fee, plus each settlement's payout. A fill without a price for all its contracts or without a fee, or
-  a figure not in whole cents, makes the known cash unknown. A reading counts as `prev` only if it was taken
-  after a clean reconcile; a reading taken while a holding is missing never counts. K is settled only if, exactly,
-  `now - prev == (known_now - known_prev) + payouts(K)`.
+  a figure not in whole cents, makes the known cash unknown. `prev` is the latest reading taken after a clean
+  reconcile with both figures read; a reading taken while a holding is missing never counts. It need not have shown
+  K: a holding bought after it is sound, because every fill between the two readings is inside the known cash. K is
+  settled only if, exactly, `now - prev == (known_now - known_prev) + payouts(K)`.
 - *Order of steps:*
   1. Journal the rows that are not yet journaled.
   2. Reconcile, cancel, reconcile.
@@ -93,15 +94,24 @@ fraction, or a holding that vanishes before Kalshi says `finalized`.
      must be clean, so the ledger's latest reconcile stays usable for the next order.
   6. If the equation does not hold, write one pending record per name and stop at stage `settlement` with the
      figures.
-- *Pending.* While any record is pending, nothing is sent. `--confirm-settlement ID --who NAME --note TEXT`
-  (person's words: trimmed, not empty, no control characters) reads Kalshi's record again, requires the first
-  witness again, journals the settlement with `witnesses` "kalshi_record+person", who and the note, and then
-  reconciles for a fresh reading. A later run never settles a pending record by itself.
+- *Pending.* While any record is pending, nothing is sent. A later run never settles a pending record by itself.
+  Two person's commands close one, each with `--who NAME --note TEXT` (trimmed, not empty, no control characters).
+  Each checks the environment first, as every run does. Then, under the lock, it refuses while anything of the
+  ledger is open or not yet journaled (a `--reconcile-only` run comes first), and runs the same reconcile a
+  `--reconcile-only` run makes. A refusal journals nothing, changes no practice state and says why; the record
+  stays open.
+  - `--confirm-settlement ID` needs the account to show the pending name at exactly 0, with nothing else different
+    (other names pending with it, also at 0, aside: holdings gone together are confirmed one by one). It then reads
+    Kalshi's record again and requires the first witness again. It journals the settlement with `witnesses`
+    "kalshi_record+person", who and the note, and reconciles for a fresh reading.
+  - `--withdraw-pending ID` is for a holding that is back in the account in full. It needs a clean reconcile and
+    closes the record without a settlement, with a `settlement_withdrawn` line carrying who and the note. If the
+    holding goes again later, a new pending record is made.
 - *The entry.* A `settlement` journal entry, once per name: the whole expected holding closed at 1.00 a contract
   when its outcome won (yes holding: Kalshi's YES value; no holding: one minus it), else 0.00. It carries the
   baseline and program parts, the fields read, the two readings, `witnesses`, and `fee` null with `fee_seen`
   "none seen".
-- *Writes.* Every settlement, pending record and reading is a row with an integer id. The journal line is keyed
+- *Writes.* Every settlement, pending record, withdrawal and reading is a row with an integer id. The journal line is keyed
   by that id and synced, then the row is marked journaled. A line whose write failed is written at the next run,
   exactly once.
 - *After a settlement.* The expected book becomes baseline plus applied fills minus settled units. Any later
@@ -112,10 +122,11 @@ fraction, or a holding that vanishes before Kalshi says `finalized`.
   transfer out, or a hand sale netting exactly zero after fees, would be recorded as a settlement with the money
   still right. The account's own order history is the third witness a later ticket adds. For a win the equation
   is real evidence. `win_cash_observed` turns true on the first win settled on it and is shown in every summary.
-- *State file.* Layout 3 adds the `settlements`, `pending` and `readings` tables. A layout-1 file holding exactly
-  its three tables is migrated in place, and its `meta`, `baseline` and `sends` are left byte for byte. Any other
-  layout is refused. That includes a layout-1 file missing a table, and the layout 2 of the first T45-1 build
-  (with its `holds` table), which was never deployed. The old hold and `--clear-hold` are gone.
+- *State file.* Layout 4 adds the `settlements`, `pending`, `readings` and `withdrawals` tables. A layout-1 file
+  holding exactly its three tables is migrated in place, and its `meta`, `baseline` and `sends` are left byte for
+  byte. Any other layout is refused. That includes a layout-1 file missing a table, the layout 2 of the first T45-1
+  build (with its `holds` table) and the layout 3 of the second, neither ever deployed. The old hold and
+  `--clear-hold` are gone.
 
 **What Webull's help pages say (read by the lead 2026-11-17).** Every opening and every closing trade costs 0.01
 dollars commission plus 0.01 dollars exchange fee a contract. Holding to settlement costs nothing, and neither
@@ -129,6 +140,9 @@ removed. Event buying power is derived from that linked account's settled cash (
 - In a real account buying power also moves with the linked brokerage account, so there the equation will often
   not hold, and a person (or, later, the account's own order history) confirms. The exact equation is meaningful
   as built only in the paper Events account. A `win_cash_observed` set there does not prove the live cash path.
+- A transfer out, or a hand sale netting exactly zero after fees, of a holding Kalshi says lost is recorded as a
+  settlement, with the money still right.
+- Any cash move from outside the ledger that exactly cancels a difference passes the equation.
 - A correction by Kalshi after `finalized` is not handled and would show only as a cash difference.
 - A holding Webull drops before Kalshi finalizes (for example while `determined`) stops the run. That blocks the
   whole Events path until Kalshi finalizes. A multi-market strategy will need a per-name waiting state for that

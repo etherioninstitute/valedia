@@ -3,6 +3,7 @@
     python -m valedia_trader.execution_and_risk.event_practice --ticker T --outcome yes|no --contracts N --side buy|sell [--limit P]
     python -m valedia_trader.execution_and_risk.event_practice --reconcile-only
     python -m valedia_trader.execution_and_risk.event_practice --confirm-settlement ID --who NAME --note TEXT
+    python -m valedia_trader.execution_and_risk.event_practice --withdraw-pending ID --who NAME --note TEXT
 
 Design: docs/specs/2026-11-13-event-orders-design.md, part 2 (roadmap 4.7). No strategy is wired to it: it proves the
 order path for event contracts with the guarantees the order step gives stocks (an order is sent at most once, an
@@ -41,6 +42,11 @@ One run, in order. A failure at any step sends nothing; the reason is returned (
                  reconcile with the new book, which must be clean. If the record fails, nothing is settled and the
                  stop names the fact; if the cash fails, one pending record per name waits for a person
                  (--confirm-settlement) and nothing is sent meanwhile. No order is sent on a settled ticker.
+    person       --confirm-settlement and --withdraw-pending: the environment first, then under the lock the same
+                 reconcile (nothing of this ledger open or unjournaled, else refused: run --reconcile-only first).
+                 A confirmation needs the pending name at exactly 0 and nothing else different (other pending names
+                 gone together aside), then Kalshi's record again; a withdrawal (no settlement) needs a clean
+                 reconcile, the holding shown in full. A refusal journals nothing and changes no practice state.
     cash         every run reads the buying power once (unread unless a finite number from 0 in whole cents), with the
                  known cash; only a reading after a clean reconcile can be the earlier side of the equation.
                  `win_cash_observed` stays false until a win has been settled on the equation.
@@ -92,7 +98,8 @@ from valedia_trader.venues.webull import EVENTS_CLASS, parse_event_name
 
 __all__ = ["MAX_CONTRACTS", "MAX_ORDER_DOLLARS", "MAX_ORDERS_PER_DAY", "QUOTE_MAX_AGE_SECONDS", "MAX_SPREAD", "MAX_CROSS",
            "PracticeState", "PracticeError", "NotSettled", "run_event_practice", "quote_from_book", "choose_limit",
-           "kalshi_book", "kalshi_market", "judge_settlement", "known_cents", "confirm_settlement", "build_events_venue", "state_path_for", "main"]
+           "kalshi_book", "kalshi_market", "judge_settlement", "known_cents", "confirm_settlement", "withdraw_pending",
+           "build_events_venue", "state_path_for", "main"]
 
 MAX_CONTRACTS = 5
 MAX_ORDER_DOLLARS = Decimal("5.00")
@@ -455,6 +462,11 @@ def _pending_entry(r: dict) -> dict:
             "price": float(Decimal(r["price"])), "kalshi": r["kalshi"], "figures": r["figures"], "reason": r["reason"]}
 
 
+def _withdrawal_entry(r: dict) -> dict:
+    return {"event": "settlement_withdrawn", "withdrawal_id": r["id"], "pending_id": r["pending_id"], "symbol": r["symbol"],
+            "who": r["who"], "note": r["note"]}
+
+
 def _reading_entry(r: dict) -> dict:
     return {"event": "buying_power", "reading_id": r["id"], "buying_power": r["buying_power"], "cents": r["cents"],
             "unread": r["unread"], "clean": bool(r["clean"]), "known_cents": r["known_cents"], "known_why": r["known_why"]}
@@ -467,13 +479,13 @@ def state_path_for(ledger_path: str | Path, venue_name: str) -> Path:
 
 # ---- the state file
 
-STATE_LAYOUT = 3
+STATE_LAYOUT = 4
 LAYOUT_1_SCHEMA = [                                      # layout 1 (T19), kept as it was
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS baseline (symbol TEXT PRIMARY KEY, units REAL NOT NULL)",
     "CREATE TABLE IF NOT EXISTS sends (tag TEXT PRIMARY KEY, day TEXT NOT NULL, time REAL NOT NULL, outcome TEXT)",
 ]
-LAYOUT_3_ADDED = [                                       # layout 3 (T45-1): settlements, pending records, readings
+LAYOUT_4_ADDED = [                                       # layout 4 (T45-1): settlements, pending, readings, withdrawals
     "CREATE TABLE IF NOT EXISTS settlements (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL UNIQUE, units REAL NOT NULL, "
     "baseline_units REAL NOT NULL, program_units REAL NOT NULL, price TEXT NOT NULL, kalshi TEXT NOT NULL, "
     "time REAL NOT NULL, batch TEXT, witnesses TEXT NOT NULL, confirmed_by TEXT, note TEXT, pending_id INTEGER, "
@@ -485,20 +497,23 @@ LAYOUT_3_ADDED = [                                       # layout 3 (T45-1): set
     "CREATE TABLE IF NOT EXISTS readings (id INTEGER PRIMARY KEY, time REAL NOT NULL, batch TEXT, buying_power REAL, "
     "cents INTEGER, unread TEXT, book TEXT NOT NULL, clean INTEGER NOT NULL, known_cents INTEGER, known_why TEXT, "
     "journaled INTEGER NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS withdrawals (id INTEGER PRIMARY KEY, pending_id INTEGER NOT NULL UNIQUE, "
+    "symbol TEXT NOT NULL, who TEXT NOT NULL, note TEXT NOT NULL, time REAL NOT NULL, batch TEXT, "
+    "journaled INTEGER NOT NULL DEFAULT 0)",
 ]
-STATE_SCHEMA = LAYOUT_1_SCHEMA + LAYOUT_3_ADDED
+STATE_SCHEMA = LAYOUT_1_SCHEMA + LAYOUT_4_ADDED
 LAYOUT_1_TABLES = frozenset({"meta", "baseline", "sends"})
-LAYOUT_3_TABLES = LAYOUT_1_TABLES | {"settlements", "pending", "readings"}
+LAYOUT_4_TABLES = LAYOUT_1_TABLES | {"settlements", "pending", "readings", "withdrawals"}
 WITNESSES = ("kalshi_record+cash_equation", "kalshi_record+person")
 
 
 class PracticeState:
     """The command's own small file: the baseline (recorded once), each order handed to the ledger with its New York
-    day and outcome, and (layout 3) each settlement, each pending settlement and each buying-power reading, every one
-    with a flag saying whether its journal line was written. Every write is one IMMEDIATE transaction. A layout-1 file
-    holding exactly its three tables is migrated in place to layout 3 by adding the three new tables only (its meta,
-    baseline and sends are not touched); any other layout is not opened, the layout 2 of the first T45-1 build (with
-    its holds table) included: it was never deployed."""
+    day and outcome, and (layout 4) each settlement, each pending settlement, each withdrawal of one and each
+    buying-power reading, every one with a flag saying whether its journal line was written. Every write is one
+    IMMEDIATE transaction. A layout-1 file holding exactly its three tables is migrated in place to layout 4 by adding
+    the four new tables only (its meta, baseline and sends are not touched); any other layout is not opened: the
+    layout 2 (with its holds table) and the layout 3 of earlier T45-1 builds included, neither ever deployed."""
 
     def __init__(self, path: str | Path, clock: Callable[[], float] = wall_clock) -> None:
         self.path, self.clock = str(path), clock
@@ -516,11 +531,11 @@ class PracticeState:
                     for statement in STATE_SCHEMA:
                         self._db.execute(statement)
                     self._db.execute(f"PRAGMA user_version = {STATE_LAYOUT}")
-                elif version == 1 and tables == LAYOUT_1_TABLES:          # layout 1 -> 3: the new tables only
-                    for statement in LAYOUT_3_ADDED:
+                elif version == 1 and tables == LAYOUT_1_TABLES:          # layout 1 -> 4: the new tables only
+                    for statement in LAYOUT_4_ADDED:
                         self._db.execute(statement)
                     self._db.execute(f"PRAGMA user_version = {STATE_LAYOUT}")
-                elif not (version == STATE_LAYOUT and tables == LAYOUT_3_TABLES):
+                elif not (version == STATE_LAYOUT and tables == LAYOUT_4_TABLES):
                     raise PracticeError(f"{path} is not an event-practice state file of layout {STATE_LAYOUT}; it is not opened")
         except BaseException:
             self._db.close()
@@ -620,8 +635,8 @@ class PracticeState:
             if observed:
                 self._db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('win_cash_observed', 'true')")
             if pending_id is not None:
-                changed = self._db.execute("UPDATE pending SET settlement_id = ? WHERE id = ? AND settlement_id IS NULL",
-                                           (ids[0], pending_id)).rowcount
+                changed = self._db.execute("UPDATE pending SET settlement_id = ? WHERE id = ? AND settlement_id IS NULL "
+                                           "AND id NOT IN (SELECT pending_id FROM withdrawals)", (ids[0], pending_id)).rowcount
                 if changed != 1:
                     raise PracticeError(f"pending record {pending_id} is not open")
         return ids
@@ -640,7 +655,8 @@ class PracticeState:
         ids = []
         with self._write():
             for r in rows:
-                if self._db.execute("SELECT 1 FROM pending WHERE symbol = ? AND settlement_id IS NULL", (r["symbol"],)).fetchone():
+                if self._db.execute("SELECT 1 FROM pending WHERE symbol = ? AND settlement_id IS NULL AND id NOT IN "
+                                    "(SELECT pending_id FROM withdrawals)", (r["symbol"],)).fetchone():
                     raise PracticeError("a pending record of that name is already open")
                 cur = self._db.execute(
                     "INSERT INTO pending (symbol, units, baseline_units, program_units, price, kalshi, figures, reason, time, "
@@ -658,7 +674,31 @@ class PracticeState:
         return rows
 
     def open_pending(self) -> list[dict]:
-        return [r for r in self.pending() if r["settlement_id"] is None]
+        """Pending records neither settled nor withdrawn."""
+        withdrawn = {r["pending_id"] for r in self.withdrawals()}
+        return [r for r in self.pending() if r["settlement_id"] is None and r["id"] not in withdrawn]
+
+    # -- withdrawals: a person closes a pending record without a settlement (the holding is back in full)
+    def add_withdrawal(self, pending_id: int, who: str, note: str, batch: str | None) -> int:
+        with self._write():
+            row = self._db.execute("SELECT symbol FROM pending WHERE id = ? AND settlement_id IS NULL AND id NOT IN "
+                                   "(SELECT pending_id FROM withdrawals)", (pending_id,)).fetchone()
+            if row is None:
+                raise PracticeError(f"pending record {pending_id} is not open")
+            cur = self._db.execute("INSERT INTO withdrawals (pending_id, symbol, who, note, time, batch, journaled) "
+                                   "VALUES (?,?,?,?,?,?,0)", (pending_id, row[0], who, note, float(self.clock()), batch))
+            return int(cur.lastrowid)
+
+    def withdrawals(self) -> list[dict]:
+        return self._rows("SELECT * FROM withdrawals ORDER BY id")
+
+    def mark_withdrawal_journaled(self, wid: int) -> None:
+        with self._write():
+            self._db.execute("UPDATE withdrawals SET journaled = 1 WHERE id = ?", (wid,))
+
+    def open_sends(self) -> list[str]:
+        """Orders handed to the ledger whose outcome this file has not written yet."""
+        return [t for (t,) in self._db.execute("SELECT tag FROM sends WHERE outcome IS NULL ORDER BY tag")]
 
     def mark_pending_journaled(self, pid: int) -> None:
         with self._write():
@@ -755,8 +795,11 @@ def run_event_practice(*, ledger: OrderLedger, venue, journal, state, ticker=Non
 
 
 class _Run:
-    def __init__(self, ledger, venue, journal, state, request, reconcile_only, book, clock, market=None) -> None:
+    def __init__(self, ledger, venue, journal, state, request, reconcile_only, book, clock, market=None,
+                 person: dict | None = None) -> None:
         self.ledger, self.venue, self.journal, self.state_arg = ledger, venue, journal, state
+        self.person = dict(person) if person is not None else None       # a person's command: confirm or withdraw
+        self.person_out: dict = {}
         self.request, self.reconcile_only, self.book, self.clock = request, reconcile_only, book, clock
         self.market = market
         self.settled_now: list[dict] = []
@@ -765,6 +808,7 @@ class _Run:
         self._settled_seen: set = set()
         self._pending_seen: set = set()
         self._reading_seen: set = set()
+        self._withdrawn_seen: set = set()
         self._read_this_run = False
         self._settle_why: dict[str, str] = {}
         self.view = _LedgerVenue(venue, ledger)
@@ -810,9 +854,13 @@ class _Run:
             self._environment()                          # the venue's name, environment and host, and the ledger
             self.stage = "input"
             req = None if self.reconcile_only else check_request(**self.request)
+            if self.person is not None:
+                self._check_person()
         except _Stop as stop:
             return self._finish("stopped", stop.stage, stop.reason)
         path = self.state_arg.path if isinstance(self.state_arg, PracticeState) else str(self.state_arg)
+        if self.person is not None and not isinstance(self.state_arg, PracticeState) and not Path(path).is_file():
+            return self._finish("stopped", "state", "there is no practice state file for this venue, so no pending record")
         lock = _RunLock(path)
         try:
             got = lock.acquire()
@@ -842,6 +890,8 @@ class _Run:
             lock.release()
 
     def _rest(self, req: dict | None) -> dict:
+        if self.person is not None:
+            return self._person_step()
         try:
             self.stage = "baseline"
             baseline = self._baseline()
@@ -958,6 +1008,7 @@ class _Run:
         self._settled_seen = ids("settlement", "settlement_id")
         self._pending_seen = ids("settlement_pending", "pending_id")
         self._reading_seen = ids("buying_power", "reading_id")
+        self._withdrawn_seen = ids("settlement_withdrawn", "withdrawal_id")
 
     # -- 2
     def _baseline(self) -> dict[str, float]:
@@ -1074,7 +1125,8 @@ class _Run:
         the journal file synced, then the row marked journaled."""
         kinds = ((self.state.readings, _reading_entry, self._reading_seen, self.state.mark_reading_journaled),
                  (self.state.pending, _pending_entry, self._pending_seen, self.state.mark_pending_journaled),
-                 (self.state.settlements, _settlement_entry, self._settled_seen, self.state.mark_settlement_journaled))
+                 (self.state.settlements, _settlement_entry, self._settled_seen, self.state.mark_settlement_journaled),
+                 (self.state.withdrawals, _withdrawal_entry, self._withdrawn_seen, self.state.mark_withdrawal_journaled))
         for rows, entry, seen, mark in kinds:
             for r in rows():
                 if r["journaled"]:
@@ -1283,7 +1335,159 @@ class _Run:
         self._write({"event": "order", **entry})
 
     # -- the summary
+    # -- a person's command (T45-1): confirm a pending settlement, or withdraw a pending record
+    def _check_person(self) -> None:
+        pid = self.person.get("id")
+        if type(pid) is not int or pid < 1:
+            raise _Stop("input", "the pending record's id must be a whole number from 1")
+        w, n = _person_words(self.person.get("who"), WHO_MAX), _person_words(self.person.get("note"), NOTE_MAX)
+        if w is None or n is None:
+            raise _Stop("input", f"--who and --note are both needed: plain text, not empty after trimming, without control "
+                                 f"characters (who at most {WHO_MAX} characters, the note at most {NOTE_MAX})")
+        self.person["who"], self.person["note"] = w, n
+
+    def _person_step(self) -> dict:
+        """Under the lock: the pending record open; nothing of the ledger open or unjournaled; the same reconcile a
+        --reconcile-only run makes (baseline plus applied fills less settled units); what the account shows now
+        checked; only then the write. Any refusal leaves the journal and the practice state as they were (the
+        ledger records its reconcile, as every reconcile does)."""
+        kind, pid = self.person["kind"], self.person["id"]
+        try:
+            self.stage = "pending"
+            found = [r for r in self.state.pending() if r["id"] == pid]
+            if not found:
+                raise _Stop("pending", f"no pending record has id {pid}")
+            p = found[0]
+            if p["settlement_id"] is not None:
+                raise _Stop("pending", f"pending record {pid} is already settled")
+            if pid in {r["pending_id"] for r in self.state.withdrawals()}:
+                raise _Stop("pending", f"pending record {pid} is already withdrawn")
+            if p["symbol"] in {r["symbol"] for r in self.state.settlements()}:
+                raise _Stop("pending", f"{p['symbol']} is already settled")
+            self.stage = "baseline"
+            baseline = self.state.baseline()
+            if baseline is None:
+                raise _Stop("baseline", "no baseline is recorded")
+            self.stage = "reconcile"
+            self._quiet(before=True)
+            result = self.ledger.reconcile(self.view, self._applied_positions(baseline))
+            self._quiet(before=False)
+            self.stage = "account"
+            self._account_now(kind, p["symbol"], result)
+            return self._confirm(p) if kind == "confirm" else self._withdraw(p)
+        except _Stop as stop:
+            return self._finish("stopped", stop.stage, stop.reason)
+        except OrdersBlocked:
+            return self._finish("stopped", self.stage, "the order ledger is blocked")
+        except (OrderError, PracticeError, sqlite3.Error, OSError) as exc:
+            return self._finish("stopped", self.stage, f"the ledger, the state file or the journal failed: {_venue_error(exc)}")
+
+    def _quiet(self, before: bool) -> None:
+        """Nothing a reconcile run would cancel, journal or settle first: no order of this ledger open or of unknown
+        outcome, no fill unapplied, no attention item, and (before) no state row unjournaled and no send whose outcome
+        is not written. Otherwise _Stop: a --reconcile-only run comes first."""
+        reasons = []
+        if self.ledger.orders(OPEN_STATES):
+            reasons.append("an order of this ledger is open or of unknown outcome")
+        if self.ledger.unapplied_fills():
+            reasons.append("a fill is not yet journaled")
+        if self.ledger.attention():
+            reasons.append("an attention item is open on the ledger")
+        if before:
+            rows = (self.state.readings(), self.state.pending(), self.state.settlements(), self.state.withdrawals())
+            if any(not r["journaled"] for group in rows for r in group):
+                reasons.append("a row of the practice state is not yet journaled")
+            if self.state.open_sends():
+                reasons.append("a send's outcome is not yet written")
+        if reasons:
+            raise _Stop("reconcile", "; ".join(reasons) + ("" if before else " (found by the reconcile)")
+                        + "; nothing is changed: run --reconcile-only first, then this command again")
+
+    def _account_now(self, kind: str, name: str, result: dict) -> None:
+        """What the account shows now. confirm: the pending name at exactly 0, and every other difference a name of
+        another open pending record also at exactly 0 (holdings gone together are pending together). withdraw: a
+        clean reconcile, so the holding is shown in full. Otherwise _Stop and the record stays open."""
+        unclean = [w for w, k in (("the venue's positions could not be read", "positions_error"),
+                                  ("an order's status could not be read", "unresolved"),
+                                  ("the reconcile found an anomaly", "anomalies")) if result.get(k)]
+        if unclean:
+            raise _Stop("account", f"{unclean[0]}; the pending record stays open; a person must look")
+        diffs = result.get("position_differences") or {}
+        if kind == "withdraw":
+            if diffs or result.get("clean") is not True:
+                raise _Stop("account", f"the reconcile is not clean ({', '.join(sorted(map(str, diffs))) or 'not clean'} "
+                                       f"differs): the account does not show {name} in full with nothing else different; "
+                                       "the pending record stays open")
+            return
+        def at_zero(sym):
+            d = diffs.get(sym)
+            return isinstance(d, dict) and _as_float(d.get("venue")) == 0.0
+        if not at_zero(name):
+            if name not in diffs:
+                raise _Stop("account", f"the account shows {name} as the ledger expects it: the holding is there, so it is "
+                                       "not settled; when it is back in full, --withdraw-pending closes the record")
+            raise _Stop("account", f"the account shows {name} at neither 0 nor what the ledger expects; a person must look")
+        waiting = {r["symbol"] for r in self.state.open_pending()}
+        bad = sorted(str(s) for s in diffs if s != name and not (s in waiting and at_zero(s)))
+        if bad:
+            raise _Stop("account", f"another name differs from baseline plus fills ({', '.join(bad)}); the pending record "
+                                   "stays open; a person must look")
+
+    def _confirm(self, p: dict) -> dict:
+        self.stage = "kalshi"
+        ticker, outcome = parse_event_name(p["symbol"])
+        now = self._now()
+        try:
+            fills = [f for f in self.ledger.fills() if f["symbol"] == p["symbol"]]
+            after = _latest_submission(self.ledger, fills)
+            try:
+                record = self.market(ticker)
+            except Exception as exc:
+                raise NotSettled(f"Kalshi's record could not be read ({_venue_error(exc)})") from None
+            yes_value = judge_settlement(record, ticker, now, after)
+        except NotSettled as why:
+            raise _Stop("kalshi", f"Kalshi's record does not show the settlement now: {why}") from None
+        row = _settlement_row(p["symbol"], outcome, p["units"], p["baseline_units"], p["program_units"], yes_value, record,
+                              self.batch)
+        if row["price"] != p["price"]:
+            raise _Stop("kalshi", "Kalshi's record now gives another result than when the pending record was made; a person "
+                                  "must look")
+        self.stage = "write"
+        who, note = self.person["who"], self.person["note"]
+        sid = self.state.add_settlements([row], witnesses=WITNESSES[1], pending_id=p["id"], confirmed_by=who, note=note)[0]
+        entry = _settlement_entry([r for r in self.state.settlements() if r["id"] == sid][0])
+        self.person_out = {"settlement_id": sid, "symbol": p["symbol"], "price": entry["price"], "who": who, "note": note,
+                           "time": now}
+        self._person_line(entry, sid, self._settled_seen, self.state.mark_settlement_journaled)
+        return self._finish("confirmed", None, None)
+
+    def _withdraw(self, p: dict) -> dict:
+        self.stage = "write"
+        who, note = self.person["who"], self.person["note"]
+        wid = self.state.add_withdrawal(p["id"], who, note, self.batch)
+        entry = _withdrawal_entry([r for r in self.state.withdrawals() if r["id"] == wid][0])
+        self.person_out = {"withdrawal_id": wid, "symbol": p["symbol"], "who": who, "note": note, "time": self._now()}
+        self._person_line(entry, wid, self._withdrawn_seen, self.state.mark_withdrawal_journaled)
+        return self._finish("withdrawn", None, None)
+
+    def _person_line(self, entry: dict, rid: int, seen: set, mark: Callable) -> None:
+        """The row stands; its journal line (synced), then the row marked journaled. A failed line: the next run."""
+        try:
+            self._write(entry)
+            path = self._journal_file()
+            if path is not None:
+                _sync_file(path)
+            seen.add(rid)
+            mark(rid)
+        except (sqlite3.Error, OSError) as exc:
+            self.person_out["journal_error"] = f"{_venue_error(exc)}; the next run writes the line"
+
     def _finish(self, status: str, stage: str | None, reason: str | None) -> dict:
+        if self.person is not None:                      # a person's command journals only its own line
+            pid = self.person.get("id")
+            return {"status": "refused" if status == "stopped" else status, "stage": stage, "reason": reason,
+                    "pending_id": pid if type(pid) is int else None, "venue": self.name, "batch": self.batch,
+                    **self.person_out}
         if self.order is not None and status == "done":
             try:
                 rec = self.ledger.order(self.order["tag"])
@@ -1315,84 +1519,31 @@ class _Run:
 # ---- confirming a pending settlement (a person's command)
 
 
-def confirm_settlement(*, journal, state, ledger: OrderLedger, venue_name: str, pending_id, who, note,
+def confirm_settlement(*, journal, state, ledger: OrderLedger, venue, pending_id, who, note,
                        market: Callable | None = None, clock: Callable[[], float] = wall_clock) -> dict:
-    """A person settles a pending record: `pending_id` a plain int from 1; `who` and `note` plain text, not empty after
-    trimming, without control or format characters (who at most WHO_MAX characters, the note at most NOTE_MAX).
-    Kalshi's record is read again and must show exactly the same settlement now (judge_settlement, the time guard on
-    the ledger's submissions included). Under the run's lock: the settlement row (witnesses kalshi_record+person, who
-    and the note) and the record's resolution in one write, then the journal line (synced), then the row marked
-    journaled; a failed line is written by the next run. Anything else is refused and nothing changes. The command
-    line then runs a reconcile, which takes the fresh reading the next settlement starts from."""
-    def refused(why: str) -> dict:
-        return {"status": "refused", "pending_id": pending_id if type(pending_id) is int else None, "reason": why}
-    if type(pending_id) is not int or pending_id < 1:
-        return refused("the pending record's id must be a whole number from 1")
-    w, n = _person_words(who, WHO_MAX), _person_words(note, NOTE_MAX)
-    if w is None or n is None:
-        return refused(f"--who and --note are both needed: plain text, not empty after trimming, without control "
-                       f"characters (who at most {WHO_MAX} characters, the note at most {NOTE_MAX})")
-    if not _plain(_NAME, venue_name) or not venue_name.endswith(EVENTS_SUFFIX):
-        return refused("the venue is not an Events venue")
-    path = state.path if isinstance(state, PracticeState) else str(state)
-    if not isinstance(state, PracticeState) and not Path(path).is_file():
-        return refused("there is no practice state file for this venue, so no pending record")
-    lock = _RunLock(path)
-    try:
-        if not lock.acquire():
-            return refused("a practice run is running on this venue's state file")
-    except OSError as exc:
-        return refused(f"the lock file could not be taken: {_venue_error(exc)}")
-    st = None
-    try:
-        st = state if isinstance(state, PracticeState) else PracticeState(path, clock)
-        found = [r for r in st.pending() if r["id"] == pending_id]
-        if not found:
-            return refused(f"no pending record has id {pending_id}")
-        p = found[0]
-        if p["settlement_id"] is not None:
-            return refused(f"pending record {pending_id} is already settled")
-        if p["symbol"] in {r["symbol"] for r in st.settlements()}:
-            return refused(f"{p['symbol']} is already settled")
-        ticker, outcome = parse_event_name(p["symbol"])
-        now = _as_float(clock())
-        if now is None:
-            return refused("the clock did not give a finite number of seconds")
-        try:
-            fills = [f for f in ledger.fills() if f["symbol"] == p["symbol"]]
-            after = _latest_submission(ledger, fills)
-            try:
-                record = (market or kalshi_market)(ticker)
-            except Exception as exc:
-                raise NotSettled(f"Kalshi's record could not be read ({_venue_error(exc)})") from None
-            yes_value = judge_settlement(record, ticker, now, after)
-        except NotSettled as why:
-            return refused(f"Kalshi's record does not show the settlement now: {why}")
-        stamp = pd.Timestamp(now, unit="s", tz="UTC").tz_convert(NEW_YORK)
-        batch = f"ep-{stamp:%Y%m%d-%H%M%S}-{os.urandom(3).hex()}"
-        row = _settlement_row(p["symbol"], outcome, p["units"], p["baseline_units"], p["program_units"], yes_value, record, batch)
-        if row["price"] != p["price"]:
-            return refused("Kalshi's record now gives another result than when the pending record was made; a person must look")
-        sid = st.add_settlements([row], witnesses=WITNESSES[1], pending_id=pending_id, confirmed_by=w, note=n)[0]
-        entry = _settlement_entry([r for r in st.settlements() if r["id"] == sid][0])
-        out = {"status": "confirmed", "pending_id": pending_id, "settlement_id": sid, "symbol": p["symbol"],
-               "price": entry["price"], "who": w, "note": n, "time": now}
-        try:
-            day = str(stamp.date())
-            journal.write(day, {"type": JOURNAL_TYPE, "venue": venue_name, "batch": batch, **entry})
-            d = getattr(journal, "dir", None)
-            if d is not None:
-                _sync_file(Path(d) / f"{day}.jsonl")
-            st.mark_settlement_journaled(sid)
-        except (sqlite3.Error, OSError) as exc:
-            out["journal_error"] = f"{_venue_error(exc)}; the next run writes the line"
-        return out
-    except (PracticeError, sqlite3.Error, OSError, OrderError) as exc:
-        return refused(f"the state file, the ledger or the journal failed: {_venue_error(exc)}")
-    finally:
-        if st is not None and not isinstance(state, PracticeState):
-            st.close()
-        lock.release()
+    """A person settles a pending record. The venue's name, environment and host first (as every run), then the inputs:
+    `pending_id` a plain int from 1; `who` and `note` plain text, not empty after trimming, without control or format
+    characters (who at most WHO_MAX characters, the note at most NOTE_MAX). Under the run's lock: nothing of the
+    ledger open or unjournaled; the same reconcile a --reconcile-only run makes, which must show the pending name at
+    exactly 0 and nothing else different (other names pending with it aside); Kalshi's record read again showing
+    exactly the same settlement (judge_settlement, the time guard on the ledger's submissions included). Only then the
+    settlement row (witnesses kalshi_record+person, who and the note) and the record's resolution in one write, the
+    journal line (synced), the row marked journaled; a failed line is written by the next run. Any refusal journals
+    nothing and changes no practice state. The command line then runs a reconcile, which takes the fresh reading the
+    next settlement starts from."""
+    return _Run(ledger, venue, journal, state, {}, True, None, clock, market if market is not None else kalshi_market,
+                person={"kind": "confirm", "id": pending_id, "who": who, "note": note}).go()
+
+
+def withdraw_pending(*, journal, state, ledger: OrderLedger, venue, pending_id, who, note,
+                     clock: Callable[[], float] = wall_clock) -> dict:
+    """A person closes a pending record WITHOUT a settlement, because the holding is back in the account in full. The
+    same checks and inputs as confirm_settlement, and the same reconcile, which must be clean (the holding shown in
+    full, nothing else different). Then a withdrawal row (who and the note) in one write, its journal line
+    (`settlement_withdrawn`, synced), the row marked journaled. Any refusal journals nothing and changes no practice
+    state."""
+    return _Run(ledger, venue, journal, state, {}, True, None, clock, None,
+                person={"kind": "withdraw", "id": pending_id, "who": who, "note": note}).go()
 
 
 # ---- the command line
@@ -1435,16 +1586,21 @@ def main(argv: list[str] | None = None, *, environ=None, build_venue: Callable |
                                                                    "orders, journal the fills and settlements")
     ap.add_argument("--confirm-settlement", type=int, metavar="ID", help="settle pending record ID (a person has looked); "
                                                                           "needs --who and --note, then reconciles")
-    ap.add_argument("--who", help="with --confirm-settlement: who looked")
-    ap.add_argument("--note", help="with --confirm-settlement: what they found")
+    ap.add_argument("--withdraw-pending", type=int, metavar="ID", help="close pending record ID without a settlement "
+                                                                        "(the holding is back in full); needs --who and "
+                                                                        "--note, then reconciles")
+    ap.add_argument("--who", help="with --confirm-settlement or --withdraw-pending: who looked")
+    ap.add_argument("--note", help="with --confirm-settlement or --withdraw-pending: what they found")
     args = ap.parse_args(argv)
-    if args.confirm_settlement is not None:
-        if args.reconcile_only or any(x is not None for x in (args.ticker, args.outcome, args.contracts, args.side, args.limit)):
-            ap.error("--confirm-settlement is given alone, with --who and --note")
+    person = args.confirm_settlement is not None or args.withdraw_pending is not None
+    if person:
+        if (args.confirm_settlement is not None and args.withdraw_pending is not None) or args.reconcile_only \
+                or any(x is not None for x in (args.ticker, args.outcome, args.contracts, args.side, args.limit)):
+            ap.error("--confirm-settlement or --withdraw-pending is given alone, with --who and --note")
     elif not args.reconcile_only and None in (args.ticker, args.outcome, args.contracts, args.side):
         ap.error("--ticker, --outcome, --contracts and --side are needed unless --reconcile-only is given")
     elif args.who is not None or args.note is not None:
-        ap.error("--who and --note go with --confirm-settlement")
+        ap.error("--who and --note go with --confirm-settlement or --withdraw-pending")
     from valedia_trader.core.secrets import SecretError
     from valedia_trader.venues.webull import WebullError
     try:
@@ -1477,12 +1633,15 @@ def main(argv: list[str] | None = None, *, environ=None, build_venue: Callable |
     ledger = open_ledger(ledger_path, clock=clock)
     try:
         reconcile_only = args.reconcile_only
-        if args.confirm_settlement is not None:
-            confirmed = confirm_settlement(journal=Journal(paths.journal), state=state_path_for(ledger_path, venue.name),
-                                           ledger=ledger, venue_name=venue.name, pending_id=args.confirm_settlement,
-                                           who=args.who, note=args.note, market=market, clock=clock)
-            print(json.dumps(confirmed, indent=2, default=str))
-            if confirmed["status"] != "confirmed":
+        if person:
+            common = dict(journal=Journal(paths.journal), state=state_path_for(ledger_path, venue.name), ledger=ledger,
+                          venue=venue, who=args.who, note=args.note, clock=clock)
+            if args.confirm_settlement is not None:
+                done = confirm_settlement(pending_id=args.confirm_settlement, market=market, **common)
+            else:
+                done = withdraw_pending(pending_id=args.withdraw_pending, **common)
+            print(json.dumps(done, indent=2, default=str))
+            if done["status"] not in ("confirmed", "withdrawn"):
                 return 2
             reconcile_only = True                        # the fresh reading the next settlement starts from
         out = run_event_practice(ledger=ledger, venue=venue, journal=Journal(paths.journal),

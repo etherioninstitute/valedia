@@ -786,6 +786,8 @@ def test_a_confirmation_is_refused_unless_the_account_shows_exactly_the_pending_
     out = confirm(w, pid)
     assert out["status"] == "refused" and out["reason"], (change, out)
     assert person_state(w) == before, change                              # nothing journaled, no state changed
+    if change == "unread":
+        assert "positions could not be read" in out["reason"], out
     if change == "host":
         assert out["stage"] == "environment" and len(w.exchange.calls) == calls     # checked before anything is read
     # the other way: the account shows exactly the pending name gone, and the confirmation goes through
@@ -816,6 +818,10 @@ def test_holdings_gone_together_are_confirmed_one_by_one(tmp_path):
     assert pending(out, w), out
     pids = sorted(e["pending_id"] for e in w.entries("settlement_pending"))
     assert len(pids) == 2
+    w.exchange.held[f"{OTHER}:no"] = 1                                    # the other one partly back: a person looks
+    before = person_state(w)
+    assert confirm(w, pids[0])["status"] == "refused" and person_state(w) == before
+    w.exchange.held[f"{OTHER}:no"] = 0
     assert confirm(w, pids[0])["status"] == "confirmed"
     assert confirm(w, pids[1])["status"] == "confirmed"
     assert len(w.entries("settlement")) == 2 and w.run(reconcile_only=True)["status"] == "done"
@@ -857,6 +863,29 @@ def test_a_pending_record_is_withdrawn_only_when_the_holding_is_back_in_full_and
     w.exchange.bp = "999.99"
     assert pending(w.run(reconcile_only=True), w)
     assert len(w.entries("settlement_pending")) == 2 and len(w.state().open_pending()) == 1
+
+
+def test_a_confirmation_keeps_the_time_guard_on_the_programs_submissions(tmp_path):
+    w = bought_world(tmp_path)                                            # sent at 14:00 New York on 13 November
+    out = vanish(w, {f"{T}:yes": TONIGHT}, "1000.37")                     # the cash does not confirm it: pending
+    assert pending(out, w), out
+    pid = w.entries("settlement_pending")[0]["pending_id"]
+    w.markets[T] = {**TONIGHT, "settlement_ts": "2026-11-13T18:00:00Z"}  # before that submission
+    before = person_state(w)
+    out = confirm(w, pid)
+    assert out["status"] == "refused" and "submitted" in out["reason"] and person_state(w) == before, out
+    w.markets[T] = TONIGHT
+    assert confirm(w, pid)["status"] == "confirmed"
+
+
+def test_a_person_command_without_a_state_file_is_refused_and_makes_none(tmp_path):
+    w = World(tmp_path, held={})
+    for f in (confirm, withdraw):
+        out = f(w, 1)
+        assert out["status"] == "refused" and out["stage"] == "state", out
+        assert not w.state_path.exists() and w.entries() == []
+    w, pid = pending_world(tmp_path / "with")                             # the other way: with the file, it is read
+    assert confirm(w, pid)["status"] == "confirmed"
 
 
 def test_a_confirmation_while_the_holding_is_back_is_refused_and_a_withdrawal_closes_it(tmp_path):
