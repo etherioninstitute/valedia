@@ -4,7 +4,12 @@ Timeline (daily bars): target weights decided with data through the close of day
 the close of day t + lag (lag >= 1) and first earn the return of day t + lag + 1. Costs are charged
 on the day a trade happens: commission and spread per unit traded, square-root market impact
 (formula 9.3) from participation in trailing dollar volume, borrow on shorts and carry on perps.
-The cost model must be complete (formula 10.1) or the engine refuses to run."""
+The cost model must be complete (formula 10.1) or the engine refuses to run.
+
+A bar is priced for a symbol when its price is finite and above zero. On an unpriced bar the engine neither buys
+nor sells the symbol: the weight carried from the bar before stays in effect (drifted by the book's return), adds
+no trading cost and still pays borrow and funding; the return booked when the price comes back is the move since
+the last priced bar. A position still open on an unpriced last bar is reported in `stranded`, not valued."""
 from __future__ import annotations
 
 import math
@@ -53,6 +58,7 @@ class BacktestResult:
     costs: pd.DataFrame     # columns: commission, slippage, impact, borrow, funding (fractions of equity)
     weights: pd.DataFrame   # weights in effect after each close
     turnover: pd.Series     # sum |traded weight| per day
+    stranded: dict = field(default_factory=dict)   # symbol -> weight still held on an unpriced last bar
 
     @property
     def equity(self) -> pd.Series:
@@ -75,22 +81,25 @@ def run_backtest(prices: pd.DataFrame, decided_weights: pd.DataFrame, cost: Cost
         raise ValueError("capital must be positive")
     cols = prices.columns
     px = prices.to_numpy(dtype=float)
-    ret = np.zeros_like(px)
-    ret[1:] = px[1:] / px[:-1] - 1.0
+    step = np.zeros_like(px)                                                 # bar-to-bar move: the impact
+    step[1:] = px[1:] / px[:-1] - 1.0                                        # model's volatility input, as before
     tradable = np.isfinite(px) & (px > 0)
-    ret[~np.isfinite(ret)] = 0.0
+    step[~np.isfinite(step)] = 0.0
+    last = pd.DataFrame(np.where(tradable, px, np.nan)).ffill().shift(1).to_numpy(dtype=float)
+    booked = tradable & np.isfinite(last)                                    # priced, with a priced bar before
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ret = np.where(booked, px / last - 1.0, 0.0)                         # move since the last priced bar
     decided = decided_weights.to_numpy(dtype=float)
     decided = np.where(np.isfinite(decided), decided, 0.0)
-    held = np.zeros_like(decided)
+    held = np.zeros_like(decided)                                            # target; becomes the weight in effect
     held[execution_lag:] = decided[:-execution_lag]
-    held = np.where(tradable, held, 0.0)
 
     fee = cost._per_asset(cost.fees_bps, cols, "fees") * 1e-4
     slip = cost._per_asset(cost.slippage_bps, cols, "slippage") * 1e-4
     fund = cost._per_asset(cost.funding_annual, cols, "funding") / periods_per_year
     borrow = float(cost.borrow_annual) / periods_per_year
 
-    ret_df = pd.DataFrame(ret, index=prices.index, columns=cols)
+    ret_df = pd.DataFrame(step, index=prices.index, columns=cols)
     sigma = ret_df.rolling(vol_window).std().shift(1).to_numpy()            # known before the trade
     adv = None
     if dollar_volume is not None:
@@ -105,6 +114,7 @@ def run_backtest(prices: pd.DataFrame, decided_weights: pd.DataFrame, cost: Cost
         g = float(prev @ ret[t])
         gross[t] = g
         drifted = prev * (1.0 + ret[t]) / (1.0 + g) if g > -1.0 else np.zeros_like(prev)
+        held[t] = np.where(tradable[t], held[t], drifted)                   # no price, no trade: carry the weight
         trade = np.abs(held[t] - drifted)
         turnover[t] = trade.sum()
         c_comm[t], c_slip[t] = float(trade @ fee), float(trade @ slip)
@@ -120,9 +130,11 @@ def run_backtest(prices: pd.DataFrame, decided_weights: pd.DataFrame, cost: Cost
     costs = pd.DataFrame({"commission": c_comm, "slippage": c_slip, "impact": c_imp, "borrow": c_bor,
                           "funding": c_fund}, index=prices.index)
     gross_s = pd.Series(gross, index=prices.index, name="gross")
+    stranded = {cols[j]: float(held[-1, j]) for j in range(len(cols)) if not tradable[-1, j] and held[-1, j] != 0.0} \
+        if n else {}
     return BacktestResult((gross_s - costs.sum(axis=1)).rename("net"), gross_s, costs,
                           pd.DataFrame(held, index=prices.index, columns=cols),
-                          pd.Series(turnover, index=prices.index, name="turnover"))
+                          pd.Series(turnover, index=prices.index, name="turnover"), stranded)
 
 
 def buy_and_hold(prices: pd.DataFrame, weights: Mapping[str, float] | None = None) -> pd.Series:
