@@ -470,3 +470,52 @@ file in LM Studio for work of its own, and the collector's calls have stayed nea
 not part of this test and is watched.
 
 The restart is declared here, with its time and the revision's commit, before it happens.
+
+## Second amendment: the model itself changes (declared at 03:26 UTC on 17 November, 19:26 PST on 16 November, before any restart; no answer has been scored)
+
+On the owner's instruction of 16 November (PST) that Nimble v3 is replaced everywhere on this Mac by another typed
+decision model, Elephant-1, and removed. Where this differs from the amendment above, this governs; that
+amendment's reasoning about the test, and its deadline, stand.
+
+**What changes, beyond the first amendment.**
+- The model: from Nimble v3 9B to Elephant-1 9B (Base Labs' typed decision model, like Nimble a post-train of
+  Qwen3.5-9B). It takes the same typed request, the same six questions, and its replies have the same shape: the
+  collector's strict parser accepts them unchanged.
+- The file: `elephant-1.Q8_0.gguf` (8-bit GGUF; a community packaging that adds llama.cpp's decision settings to
+  an existing quantisation; 9,527,504,224 bytes; SHA-256
+  `652c102967efa9a1adf9c63ebaada547fba189888ca0680944aae595398fdf9d`, computed here and equal to the value its
+  publisher states).
+- How it is loaded: one instance named `elephant-1`, one slot, context 8,192, physical batch 2,048, by LM
+  Studio's own load call, never unloaded when idle. With the server's default batch every typed call fails, so
+  these settings are part of the check before every call.
+- What is stored: `model_tag` becomes `lmstudio:elephant-1@q8_0` and `model_digest` this file's SHA-256.
+
+**What this does to the idea being tested.** The test was registered as the newsletter's design with Nimble v3 in
+the place of its model. Nimble v3 is withdrawn untested: none of its answers was ever compared with an outcome,
+and none can enter the pass rule, because the test period has not begun. What is tested from 19 November is the
+same design with Elephant-1. The battery and its hash, the rule, the periods, the yardsticks and the evaluation
+code do not change. This document keeps its title.
+
+**What I expect, restated before the record holds any answer of the new model.** "What I expect" was written from
+two probes of Nimble v3 in which its direction answer did not move with the state. Elephant-1's answers to
+invented states do move (over 30 invented states its four yes/no probabilities ranged over 0.26 to 0.69, 0.36 to
+0.82, 0.40 to 0.74 and 0.52 to 0.73), which says nothing about whether they are right. I have no evidence about
+its skill on this task, so the expectation stands as written, in kind and in its number: no skill on `up_15m`,
+`down_15m` or `toxic_15m`; some on `move_15m` against the plain rate and none against the code yardstick; the model
+rule no better per slot than the plain rule; about one chance in fifteen that the idea passes both parts.
+
+**The deadline stands, and missing it now costs more.** The new revision takes over only if it has passed a blind
+check and been restarted before 12:00 UTC on 18 November. There is no longer a model to fall back on (Ollama is
+out of use on this Mac and Nimble v3 is being removed), so if the deadline is missed the test cannot run as
+registered: the collector would go on recording books and trades without decisions, and a new test with new
+periods would have to be registered. That would be said here.
+
+**A loss already running, recorded now.** The collector's model has been unreachable since 00:39 UTC on
+17 November: the Ollama application was quit on this Mac at 00:38:48 UTC, on the owner's decision that Ollama is
+used for nothing, not as part of this test. From then until the restart every decision row is
+`model_unavailable`; snapshots, trades and heartbeats go on. The count and the times are given with the restart.
+
+**Measured before this was written** (17 November, 03:15 to 03:24 UTC; invented states only, never a stored one):
+30 of 30 replies passed the strict parser; about 4.0 seconds a decision against the 10 second limit, whatever the
+number of slots; identical answers when one request was repeated; the instance was not unloaded when another model
+was loaded on demand.
