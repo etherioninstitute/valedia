@@ -122,7 +122,7 @@ def test_defaults_and_shape():
     assert set(snap) >= {"version", "sha", "branch", "dirty", "items"}
     assert snap["version"] == "0.75.0"
     assert vc.VALEDIA_VERSION == "0.75.0"
-    assert not hasattr(vc, "VALEDIA_" + "JEV")  # Jev retired: Nimble 2 is the only model
+    assert not hasattr(vc, "VALEDIA_" + "JEV")  # Jev retired: the shared Elephant-1 instance is the only model
     assert vc.POLYMARKET_US_LIVE is False
     assert vc.systemone_enabled() is False
     names = [r["name"] for r in snap["items"]]

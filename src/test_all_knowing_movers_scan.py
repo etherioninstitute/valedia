@@ -213,6 +213,7 @@ def test_systemone_default_off_and_fail_open():
     assert RETIRED not in ak.format_table(off).lower()
     assert "label" in off["ranked"][0] and "decide" not in off["ranked"][0]
     os.environ["VALEDIA_SYSTEMONE"] = "1"
+    saved_post = ak.s1._post
     try:
         seen = []
 
@@ -272,6 +273,7 @@ def test_systemone_default_off_and_fail_open():
         assert "create_order=false" in proof
         assert "label=would_buy" in proof
     finally:
+        ak.s1._post = saved_post
         os.environ.pop("VALEDIA_SYSTEMONE", None)
 
 
@@ -279,6 +281,7 @@ def test_scan_logs_every_decision_with_code_label_and_facts():
     if os.path.exists(SLOG):
         os.remove(SLOG)
     os.environ["VALEDIA_SYSTEMONE"] = "1"
+    saved_post = ak.s1._post
     try:
         seen = []
 
@@ -319,6 +322,7 @@ def test_scan_logs_every_decision_with_code_label_and_facts():
         blk = doc["systemone"]
         assert blk["budget_ms"] == 500.0 and "latency_ms_p95" in blk and blk["n_ok"] == len(spot)
     finally:
+        ak.s1._post = saved_post
         os.environ.pop("VALEDIA_SYSTEMONE", None)
 
 

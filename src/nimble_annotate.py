@@ -117,7 +117,7 @@ SCAN_QUESTIONS = {
 
 
 def on():
-    """Same switch as every Nimble 2 call: VALEDIA_SYSTEMONE=1."""
+    """Same switch as every decision call to the shared Elephant-1 instance: VALEDIA_SYSTEMONE=1."""
     return s1.enabled()
 
 
