@@ -8179,6 +8179,7 @@ def _t34_live_scenario(mod, base_mod, tmp, seed, monkeypatch, venue=None, before
                 wb.ledger_path = copy_dir / w.ledger_path.relative_to(w.tmp)
                 _t51_ledger_for_base(wb.ledger_path, base_mod)            # T51: its own file, in its own layout
                 wb.state_path = copy_dir / Path(w.state_path).relative_to(w.tmp)
+                _t51c_state_for_base(wb.state_path, base_mod)             # T51c: its own file, in its own layout
                 wb.limits, wb.latch = copy_dir / "config" / "risk.json", copy_dir / w.latch.relative_to(w.tmp)
                 wb.venue, wb.second = _copy.deepcopy(w.venue), _copy.deepcopy(w.second)
                 wb.clock, wb.prices, wb.quote_age = Clock(w.clock.t), dict(w.prices), dict(w.quote_age)
@@ -8872,6 +8873,29 @@ def _t51_ledger_for_base(path, base_mod):
     view = _t51_layout3_view(_dump(path))
     own = Path(str(path) + ".base-layout3")
     base_orders.OrderLedger(own).close()
+    con = sqlite3.connect(own)
+    try:
+        for table, rows in view["rows"].items():
+            if rows and table != "sqlite_sequence":
+                con.executemany(f"INSERT INTO {table} VALUES ({','.join('?' * len(rows[0]))})", rows)
+        con.execute("DELETE FROM sqlite_sequence")
+        con.executemany("INSERT INTO sqlite_sequence VALUES (?, ?)", view["rows"].get("sqlite_sequence", []))
+        con.commit()
+    finally:
+        con.close()
+    assert _dump(own) == view                                     # the base's own file holds exactly the same rows
+    _os.replace(own, path)
+
+
+def _t51c_state_for_base(path, base_mod):
+    """T51c S3: when the base writes state layout 1 and the copied world holds a layout-2 state file, the base gets a
+    state file of its own: made by the base's OrderStepState (layout 1), holding the same rows seen as layout 1
+    (`_t51c_layout1_view`, which asserts the owner's entries table is empty; checked equal), in place of the copy."""
+    if getattr(base_mod, "STATE_LAYOUT", 1) != 1 or not Path(path).exists() or _dump(path)["version"] == 1:
+        return
+    view = _t51c_layout1_view(_dump(path))
+    own = Path(str(path) + ".base-layout1")
+    base_mod.OrderStepState(own).close()
     con = sqlite3.connect(own)
     try:
         for table, rows in view["rows"].items():
