@@ -273,6 +273,14 @@ run beside MiroFish and Elephant-1):
   workers pause during a run whichever model is chosen.
 - **WATCH** at 15:18 PST on 2026-11-17 the 27B was NOT loaded (only Elephant-1 and the embedding model) and
   11.9 of 13.3 GB of swap was in use.
+- **QUEUED** the hourly pick job names the 27B by its plain key without checking it is loaded (found
+  2026-11-17): LM Studio then loads it on demand, which is how the 27B comes and goes. A second 16 GB copy can
+  load if the same weights are already loaded under another name. Make the job check what is loaded first, or
+  give the model one name for every user of it. The job itself stays on (owner's rule).
+- **OWNER** one 30-minute trial of the 27B generating beside the collector (asked 2026-11-17 16:40); the rule
+  for reading it is written in the ledger before the trial. The collector's own record already hints at a
+  small effect in the minutes after each hour's pick run (90th-percentile decision time 4.1 s against 3.87 s;
+  no more failed decisions).
 
 - **WATCH** Telegram is on and has dropped its connection before; Signal is parked (possible relink about
   11 Dec; its job is not installed).
