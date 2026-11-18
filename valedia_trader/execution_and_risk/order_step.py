@@ -679,7 +679,9 @@ class BookFigures:
     `value_per_unit` is `value` over them (None with none outstanding). `fees_taken_as_none` counts the purchases
     whose fee the venue left empty and whose recheck window has closed (addendum 7, R22 (b)). `open_by` holds the
     lines of `bounded_by` whose order leaves a bound open (a fee not known, or units without a price that no limit
-    bounds or that a sale brought), the reasons a refusal gives (S4a addendum 1, R32)."""
+    bounds or that a sale brought), the reasons a refusal gives (S4a addendum 1, R32). `bounded_orders` and
+    `open_orders` are the WHOLE tags of the orders those lines name (a line cuts its tag for the eye; two tags sharing
+    their first characters are still two orders: T51c S4b)."""
     units: dict
     cash: Decimal | None
     cash_low: Decimal | None
@@ -694,6 +696,8 @@ class BookFigures:
     unmarked: tuple
     fees_taken_as_none: int                       # addendum 7 (R22): purchases whose empty fee was taken as none
     open_by: tuple                                # S4a addendum 1 (R32): the lines of `bounded_by` that leave a bound open
+    bounded_orders: frozenset = frozenset()       # T51c S4b: the whole tags of the orders `bounded_by` names ...
+    open_orders: frozenset = frozenset()          # ... and of those `open_by` names
 
 
 @dataclass(frozen=True)
@@ -803,8 +807,11 @@ def book_figures(fills, orders, entries, marks, day: str, *, now: float) -> Book
         none_taken = 0
         bounded: list[str] = []
         opened: list[str] = []                    # R32: the lines of orders that leave a bound OPEN (not merely bounded)
+        bounded_tags: set = set()                 # S4b: the WHOLE tags of the orders those lines name
+        open_tags: set = set()
         for tag in sorted(rows):
             o, rs = by_tag[tag], rows[tag]
+            lines_before, open_before = len(bounded), len(opened)
             total = sum((_dec(r["units"], f"the units of fill row {r.get('id')}") for r in rs), Decimal(0))
             priced = covered = Decimal(0)
             for r in rs:
@@ -868,6 +875,10 @@ def book_figures(fills, orders, entries, marks, day: str, *, now: float) -> Book
                 low -= fees_most
             if high is not None:
                 high -= fees_least
+            if len(bounded) > lines_before:
+                bounded_tags.add(tag)
+            if len(opened) > open_before:
+                open_tags.add(tag)
         units: dict[str, Decimal] = {}
         steps = [((_dec(f["time"], "a fill's time"), 0, int(f.get("id") or 0)), "fill", f) for f in fills]
         steps += [((_dec(e["time"], "an entry's time"), 1, int(e["id"])), "entry", e) for e in entries]
@@ -907,7 +918,8 @@ def book_figures(fills, orders, entries, marks, day: str, *, now: float) -> Book
         return BookFigures(units=units, cash=low, cash_low=low, cash_high=high, cash_bounded=bool(bounded),
                            bounded_by=tuple(sorted(bounded)), usable_cash=usable, value=value, value_high=value_high,
                            units_outstanding=outstanding, value_per_unit=per_unit, unmarked=unmarked,
-                           fees_taken_as_none=none_taken, open_by=tuple(sorted(opened)))
+                           fees_taken_as_none=none_taken, open_by=tuple(sorted(opened)),
+                           bounded_orders=frozenset(bounded_tags), open_orders=frozenset(open_tags))
 
 
 def _value_unknown_why(figures: BookFigures) -> str:
@@ -917,8 +929,7 @@ def _value_unknown_why(figures: BookFigures) -> str:
     reasons = list(figures.open_by) + ([f"no mark for {', '.join(figures.unmarked)}"] if figures.unmarked else [])
     if not reasons:                                       # nothing open is known: every line, as before
         return _cut("; ".join(figures.bounded_by), 300)
-    named = {b.split(": ", 1)[0] for b in figures.open_by}          # each line starts "order TAG: "
-    others = len({b.split(": ", 1)[0] for b in figures.bounded_by} - named)
+    others = len(figures.bounded_orders - figures.open_orders)      # T51c S4b: by the WHOLE tag, never the cut one
     why = _cut("; ".join(reasons), 300)
     if others:
         why += (f"; {others} other order{' is' if others == 1 else 's are'} only bounded, which is not why the value "
@@ -1031,6 +1042,16 @@ def untracked_tags(ledger_tags, *, venue: str, journal=(), tickets=(), sends=())
 _FIGURE = re.compile(r"[0-9]+(\.[0-9]+)?")       # the owner's figure as written: digits, an optional decimal part
 _OWNER_USES = {"cash_in": ("amount",), "cash_out": ("amount",), "units_out": ("symbol", "units"),
                "split": ("symbol", "ratio")}
+_OWNER_ARGUMENTS = ("amount", "units", "ratio", "symbol")
+_ENTRY_HASH = re.compile(r"[0-9a-f]{64}")
+_ENTRY_NUMBER = re.compile(r"[1-9][0-9]*")
+OWNER_PREVIEW_KIND = "order-step owner-entry preview"   # T51c S4b: what the pending preview's file says it is
+# T51c S4b: the ledger's fields that book_figures reads; a confirm holds them against its preview's
+_FIGURED_FILL_FIELDS = ("id", "tag", "symbol", "units", "price", "price_covers_units", "fee", "time")
+_FIGURED_ORDER_FIELDS = ("tag", "units", "order_type", "limit_price", "collar_price", "fee", "state", "finished_at",
+                         "never_arrived_at")
+_RUN_FLAGS_WORDS = ("the owner's entry is written on its own, without --propose, --approve, --live, --check, "
+                    "--capital or --fractional; nothing was written")
 
 
 def _owner_figure(text, what: str) -> Decimal:
@@ -1040,78 +1061,284 @@ def _owner_figure(text, what: str) -> Decimal:
     return Decimal(text)
 
 
-def owner_entry_command(args, paths, clock: Callable[[], float] | None = None) -> int:
-    """T51c S3 (R5): `order-step --owner-entry KIND --venue NAME --who WHO --note NOTE` and the figures of that kind,
-    which the OWNER runs: `cash_in`/`cash_out` take --amount; `units_out` takes --symbol and --units (shares he took
-    that the book counted as its own); `split` takes --symbol and --ratio (new units per old unit). Every symbol the
-    book holds needs `--mark SYMBOL=PRICE` (for a split, the price after it): his own figure, never looked up. The
-    entry is valued with book_figures and next_entry and appended to the venue's state file
-    (`state_path_for(ledger_path_for(memory, NAME), NAME)`; the ledger is only read), under the run lock, and then
-    journaled (one `owner_entry` line, by the journal's own writer: the witness outside the file, addendum 4 R12).
-    Prints what it wrote and returns 0; refuses in words on stderr and returns 2, writing nothing: beside the run's own
-    flags, without who, note or venue, a figure that is not a positive decimal, a figure missing or one the kind does
-    not use (none is ever defaulted), a symbol held without its mark, more than the book holds, a book whose value is
-    not known, a clock with no New York day, an entry that breaks the file's chain, a state file and journal that
-    differ on the entries (owner_entry_differences), or a run holding the lock. Every refusal is decided before
-    anything is created, taken or opened for writing (R13): the clock is read once, the state file through a
-    read-only open; only an entry that will be written takes the lock. An entry written whose journal line could not
-    be written is said in words and returns JOURNAL_NOT_WRITTEN (3). Nothing in a run reads the entries yet (S4)."""
-    import sys
+def owner_preview_path_for(state_path: str | Path) -> Path:
+    """T51c S4b (R34 as built): the owner's ONE pending preview of a venue, in its own small file beside the state
+    file (order_step-<venue>.owner-preview.json), written atomically and owner-only. Read only by the owner's command:
+    no run, reconcile, ticket book, journal reader or alert opens it."""
+    p = Path(state_path)
+    return p.with_name(f"{p.stem}.owner-preview.json")
 
-    def refuse(words: str) -> int:
-        print(f"refused: {words}", file=sys.stderr)
-        return 2
-    kind = args.owner_entry
+
+def _spend_preview(path: Path, record: dict | None) -> str:
+    """Remove the pending preview `record` from `path` (None: whatever is there, a file that is not a preview); a
+    preview made since (another code) is left as it is. The words a refusal adds."""
+    try:
+        now_there = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return "; the preview is spent"
+    except (OSError, ValueError):
+        now_there = None
+    if record is not None and isinstance(now_there, dict) and now_there.get("code") != record.get("code"):
+        return "; a newer preview was made meanwhile and stays pending"
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        return f"; the preview could not be removed ({_local_error(exc)}), but its code is never taken twice"
+    return "; the preview is spent: run the command again without --confirm to see the figures again"
+
+
+def _owner_refuse(words: str, pending: tuple | None = None) -> int:
+    """The owner's command's one way to refuse: the words on stderr, exit 2. With `pending` ((path, record): a confirm
+    that has read the pending preview) the preview is spent first (T51c S4b). Every refusal goes through here."""
+    import sys
+    if pending is not None:
+        words += _spend_preview(*pending)
+    print(f"refused: {words}", file=sys.stderr)
+    return 2
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Write `text` to `path` atomically (a new file in the same folder, made durable, then renamed over it), readable
+    and writable by its owner only."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        _sync_file(tmp)
+        os.replace(tmp, path)
+        _sync_file(path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _ledger_digest(fills, orders) -> str:
+    """The sha256 of the ledger's rows as book_figures reads them (its fields only, in any order the rows come)."""
+    rows = {"fills": sorted(([f.get(k) for k in _FIGURED_FILL_FIELDS] for f in fills), key=repr),
+            "orders": sorted(([o.get(k) for k in _FIGURED_ORDER_FIELDS] for o in orders), key=repr)}
+    return hashlib.sha256(json.dumps(rows, default=repr, separators=(",", ":")).encode()).hexdigest()
+
+
+def owner_mark_close(calendar, now: float) -> tuple[bool, float | None, str | None]:
+    """T51c S4b: which quotes may mark an owner's entry at `now`. (True, None, None) INSIDE the exchange's session:
+    from its open to its close on `now`'s New York day, by `_window` (the order step's own reading of the calendar)
+    with no offsets. (False, close, None) OUTSIDE it: the last session's close, in seconds: today's close once it has
+    passed, else the calendar's own `previous_close` of `now`'s minute (before the open, a day without a session).
+    (False, None, why) when the calendar cannot say."""
+    start, end, why = _window(calendar, now, pd.Timedelta(0), pd.Timedelta(0))
+    if why is None and start <= now <= end:
+        return True, None, None
+    if why is None and now > end:
+        return False, float(end), None
+    try:
+        close = _as_float(pd.Timestamp(calendar.previous_close(
+            pd.Timestamp(now, unit="s", tz="UTC").floor("min"))).timestamp())
+    except Exception as exc:
+        return False, None, f"the exchange calendar could not give the last session's close ({_describe(exc)})"
+    if close is None or close > now:
+        return False, None, "the exchange calendar gave no session close before now"
+    return False, close, None
+
+
+def _owner_marks(symbols: list[str], quotes, calendar, now: float) -> tuple[dict, float | None, str | None]:
+    """T51c S4b (R29): the marks of `symbols` from the order step's own quote source (`quotes`, the function a run is
+    handed: minute_quotes), each read with the run's own reader (_read_quote): inside the session judged at `now`
+    (at most QUOTE_MAX_AGE_SECONDS old, not stamped more than QUOTE_MAX_AHEAD_SECONDS ahead); outside it judged by the
+    same rule at the last session's close, so the quote that was usable at that close serves. ({symbol: {"price",
+    "time"}}, the close or None inside, None), or ({}, None, why) naming each fund and why. No symbol: nothing is
+    asked, not even the calendar."""
+    if not symbols:
+        return {}, None, None
+    try:
+        cal = _default_calendar() if calendar is None else calendar
+    except Exception as exc:
+        return {}, None, f"the exchange calendar could not be read ({_describe(exc)}); nothing was written"
+    inside, close, why = owner_mark_close(cal, now)
+    if why is not None:
+        return {}, None, f"{why}, so no quote can be judged; nothing was written"
+    try:
+        raw = dict(quotes(list(symbols)) or {})
+    except Exception as exc:
+        return {}, None, f"the quotes could not be read: {_venue_error(exc)}; nothing was written"
+    marks, bad = {}, []
+    for sym in symbols:
+        price, t, why = _read_quote(raw.get(sym), now if inside else close)
+        if price is None:
+            bad.append(f"{sym}: {why}" + ("" if inside else f" at the last session's close, {_iso(close)}"))
+        else:
+            marks[sym] = {"price": price, "time": t}
+    if bad:
+        return {}, None, (f"no usable quote for {'; '.join(bad)} (the order step's own quote source and age rule; a "
+                          "typed figure is never a mark); nothing was written")
+    return marks, close, None
+
+
+def _owner_journal_line(venue: str, row: dict) -> dict:
+    """The journal line of an owner's entry, as the command writes it (and the repair writes it again)."""
+    return {"type": "owner_entry", "venue": venue, **{k: row[k] for k in _JOURNALED_ENTRY},
+            "time": repr(float(row["time"]))}
+
+
+def _figure_text(kind: str, arguments: dict) -> str:
+    if kind in ("cash_in", "cash_out"):
+        return arguments["amount"]
+    if kind == "units_out":
+        return f"{arguments['units']} {arguments['symbol']}"
+    return f"{arguments['symbol']} at {arguments['ratio']} new units per old"
+
+
+def _read_preview(path: Path, venue: str) -> dict | None:
+    """The pending preview of `venue`, or None when there is none; ValueError when it is not one."""
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if not (isinstance(record, dict) and record.get("what") == OWNER_PREVIEW_KIND and record.get("venue") == venue
+            and isinstance(record.get("code"), str) and _finite(record.get("created"))
+            and _finite(record.get("expires")) and isinstance(record.get("marks"), dict)):
+        raise ValueError("it is not an owner-entry preview of this venue")
+    return record
+
+
+def _preview_differences(pending: dict, now_record: dict) -> list[str]:
+    """T51c S4b: what differs between the pending preview and the same command's figures now, in words: anything but
+    the marks differing at all, a mark more than TICKET_QUOTE_MOVE from the preview's (the ticket's own band, judged
+    as an approval judges a line's quote)."""
+    out = []
+    words = {"arguments": "the entry's arguments (its kind, figures, symbol, who or note)",
+             "head": "the owner's entries (another entry was written since the preview)",
+             "ledger": "the ledger's fills or orders as the book's figures read them (a fill or an order arrived or "
+                       "changed since the preview)",
+             "held": "the set of funds the book holds",
+             "close": "the marks' basis (the session opened or closed since the preview)"}
+    for key, said in words.items():
+        if pending.get(key) != now_record[key]:
+            out.append(said)
+    old, new = pending.get("marks") or {}, now_record["marks"]
+    if set(old) != set(new):
+        out.append(f"the funds quoted ({', '.join(sorted(old)) or 'none'} then, {', '.join(sorted(new)) or 'none'} now)")
+    else:
+        for sym in sorted(new):
+            was, now = _as_float((old[sym] or {}).get("price")), new[sym]["price"]
+            if was is None or not abs(now - was) <= TICKET_QUOTE_MOVE * was:
+                out.append(f"the mark of {sym}: {now:g} now, more than {TICKET_QUOTE_MOVE:.1%} from the preview's "
+                           f"{was if was is None else format(was, 'g')}")
+    return out
+
+
+def owner_entry_command(args, paths, clock: Callable[[], float] | None = None, *, quotes: Callable | None = None,
+                        calendar=None) -> int:
+    """T51c S3 (R5), wired by S4b (R29): `order-step --owner-entry KIND --venue NAME --who WHO --note NOTE` and the
+    figures of that kind, which the OWNER runs: `cash_in`/`cash_out` take --amount; `units_out` takes --symbol and
+    --units (shares he took that the book counted as its own); `split` takes --symbol and --ratio (new units per old).
+
+    Marks are never typed (`--mark` is refused): every fund the book holds units of, and the entry's own symbol for a
+    units_out or a split, is quoted by the order step's own quote source (`quotes`; minute_quotes, the function a run
+    is handed) and read by the run's own reader and age rule (_owner_marks, owner_mark_close: inside the session at
+    the clock reading, outside it at the last session's close). A book holding no units asks for no quote.
+
+    Run without --confirm it is a PREVIEW: it prints the kind and its figure, each mark with its time and source, the
+    units outstanding and the value per unit before and after, the book's value and its bounds, and a six-digit code,
+    and writes one pending preview (owner_preview_path_for; a new preview replaces the one before) and nothing else:
+    no byte of the state file, the journal or the ledger. Run again with the same arguments and `--confirm CODE`
+    within TICKET_LIFE_SECONDS, it asks the quotes again and writes the entry (at the CONFIRM's marks) only when every
+    mark is within TICKET_QUOTE_MOVE of the preview's and nothing else differs (_preview_differences); a confirm that
+    has read the pending preview and does not write SPENDS it, whatever the reason, so the owner sees the figures again
+    before any entry. The entry is valued with book_figures and next_entry and appended to the venue's state file
+    under the run lock, then journaled (one `owner_entry` line, by the journal's own writer, addendum 4 R12).
+
+    `--owner-entry-rejournal N --hash H --who --note` (no kind, no figure) writes the missing journal line of entry N
+    (_owner_rejournal). A production venue's name is refused in every form before any quote is asked (R23).
+
+    Exit 0: a preview printed, an entry written and journaled, or a line rejournaled. Exit 2: refused in words on
+    stderr, writing nothing to the state file, the journal or the ledger (R13: every refusal is decided before the
+    lock is taken or the state file opened for writing; the clock is read once). Exit JOURNAL_NOT_WRITTEN (3): the
+    entry is written and its journal line is not; the words give its hash for the repair."""
+    import sys
+    kind = getattr(args, "owner_entry", None)
+    confirm = getattr(args, "confirm", None)
     if (getattr(args, "propose", False) or getattr(args, "approve", None) is not None or getattr(args, "live", False)
             or getattr(args, "check", False) or getattr(args, "capital", None) is not None
             or getattr(args, "fractional", False)):
-        return refuse("the owner's entry is written on its own, without --propose, --approve, --live, --check, "
-                      "--capital or --fractional; nothing was written")
+        return _owner_refuse(_RUN_FLAGS_WORDS)
     venue = getattr(args, "venue", None)
     if not isinstance(venue, str) or not venue or _safe_name(venue) != venue or venue.strip(".") == "":
-        return refuse("the owner's entry needs --venue, the plain name of the venue whose book it is (the name in its "
-                      "state file's name); nothing was written")
+        return _owner_refuse("the owner's entry needs --venue, the plain name of the venue whose book it is (the name "
+                             "in its state file's name); nothing was written")
     if _production_venue_name(venue):                     # addendum 7 (R23): the live venue's state file, by name alone
-        return refuse(f"{_cut(repr(venue))} is a production venue's name: an owner's entry for a live venue is not open "
-                      "yet (it opens later, only together with --live); nothing was written")
+        return _owner_refuse(f"{_cut(repr(venue))} is a production venue's name: an owner's entry for a live venue is "
+                             "not open yet (it opens later, only together with --live); nothing was written")
+    if getattr(args, "mark", None) is not None:           # S4b (R29): marks are never typed
+        return _owner_refuse("--mark is not taken: an owner's entry is valued at the order step's own quotes (the "
+                             "quote source and age rule a run uses; outside the session the last session's close), "
+                             "never at a typed figure; nothing was written")
     for what in ("who", "note"):                          # addendum 5 (R15): judged in full, before anything is read
         problem = _owner_text_problem(what, getattr(args, what, None))
         if problem is not None:
-            return refuse(f"the owner's entry needs --{problem}")
+            return _owner_refuse(f"the owner's entry needs --{problem}")
+    if getattr(args, "owner_entry_rejournal", None) is not None:
+        return _owner_rejournal(args, paths, venue, clock)
+    if getattr(args, "hash", None) is not None:
+        return _owner_refuse("--hash goes only with --owner-entry-rejournal N; nothing was written")
     if kind not in _OWNER_USES:
-        return refuse(f"an owner's entry is of kind {', '.join(ENTRY_KINDS)}; nothing was written")
-    for name in ("amount", "units", "ratio", "symbol"):
+        return _owner_refuse(f"an owner's entry is of kind {', '.join(ENTRY_KINDS)}; nothing was written")
+    for name in _OWNER_ARGUMENTS:
         given = getattr(args, name, None) is not None
         if name in _OWNER_USES[kind] and not given:
-            return refuse(f"a {kind} entry needs --{name}; no figure is ever assumed; nothing was written")
+            return _owner_refuse(f"a {kind} entry needs --{name}; no figure is ever assumed; nothing was written")
         if name not in _OWNER_USES[kind] and given:
-            return refuse(f"a {kind} entry takes no --{name}; nothing was written")
+            return _owner_refuse(f"a {kind} entry takes no --{name}; nothing was written")
+    if confirm is not None and not _plain(_NUMBER, confirm):
+        return _owner_refuse(f"--confirm takes the six-digit code the preview printed, not {_cut(repr(confirm))}; "
+                             "nothing was written")
     try:
         figs = {n: _owner_figure(getattr(args, n), f"--{n}") for n in ("amount", "units", "ratio")
                 if n in _OWNER_USES[kind]}
-        marks: dict[str, Decimal] = {}
-        for item in getattr(args, "mark", None) or []:
-            sym, eq, price = str(item).partition("=")
-            if not eq or not _plain(_SYMBOL, sym) or sym in marks:
-                raise BookError(f"--mark takes SYMBOL=PRICE, once per symbol, not {_cut(repr(item))}; nothing was written")
-            marks[sym] = _owner_figure(price, f"the mark of {sym}")
     except BookError as exc:
-        return refuse(str(exc))
+        return _owner_refuse(str(exc))
     symbol = getattr(args, "symbol", None)
     if symbol is not None and not _plain(_SYMBOL, symbol):
-        return refuse(f"--symbol names a plain symbol, not {_cut(repr(symbol))}; nothing was written")
-    if kind == "units_out" and symbol not in marks:
-        return refuse(f"a units_out entry needs --mark {symbol}=PRICE, the price its shares are valued at; nothing "
-                      "was written")
+        return _owner_refuse(f"--symbol names a plain symbol, not {_cut(repr(symbol))}; nothing was written")
     from valedia_trader.execution_and_risk.orders import open_read_only
     ledger_path = ledger_path_for(paths.memory, venue)
     state_path = state_path_for(ledger_path, venue)
+    preview_path = owner_preview_path_for(state_path)
     clock = clock if clock is not None else wall_clock
+    quotes = quotes if quotes is not None else minute_quotes
     reading = clock()                                     # addendum 4 (R13): read ONCE; the entry's time and day
     day = _ny_day(reading)
     if day is None:
-        return refuse("the clock gives no New York day, so the entry has no day; nothing was written")
+        return _owner_refuse("the clock gives no New York day, so the entry has no day; nothing was written")
     now = float(reading)
+    arguments = {"kind": kind, **{n: getattr(args, n, None) for n in _OWNER_ARGUMENTS}, "who": args.who,
+                 "note": args.note}
+    pending = None
+    if confirm is not None:                               # S4b: the pending preview, before anything else is read
+        try:
+            record = _read_preview(preview_path, venue)
+        except (OSError, ValueError) as exc:
+            return _owner_refuse(f"the pending preview cannot be read ({_cut(_local_error(exc), 200)}); nothing was "
+                                 "written", (preview_path, None))
+        if record is None:
+            return _owner_refuse("no preview is pending for this venue: run the same command without --confirm first, "
+                                 "read what it prints, then confirm its code; nothing was written")
+        pending = (preview_path, record)
+        if not hmac.compare_digest(record["code"].encode(), confirm.encode()):
+            return _owner_refuse("that code is not the pending preview's (a mistyped code, or an earlier preview's: a "
+                                 "new preview replaces the one before it); nothing was written", pending)
+        if now > ticket_expiry(record):
+            return _owner_refuse(f"the preview has expired (made at {_iso(float(record['created']))}, good until "
+                                 f"{_iso(ticket_expiry(record))}); nothing was written", pending)
+        if not now >= float(record["created"]):
+            return _owner_refuse("the clock gives a time before the preview was made: the clock is behind the "
+                                 "record; nothing was written", pending)
     from valedia_trader.research_loop.paper import Journal
     journal_dir = Path(paths.journal)
     try:                                                  # every refusal is decided here, before anything is created,
@@ -1124,59 +1351,182 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None) -
                 ro.close()
         entries = _owner_entries_read_only(Path(state_path))
         if entries and not now > float(entries[-1]["time"]):   # addendum 5 (R18): the clock is behind the record
-            return refuse(f"the clock gives {now!r}, not later than owner entry {entries[-1]['id']}'s time "
-                          f"{float(entries[-1]['time'])!r}: the clock is behind the record (the entry would be filed "
-                          "in an earlier day's journal); nothing was written")
+            return _owner_refuse(f"the clock gives {now!r}, not later than owner entry {entries[-1]['id']}'s time "
+                                 f"{float(entries[-1]['time'])!r}: the clock is behind the record (the entry would be "
+                                 "filed in an earlier day's journal); nothing was written", pending)
         lines: list[dict] = []
         if journal_dir.is_dir():                          # (the Journal makes its folder; only one that is there is read)
             lines = Journal(journal_dir).read()           # R18: a line that is not whole is skipped, as a run skips it;
         differences = owner_entry_differences(entries, lines, venue=venue)
         if differences:
-            return refuse(f"the state file and the journal differ on the owner's entries: {_cut('; '.join(differences), 600)};"
-                          " a person must look; nothing was written")
+            return _owner_refuse(f"the state file and the journal differ on the owner's entries: "
+                                 f"{_cut('; '.join(differences), 600)}; a person must look; nothing was written",
+                                 pending)
+        held = sorted(book_figures(fills, orders, entries, {}, day, now=now).unmarked)   # every fund it holds units of
+        asked = sorted(set(held) | ({symbol} if kind in ("units_out", "split") else set()))
+        marks, close, why = _owner_marks(asked, quotes, calendar, now)
+        if why is not None:
+            return _owner_refuse(why, pending)
+        prices = {s: m["price"] for s, m in marks.items()}
         valued = entries
         if kind == "split":                               # valued after the split, at the marks after it
             last = entries[-1]["units_after"] if entries else "0"
             valued = entries + [{"id": len(entries) + 1, "time": now, "kind": "split", "symbol": symbol,
                                  "ratio": str(figs["ratio"]), "units_before": last, "units_after": last}]
-        figures = book_figures(fills, orders, valued, marks, day, now=now)
-        if figures.unmarked:
-            return refuse(f"the book holds {', '.join(figures.unmarked)}: give --mark SYMBOL=PRICE for each (the "
-                          "owner's own figure; none is looked up); nothing was written")
+        figures = book_figures(fills, orders, valued, prices, day, now=now)
+        mark = _dec(prices[symbol], f"the mark of {symbol}") if kind == "units_out" else None
         fields = next_entry(figures, kind, amount=figs.get("amount"), symbol=symbol, units=figs.get("units"),
-                            ratio=figs.get("ratio"), mark=marks.get(symbol) if kind == "units_out" else None)
+                            ratio=figs.get("ratio"), mark=mark)
+        head = entries[-1]["hash"] if entries else _GENESIS
+        now_record = {"arguments": arguments, "head": head, "ledger": _ledger_digest(fills, orders), "held": held,
+                      "close": close, "marks": marks}
+        life = ticket_life()
     except (OrderStepError, OrderError, sqlite3.Error, OSError) as exc:
-        return refuse(f"{_cut(str(exc), 600)}")
+        return _owner_refuse(f"{_cut(str(exc), 600)}", pending)
+    if pending is None:
+        return _owner_preview(venue, preview_path, now, life, now_record, fields, figures, quotes)
+    moved = _preview_differences(pending[1], now_record)
+    if moved:
+        return _owner_refuse(f"the confirm differs from its preview: {_cut('; '.join(moved), 600)}; nothing was "
+                             "written", pending)
     lock = _RunLock(str(state_path))                      # only an entry that will be written takes the lock
     if not lock.acquire():
-        return refuse("an order-step run holds this venue's state file now; write the entry once it has ended; "
-                      "nothing was written")
+        return _owner_refuse("an order-step run holds this venue's state file now; write the entry once it has ended; "
+                             "nothing was written", pending)
     state = None
     try:
+        spent = _spend_preview(*pending)                  # used once: spent before the entry is written
+        if not spent.startswith("; the preview is spent"):
+            return _owner_refuse(f"the pending preview could not be taken{spent}; nothing was written")
         try:
             state = OrderStepState(state_path, clock=clock)
-            row = state.add_owner_entry(fields, who=args.who, note=args.note, now=now,
-                                        after=entries[-1]["hash"] if entries else _GENESIS)
+            row = state.add_owner_entry(fields, who=args.who, note=args.note, now=now, after=head)
         except (OrderStepError, OrderError, sqlite3.Error) as exc:
-            return refuse(f"{_cut(str(exc), 600)}")
+            return _owner_refuse(f"{_cut(str(exc), 600)}; the preview is spent")
         finally:
             if state is not None:
                 state.close()
-        line = {"type": "owner_entry", "venue": venue, **{k: row[k] for k in _JOURNALED_ENTRY},
-                "time": repr(float(row["time"]))}
         try:                                              # R12: the witness outside the file, by the journal's writer
-            Journal(journal_dir).write(row["day"], line)
+            Journal(journal_dir).write(row["day"], _owner_journal_line(venue, row))
             _sync_file(journal_dir / f"{row['day']}.jsonl")
         except (OSError, ValueError, TypeError) as exc:
-            print(f"written: owner entry {row['id']}, {kind}, to {state_path.name}; but its journal line could not be "
-                  f"written ({_cut(str(exc), 300)}): the entry stays in the state file, and the next owner's entry "
-                  "(and, from S4, every run) finds the state file and the journal differ until a person has looked",
-                  file=sys.stderr)
+            print(f"written: owner entry {row['id']}, {kind}, to {state_path.name}, hash {row['hash']}; but its "
+                  f"journal line could not be written ({_cut(str(exc), 300)}): the entry stays in the state file, and "
+                  "the next owner's entry (and, from S4, every run) finds the state file and the journal differ "
+                  f"until the line is written: `order-step --venue {venue} --owner-entry-rejournal {row['id']} "
+                  f"--hash {row['hash']} --who WHO --note NOTE` writes it, and only it", file=sys.stderr)
             return JOURNAL_NOT_WRITTEN
     finally:
         lock.release()
     print(f"written: owner entry {row['id']}, {kind}, to {state_path.name}, and journaled")
     print(json.dumps(row, indent=2))
+    return 0
+
+
+def _owner_preview(venue: str, path: Path, now: float, life: float, now_record: dict, fields: dict,
+                   figures: BookFigures, quotes) -> int:
+    """T51c S4b: print the preview and write it as the one pending preview of `venue`. Nothing else is written."""
+    code = ticket_number()
+    record = {"what": OWNER_PREVIEW_KIND, "venue": venue, "code": code, "created": now, "expires": now + life,
+              **now_record, "entry": fields}
+    try:
+        _write_private(path, json.dumps(record, sort_keys=True))
+    except OSError as exc:
+        return _owner_refuse(f"the preview could not be written ({_cut(_local_error(exc), 200)}); nothing was written")
+    kind, a = fields["kind"], now_record["arguments"]
+    source = getattr(quotes, "__name__", None) or "the quote source"
+    close = now_record["close"]
+    basis = (f"outside the session: the quote usable at the last session's close, {_iso(close)}" if close is not None
+             else "inside the session: at most "
+                  f"{QUOTE_MAX_AGE_SECONDS // 60} minutes old")
+    print(f"preview: owner entry, {kind} {_figure_text(kind, a)}, for {venue}; NOTHING was written")
+    for sym, m in sorted(now_record["marks"].items()):
+        print(f"  mark {sym}: {m['price']!r} at {_iso(m['time'])} (source: {source}, the order step's own; {basis})")
+    if not now_record["marks"]:
+        print("  marks: none (the book holds no units, so no quote was asked)")
+    high = "no upper bound" if figures.value_high is None else str(figures.value_high)
+    print(f"  the book's value: {figures.value} (from {figures.value} to {high}"
+          + (f"; bounded by: {_cut('; '.join(figures.bounded_by), 300)}" if figures.bounded_by else "") + ")")
+    print(f"  units outstanding: {fields['units_before']} before, {fields['units_after']} after")
+    print(f"  value per unit: {fields['value_per_unit_before'] or 'none (no units outstanding)'} before, "
+          f"{fields['value_per_unit_after'] or 'none'} after")
+    print(f"to write it, run the same command again with --confirm {code} by {_iso(record['expires'])}; it asks the "
+          f"quotes again and writes only if every mark is within {TICKET_QUOTE_MOVE:.1%} and nothing else changed")
+    print(f"code: {code}")
+    return 0
+
+
+def _owner_rejournal(args, paths, venue: str, clock: Callable[[], float] | None) -> int:
+    """T51c S4b (R29): `order-step --venue NAME --owner-entry-rejournal N --hash H --who WHO --note NOTE`, the repair
+    of an entry whose journal line could not be written (exit JOURNAL_NOT_WRITTEN). It writes entry N's journal line
+    exactly as the entry's own command writes it (_owner_journal_line, into the journal of the entry's day), with one
+    field more, `rejournaled` ({who, note, time}: who repaired it, why, when); the journal's writer adds its own
+    timestamp as for every line. Only when ALL hold, judged before the lock and again under it: the chain of the
+    state file checks; owner_entry_differences gives exactly "owner entry N is in the state file and not in the
+    journal" and nothing else; N is the LAST entry; H is entry N's hash. Anything else is refused in words, nothing
+    written. A changed or reordered entry is never made good: it is another difference, or a broken chain."""
+    import sys
+    number, given = getattr(args, "owner_entry_rejournal", None), getattr(args, "hash", None)
+    if (getattr(args, "owner_entry", None) is not None or getattr(args, "confirm", None) is not None
+            or any(getattr(args, n, None) is not None for n in _OWNER_ARGUMENTS)):
+        return _owner_refuse("--owner-entry-rejournal takes only --venue, --hash, --who and --note: it writes a "
+                             "missing journal line, never an entry; nothing was written")
+    if not _plain(_ENTRY_NUMBER, number):
+        return _owner_refuse(f"--owner-entry-rejournal takes the entry's number, not {_cut(repr(number))}; nothing "
+                             "was written")
+    if not _plain(_ENTRY_HASH, given):
+        return _owner_refuse("--hash takes the entry's hash, the 64 hexadecimal digits the failed command printed, not "
+                             f"{_cut(repr(given))}; nothing was written")
+    n = int(number)
+    state_path = state_path_for(ledger_path_for(paths.memory, venue), venue)
+    journal_dir = Path(paths.journal)
+    reading = (clock if clock is not None else wall_clock)()   # read once: the repair's own time
+    if _ny_day(reading) is None:
+        return _owner_refuse("the clock gives no New York day; nothing was written")
+    from valedia_trader.research_loop.paper import Journal
+
+    def judged() -> tuple[dict | None, str | None]:
+        try:
+            entries = _owner_entries_read_only(Path(state_path))   # the chain checks, or this refuses
+            lines = Journal(journal_dir).read() if journal_dir.is_dir() else []
+            differences = owner_entry_differences(entries, lines, venue=venue)
+        except (OrderStepError, sqlite3.Error, OSError) as exc:
+            return None, f"{_cut(str(exc), 600)}; nothing was written"
+        missing = f"owner entry {n} is in the state file and not in the journal"
+        if not entries or int(entries[-1]["id"]) != n:
+            return None, (f"only the LAST entry can be rejournaled, and owner entry {n} is not it (the state file holds "
+                          f"{len(entries)}); nothing was written")
+        if differences != [missing]:
+            return None, ("the repair writes a missing journal line only when that is the ONE difference between the "
+                          f"state file and the journal; they differ in: {_cut('; '.join(differences) or 'nothing', 600)}"
+                          "; a person must look; nothing was written")
+        if not hmac.compare_digest(str(entries[-1]["hash"]).encode(), given.encode()):
+            return None, f"that hash is not owner entry {n}'s; nothing was written"
+        return entries[-1], None
+    row, why = judged()
+    if why is None:
+        lock = _RunLock(str(state_path))
+        if not lock.acquire():
+            why = "an order-step run holds this venue's state file now; repair once it has ended; nothing was written"
+        else:
+            try:
+                row, why = judged()                       # again under the lock: nothing moved meanwhile
+                if why is None:
+                    line = {**_owner_journal_line(venue, row),
+                            "rejournaled": {"who": args.who, "note": args.note, "time": repr(float(reading))}}
+                    try:
+                        Journal(journal_dir).write(row["day"], line)
+                        _sync_file(journal_dir / f"{row['day']}.jsonl")
+                    except (OSError, ValueError, TypeError) as exc:
+                        print(f"the journal line of owner entry {n} could not be written ({_cut(str(exc), 300)}); the "
+                              "state file is as it was; the repair may be run again", file=sys.stderr)
+                        return JOURNAL_NOT_WRITTEN
+            finally:
+                lock.release()
+    if why is not None:
+        return _owner_refuse(why)
+    print(f"rejournaled: owner entry {n}, {row['kind']}, to the journal of {row['day']}; the state file and the "
+          "journal now hold the same entries")
     return 0
 
 

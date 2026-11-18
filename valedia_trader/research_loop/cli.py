@@ -1109,9 +1109,15 @@ def main(argv=None) -> int:
     owner.add_argument("--units", default=None, help="units_out: the shares taken that the book counted as its own")
     owner.add_argument("--ratio", default=None, help="split: new units per old unit")
     owner.add_argument("--mark", action="append", default=None, metavar="SYMBOL=PRICE",
-                       help="the price of a symbol the book holds (one per symbol; for a split, the price after it)")
+                       help="not taken (T51c S4b): marks come from the order step's own quotes; given, it is refused")
     owner.add_argument("--who", default=None, help="who writes the entry")
     owner.add_argument("--note", default=None, help="why")
+    owner.add_argument("--confirm", default=None, metavar="CODE",
+                       help="write the entry the preview showed: the same command with the code it printed, within a "
+                            "ticket's life; without it the command only previews and writes no entry")
+    owner.add_argument("--owner-entry-rejournal", default=None, metavar="N",
+                       help="repair: write the missing journal line of the LAST entry N (with --hash, --who, --note)")
+    owner.add_argument("--hash", default=None, help="with --owner-entry-rejournal: the entry's hash, as printed")
     p = sub.add_parser("critic")
     p.add_argument("--narrate", help="backend that puts the findings into words, e.g. hermes:valedia-trading-auditor")
     p.add_argument("--days", type=int, default=7)
@@ -1129,7 +1135,9 @@ def main(argv=None) -> int:
     p.add_argument("--agent-timeout", type=float, default=None, help="seconds one research agent may take (default: no limit)")
     args = ap.parse_args(argv)
     venue = None
-    if args.cmd == "order-step" and args.owner_entry is not None:   # T51c S3: the owner's entry; no venue is built
+    if args.cmd == "order-step" and (args.owner_entry is not None or args.owner_entry_rejournal is not None
+                                     or args.confirm is not None or args.hash is not None):
+        # T51c S3: the owner's entry; no venue is built (S4b: its preview, its confirm and its repair too)
         from valedia_trader.execution_and_risk import order_step
         return order_step.owner_entry_command(args, LoopPaths(Path(args.root).resolve()) if args.root else LoopPaths())
     if args.cmd == "order-step" and (args.live or args.check):  # live mode: its flags and locks before anything else

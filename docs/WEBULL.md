@@ -470,7 +470,7 @@ what settlement looks like.
 ## The shared account (being built)
 
 The owner also trades the account the fund book is to trade in (T51c). What exists after slices S1 to S3, and what is
-not wired yet:
+not wired yet (S4b wired the owner's command; see below):
 
 - **The reconcile can compare one way** (`OrderLedger.reconcile(..., one_sided=True)`): what the account holds beyond
   the book and its unapplied fills is listed under `owner_surplus` and is no difference; an account holding LESS than
@@ -527,22 +527,65 @@ figures or the one-sided reconcile; limits, purchases and sales are still judged
 Still not seen by the book at all: a distribution paid on the book's shares, and any order the venue holds that the
 ledger never knew (the venue's order history is a later slice).
 
-**The owner's command.** Every figure is the owner's own; the command never proposes or defaults one, refuses a
-figure that is not a positive decimal written as digits, needs `--who` and `--note`, and prints the entry it wrote.
-Each symbol the book holds needs its price with `--mark` (for a split, the price after it). The kinds:
-`cash_in` and `cash_out` (`--amount`), `units_out` (`--symbol`, `--units`: shares he took that the book counted as its
-own, which clears exactly that much of a shortfall), `split` (`--symbol`, `--ratio`: new units per old unit; the value
-stays, the units change). The shape, with figures that are AN EXAMPLE ONLY and not a suggestion of any amount:
+**The owner's command** (T51c S3, wired by S4b, addendum 7 R29). The entry's own figure is the owner's; the command
+never proposes or defaults one, refuses a figure that is not a positive decimal written as digits, and needs `--who`
+and `--note`. The kinds: `cash_in` and `cash_out` (`--amount`), `units_out` (`--symbol`, `--units`: shares he took
+that the book counted as its own, which clears exactly that much of a shortfall), `split` (`--symbol`, `--ratio`: new
+units per old unit; the value stays, the units change).
+
+*Marks are never typed* (`--mark` is refused in words). Every fund the book holds units of, and the entry's own symbol
+for a `units_out` or a `split`, is asked of the order step's OWN quote source (the function a run is handed: the last
+one-minute bar, stamped at the bar's start) and read with the run's own reader and age rule. Inside the session
+(from the exchange's open to its close on that New York day, by the calendar the order step already reads, through
+its `_window` with no offsets) a quote more than `QUOTE_MAX_AGE_SECONDS` old, stamped more than
+`QUOTE_MAX_AHEAD_SECONDS` ahead, or missing refuses, naming the fund and why. Outside the session the last session's
+close serves: the latest close at or before the clock (today's once it has passed, else the calendar's own
+`previous_close`), and a quote is taken when the same age rule, judged AT that close, finds it usable (so the last
+bar of the session, stamped a minute before the close, serves; a quote from an earlier day, or one stamped after the
+close, does not); its time is shown. A book holding no units asks for no quote (the opening `cash_in` works with the
+network down). No new age limit, band or lifetime exists: only the order step's constants.
+
+*A preview, then a confirm.* Run without `--confirm`, the command PRINTS the kind and its figure, each mark with its
+time, source and basis (inside, or the close it stands for), the book's value with its bounds, the units outstanding
+and the value per unit before and after, and a six-digit code; when the value is not known it refuses as before,
+naming the order (R32). It writes NO byte of the state file, the journal or the ledger: only the one pending preview
+of that venue, `memory/order_step-VENUE_NAME.owner-preview.json`, beside the state file, written atomically and
+readable by its owner only (a new preview replaces the one before; no run, reconcile, ticket, journal reader, alert
+or owner's page reads that file, so it is never a fault). Run again with the same arguments and `--confirm CODE`
+within a ticket's life (`TICKET_LIFE_SECONDS`), it asks the quotes AGAIN and writes the entry, at the confirm's own
+marks, only when every mark is within `TICKET_QUOTE_MOVE` of the preview's and nothing else differs: the arguments
+(kind, figures, symbol, who, note), the chain's last hash (no entry since), the ledger's fills and orders as the
+book's figures read them (no fill or order arrived or changed), the funds held, and the marks' basis (the session has
+not opened or closed meanwhile). Otherwise it refuses in words saying what moved and writes nothing. A confirm that
+has read the pending preview and does not write SPENDS it, whatever the reason (a wrong or old code, expired, moved,
+another difference, a run holding the lock): the owner then runs the preview again and sees the figures before any
+entry is written, and no code is tried twice against one preview. The code checks against a stale or mistyped
+confirm; it is not a secret. The shape, with figures that are AN EXAMPLE ONLY and not a suggestion of any amount:
 
     order-step --owner-entry cash_in --venue VENUE_NAME --amount 1234.56 --who owner --note "example only"
+    order-step --owner-entry cash_in --venue VENUE_NAME --amount 1234.56 --who owner --note "example only" --confirm CODE
 
 `VENUE_NAME` is the name in the venue's state file, `memory/order_step-VENUE_NAME.sqlite` (under `--root` when one
-is given); the ledger beside it is only read, and the entry is refused while a run holds that file's lock. A
+is given); the ledger beside it is only read, and the confirm is refused while a run holds that file's lock. A
 production venue's name (anything starting `webull-production`, compared without case and trailing dots) is refused
-for now: live entries open later, only together with `--live`. A refusal
-writes nothing: no folder, lock file or upgrade of the state file (it exits 2). An entry written whose journal line
-could not be written is said in words and exits 3; the entry stays in the state file, and the next owner's entry is
-refused until a person has looked.
+in every form (preview, confirm, repair) before any quote is asked: live entries open later, only together with
+`--live`. A refusal writes nothing to the state file or the journal: no folder, lock file or upgrade of the state
+file (it exits 2). An entry written whose journal line could not be written is said in words, with the entry's hash
+and the repair to run, and exits 3; the entry stays in the state file, and every later entry is refused until the
+line is written.
+
+*The repair*: `order-step --venue VENUE_NAME --owner-entry-rejournal N --hash H --who WHO --note NOTE` writes entry
+N's missing journal line exactly as the entry's command would have (the same fields, into the journal of the entry's
+day), with one field more, `rejournaled` (who repaired it, why, when); the journal's writer adds its own timestamp as
+to every line. Only when ALL hold, checked before the lock and again under it: the state file's chain checks; the
+ONE difference between the state file and the journal is "entry N is in the state file and not in the journal"; N
+is the LAST entry; H is entry N's hash, as the failed command printed it. Anything else is refused and nothing is
+written. It cannot make good an entry that was changed (the chain breaks, or the journal differs in a field), lines
+put in another order, a missing entry that is not the last, or an entry whose hash is not given; and, as before, an
+entry appended by hand with its hash recomputed and its hash typed is not told from the owner's own.
+
+*Not there yet*: live entries (S4d, with `--live`); shared mode in a run (S4c): no run reads the entries, the
+pending preview, the book's figures or the one-sided reconcile.
 
 ## Not covered yet
 
