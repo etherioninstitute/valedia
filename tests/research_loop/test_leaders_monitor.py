@@ -1547,6 +1547,18 @@ def test_a_pass_whose_only_not_good_reads_are_page_limits_is_done_and_counts_the
 
 
 # ------------------------------------------------------------------ T52b addendum 3 (after V208)
+def _doc_entry(word):
+    """A word's entry in the module's list of how a pass ends, with its continuation lines."""
+    lines = lm.__doc__.splitlines()
+    i = [k for k, l in enumerate(lines) if l.strip().startswith(word + " ")][0]
+    out = [lines[i]]
+    for l in lines[i + 1:]:
+        if not l.startswith(" " * 20):
+            break
+        out.append(l)
+    return " ".join(x.strip() for x in out)
+
+
 def _listing(root):
     return sorted((str(p.relative_to(root)), p.is_dir(), p.stat().st_size if p.is_file() else 0)
                   for p in root.rglob("*"))
@@ -1595,7 +1607,7 @@ def test_a_pass_waits_busy_seconds_for_a_write_lock_held_in_the_same_process_the
     assert "another version" not in out and "not readable" not in out and len(out.strip().splitlines()) == 1
     assert 1.4 < took < 6.0, took                             # its own wait, BUSY_SECONDS, not WAIT_SECONDS
     assert len(world.urls) == n
-    busy = [l for l in lm.__doc__.splitlines() if l.strip().startswith("BUSY ")][0]
+    busy = _doc_entry("BUSY")
     assert "BUSY_SECONDS" in busy and "WAIT_SECONDS" in busy, busy     # the doc says what a pass waits for
 
 
@@ -1625,5 +1637,5 @@ def test_pass_and_report_create_nothing_where_no_store_is(tmp_path, where):
 
 
 def test_the_doc_text_says_report_answers_the_lock_code_while_a_pass_holds_the_lock():
-    locked = [l for l in lm.__doc__.splitlines() if l.strip().startswith("LOCKED ")][0]
+    locked = _doc_entry("LOCKED")
     assert "report" in locked and "a pass is writing; try again" in locked, locked

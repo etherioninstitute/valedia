@@ -16,14 +16,20 @@ python -m valedia_trader.research_loop.leaders_monitor report      [--store PATH
 The default store is `artifacts/leaders_monitor/leaders.sqlite`, with its lock file `leaders.sqlite.lock` beside it.
 The last line of every `pass` starts with one word for how it ended, and the exit code says the same:
 DONE 0, every wallet was read well or is past the page limit (a known state; the line counts such wallets);
-LOCKED 2, another pass holds the lock, nothing done; REFUSED 3, nothing done because no leaders are fixed yet or
-the store's folder, lock file or store cannot be made, opened or written (the words say which); FAILED 4, the pass
+LOCKED 2, another pass holds the lock, nothing done (`report` answers code 2 too while a pass holds the lock, with
+"a pass is writing; try again"); REFUSED 3, nothing done because there is no store or no leaders are fixed yet
+(run `fix-leaders` first), or the lock file or the store cannot be opened or written (the words say which); FAILED 4, the pass
 ran but at least one wallet's read failed (`read_error`, `rows_shrank`); STOPPED 5, the pass stopped for memory
 between wallets; INTERNAL 6, the pass ran but at least one wallet's read ended in `internal_error` (see Failed
 reads); SHAPE 7, the store was made by another version of the record or is not its store, nothing done;
-UNREADABLE 8, the file cannot be read as a store, nothing done; BUSY 9, another writer holds the store for more than
-five seconds ("a pass is writing; try again"), nothing done. When several hold, STOPPED comes before INTERNAL and
+UNREADABLE 8, the file cannot be read as a store, nothing done; BUSY 9, another connection holds SQLite's lock on
+the store ("a pass is writing; try again"), nothing done. How long each waits for that lock: the shape check of
+every command, `report` and `fix-leaders` at most five seconds (WAIT_SECONDS); a pass, under its own lock file,
+up to thirty seconds (BUSY_SECONDS) for another connection's write lock, so that a short reader or writer does not
+cost it its day. When several hold, STOPPED comes before INTERNAL and
 INTERNAL before FAILED. `fix-leaders` and `report` answer SHAPE, UNREADABLE and BUSY with the same codes and words.
+Only `fix-leaders` makes a store: `pass` and `report` where there is no store (no folder, no file, an empty file)
+refuse with code 3 and make nothing. A store's `user_version` is part of its shape (this version's is 0).
 
 `pass` is one command: it reads every leader once and ends. Nothing in this build creates, installs or describes a
 repeating job, a loop, a daemon or a watch mode. Whether `pass` runs again, and how often, is the owner's decision

@@ -39,12 +39,18 @@ nothing here repeats itself: `pass` reads once and ends; whether and how often i
   the end, rows of changes, snapshots, rejects, wallet_reads and passes dated more than RETENTION_DAYS before the pass are removed, DELETE_BATCH rows a
   statement, at most DELETE_STATEMENTS statements a pass; holdings_current, leaders and each wallet's last good
   read are never aged out.
+* Only `fix-leaders` makes a store: `pass` and `report` on an absent store, an empty file or a database with no
+  object refuse (REFUSED: no leaders are fixed here) and make no folder, store or lock file. A new store gets
+  user_version USER_VERSION.
 * A store whose whole schema as SQLite records it (type, name, table and statement text of every table, index,
-  view and trigger) is not exactly this version's, built in memory from SCHEMA, was made by another version of the
+  view and trigger) and whose user_version are not exactly this version's (SCHEMA built in memory, USER_VERSION)
+  was made by another version of the
   record or is not its store: every command refuses it in words, having opened it read only, with nothing written.
-  A file that SQLite cannot read as a database is refused as unreadable. A store held by a writer (SQLite's lock)
-  is refused as busy ("a pass is writing; try again") after at most WAIT_SECONDS; `report` and `fix-leaders` never
-  wait longer for SQLite's lock, and `report` refuses at once while a pass holds STORE.lock. When STORE.lock does
+  A file that SQLite cannot read as a database is refused as unreadable. A store kept from being read by SQLite's
+  lock is refused as busy ("a pass is writing; try again") after WAIT_SECONDS. `report` and `fix-leaders` never
+  wait longer than WAIT_SECONDS for SQLite's lock; `report` refuses at once, code LOCKED, while a pass holds
+  STORE.lock. A `pass`, under its own lock, waits up to BUSY_SECONDS for another connection's write lock (a daily
+  pass must not lose its day to a short reader or writer) and then ends BUSY. When STORE.lock does
   not exist yet (no pass ever ran here) the shape is checked before the lock is made, so a refused store's folder is
   left as it was; a `fix-leaders` refused on an absent store leaves no file.
 * `report`: counts per leader and per kind over a window, each leader's carried holdings and the share of its good
@@ -53,15 +59,17 @@ nothing here repeats itself: `pass` reads once and ends; whether and how often i
 
 The last line of every `pass` starts with one word for how it ended, and its exit code tells the ends apart:
     DONE         0  every leader's read was good, or past the page limit (a known state: the line counts them)
-    LOCKED       2  another pass holds STORE.lock; nothing done
-    REFUSED      3  nothing done: no leaders fixed yet, or the store's folder, lock file or store cannot be
-                    made, opened or written
+    LOCKED       2  another pass holds STORE.lock; nothing done (`report` answers the same code, saying
+                    "a pass is writing; try again")
+    REFUSED      3  nothing done: no store or no leaders fixed yet (run fix-leaders first), or the lock file
+                    or the store cannot be opened or written
     FAILED       4  the pass ran; at least one wallet's read failed (read_error, rows_shrank)
     STOPPED      5  the memory guard stopped the pass between wallets (--max-memory-mb)
     INTERNAL     6  the pass ran; at least one wallet's read ended in internal_error
     SHAPE        7  the store was made by another version of the record, or is not its store; nothing done
     UNREADABLE   8  the file is not readable as a store; nothing done
-    BUSY         9  a writer holds SQLite's lock beyond WAIT_SECONDS ("a pass is writing; try again"); nothing done
+    BUSY         9  SQLite's lock held by another connection: beyond WAIT_SECONDS for the shape check, beyond
+                    BUSY_SECONDS for a pass's write ("a pass is writing; try again"); nothing done
 When several hold, STOPPED comes before INTERNAL and INTERNAL before FAILED. `fix-leaders` and `report` answer
 SHAPE, UNREADABLE and BUSY with the same codes and words (without the leading word).
 
@@ -98,6 +106,7 @@ DELETE_STATEMENTS = 20
 SIZE_EPS = 1e-6
 RAW_MAX = 2000                              # characters of a rejected row kept in the store
 BUSY_SECONDS = 30.0                         # a pass, under its own lock, waits this long for SQLite's lock
+USER_VERSION = 0                            # the store's PRAGMA user_version, part of its shape
 WAIT_SECONDS = 5.0                          # every shape check, `report` and `fix-leaders` wait at most this long
 DAY = 86_400
 CLAIM_KEY = "leaders_fixed_at"
@@ -195,12 +204,14 @@ def _safe(name) -> str:
     return re.sub(r"[^0-9A-Za-z_.-]", "?", str(name))[:40]
 
 
-def _shape_problem(path: Path) -> str | None:
-    """None when `path` is absent, empty, holds no object, or has exactly the schema this version's statements build
-    (as orders.py compares the order ledger's); else the first object that differs. Read only: the store is opened
-    read-only, never through `_connect`, and nothing is written to it. Raises sqlite3.Error when it cannot be read."""
+def _shape_problem(path: Path) -> tuple:
+    """(what differs, whether there is no store). What differs is None when `path` is absent, empty, holds no object
+    at user_version USER_VERSION, or has exactly the schema this version's statements build (as orders.py compares
+    the order ledger's) and user_version USER_VERSION; else the user_version or the first object that differs. Read
+    only: the store is opened read-only, never through `_connect`, and nothing is written to it. Raises
+    sqlite3.Error when it cannot be read."""
     if not path.exists() or path.stat().st_size == 0:
-        return None
+        return None, True
     mem = sqlite3.connect(":memory:")
     try:
         mem.executescript(SCHEMA)
@@ -210,15 +221,18 @@ def _shape_problem(path: Path) -> str | None:
     conn = _read_only(path)
     try:
         have = {(r[0], r[1]): r for r in _master(conn)}
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
     finally:
         conn.close()
+    if version != USER_VERSION:
+        return "user_version %d, this version's is %d" % (version, USER_VERSION), False
     if not have:
-        return None
+        return None, True
     for key in sorted(set(want) | set(have), key=lambda k: (str(k[0]), str(k[1]))):
         if want.get(key) != have.get(key):
             what = "an extra" if key not in want else "no" if key not in have else "a different"
-            return "%s %s %s" % (what, _safe(key[0]), _safe(key[1]))
-    return None
+            return "%s %s %s" % (what, _safe(key[0]), _safe(key[1])), False
+    return None, False
 
 
 def _busy(e: BaseException) -> bool:
@@ -227,10 +241,11 @@ def _busy(e: BaseException) -> bool:
         (getattr(e, "sqlite_errorcode", 0) or 0) & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
 
 
-def _check(store: Path):
-    """None when the store can be used; else (code, word, line) of its refusal."""
+def _check(store: Path, need_store: bool):
+    """None when the store can be used; else (code, word, line) of its refusal. With `need_store` (pass, report) an
+    absent store, an empty file or a database with no object is refused: only fix-leaders makes a store."""
     try:
-        why = _shape_problem(store)
+        why, none = _shape_problem(store)
     except sqlite3.Error as e:
         if _busy(e):
             return _busy_refusal(store)
@@ -239,7 +254,14 @@ def _check(store: Path):
     if why:
         return (OTHER_SHAPE, "SHAPE", "refused: the store %s was made by another version of the record, or is not "
                 "its store (%s); nothing done" % (store, why))
+    if none and need_store:
+        return _no_store(store)
     return None
+
+
+def _no_store(store) -> tuple:
+    return (REFUSED, "REFUSED", "refused: no store at %s (no leaders are fixed here: run fix-leaders first); nothing "
+            "done" % store)
 
 
 def _busy_refusal(store) -> tuple:
@@ -310,8 +332,11 @@ def fix_leaders(store: Path, client, wall: Callable[[], float], say) -> int:
     for key, d in sorted(leaders.items()):
         s, c = d.get("sports", (None,) * 4), d.get("crypto", (None,) * 4)
         values.append((key, d["wallet"], *s, *c, fixed_ts))
+    new = not store.exists() or store.stat().st_size == 0
     conn = _connect(store, WAIT_SECONDS)
     try:
+        if new:                                 # a new store is marked with this version's user_version
+            conn.execute("PRAGMA user_version = %d" % USER_VERSION)
         return _claim(conn, leaders, values, fixed_ts, say)
     finally:
         conn.close()
@@ -656,13 +681,13 @@ def main(argv=None, *, client=None, wall: Callable[[], float] = time.time, out=N
         """The last line: a pass's starts with the word for how it ended (see the module's doc text)."""
         say(word + " " + line if is_pass else line)
         return code
-    try:
-        store.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        return end(REFUSED, "REFUSED", "refused: the store's folder could not be made (%s); nothing done"
-                   % type(e).__name__)
     if args.cmd == "fix-leaders":
-        bad = _check(store)
+        try:
+            store.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return end(REFUSED, "REFUSED", "refused: the store's folder could not be made (%s); nothing done"
+                       % type(e).__name__)
+        bad = _check(store, need_store=False)
         if bad:
             return end(*bad)
         try:
@@ -671,9 +696,11 @@ def main(argv=None, *, client=None, wall: Callable[[], float] = time.time, out=N
             if not _busy(e):
                 raise
             return end(*_busy_refusal(store))
+    if not store.exists() or store.stat().st_size == 0:
+        return end(*_no_store(store))           # only fix-leaders makes a store: no folder, store or lock file here
     if not Path(str(store) + ".lock").exists():
         # no pass ever held the lock here, so none is writing: a refused store's folder is left as it was
-        bad = _check(store)
+        bad = _check(store, need_store=True)
         if bad:
             return end(*bad)
     try:
@@ -686,7 +713,7 @@ def main(argv=None, *, client=None, wall: Callable[[], float] = time.time, out=N
             return end(LOCKED, "LOCKED", "refused: another run holds the lock %s.lock; nothing done" % store)
         return end(LOCKED, "LOCKED", "refused: a pass holds the lock %s.lock (%s); nothing done" % (store, BUSY_WORDS))
     try:
-        bad = _check(store)                         # the shape, checked under the lock
+        bad = _check(store, need_store=True)        # the shape, checked under the lock
         if bad:
             return end(*bad)
         if is_pass:
