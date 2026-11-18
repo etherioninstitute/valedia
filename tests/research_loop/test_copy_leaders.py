@@ -2377,7 +2377,8 @@ def test_t47c_planning_develop_and_sealed_equal_the_code_before_on_40_seeded_sto
         assert sha_old != sha_new
         raw_old = (o_old / "develop.json").read_bytes().replace(sha_old.encode(), sha_new.encode())
         raw_old = raw_old.replace(str(c_old.resolve()).encode(), str(c_new.resolve()).encode())
-        assert raw_old == (o_new / "develop.json").read_bytes(), seed
+        counts, stripped = _without_counts(json.loads((o_new / "develop.json").read_bytes()))   # T47e's two zeros
+        assert counts == (0, 0) and raw_old == cl._dump(stripped), seed
         res = r_new[1]["result"]
         seen["months_left_out"] += sum(res["months_left_out"].values())
         seen["entry_skips"] += sum(v for k, v in res["position_skips"].items()
@@ -2400,7 +2401,8 @@ def test_t47c_planning_develop_and_sealed_equal_the_code_before_on_40_seeded_sto
         raw_old = (o_old / "sealed.json").read_bytes()
         for x, y in swap:
             raw_old = raw_old.replace(x.encode(), y.encode())
-        assert raw_old == (o_new / "sealed.json").read_bytes(), seed
+        counts, stripped = _without_counts(json.loads((o_new / "sealed.json").read_bytes()))    # T47e's two zeros
+        assert counts == (0, 0) and raw_old == cl._dump(stripped), seed
         m_old, m_new = (json.loads((o / "sealed.used").read_text()) for o in (o_old, o_new))
         for m in (m_old, m_new):
             m.pop("time")
@@ -2805,3 +2807,293 @@ def test_after_its_claim_sealed_never_stops_for_memory_and_says_so_first(tmp_pat
     assert peak and order.index(peak[0]) < order.index("claim") and "321 MB" in peak[0], order[-5:]
     alerts = [m for m in said if "ABOVE THE LIMIT" in m]
     assert len(alerts) == 1 and alerts[0] == alerts[0].upper() and "WALLET 1 OF" in alerts[0], alerts
+
+
+# ------------------------------------------------------------------ T47e: an id the service refuses (fourth amendment)
+BEFORE_T47E = "b55bc88"                                # the reader and the program before T47e: the reference
+ID_IN_LINE = re.compile(r"\b(cond|mmc|tok|mmt)\d+")
+
+
+def _code_before_t47e(tmp_path):
+    """(the reader, the program) at BEFORE_T47E, each loaded as its own module from its own file; the old program
+    reads with the old reader. A missing history is a failure that says so, never a skip."""
+    import types
+    root = Path(cl.__file__).resolve().parents[2]
+    mods = []
+    for rel, name in (("valedia_trader/venues/polymarket_data.py", "pd_before_t47e"),
+                      ("valedia_trader/research_loop/copy_leaders.py", "cl_before_t47e")):
+        got = subprocess.run(["git", "-C", str(root), "show", "%s:%s" % (BEFORE_T47E, rel)], capture_output=True,
+                             text=True)
+        if got.returncode != 0:
+            pytest.fail("%s at %s cannot be read from this checkout's history (git show: %s)"
+                        % (rel, BEFORE_T47E, got.stderr.strip()[:200]), pytrace=False)
+        path = tmp_path / (name + ".py")
+        path.write_text(got.stdout)
+        mod = types.ModuleType(name)
+        mod.__file__ = str(path)
+        sys.modules[name] = mod
+        exec(compile(got.stdout, str(path), "exec"), mod.__dict__)
+        mods.append(mod)
+    opd, ocl = mods
+    ocl.pd = opd
+    assert not hasattr(opd, "REFUSED") and ocl.pd is opd and Path(ocl.pd.__file__).parent == tmp_path
+    return opd, ocl
+
+
+class RefusingWorld(PagedWorld):
+    """PagedWorld whose resolutions route answers HTTP 400 (the class of `mod`, the reader the client uses) to any
+    request holding an id of `refused`, as the real service does; once it has refused a request, a request holding
+    an id of `broken` gets a 503 (a failure of another kind met while narrowing)."""
+
+    def __init__(self, world, seed, refused, mod=pd, broken=(), **kw):
+        super().__init__(world, seed, **kw)
+        self.refused, self.mod, self.broken, self.has_refused = set(refused), mod, set(broken), False
+
+    def __call__(self, url):
+        parts = urllib.parse.urlsplit(url)
+        if parts.path == "/v2/resolutions":
+            conds = set(dict(urllib.parse.parse_qsl(parts.query))["condition"].split(","))
+            if self.has_refused and conds & self.broken:
+                self.urls.append(url)
+                raise self.mod.HttpError(503, url)
+            if conds & self.refused:
+                self.urls.append(url)
+                self.has_refused = True
+                raise self.mod.HttpError(400, url)
+        return super().__call__(url)
+
+
+def _client_of(mod, svc):
+    clock, n = [0.0], [0]
+
+    def now():
+        n[0] += 1
+        return "2026-11-17T10:%02d:%02d+00:00" % divmod(n[0] % 3600, 60)
+    return mod.PolymarketData(svc, sleep=lambda s: clock.__setitem__(0, clock[0] + s), clock=lambda: clock[0],
+                              now=now, wall=lambda: WALL)
+
+
+def _asked_ids(urls):
+    return [dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(u).query))["condition"].split(",") for u in urls
+            if "/v2/resolutions" in u]
+
+
+def _open_resolutions(store):
+    db = sqlite3.connect(str(store))
+    try:
+        return {k for (k,) in db.execute("SELECT key FROM walks WHERE kind='resolutions' AND status!='finished'")}
+    finally:
+        db.close()
+
+
+def test_t47e_a_store_the_code_before_left_incomplete_is_resumed_asks_only_the_unfinished_ids_and_ends_complete(
+        tmp_path, monkeypatch, capsys):
+    opd, ocl = _code_before_t47e(tmp_path)
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    monkeypatch.setattr(ocl, "_now", lambda: FIXED)
+    w = _small_world(3)
+    conds = sorted(w.res)
+    refused = set(random.Random(47).sample(conds, 6))
+    store = tmp_path / "s.sqlite"
+    oc = _client_of(opd, RefusingWorld(w, 3, refused, mod=opd))
+    monkeypatch.setattr(opd, "PolymarketData", lambda: oc)
+    assert ocl.main(["pull", "--phase", "1", "--store", str(store)]) == 3        # the code before: INCOMPLETE
+    assert "INCOMPLETE" in capsys.readouterr().err
+    unfinished = _open_resolutions(store)
+    assert refused <= unfinished and len(unfinished - refused) >= 19          # refused and ordinary ids mixed
+    with cl.Store(store) as s:
+        assert not unfinished & set(s.resolution_answers())
+    before = _tables(store)
+    svc, svc2 = RefusingWorld(w, 3, refused), RefusingWorld(w, 3, refused)
+    nc, nc2, nc3 = _client_of(pd, svc), _client_of(pd, svc2), _client_of(pd, svc2)
+    monkeypatch.setattr(pd, "PolymarketData", lambda: nc)
+    assert cl.main(["pull", "--phase", "1", "--store", str(store)]) == 0       # resumed: complete
+    lines = capsys.readouterr().out.splitlines()
+    assert svc.urls and all("/v2/resolutions" in u for u in svc.urls)        # no board, no trade asked again
+    asked = _asked_ids(svc.urls)
+    assert {x for a in asked for x in a} == unfinished                         # only the unfinished ids, each one
+    assert all(x in conds for a in asked for x in a)                           # every id exactly as stored
+    u = sorted(unfinished)
+    tops = [u[i:i + 20] for i in range(0, len(u), 20)]                       # the resumed requests of twenty
+    narrowed = [x for x in lines if "the service refused a request of" in x]
+    assert len(narrowed) == sum(1 for t in tops if set(t) & refused)          # one line a refused request
+    assert all(not ID_IN_LINE.search(x) and "0x" not in x for x in narrowed)  # counts only, never an id
+    got = [tuple(map(int, re.search(r"of (\d+) ids .* (\d+) more requests: (\d+) ids answered, (\d+) ids refused",
+                                    x).groups())) for x in narrowed]
+    assert sum(g[3] for g in got) == len(refused) and all(g[0] == g[2] + g[3] and g[1] <= 2 * g[0] - 2 for g in got)
+    assert not any("stopped by another failure" in x for x in narrowed)
+    with cl.Store(store) as s:
+        answers = s.resolution_answers()
+        assert {c for c, a in answers.items() if a == pd.REFUSED} == refused
+        assert {answers[c] for c in unfinished - refused} <= {"row", "no_row"}
+        assert cl.phase1_problems(s) == []
+        assert not s.resolution_rows(refused)                                   # no resolution row: as no_row
+    assert _open_resolutions(store) == set()
+    cl.check_own_shape(store)                                                   # the stored shape is unchanged
+    after = _tables(store)
+    for name in ("boards", "board_reads", "candidates", "trades", "plan", "plan_windows", "price_points"):
+        assert after[name] == before[name], name
+    keep = {r[0] for r in before["resolution_answers"]}
+    assert [r for r in after["resolution_answers"] if r[0] in keep] == before["resolution_answers"]
+    cl.pull(store, nc2, phase=1, say=lambda m: None)
+    assert svc2.urls == []                                                      # nothing left to ask
+    cl.pull(store, nc3, phase=2, say=lambda m: None)                            # phase 2 no longer refuses
+
+
+def test_t47e_another_failure_while_narrowing_leaves_the_unanswered_ids_unfinished_and_a_rerun_finishes_them(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    w = _small_world(5)
+    conds = sorted(w.res)
+    refused, broken = {conds[3]}, {conds[15]}                                  # one twenty: 3 refused, 15 broken
+    said = []
+    store = tmp_path / "s.sqlite"
+    with pytest.raises(cl.PullIncomplete):
+        cl.pull(store, _client_of(pd, RefusingWorld(w, 5, refused, broken=broken)), phase=1, say=said.append)
+    left = _open_resolutions(store)
+    assert left == set(conds[10:20])                                           # the second half, never answered
+    with cl.Store(store) as s:
+        answers = s.resolution_answers()
+        assert answers[conds[3]] == pd.REFUSED and not left & set(answers) and len(answers) == len(conds) - 10
+    line, = [x for x in said if "the service refused a request of" in x]
+    assert "of 20 ids" in line and "9 ids answered, 1 ids refused" in line
+    assert "stopped by another failure: 10 ids stay unfinished" in line and not ID_IN_LINE.search(line)
+    svc = RefusingWorld(w, 5, refused)
+    cl.pull(store, _client_of(pd, svc), phase=1, say=said.append)
+    assert {x for a in _asked_ids(svc.urls) for x in a} == left and _open_resolutions(store) == set()
+
+
+def _refused_counts(store, wallets):
+    """The two counts from the trades table alone: refused markets traded by `wallets`, and their trade rows."""
+    db = sqlite3.connect(str(store))
+    try:
+        q = ("FROM trades t JOIN resolution_answers a ON a.condition_id = t.condition_id WHERE a.answer = 'refused' "
+             "AND t.wallet IN (%s)" % ",".join("?" * len(wallets)))
+        return (db.execute("SELECT COUNT(DISTINCT t.condition_id) " + q, wallets).fetchone()[0],
+                db.execute("SELECT COUNT(*) " + q, wallets).fetchone()[0])
+    finally:
+        db.close()
+
+
+def _without_counts(doc, **same):
+    prov = dict(doc["provenance"])
+    counts = tuple(prov.pop(k) for k in cl.REFUSED_COUNTS)
+    prov.update(same)
+    return counts, dict(doc, provenance=prov)
+
+
+def test_t47e_a_refused_market_is_treated_exactly_as_a_no_row_market_on_seeded_stores(tmp_path, monkeypatch):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    seen = Counter()
+    for seed in range(30):
+        w = World(seed, **_variety(seed))
+        leave = ["pro01"] if seed % 5 == 3 else []
+        rng = random.Random(4747 + seed)
+        refused = set(rng.sample(sorted(w.res), max(1, len(w.res) // rng.choice([4, 10, 40, 100]))))
+        d = tmp_path / ("r%02d" % seed)
+        d.mkdir()
+        a, b = d / "a.sqlite", d / "b.sqlite"
+        cl.pull(a, _client_of(pd, RefusingWorld(w, seed, refused)), phase=1, say=lambda m: None)
+        shutil.copy(a, b)                                                       # b: every refused market as no_row
+        db = sqlite3.connect(str(b))
+        assert db.execute("UPDATE resolution_answers SET answer = 'no_row' WHERE answer = 'refused'").rowcount == \
+            len(refused)
+        db.commit()
+        db.close()
+        for s in (a, b):
+            cl.pull(s, _client_of(pd, RefusingWorld(w, seed, refused)), phase=2, leave_out=leave, say=lambda m: None)
+        ta, tb = _tables(a), _tables(b)
+        assert sorted((c, "no_row" if x == "refused" else x, r) for c, x, r in ta["resolution_answers"]) == \
+            tb["resolution_answers"]
+        for name in ta:
+            if name != "resolution_answers":
+                assert ta[name] == tb[name], (seed, name)                       # the same plan and windows
+        seen["planned"] += len(ta["plan"])
+        oa, ob = d / "oa", d / "ob"
+        ra = _outcome(lambda: cl.run_develop(store=a, out_dir=oa, leave_out=leave, say=lambda m: None))
+        rb = _outcome(lambda: cl.run_develop(store=b, out_dir=ob, leave_out=leave, say=lambda m: None))
+        assert ra[0] == rb[0] and (ra[0] == "ok" or ra[1].replace(str(a), str(b)) == rb[1]), (seed, ra, rb)
+        if ra[0] != "ok":
+            seen["develop_refused"] += 1
+            continue
+        ca, da = _without_counts(ra[1], store="s")
+        cb, db_ = _without_counts(rb[1], store="s")
+        assert da == db_ and cb == (0, 0), seed
+        seen["dev_markets"] += ca[0]
+        seen["dev_rows"] += ca[1]
+        seen[ra[1]["result"]["step_1"]["verdict"]] += 1
+        qa = _outcome(lambda: cl.run_sealed(store=a, out_dir=oa, flag=True, leave_out=leave, say=lambda m: None))
+        qb = _outcome(lambda: cl.run_sealed(store=b, out_dir=ob, flag=True, leave_out=leave, say=lambda m: None))
+        assert qa[0] == qb[0], (seed, qa, qb)
+        if qa[0] != "ok":
+            continue
+        same = dict(store="s", development_file="f", development_sha256="h")
+        ca, sa = _without_counts(qa[1], **same)
+        cb, sb = _without_counts(qb[1], **same)
+        assert sa == sb and cb == (0, 0), seed
+        with cl.Store(a) as s:
+            kept = [x for x in s.candidates() if x not in leave]
+        assert ca == _refused_counts(a, kept), seed                             # sealed reads every trade here
+        seen["sealed"] += 1
+        seen["sealed_markets"] += ca[0]
+        text = cl.format_table(qa[1])
+        assert "service refused as invalid (no known resolution, as no row): %d; trade rows read that name them: %d" \
+            % ca in text
+    assert seen["planned"] > 0 and seen["dev_markets"] > 0 and seen["dev_rows"] > 0, seen
+    assert seen["sealed"] >= 3 and seen["sealed_markets"] > 0 and seen["PROCEED"] >= 3 and seen["FAIL"] > 0, seen
+    print("T47e refused stores:", dict(sorted(seen.items())))
+
+
+def test_t47e_with_no_refused_id_the_pull_and_the_outputs_equal_the_code_before_on_30_seeded_worlds(tmp_path,
+                                                                                                    monkeypatch):
+    opd, ocl = _code_before_t47e(tmp_path)
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    monkeypatch.setattr(ocl, "_now", lambda: FIXED)
+    seen = Counter()
+    for seed in range(30):
+        w = World(seed, **_variety(seed))
+        leave = ["pro01"] if seed % 5 == 3 else []
+        d = tmp_path / ("e%02d" % seed)
+        d.mkdir()
+        old, new = d / "old.sqlite", d / "new.sqlite"
+        for phase in (1, 2):
+            ocl.pull(old, _client_of(opd, PagedWorld(w, seed)), phase=phase, leave_out=leave, say=lambda m: None)
+            cl.pull(new, _client_of(pd, PagedWorld(w, seed)), phase=phase, leave_out=leave, say=lambda m: None)
+        assert _tables(old) == _tables(new), seed                               # the same tables pulled
+        c_old, c_new, o_old, o_new = d / "c_old.sqlite", d / "c_new.sqlite", d / "o_old", d / "o_new"
+        shutil.copy(new, c_old)
+        shutil.copy(new, c_new)
+        r_old = _outcome(lambda: ocl.run_develop(store=c_old, out_dir=o_old, leave_out=leave, say=lambda m: None))
+        r_new = _outcome(lambda: cl.run_develop(store=c_new, out_dir=o_new, leave_out=leave, say=lambda m: None))
+        assert r_old[0] == r_new[0] and (r_old[0] == "ok" or r_old[1].replace(str(c_old), str(c_new)) == r_new[1]), \
+            (seed, r_old, r_new)
+        if r_old[0] != "ok":
+            seen["develop_refused"] += 1
+            continue
+        sha_old, sha_new = r_old[1]["provenance"]["code_sha256"], r_new[1]["provenance"]["code_sha256"]
+        assert sha_old != sha_new
+        counts, stripped = _without_counts(json.loads((o_new / "develop.json").read_bytes()))
+        assert counts == (0, 0), seed
+        raw_old = (o_old / "develop.json").read_bytes().replace(sha_old.encode(), sha_new.encode())
+        raw_old = raw_old.replace(str(c_old.resolve()).encode(), str(c_new.resolve()).encode())
+        assert raw_old == cl._dump(stripped), seed                              # byte for byte but the two zeros
+        seen[r_new[1]["result"]["step_1"]["verdict"]] += 1
+        q_old = _outcome(lambda: ocl.run_sealed(store=c_old, out_dir=o_old, flag=True, leave_out=leave,
+                                                say=lambda m: None))
+        q_new = _outcome(lambda: cl.run_sealed(store=c_new, out_dir=o_new, flag=True, leave_out=leave,
+                                               say=lambda m: None))
+        assert q_old[0] == q_new[0], (seed, q_old, q_new)
+        if q_old[0] != "ok":
+            assert q_old[1].replace(str(c_old), str(c_new)).replace(str(o_old), str(o_new)) == q_new[1], seed
+            continue
+        seen["sealed"] += 1
+        swap = [(sha_old, sha_new), (str(c_old.resolve()), str(c_new.resolve())),
+                (str(o_old / "develop.json"), str(o_new / "develop.json"))] + [
+            tuple((o / "develop.json.sha256").read_text().strip() for o in (o_old, o_new))]
+        raw_old = (o_old / "sealed.json").read_bytes()
+        for x, y in swap:
+            raw_old = raw_old.replace(x.encode(), y.encode())
+        counts, stripped = _without_counts(json.loads((o_new / "sealed.json").read_bytes()))
+        assert counts == (0, 0) and raw_old == cl._dump(stripped), seed
+    assert seen["PROCEED"] > 0 and seen["FAIL"] > 0 and seen["sealed"] > 0, seen
+    print("T47e equal stores:", dict(sorted(seen.items())))

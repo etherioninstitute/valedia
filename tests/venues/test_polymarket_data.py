@@ -1091,3 +1091,153 @@ def test_a_resolution_row_whose_condition_is_not_a_string_is_an_answer_not_an_er
 def test_the_store_check_looks_inside_lists_at_any_depth_without_recursion():
     assert pd._fits_store([[0, [2 ** 63]]]) is False and pd._fits_store([1, [2, [-2 ** 63 - 1]]]) is False
     assert pd._fits_store([[0, [2 ** 63 - 1]], _deep(50_000)]) is True
+
+
+# ------------------------------------------------------------------ T47e: an id the service refuses (fourth amendment)
+B55BC88 = "b55bc88"                                  # the reader before T47e: the reference for "nothing else changes"
+IDS = ["0x%02d" % i for i in range(20)]
+
+
+def refusing(bad=(), no_row=(), fail=None):
+    """A stand-in /v2/resolutions: HTTP 400 for any request holding an id of `bad` (the service's words for it are
+    not kept by the transport); `fail(conds)` may answer another failure first; else one row an id but `no_row`."""
+    def h(p, q):
+        assert p == "/v2/resolutions"
+        conds = q["condition"].split(",")
+        if fail is not None:
+            ans = fail(conds)
+            if ans is not None:
+                return ans
+        if set(conds) & set(bad):
+            return pd.HttpError(400, "invalid resolution condition id")
+        return {"data": [resolution(cd) for cd in conds if cd not in no_row]}
+    return h
+
+
+def _asked(t):
+    return [q["condition"].split(",") for q in t.queries()]
+
+
+def test_a_refused_twenty_is_asked_again_in_halves_down_to_single_ids_and_a_refused_id_gets_its_own_answer():
+    told = []
+    c, t, clock = client(refusing(bad={"0x03", "0x11"}, no_row={"0x07"}))
+    out = list(c.resolution_batches(IDS, narrowed=told.append))
+    assert [b for b, _, _ in out] == [IDS[0:2], ["0x02"], ["0x03"], ["0x04"], IDS[5:10], ["0x10"], ["0x11"],
+                                      IDS[12:15], IDS[15:20]]                 # the first half first, depth first
+    answers = {k: v for _, _, a in out for k, v in a.items()}
+    assert sum(len(b) for b, _, _ in out) == 20 and sorted(answers) == IDS        # each id answered once
+    assert answers["0x03"] == answers["0x11"] == pd.REFUSED == "refused"
+    assert pd.REFUSED not in ("row", "no_row", "rejected", "row_and_reject", "duplicate")
+    assert answers["0x07"] == "no_row" and {answers[k] for k in IDS if k not in ("0x03", "0x07", "0x11")} == {"row"}
+    for b, w, a in out:
+        if a[b[0]] == pd.REFUSED:
+            assert len(b) == 1 and w.rows == [] and w.raw == [] and w.pages == 1 and len(w.read_at) == 1
+    assert len(t.urls) == 17 and c.requests == 17                                  # 1 + 16 more: at most 38 more
+    assert told == [{"asked": 20, "answered": 18, "refused": 2, "requests": 16, "finished": True}]
+    assert all(pd._allowed(u) for u in t.urls)                                     # the allow-list, every request
+    assert all(set(a) <= set(IDS) for a in _asked(t))                              # every id exactly as given
+    assert {x for a in _asked(t) for x in a} == set(IDS)
+    assert len(clock.sleeps) == 16 and all(abs(s - (1 / 3 + 0.01)) < 1e-9 for s in clock.sleeps)   # the pace
+
+
+def test_the_more_requests_a_refused_request_costs_are_at_most_2n_minus_2_and_reach_it_when_every_id_is_refused():
+    import random
+    worst = 0
+    for seed in range(300):
+        rng = random.Random(seed)
+        n = 20 if seed == 0 else rng.randint(1, 20)
+        ids = ["0xc%03d" % i for i in rng.sample(range(1000), n)]                # distinct ids
+        bad = set(ids) if seed % 10 == 0 else {x for x in ids if rng.random() < rng.choice([0.0, 0.05, 0.2, 0.5])}
+        told = []
+        c, t, clock = client(refusing(bad=bad))
+        out = list(c.resolution_batches(ids, narrowed=told.append))
+        answers = {k: v for _, _, a in out for k, v in a.items()}
+        assert sorted(answers) == sorted(ids) and sum(len(b) for b, _, _ in out) == n
+        assert {k for k, v in answers.items() if v == pd.REFUSED} == bad
+        more = len(t.urls) - 1
+        if not bad:
+            assert more == 0 and told == []
+            continue
+        assert more <= 2 * n - 2, (seed, n, len(bad), more)
+        assert told == [{"asked": n, "answered": n - len(bad), "refused": len(bad), "requests": more,
+                         "finished": True}]
+        if bad == set(ids):
+            assert more == 2 * n - 2
+            worst = max(worst, n)
+    assert worst == 20                                                     # twenty refused: 38 more requests
+
+
+def test_a_single_id_refused_is_answered_refused_with_no_more_request_and_an_answer_after_it_is_still_read():
+    told = []
+    c, t, clock = client(refusing(bad={"0xbad"}))
+    out = list(c.resolution_batches(IDS + ["0xbad", "0xok"], narrowed=told.append))
+    assert [(b, a) for b, _, a in out][1:] == [(["0xbad"], {"0xbad": "refused"}), (["0xok"], {"0xok": "row"})]
+    assert _asked(t) == [IDS, ["0xbad", "0xok"], ["0xbad"], ["0xok"]]       # twenty ids a request, then halves
+    assert told == [{"asked": 2, "answered": 1, "refused": 1, "requests": 2, "finished": True}]
+    told.clear()
+    c, t, clock = client(refusing(bad={"0xbad"}))
+    assert list(c.resolution_batches(["0xbad"], narrowed=told.append))[0][2] == {"0xbad": "refused"}
+    assert len(t.urls) == 1 and told == [{"asked": 1, "answered": 0, "refused": 1, "requests": 0, "finished": True}]
+
+
+OTHER_FAILURES = {                                   # each failure in the error class of the reader `m` asking
+    "429": lambda m=pd: m.HttpError(429, "u"), "503": lambda m=pd: m.HttpError(503, "u"),
+    "404": lambda m=pd: m.HttpError(404, "u"), "302": lambda m=pd: m.HttpError(302, "u"),
+    "reset": lambda m=pd: ConnectionResetError("reset by peer"), "timeout": lambda m=pd: socket.timeout("timed out"),
+    "not_json": lambda m=pd: b"<html>", "paged": lambda m=pd: page([], True, "c"),
+    "no_data": lambda m=pd: {"rows": []}}
+
+
+@pytest.mark.parametrize("kind", sorted(OTHER_FAILURES))
+def test_any_other_first_failure_is_not_narrowed_and_raises_as_the_reader_before_did(kind, tmp_path):
+    old = _reader_at(B55BC88, tmp_path)
+    got = []
+    for m in (old, pd):
+        clock = FakeClock()
+        t = FakeTransport(refusing(bad={"0x03"}, fail=lambda conds, m=m: OTHER_FAILURES[kind](m)))
+        c = m.PolymarketData(t, sleep=clock.sleep, clock=clock)
+        told, yielded = [], []
+        kw = {"narrowed": told.append} if m is pd else {}
+        with pytest.raises(Exception) as e:
+            for x in c.resolution_batches(IDS + ["0x20"], **kw):
+                yielded.append(x)
+        got.append((type(e.value).__name__, str(e.value), t.urls, clock.sleeps, yielded))
+        assert told == []
+    assert got[0] == got[1]
+    assert got[1][4] == [] and len(got[1][2]) in (1, 5)                     # one request, or the reader's five tries
+
+
+@pytest.mark.parametrize("kind", ["503", "404", "reset", "timeout", "not_json", "paged"])
+def test_another_failure_met_while_narrowing_raises_and_the_ids_not_yet_answered_have_no_answer(kind):
+    told, out = [], []
+    c, t, clock = client(refusing(bad={"0x03"}, fail=lambda conds: OTHER_FAILURES[kind]() if "0x15" in conds
+                                                                    and len(conds) < 20 else None))
+    with pytest.raises((pd.PolymarketDataError, pd.HttpError)):
+        for x in c.resolution_batches(IDS + ["0xnext"], narrowed=told.append):
+            out.append(x)
+    answers = {k: v for _, _, a in out for k, v in a.items()}
+    assert sorted(answers) == IDS[:10] and answers["0x03"] == pd.REFUSED       # the first half, then the failure
+    assert told == [{"asked": 20, "answered": 9, "refused": 1, "requests": 10, "finished": False}]
+    assert not any("0xnext" in u for u in t.urls)                            # the next twenty is never asked
+
+
+def test_with_no_refused_id_the_reader_asks_and_answers_exactly_as_before(tmp_path):
+    import random
+    old = _reader_at(B55BC88, tmp_path)
+    for seed in range(40):
+        rng = random.Random(seed)
+        ids = ["0xc%d" % i for i in range(rng.randint(1, 65))]
+        rows = {x: [resolution(x)] if rng.random() < 0.6 else [] if rng.random() < 0.5 else
+                [resolution(x), resolution(x, payouts=[0, 1_000_000])] if rng.random() < 0.5 else
+                [resolution(x, payouts="bad")] for x in ids}
+
+        def h(p, q):
+            return {"data": [r for x in q["condition"].split(",") for r in rows[x]]}
+        got = []
+        for m in (old, pd):
+            t = FakeTransport(h)
+            c = m.PolymarketData(t, sleep=lambda s: None, clock=lambda: 0.0, now=lambda: "2026-11-18T00:00:00+00:00",
+                                 wall=lambda: 1_790_000_000.0)
+            got.append((t.urls, json.dumps([[b, w.rows, w.raw, sorted(w.rejects.items()), w.pages, w.read_at, a]
+                                            for b, w, a in c.resolution_batches(ids)], sort_keys=True, default=repr)))
+        assert got[0] == got[1], seed
