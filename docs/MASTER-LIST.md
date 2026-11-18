@@ -70,8 +70,13 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   slow backup read does not. RULES for the scored period (from 2026-11-19 00:00 UTC): ONE test activity at a
   time; no kill or race suites; no large file work on NIMROD_SSD without the lead's guard
   (`claude-tmp/valedia-trader1/lead-pull/guard.py`, which stops the load at the first late decision); big
-  research data off that SSD. **NEXT** the controlled comparison the owner approved, before 14:00 PST today,
-  with the disk arm first.
+  research data off that SSD. **DONE 2026-11-18 12:45 PST** the controlled comparison the owner approved: two
+  test activities overlapping with their scratch on NIMROD_SSD cost 3 of 9 decisions inside three and a half
+  minutes; the same overlap with scratch on the internal disk, four arms and 16 minutes with the kill suite
+  among them, cost 0 of 39. THE RULE NOW: all test scratch on the internal disk, and every test run of every
+  session through the machine-wide lock `~/valedia-data/bin/test-slot` (one holder, 20-minute cap, a shared
+  log at `~/valedia-data/locks/test-activity.log`). Today's losses: 36 decisions (3 the pull's start, 30 the
+  lead's copy, 3 the comparison's SSD arm), all in the development period.
 - **NEXT** the nightly backup (03:40) must not take very large research stores: with the 70 GB store in
   `artifacts/` its copy held a read lock for 21 minutes and its integrity check of the copy ran for hours.
   The store has left those folders; the lead checks that today's backup ends and tomorrow's is ordinary.
