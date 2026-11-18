@@ -811,3 +811,147 @@ def test_position_pages_hand_one_page_at_a_time_with_identity_across_pages():
     with pytest.raises(pd.PageCapHit):
         list(c.position_pages("0xabc", page_cap=3, ids={}, conflicted=set()))
     assert len(t.urls) == 3
+
+
+# ------------------------------------------------------------------ T52 addendum 2, item 1: no value stops a read
+def _deep(n, kind=list):
+    """A value nested `n` deep, built without recursion (deeper than json.dumps or repr can walk)."""
+    top = cur = kind()
+    for _ in range(n):
+        nxt = kind()
+        if kind is list:
+            cur.append(nxt)
+        else:
+            cur["k"] = nxt
+        cur = nxt
+    return top
+
+
+BIG = 10 ** 400                                  # a whole number of 401 digits: beyond a float's range
+HUGE_STR = "x" * 10_000_000
+HOSTILE = [BIG, -BIG, 2 ** 63, True, False, None, 0, -1, 1e308, float("nan"), float("inf"),
+           "", "\ud800", "a\x00b", "\udfff" * 3, HUGE_STR, [], {}, [1, 2], [BIG, BIG], {"a": BIG},
+           _deep(50_000), _deep(50_000, dict)]
+VALIDATORS = {
+    "board": (lambda r: pd.validate_board_row(r), board_row(1, "0xabc")),
+    "trade": (lambda r: pd.validate_trade(r, "0xabc", 1_800_000_000), trade(1)),
+    "trade_any_wallet": (lambda r: pd.validate_trade(r), trade(1)),
+    "position": (lambda r: pd.validate_position(r, "0xabc"), position(1)),
+    "position_any_wallet": (lambda r: pd.validate_position(r), position(1)),
+    "resolution": (lambda r: pd.validate_resolution(r, 1_800_000_000), resolution("0xc1")),
+    "price_point": (lambda r: pd.validate_price_point(r, 1_800_000_000),
+                    {"price": 0.5, "resolution_seconds": 60, "timestamp": 1_700_000_000}),
+}
+
+
+def test_is_number_never_raises_and_every_whole_number_is_a_number_whatever_its_size():
+    for v in HOSTILE:
+        assert pd.is_number(v) in (True, False)
+    assert pd.is_number(BIG) is True and pd.is_number(-BIG) is True        # was an OverflowError
+    for v in (True, False, None, "1", float("nan"), float("inf"), [1], {}, "\ud800"):
+        assert pd.is_number(v) is False
+
+
+@pytest.mark.parametrize("name", sorted(VALIDATORS))
+def test_no_validator_raises_whatever_value_sits_in_whatever_field(name):
+    check, base = VALIDATORS[name]
+    fields = list(base) + ["an_extra_field"]
+    for f in fields:
+        for v in HOSTILE:
+            good, why = check(dict(base, **{f: v}))
+            assert (good is None) != (why is None), (f, type(v).__name__)
+    for v in HOSTILE:
+        assert check(v)[1] == "not_an_object" or isinstance(v, dict)
+        if isinstance(v, dict):
+            assert check(v)[0] is None
+
+
+@pytest.mark.parametrize("name", sorted(VALIDATORS))
+def test_a_walk_keeps_counting_whatever_row_the_service_sends(name):
+    """Walk.add (the validator, then the identity and the whole-row signature) never raises either."""
+    check, base = VALIDATORS[name]
+    rows = [dict(base, an_extra_field=v) for v in HOSTILE] + [dict(base, an_extra_field=_deep(50_000))] * 2
+    w, ids, conflicted = pd.Walk(), {}, set()
+    for r in rows:
+        w.add(r, check, "t", identity=lambda g: "one", ids=ids, conflicted=conflicted)
+    assert len(w.raw) == len(rows)
+
+
+def test_a_whole_number_beyond_a_floats_range_takes_the_too_large_reason_where_that_rule_applies():
+    tl = "number_too_large_for_store"
+    for big in (BIG, -BIG):
+        assert pd.validate_trade(dict(trade(3), size=abs(big)), "0xabc") == (None, tl)
+        assert pd.validate_board_row(board_row(1, "u", pnl=big)) == (None, tl)
+        assert pd.validate_board_row(dict(board_row(1, "u"), volume=big)) == (None, tl)
+        assert pd.validate_board_row(dict(board_row(1, "u"), rank=big)) == (None, tl)
+        assert pd.validate_price_point({"price": 0.5, "resolution_seconds": abs(big),
+                                        "timestamp": 1_700_000_000}) == (None, tl)
+        assert pd.validate_resolution(resolution("c", payouts=[0, abs(big)])) == (None, tl)
+    # where a price must lie in [0, 1] the number is simply out of it, as 2**63 is today
+    assert pd.validate_trade(dict(trade(3), price=BIG), "0xabc") == (None, "bad_price")
+    assert pd.validate_price_point({"price": BIG, "resolution_seconds": 1, "timestamp": 1_700_000_000}) == \
+        (None, "bad_price")
+    assert pd.validate_trade(dict(trade(3), timestamp=BIG), "0xabc") == (None, "timestamp_out_of_span")
+
+
+@pytest.mark.parametrize("field", pd.POSITION_NUM)
+def test_a_position_money_field_beyond_a_floats_range_is_that_fields_reject(field):
+    assert pd.validate_position(position(0, **{field: BIG}), "0xabc") == (None, "bad_" + field)
+    assert pd.validate_position(position(0, **{field: -BIG}), "0xabc") == (None, "bad_" + field)
+    assert pd.validate_position(position(0, **{field: 2 ** 63}), "0xabc")[1] is None     # in range: as today
+
+
+def test_a_401_digit_current_price_is_none_and_counted_never_an_error():
+    good, why = pd.validate_position(position(0, current_price=BIG), "0xabc")
+    assert why is None and good["current_price"] is None and good["unread"] == ("current_price",)
+    c, t, clock = client(lambda p, q: b'{"data": [' + json.dumps(position(0)).encode()[:-1] +
+                         b', "current_price": ' + b"9" * 401 + b'}], "pagination": {"has_more": false}}')
+    w = c.positions("0xabc")
+    assert len(w.rows) == 1 and dict(w.unread) == {"current_price": 1}
+
+
+BAD_TEXT = ["\ud800", "ok\udc00", "a\x00b", "\x00"]
+
+
+@pytest.mark.parametrize("value", BAD_TEXT)
+@pytest.mark.parametrize("field", ["title", "outcome"])
+def test_an_information_string_that_cannot_be_stored_or_printed_is_none_and_counted(field, value):
+    good, why = pd.validate_position(position(0, **{field: value}), "0xabc")
+    assert why is None and good[field] is None and good["unread"] == (field,)
+    good["title" if field == "outcome" else "outcome"].encode("utf-8")
+
+
+def test_a_lone_surrogate_title_through_the_wire_is_none_and_counted():
+    body = json.dumps(page([position(0, title="\ud800"), position(1)])).encode()     # JSON escapes it as \ud800
+    assert b"\\ud800" in body
+    c, t, clock = client(lambda p, q: body)
+    w = c.positions("0xabc")
+    assert len(w.rows) == 2 and w.rows[0]["title"] is None and dict(w.unread) == {"title": 1}
+
+
+@pytest.mark.parametrize("value", BAD_TEXT)
+def test_a_string_that_decides_a_reject_and_cannot_be_stored_is_that_fields_reject(value):
+    for f in ("proxy_wallet", "token_id", "condition_id", "status"):
+        assert pd.validate_position(position(0, **{f: value})) == (None, "bad_" + f)
+    for f in ("proxy_wallet", "token_id", "condition_id", "event_slug", "transaction_hash"):
+        assert pd.validate_trade(dict(trade(1), **{f: value})) == (None, "bad_" + f)
+    assert pd.validate_board_row(board_row(1, value)) == (None, "bad_user_id")
+    assert pd.validate_resolution(resolution(value)) == (None, "bad_condition_id")
+    assert pd.validate_resolution(resolution("c", status=value)) == (None, "bad_status")
+    assert pd.validate_resolution(resolution("c", resolved_at="2026-02-01T10:00:00" + value + "Z")) == \
+        (None, "bad_resolved_at")
+
+
+@pytest.mark.parametrize("value", BAD_TEXT)
+def test_a_kept_string_that_cannot_be_stored_is_none(value):
+    good, why = pd.validate_position(position(0, event_slug=value, event_id=value, opposite_token_id=value))
+    assert why is None and (good["event_slug"], good["event_id"], good["opposite_token_id"]) == (None, None, None)
+    good, why = pd.validate_trade(dict(trade(1), title=value, slug=value, outcome=value))
+    assert why is None and (good["title"], good["slug"], good["outcome"]) == (None, None, None)
+
+
+def test_a_resolution_row_whose_condition_is_not_a_string_is_an_answer_not_an_error():
+    rows = [resolution("0x1"), {"condition_id": ["0x2"], "status": "r"}, {"condition_id": {"a": 1}, "status": "r"}]
+    c, t, clock = client(lambda p, q: {"data": rows})
+    (batch, w, answers), = list(c.resolution_batches(["0x1", "0x2"]))
+    assert answers == {"0x1": "row", "0x2": "no_row"} and dict(w.rejects) == {"bad_condition_id": 2}

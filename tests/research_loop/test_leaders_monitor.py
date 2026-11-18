@@ -668,3 +668,93 @@ def test_two_fix_leaders_processes_at_once_exactly_one_fixes(tmp_path):
     assert len(rows) == 10
     firsts = {int(r[0][2:10], 16) - 0x1a2b3c00 for r in rows}
     assert firsts in ({*range(10)}, {*range(20, 30)})          # one process's boards, never a mix
+
+
+# ------------------------------------------------------------------ addendum 2, item 1: no value stops a pass
+def test_a_lone_surrogate_title_and_a_401_digit_price_stop_nothing(store):
+    world, wall = fixed(store)
+    w = wallet(0)
+    world.held[w] = [pos(w, 1, title="\ud800"), pos(w, 2, current_price=10 ** 400), pos(w, 3, outcome="a\x00b")]
+    code, out = run(["pass"], world, wall, store)
+    assert code == 0, out
+    c = db(store)
+    r = c.execute("SELECT * FROM wallet_reads WHERE wallet_key=?", (w,)).fetchone()
+    assert (r["good"], r["rows"]) == (1, 3)
+    assert json.loads(r["unread"]) == {"title": 1, "current_price": 1, "outcome": 1}
+    assert c.execute("SELECT count(*) FROM wallet_reads WHERE good=1").fetchone()[0] == 10
+    assert c.execute("SELECT count(*) FROM holdings_current WHERE wallet_key=? AND title IS NULL", (w,)).fetchone()[0] == 1
+
+
+class RaisingWorld(World):
+    """Raises an error of no expected kind inside one wallet's read (its message holds a row's content)."""
+    bad: str = ""
+
+    def __call__(self, url):
+        if "user=" + self.bad in url and self.bad:
+            self.urls.append(url)
+            raise ValueError("SECRET-TITLE-1 broke the reader")
+        return super().__call__(url)
+
+
+def test_an_error_inside_one_wallets_read_is_that_wallets_failed_read_and_the_pass_goes_on(store):
+    world = RaisingWorld()
+    world, wall = fixed(store, world)
+    for i in range(10):
+        world.held[wallet(i)] = [pos(wallet(i), 10 * i + 1)]
+    run(["pass"], world, wall, store)
+    wall.t += 300
+    world.bad = wallet(2)
+    world.held[wallet(2)] = []
+    code, out = run(["pass"], world, wall, store)
+    assert code == lm.INTERNAL_ERROR and code not in (lm.OK, lm.LOCKED, lm.REFUSED, lm.STOPPED_MEMORY)
+    c = db(store)
+    last = c.execute("SELECT * FROM wallet_reads WHERE wallet_key=? ORDER BY read_id DESC", (wallet(2),)).fetchone()
+    assert (last["good"], last["reason"], last["detail"]) == (0, "internal_error", "ValueError")
+    assert c.execute("SELECT count(*) FROM wallet_reads WHERE good=1").fetchone()[0] == 19
+    assert changes(store) == []                              # its holding stays; nothing inferred
+    assert c.execute("SELECT count(*) FROM holdings_current WHERE wallet_key=?", (wallet(2),)).fetchone()[0] == 1
+    lines = out.strip().splitlines()
+    assert len(lines) == 11 and "internal_error" in lines[2] and "internal_error=1" in lines[-1]
+    assert "1 failed" in lines[-1] and "SECRET" not in out
+    assert lm.consistency(c) == []
+
+
+def test_a_write_that_fails_for_one_wallet_is_that_wallets_failed_read_and_the_pass_goes_on(store, monkeypatch):
+    world, wall = fixed(store)
+    for i in range(10):
+        world.held[wallet(i)] = [pos(wallet(i), 10 * i + 1)]
+    run(["pass"], world, wall, store)
+    before = holdings(store)
+    wall.t += 300
+    for i in range(10):
+        world.held[wallet(i)] = [pos(wallet(i), 10 * i + 2)]
+    real = lm._holding
+
+    def failing(r):
+        if r["proxy_wallet"] == wallet(3):
+            raise sqlite3.InterfaceError("SECRET-TITLE-32 could not be bound")
+        return real(r)
+    monkeypatch.setattr(lm, "_holding", failing)
+    code, out = run(["pass"], world, wall, store)
+    assert code == lm.INTERNAL_ERROR
+    c = db(store)
+    last = c.execute("SELECT * FROM wallet_reads WHERE wallet_key=? ORDER BY read_id DESC", (wallet(3),)).fetchone()
+    assert (last["good"], last["reason"], last["detail"]) == (0, "internal_error", "InterfaceError")
+    after = holdings(store)
+    assert {k: v for k, v in after.items() if k[0] == wallet(3)} == {k: v for k, v in before.items() if k[0] == wallet(3)}
+    assert len(changes(store)) == 18                         # nine wallets: one EXIT and one NEW each
+    assert "internal_error=1" in out and "SECRET" not in out
+    assert lm.consistency(c) == []
+
+
+@pytest.mark.parametrize("error", [MemoryError, KeyboardInterrupt])
+def test_a_memory_error_or_an_interrupt_is_not_caught(store, monkeypatch, error):
+    world, wall = fixed(store)
+    world.held[wallet(0)] = [pos(wallet(0), 1)]
+
+    def boom(r):
+        raise error()
+    monkeypatch.setattr(lm, "_holding", boom)
+    with pytest.raises(error):
+        run(["pass"], world, wall, store)
+    assert lm.consistency(db(store)) == []
