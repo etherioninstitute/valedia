@@ -298,6 +298,9 @@ SELL_BELOW_REDUCING = Decimal("0.02")             # ... less 2% when the sale re
 SETTLED_ABOVE_CASH = 0.01                         # settled cash may exceed cash by at most a cent (rounding)
 CASH_KEPT = 0.01                                  # purchases may use the venue's cash less 1%
 FRACTIONAL_DECIMALS = 5
+MARKET_QUOTE_MAX_AGE_SECONDS = 120                # T51 R5 (B1): a MARKET leg's judged quote at most this old when sent
+MARKET_AFTER_OPEN = pd.Timedelta(minutes=30)      # T51 R5 (B4): MARKET legs only from this long after the open ...
+MARKET_BEFORE_CLOSE = pd.Timedelta(minutes=30)    # ... to this long before the close (a half-day's, as the calendar has it)
 FRACTIONAL_MIN_VALUE = Decimal(5)                 # T51 R1: Webull's smallest fractional order value, in dollars (M)
 OPEN_STATES = ("accepted", "partly_filled", "sent", "unknown")   # orders that may still be open at the broker
 UNITS_EPS = 1e-12
@@ -873,16 +876,45 @@ def _default_calendar():
 def market_window(calendar, now: float) -> tuple[float | None, float | None, str | None]:
     """(start, end, None) in seconds when `now` falls on a trading day of `calendar`; (None, None, why) when it does
     not. The window runs SESSION_AFTER_OPEN after the open to SESSION_BEFORE_CLOSE before the close."""
+    return _window(calendar, now, SESSION_AFTER_OPEN, SESSION_BEFORE_CLOSE)
+
+
+def market_leg_window(calendar, now: float) -> tuple[float | None, float | None, str | None]:
+    """T51 R5 (B4): the window a MARKET leg is sent in, read as `market_window` reads the day (a half-day's close as
+    the calendar has it): MARKET_AFTER_OPEN after the open to MARKET_BEFORE_CLOSE before the close."""
+    return _window(calendar, now, MARKET_AFTER_OPEN, MARKET_BEFORE_CLOSE)
+
+
+def _window(calendar, now: float, after, before) -> tuple[float | None, float | None, str | None]:
     ny = pd.Timestamp(now, unit="s", tz="UTC").tz_convert(NEW_YORK)
     day = str(ny.date())
     try:
         if not calendar.is_session(day):
             return None, None, f"{day} ({ny.day_name()}) is not a trading day"
-        start = pd.Timestamp(calendar.session_open(day)) + SESSION_AFTER_OPEN
-        end = pd.Timestamp(calendar.session_close(day)) - SESSION_BEFORE_CLOSE
+        start = pd.Timestamp(calendar.session_open(day)) + after
+        end = pd.Timestamp(calendar.session_close(day)) - before
     except Exception as exc:
         return None, None, f"the exchange calendar could not answer for {day}: {_describe(exc)}"
     return start.timestamp(), end.timestamp(), None
+
+
+def market_leg_clears_minimum(units, quote) -> bool:
+    """T51 R5 (B6): whether a MARKET leg of `units` (either side) still clears the split's minimum at `quote`, by the
+    split's own rule (R1 iv): |units| x quote x (1 - TICKET_QUOTE_MOVE) at least FRACTIONAL_MIN_VALUE, exact in
+    Decimal. False for anything that is not a finite number above zero."""
+    if not (_finite(units) and _finite(quote)) or units == 0 or quote <= 0:
+        return False
+    with localcontext() as ctx:
+        ctx.prec = 100
+        margin = 1 - Decimal(repr(float(TICKET_QUOTE_MOVE)))
+        return abs(Decimal(repr(float(units)))) * Decimal(repr(float(quote))) * margin >= FRACTIONAL_MIN_VALUE
+
+
+def _load_second_source():
+    """T51 ruling C: the second price source's verdict function, the one live mode asks (read-only quotes), for the
+    practice path too. Imported here and only here, so a test can stand it in."""
+    from valedia_trader.data_and_fees.second_quote import second_opinion
+    return second_opinion
 
 
 def _iso(seconds: float) -> str:
@@ -1621,7 +1653,8 @@ def run_order_step(*, ledger: OrderLedger, venue, paper, quotes: Callable, journ
     `propose` writes a ticket instead of sending; `approve` (the ticket's number) sends only what that ticket holds.
     `live` (a go_live.LiveFiles, with propose or approve and a capital) is live mode: Webull's production environment
     under the four locks of the go-live gate; `second_opinion` is the second price source's verdict function
-    (default: second_quote.second_opinion), asked only in live mode. `follow` (a Follow: config/broker_book.json as
+    (default: second_quote.second_opinion), asked in live mode and, with `fractional` on, for each MARKET leg on
+    practice (T51 ruling C; with `fractional` off practice asks none). `follow` (a Follow: config/broker_book.json as
     the command line reads it, T32) makes the broker book follow only the strategies it names; None follows the
     whole book, except in live mode, which stops without one."""
     mode = "propose" if propose else ("approve" if approve is not None else None)
@@ -1635,8 +1668,13 @@ def run_order_step(*, ledger: OrderLedger, venue, paper, quotes: Callable, journ
         run.live = live
         run.expected_env = LIVE_ENVIRONMENT
         if second_opinion is None:
-            from valedia_trader.data_and_fees.second_quote import second_opinion
+            second_opinion = _load_second_source()
         run.second_opinion = second_opinion
+    elif run.fractional:                                 # T51 ruling C: a MARKET leg on practice needs it too; loaded
+        if second_opinion is None:                       # ... (the live path's own) when the first one asks, once
+            run.second_load = _load_second_source
+        else:
+            run.second_opinion = second_opinion
     if mode is not None:
         run.mode, run.approve_number = mode, approve
         if propose and approve is not None:
@@ -1726,6 +1764,10 @@ class _Run:
         self.day_stop: dict | None = None                # T34b-2 (S2, S4, live): set, the run is in the day stop
         self.residuals: list[dict] = []                  # T51 R1 (fractional): what each fund's split held back
         self.whole_passed: dict[str, float] = {}         # T51 R4: fund -> its LIMIT leg's units accepted (proposed) this run
+        self.whole_fate: dict[str, str] = {}             # T51 A3 (a): fund -> what became of its LIMIT leg that did not pass
+        self.second_load = None                          # T51 ruling C: practice, fractional: how to load the second source
+        self.second_unloadable: str | None = None        # ... why it could not be loaded, once tried
+        self.market_hours: tuple | None = None           # T51 R5 (B4): (start, end, why) of the MARKET legs' window
 
     # -- helpers
     def _follow_view(self) -> dict:
@@ -2097,11 +2139,13 @@ class _Run:
         breach) on the wrong side of the order's limit; `unjudged` when the order, its units, its limit or `avg` cannot
         be read as usable numbers; else `ok`. Every limit the order step sends is a whole number of cents, so an
         average the broker rounds to the cent is at its limit or a cent through it; an average that includes fees
-        would trip this rule."""
+        would trip this rule. T51 R6: a MARKET leg (no limit) is judged against its collar price, the price a LIMIT leg
+        would have carried (a whole number of cents too), by the same rule; a breach of it is `cap` like any other."""
         asked = _as_float(order.get("units")) if isinstance(order, dict) else None
         if asked is None or asked == 0:
             return "unjudged"
-        avg, limit = _as_float(avg), _as_float(order.get("limit_price"))
+        bound = "collar_price" if order.get("order_type") == "MARKET" else "limit_price"
+        avg, limit = _as_float(avg), _as_float(order.get(bound))
         if avg is None or not avg > 0 or limit is None or not limit > 0:
             return "unjudged"
         return "breach" if ((avg - limit) if asked > 0 else (limit - avg)) > LIMIT_SAME * limit * LIMIT_EDGE else "ok"
@@ -2550,6 +2594,7 @@ class _Run:
         self.dropped.append(item)
         self._write({"event": "dropped", **item})
         self._ticket_note(c, "not sent", reason=reason)
+        self._whole_failed(c, f"was dropped ({reason})")
 
     def _settle_tickets(self) -> list[dict]:
         """At the end of every run that held the lock: make every used ticket's lines mirror the order ledger (first
@@ -2781,6 +2826,8 @@ class _Run:
             raise _Stop("session", f"outside the regular session window {_hhmm(start)} to {_hhmm(end)} New York time "
                                    f"(it is {_hhmm(now)})")
         self.window_end = end
+        if self.fractional:                              # T51 R5 (B4): the MARKET legs' own, narrower window
+            self.market_hours = market_leg_window(self.calendar, now)
 
     # -- 3
     def _baseline(self) -> dict[str, float]:
@@ -3100,22 +3147,27 @@ class _Run:
                 self.quote_times[sym] = t
         return prices, why_not
 
-    def _quote_fresh(self, sym: str) -> bool:
-        """Whether the quote in hand for `sym` is within QUOTE_MAX_AGE_SECONDS on the clock now."""
-        t, now = self.quote_times.get(sym), self._now()
-        return t is not None and -QUOTE_MAX_AHEAD_SECONDS <= now - t <= QUOTE_MAX_AGE_SECONDS
+    def _quote_fresh(self, sym: str, max_age: float = QUOTE_MAX_AGE_SECONDS, now: float | None = None) -> bool:
+        """Whether the quote in hand for `sym` is within `max_age` (QUOTE_MAX_AGE_SECONDS; a MARKET leg's
+        MARKET_QUOTE_MAX_AGE_SECONDS) on the clock now, or on the reading `now` when given."""
+        t, now = self.quote_times.get(sym), (self._now() if now is None else now)
+        return t is not None and -QUOTE_MAX_AHEAD_SECONDS <= now - t <= max_age
 
-    def _refresh(self, sym: str, quote: float, held: dict, in_hand: dict) -> tuple[float | None, str | None, list[str]]:
+    def _refresh(self, sym: str, quote: float, held: dict, in_hand: dict,
+                 market: bool = False) -> tuple[float | None, str | None, list[str]]:
         """At most one ask of the quote function before an order is judged: the order's own symbol when its quote in
         hand is older than QUOTE_MAX_AGE_SECONDS (always: it is the quote the order is judged and sent on), and every
         holding whose quote in hand is too old and was last asked for QUOTE_ASK_GAP_SECONDS or more ago. Returns
         (the order's quote, None, the holdings still without a fresh quote), or (None, why, []) when the order's own
-        quote asked for again is not usable. Usable answers go into `in_hand` with their times."""
+        quote asked for again is not usable. Usable answers go into `in_hand` with their times. T51 R5 (B1): a MARKET
+        leg (`market`) also asks for its own symbol when its quote is older than MARKET_QUOTE_MAX_AGE_SECONDS and takes
+        the answer only when it is usable and newer; otherwise it keeps the quote in hand (the collar then judges it)."""
         own = not self._quote_fresh(sym)
+        fresher = market and not own and not self._quote_fresh(sym, MARKET_QUOTE_MAX_AGE_SECONDS)
         now = self._now()
         holdings = [s for s, u in sorted(held.items()) if u > UNITS_EPS and s != sym and not self._quote_fresh(s)
                     and now - self.asked.get(s, -math.inf) >= QUOTE_ASK_GAP_SECONDS]
-        ask = ([sym] if own else []) + holdings
+        ask = ([sym] if own or fresher else []) + holdings
         raw, failed = {}, None
         if ask:
             for s in ask:
@@ -3137,6 +3189,10 @@ class _Run:
             if price is None:
                 return None, f"{old} and the quote asked for again is not usable: {why}", []
             self.quote_times[sym], quote = t, price
+        elif fresher and failed is None:
+            price, t, _ = _read_quote(raw.get(sym), now)
+            if price is not None and t > self.quote_times.get(sym, -math.inf):
+                self.quote_times[sym], quote = t, price
         in_hand[sym] = quote
         return quote, None, sorted(s for s, u in held.items() if u > UNITS_EPS and not self._quote_fresh(s))
 
@@ -3166,7 +3222,14 @@ class _Run:
     def _differences(self, book, per_strategy, prices, why_not, min_value) -> list[dict]:
         holdings = strategy_holdings(self.ledger.orders())
         out = []
-        for sym in sorted(set(self.target_units) | set(book)):
+        funds = sorted(set(self.target_units) | set(book))
+        clash = {}                                       # T51 A3 (b): a fund's tag that is another fund's remainder tag
+        if self.fractional:
+            for sym in funds:
+                if sym.endswith(".r") and sym[:-2] in funds:
+                    clash.setdefault(sym, sym[:-2])
+                    clash.setdefault(sym[:-2], sym[:-2])
+        for sym in funds:
             target, owned = self.target_units.get(sym, 0.0), book.get(sym, 0.0)
             delta = target - owned
             if abs(delta) <= UNITS_EPS:
@@ -3178,6 +3241,13 @@ class _Run:
             if units < 0:
                 units = round_units(max(units, -max(owned, 0.0)), self.fractional)   # a sale never exceeds the book
             if abs(units) <= UNITS_EPS:
+                continue
+            if sym in clash:                             # refused before anything is sent for either fund
+                base = clash[sym]
+                self._refuse({"symbol": sym, "units": units}, "order step",
+                             f"the fund {base}.r's whole-share tag would equal the fund {base}'s remainder tag "
+                             f"({self.batch}-{base}.r), and no two orders may share a tag, so neither fund is sent in "
+                             "this run")
                 continue
             quote = prices.get(sym)
             if quote is None:
@@ -3327,16 +3397,16 @@ class _Run:
             return -c["value"], c["symbol"], c.get("leg") == "remainder"   # a fund's LIMIT leg before its remainder
         sales = sorted((c for c in candidates if c["units"] < 0), key=order_key)
         buys = sorted((c for c in candidates if c["units"] > 0), key=order_key)
-        for c in sales + buys:
+        queue = sales + buys
+        for i, c in enumerate(queue):
             sym, units = c["symbol"], c["units"]
+            market = c.get("order_type") == "MARKET"     # T51 R4: the remainder leg, by quantity, behind its collar
             owned_here = held.get(sym, 0.0)
             if c.get("leg") == "remainder":              # T51 R4: judged on top of its fund's LIMIT leg of this run
                 owned_here = math.fsum((owned_here, self.whole_passed.get(sym, 0.0)))
             reduces = units < 0 and owned_here > 0 and abs(owned_here + units) < abs(owned_here)
             if c.get("leg") == "remainder" and c["after_whole"] and sym not in self.whole_passed:
-                self._leave(c, "its fund's whole-share LIMIT leg of this run "               # T51 R4, R9
-                               + ("did not become a line of this ticket" if self.mode == "propose" else
-                                  "was not accepted by the venue") + ", so the remainder is not sent in this run")
+                self._leave(c, self._gate_words(sym))     # T51 R4, R9, A3 (a): by the LIMIT leg's state, named
                 continue
             if self._now() > self.window_end:
                 self._leave(c, "the session window closed during the run")
@@ -3347,14 +3417,15 @@ class _Run:
             if units > 0 and purchases_stopped:            # left over; labelled by the budget that stops it now
                 q = in_hand.get(sym, c["quote"])
                 lp = limit_price(units, q)
-                self._leave(c, words[money(units * (lp if lp is not None else q)) or purchases_stopped])
+                self._leave(c, words[money(units * (lp if lp is not None else q)) or purchases_stopped],
+                            collar="value" if market else None)   # T51 R5 (B5): r x c, the collar's own price
                 continue
             if abs(units) > MAX_UNITS:
                 self._leave(c, f"the order is above {MAX_UNITS:,.0f} units in size")
                 continue
             quote, judged = in_hand.get(sym, c["quote"]), None   # the latest quote in hand (a holding's may be newer)
             for round_ in (1, 2):
-                quote, stale, unpriced = self._refresh(sym, quote, held, in_hand)   # 1. fresh quotes, one ask at most
+                quote, stale, unpriced = self._refresh(sym, quote, held, in_hand, market)   # 1. fresh quotes, one ask
                 if quote is None:
                     self._leave(c, stale)
                     break
@@ -3384,7 +3455,7 @@ class _Run:
                 if units > 0 and spent + cost > budget:
                     purchases_stopped = money(cost) or ("cash" if settled_budget is None or cash_budget <= settled_budget
                                                         else "settled")
-                    self._leave(c, words[purchases_stopped])
+                    self._leave(c, words[purchases_stopped], collar="value" if market else None)   # T51 R5 (B5)
                     break
                 self._check_environment()                # 3. the environment and host, read again
                 if self._quote_fresh(sym):               # 4. the quote still fresh on the clock: judged at it
@@ -3405,7 +3476,11 @@ class _Run:
                 if why is not None:
                     self._drop(c, why)
                     continue
-            market = c.get("order_type") == "MARKET"     # T51 R4: the remainder leg, by quantity, behind its collar
+            if market and self.mode != "propose":        # T51 R5: the collar, before its intend (a line is not an order)
+                held_back = self._collar(c, units, quote)
+                if held_back is not None:
+                    self._leave(c, held_back[1], collar=held_back[0])
+                    continue
             tag = f"{self.batch}-{sym}" + (".r" if c.get("leg") == "remainder" else "")
             watch = _SubmitWatch(self.venue)
             if self.mode == "approve":                   # the line's tag, on file before its intend
@@ -3442,7 +3517,7 @@ class _Run:
                 late = self._last_look(sym, reduces)     # ... the quote's age, the halt and latch files ...
                 if late is None and self.mode == "approve":
                     late = self._ticket_held()           # ... the ticket still this run's ...
-                lost = None
+                lost = late_collar = None
                 if late is None and self.live is not None:   # ... T22d-1 (A2): the run lock still the file it took ...
                     late = lost = self._lock_lost("nothing more is sent")
                 if late is None:                         # ... then one reading: the window (and the ticket's life)
@@ -3451,17 +3526,24 @@ class _Run:
                         late = "the session window closed during the run"
                     elif self.mode == "approve" and self._ticket_expired(now):
                         late = "the ticket expired before the order was sent"
+                    elif market:                         # T51 R5 (B4, B1): a MARKET leg, on that same reading
+                        late_collar, late = next(((n, w) for n, w in (("clock", self._market_clock(now)),
+                                                                      ("quote_age", self._market_quote_age(sym, now)))
+                                                  if w is not None), (None, None))
                 if late is not None:
                     self.state.note_outcome(tag, "not sent")             # it stays intended, never sent
-                    self._leave(c, late)
+                    self._leave(c, late, collar=late_collar)
                     if lost is not None:                 # the lock gone: the run stops here
+                        self._hold_remainders(c, queue[i + 1:])
                         raise _Stop("lock", lost)
                     continue
                 rec = self.ledger.submit_once(watch, tag)
             except OrdersBlocked:
+                self._hold_remainders(c, queue[i + 1:], tag)
                 words = "; ".join(self._ledger_words(self.ledger.orders(OPEN_STATES), {}))
                 raise _Stop("send", f"the ledger refused to send {tag}: {words}"[:1000]) from None
             except (OrderError, sqlite3.Error) as exc:
+                self._hold_remainders(c, queue[i + 1:], tag)
                 raise _Stop("send", f"order {tag} could not be recorded or sent: {_local_error(exc)}; the next run's "
                                     "reconcile settles it") from None
             outcome = rec["state"] if rec.get("state") in STATES else "unknown"
@@ -3470,7 +3552,8 @@ class _Run:
                 why = f"the venue did not take it: {_venue_error(watch.error)}" if watch.error is not None else "the venue did not take it"
                 self._refuse(c, "venue", why, tag=tag)
                 continue
-            if outcome != "accepted":
+            took = outcome == "accepted" or (self.fractional and outcome in ("partly_filled", "filled"))   # A3 (a)
+            if not took:
                 if watch.error is not None:
                     why = f"the venue's call raised {_venue_error(watch.error)}"
                 elif watch.called:
@@ -3479,6 +3562,7 @@ class _Run:
                     why = "the venue was not called"
                 self._write({"event": "unknown", "tag": tag, "symbol": sym, "units": units, **_leg_of(c), "state": outcome,
                              "reason": why})
+                self._hold_remainders(c, queue[i + 1:], tag)
                 raise _Stop("send", f"the outcome of order {tag} ({sym} {units:+g}) is {outcome}: {why}; nothing more is "
                                     "sent until a reconcile settles it")
             sent_today += 1
@@ -3515,11 +3599,113 @@ class _Run:
             return "the drawdown latch is there at the last look before sending"
         return None
 
-    def _leave(self, c: dict, reason: str) -> None:
+    def _leave(self, c: dict, reason: str, collar: str | None = None) -> None:
+        """Left over, with its reason; `collar` names the check of T51 R5 that held a MARKET leg back (B1 quote_age,
+        B2 second_source, B3 quote_move, B4 clock, B5 value, B6 minimum), on its line and in the summary."""
         item = {"symbol": c["symbol"], "units": c["units"], **_leg_of(c), "reason": reason}
+        if collar is not None:
+            item["collar"] = collar
         self.left_over.append(item)
         self._write({"event": "left_over", **item})
         self._ticket_note(c, "not sent", reason=reason)
+        self._whole_failed(c, f"was left over ({reason})")
+
+    def _whole_failed(self, c: dict, fate: str) -> None:
+        """T51 A3 (a): what became of a fund's whole-share LIMIT leg that did not pass, the first time it is said."""
+        if c.get("leg") == "whole":
+            self.whole_fate.setdefault(c["symbol"], fate)
+
+    def _gate_words(self, sym: str) -> str:
+        """T51 R4, A3 (a): why a fund's remainder leg is held back: its LIMIT leg of this run did not pass, and how."""
+        fate = self.whole_fate.get(sym, "was not accepted by the venue")
+        if self.mode == "propose":
+            return (f"its fund's whole-share LIMIT leg of this run did not become a line of this ticket (it {fate}), so "
+                    "the remainder is not sent in this run")
+        return f"its fund's whole-share LIMIT leg of this run {fate}, so the remainder is not sent in this run"
+
+    def _hold_remainders(self, c: dict, rest: list[dict], tag: str | None = None) -> None:
+        """T51 A3 (a), just before the run stops at the leg `c`: a whole leg's fate by its state in the ledger, then a
+        held-back line for every remainder still to come whose fund's LIMIT leg did not pass. A failure here is
+        swallowed: the stop's own reason is what the run reports."""
+        try:
+            if c.get("leg") == "whole" and c["symbol"] not in self.whole_passed:
+                rec = self.ledger.order(tag) if tag else None
+                state = rec.get("state") if isinstance(rec, dict) and rec.get("state") in STATES else "unknown"
+                self._whole_failed(c, f"has the state {state} in the ledger after its submit was tried, with no answer "
+                                      "that it was accepted")
+            for r in rest:
+                if (r.get("leg") == "remainder" and r.get("after_whole") and r["symbol"] in self.whole_fate
+                        and r["symbol"] not in self.whole_passed):
+                    self._leave(r, self._gate_words(r["symbol"]))
+        except Exception:
+            pass
+
+    def _collar(self, c: dict, units: float, quote: float) -> tuple[str, str] | None:
+        """T51 R5: why a MARKET leg is held back before its intend, as (the check's name, words), or None. In order:
+        B4 the clock; B1 its quote's age; B3 the quote's move from the one it was decided at (an approval: the ticket's
+        line); B6 the minimum at this quote; B2 the second price source's verdict on this quote, asked last and only
+        when the others pass. B5 is the caller's: the collar price c is this leg's `limit` (the price a LIMIT leg would
+        carry), charged as r x c to the purchase budget, and (live) to max_order_value and max_capital. B1 and B4 are
+        judged again at the moment of sending."""
+        sym, now = c["symbol"], self._now()
+        why = self._market_clock(now)
+        if why is not None:
+            return "clock", why
+        why = self._market_quote_age(sym, now)
+        if why is not None:
+            return "quote_age", why
+        ref = self._line(c)["quote"] if self.mode == "approve" else c["quote"]
+        if not abs(quote - ref) <= TICKET_QUOTE_MOVE * ref:
+            return "quote_move", (f"the quote {quote:g} is more than {TICKET_QUOTE_MOVE:.1%} from the quote {ref:g} the "
+                                  f"leg was {'proposed' if self.mode == 'approve' else 'decided'} at; a MARKET leg goes "
+                                  "only within that band")
+        if not market_leg_clears_minimum(units, quote):
+            return "minimum", (f"at the quote {quote:g} the remainder of {abs(units):g} units no longer clears the "
+                               f"minimum of {FRACTIONAL_MIN_VALUE} with its margin of {TICKET_QUOTE_MOVE:g}")
+        verdict = self._second_source_verdict(sym, quote)
+        if verdict != "agree":
+            return "second_source", (f"the second price source says {verdict} for the quote {quote:g}; a MARKET leg "
+                                     "goes only when it agrees")
+        return None
+
+    def _market_clock(self, now: float) -> str | None:
+        """T51 R5 (B4): why `now` is outside the MARKET legs' window, or None."""
+        start, end, why = self.market_hours or (None, None, "it was not worked out")
+        if why is not None:
+            return f"no window for MARKET legs could be worked out ({why})"
+        if not start <= now <= end:
+            after, before = (int(x.total_seconds() // 60) for x in (MARKET_AFTER_OPEN, MARKET_BEFORE_CLOSE))
+            at = pd.Timestamp(now, unit="s", tz="UTC").tz_convert(NEW_YORK).strftime("%H:%M:%S")
+            return (f"a MARKET leg is sent only from {_hhmm(start)} to {_hhmm(end)} New York time ({after} minutes after "
+                    f"the open to {before} minutes before the close); it is {at}")
+        return None
+
+    def _market_quote_age(self, sym: str, now: float) -> str | None:
+        """T51 R5 (B1): why the quote in hand for a MARKET leg is too old on the reading `now`, or None."""
+        if self._quote_fresh(sym, MARKET_QUOTE_MAX_AGE_SECONDS, now):
+            return None
+        return (f"the quote is older than {MARKET_QUOTE_MAX_AGE_SECONDS} seconds at the moment of sending; a MARKET leg "
+                "goes only on a quote at most that old")
+
+    def _second_source_verdict(self, sym: str, quote: float) -> str:
+        """T51 ruling C (B2): the second source's verdict on a MARKET leg's quote, as live mode asks it (`_judged`). On
+        practice it is loaded (the live path's own loader) the first time it is needed, once; when it cannot be
+        loaded, the verdict says so and every MARKET leg of the run is held back."""
+        if self.second_opinion is None and self.second_load is not None:
+            load, self.second_load = self.second_load, None
+            try:
+                fn = load()
+            except Exception as exc:
+                self.second_unloadable = type(exc).__name__
+            else:
+                if callable(fn):
+                    self.second_opinion = fn
+                else:
+                    self.second_unloadable = "it is not a function"
+        if self.second_opinion is None:
+            return ("no second quote (the second price source could not be loaded: "
+                    f"{self.second_unloadable or 'none was given'})")
+        return self._judged(sym, quote)
 
     def _void_ticket(self, why: str) -> str:
         """E4: a propose run that made its ticket and then ended stopped: the ticket's batch is refused in the ticket
@@ -3538,6 +3724,7 @@ class _Run:
         self.refused.append(item)
         self._write({"event": "refused", **item, **extra})
         self._ticket_note(c, "not sent", reason=f"refused by the {by}: {item['reason']}")
+        self._whole_failed(c, f"was refused by the {by} ({item['reason']})")
 
     # -- 11
     def _finish(self, status: str, stage: str | None, reason: str | None) -> dict:
