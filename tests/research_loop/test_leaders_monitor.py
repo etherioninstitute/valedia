@@ -1639,3 +1639,212 @@ def test_pass_and_report_create_nothing_where_no_store_is(tmp_path, where):
 def test_the_doc_text_says_report_answers_the_lock_code_while_a_pass_holds_the_lock():
     locked = _doc_entry("LOCKED")
     assert "report" in locked and "a pass is writing; try again" in locked, locked
+
+
+# ------------------------------------------------------------------ T52c: the leaders from a given list of wallets
+import hashlib as _hashlib
+
+
+class NoTransport:
+    """A transport that raises: a call to it is a request, and none may be made."""
+
+    def __init__(self):
+        self.urls = []
+
+    def __call__(self, url):
+        self.urls.append(url)
+        raise AssertionError("a request was made: %s" % url)
+
+
+def wallets_file(path, lines, end="\n"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(end.join(lines).encode() + end.encode())
+    return path
+
+
+def from_file(store, wfile, wall=None, transport=None):
+    transport = transport if transport is not None else NoTransport()
+    wall = wall or Wall()
+    out = io.StringIO()
+    code = lm.main(["fix-leaders", "--wallets-file", str(wfile), "--store", str(store)],
+                   client=make_client(transport, wall), wall=wall, out=out)
+    return code, out.getvalue(), transport
+
+
+def test_fix_leaders_from_a_wallets_file_fixes_exactly_those_wallets_and_makes_no_request(tmp_path, monkeypatch):
+    ws = [wallet(20 + i) for i in range(4)]
+    lines = ["# the forward test's screened set", "", ws[0], "  ", ws[1].upper().replace("0X", "0x"), "#" + ws[3],
+             ws[2]]
+    wf = wallets_file(tmp_path / "in" / "wallets.txt", lines, end="\r\n")
+    s = tmp_path / "lm" / "leaders.sqlite"
+    wall = Wall()
+    code, out, transport = from_file(s, wf, wall)
+    assert code == lm.OK, out
+    assert transport.urls == []                                      # a transport that raises is never called
+    c = db(s)
+    rows = [dict(r) for r in c.execute("SELECT * FROM leaders ORDER BY wallet_key")]
+    assert [r["wallet_key"] for r in rows] == sorted(w.lower() for w in ws[:3])
+    assert {r["wallet"] for r in rows} == {ws[0], ws[1].upper().replace("0X", "0x"), ws[2]}   # kept as written
+    board_cols = ("sports_rank", "sports_pnl", "sports_volume", "sports_read_ts",
+                  "crypto_rank", "crypto_pnl", "crypto_volume", "crypto_read_ts")
+    assert all(r[k] is None for r in rows for k in board_cols) and all(r["fixed_ts"] == T0 for r in rows)
+    meta = dict(c.execute("SELECT key, value FROM meta"))
+    assert meta == {"leaders_fixed_at": lm._iso(T0), "leaders_source": "file",
+                    "leaders_file_sha256": _hashlib.sha256(wf.read_bytes()).hexdigest(),
+                    "leaders_file_wallets": "3", "leaders_file_read_at": lm._iso(T0)}
+    assert all(isinstance(v, str) for v in meta.values())
+    assert c.execute("PRAGMA user_version").fetchone()[0] == lm.USER_VERSION
+    assert "3 wallets" in out and "from a file" in out and ws[0] not in out and ws[0][:10] in out
+    assert lm._check(s, need_store=True) is None                     # the shape is this version's
+    # with no client given, no client is even built
+    monkeypatch.setattr(lm.pd, "PolymarketData", NoTransport())
+    s2, o2 = tmp_path / "lm2" / "leaders.sqlite", io.StringIO()
+    assert lm.main(["fix-leaders", "--wallets-file", str(wf), "--store", str(s2)], wall=Wall(), out=o2) == lm.OK
+    assert lm.pd.PolymarketData.urls == [], o2.getvalue()
+
+
+def test_a_wallets_file_of_fifty_is_fixed_and_of_fifty_one_refused(tmp_path):
+    ws = [wallet(100 + i) for i in range(51)]
+    s = tmp_path / "a" / "leaders.sqlite"
+    assert from_file(s, wallets_file(tmp_path / "f50.txt", ws[:50]))[0] == lm.OK
+    assert db(s).execute("SELECT count(*) FROM leaders").fetchone()[0] == 50
+    root = tmp_path / "r"
+    wf = wallets_file(root / "f51.txt", ["# fifty-one"] + ws)
+    before = _listing(root)
+    code, out, transport = from_file(root / "lm" / "leaders.sqlite", wf)
+    assert code == lm.REFUSED and "line 52" in out and "50" in out and "nothing done" in out, out
+    assert _listing(root) == before and transport.urls == []
+
+
+BAD_FILES = {   # name: (lines, the line the refusal names, or None)
+    "malformed": ([wallet(1), "", "0xabc"], 3),
+    "39 digits": ([wallet(1), "0x" + "a" * 39], 2),
+    "a leading space": ([" " + wallet(1)], 1),
+    "a trailing comment": ([wallet(1) + " # note"], 1),
+    "0X": (["0X" + wallet(1)[2:]], 1),
+    "a repeat after folding": (["# x", wallet(1), wallet(2), wallet(1).upper().replace("0X", "0x")], 4),
+    "no wallet": (["# only a comment", "", "   "], None),
+    "empty": ([], None),
+}
+
+
+@pytest.mark.parametrize("case", sorted(BAD_FILES) + ["absent", "a folder", "not text"])
+def test_a_wallets_file_that_is_refused_names_the_line_and_creates_nothing(tmp_path, case):
+    root = tmp_path / "root"
+    root.mkdir()
+    wf = root / "wallets.txt"
+    if case in BAD_FILES:
+        lines, line = BAD_FILES[case]
+        wf.write_bytes(("\n".join(lines) + "\n").encode() if lines else b"")
+    elif case == "a folder":
+        wf.mkdir()
+        line = None
+    elif case == "not text":
+        wf.write_bytes(wallet(1).encode() + b"\n\xff\xfe\x00\n")
+        line = 2
+    else:
+        line = None
+    before = _listing(root)
+    code, out, transport = from_file(root / "lm" / "leaders.sqlite", wf)
+    assert code == lm.REFUSED and out.startswith("fix-leaders refused: ") and "nothing done" in out, out
+    assert len(out.strip().splitlines()) == 1
+    if line is not None:
+        assert ("line %d" % line) in out, out
+    if case == "a repeat after folding":
+        assert "line 2" in out, out                                  # and the line it repeats
+    assert _listing(root) == before and transport.urls == []         # no folder, no store, no lock file
+
+
+def test_a_wallets_file_needs_its_own_store_and_never_makes_the_default_one(tmp_path, monkeypatch):
+    default = tmp_path / "default" / "leaders_monitor" / "leaders.sqlite"
+    monkeypatch.setattr(lm, "DEFAULT_STORE", default)
+    wf = wallets_file(tmp_path / "w.txt", [wallet(1)])
+    for argv in (["fix-leaders", "--wallets-file", str(wf)],
+                 ["fix-leaders", "--wallets-file", str(wf), "--store", str(default)],
+                 ["fix-leaders", "--store", str(default.parent) + "/../leaders_monitor/leaders.sqlite",
+                  "--wallets-file", str(wf)]):
+        transport, out = NoTransport(), io.StringIO()
+        code = lm.main(argv, client=make_client(transport, Wall()), wall=Wall(), out=out)
+        assert code == lm.REFUSED and "--store" in out.getvalue() and "nothing done" in out.getvalue(), out.getvalue()
+        assert not (tmp_path / "default").exists() and transport.urls == []
+
+
+def test_a_store_that_holds_leaders_refuses_a_wallets_file_and_a_store_from_a_file_refuses_the_boards(tmp_path):
+    wf = wallets_file(tmp_path / "w.txt", [wallet(30), wallet(31)])
+    s = tmp_path / "b" / "leaders.sqlite"
+    fixed(s)                                                         # from the boards
+    before = s.read_bytes()
+    code, out, transport = from_file(s, wf, Wall(T0 + DAY))
+    assert code == lm.REFUSED and "already" in out and transport.urls == [] and s.read_bytes() == before, out
+    s2 = tmp_path / "f" / "leaders.sqlite"
+    assert from_file(s2, wf)[0] == lm.OK                             # from a file
+    before = s2.read_bytes()
+    world = World()
+    code, out = run(["fix-leaders"], world, Wall(T0 + DAY), s2)
+    assert code == lm.REFUSED and "already" in out and world.urls == [] and s2.read_bytes() == before, out
+    code, out, transport = from_file(s2, wallets_file(tmp_path / "w2.txt", [wallet(32)]), Wall(T0 + DAY))
+    assert code == lm.REFUSED and "already" in out and s2.read_bytes() == before, out
+    keys = [r[0] for r in db(s2).execute("SELECT wallet_key FROM leaders ORDER BY wallet_key")]
+    assert keys == [wallet(30).lower(), wallet(31).lower()]          # one store, one source: nothing added
+
+
+def test_a_store_fixed_from_the_boards_says_boards_and_an_older_one_reads_as_boards_and_is_not_rewritten(store):
+    world, wall = fixed(store)
+    assert dict(db(store).execute("SELECT key, value FROM meta")) == {"leaders_fixed_at": lm._iso(T0),
+                                                                     "leaders_source": "boards"}
+    code, out = run(["report"], world, wall, store)
+    assert code == 0 and "from the boards" in out.splitlines()[0], out
+    c = db(store)
+    c.execute("DELETE FROM meta WHERE key='leaders_source'")         # as a store fixed before T52c
+    c.commit()
+    c.close()
+    for cmd in (["pass"], ["report"], ["fix-leaders"], ["pass"]):
+        wall.t += 300
+        run(cmd, world, wall, store)
+    assert dict(db(store).execute("SELECT key, value FROM meta")) == {"leaders_fixed_at": lm._iso(T0)}
+    code, out = run(["report"], world, wall, store)
+    assert code == 0 and "from the boards" in out.splitlines()[0], out
+
+
+def test_pass_and_report_on_a_store_fixed_from_a_file_work_unchanged(tmp_path):
+    ws = [wallet(40 + i) for i in range(3)]
+    wf = wallets_file(tmp_path / "w.txt", ws)
+    s = tmp_path / "lm" / "leaders.sqlite"
+    wall = Wall()
+    assert from_file(s, wf, wall)[0] == lm.OK
+    world = World()
+    world.boards = {"sports": [], "crypto": []}                      # no board is read for such a store
+    for i, w in enumerate(ws):
+        world.held[w] = [pos(w, 100 * i + n, opp=token(100 * i + n + 50)) for n in range(2)]
+    code, out = run(["pass"], world, wall, s)
+    lines = out.strip().splitlines()
+    assert code == lm.OK and len(lines) == 4 and all(" baseline " in l for l in lines[:3]), out
+    assert lines[-1].startswith("DONE pass 1 done: 3 good, 0 failed"), out
+    wall.t += 300
+    world.held[ws[0]] = world.held[ws[0]][1:] + [pos(ws[0], 9, opp=token(0))]
+    world.fail[ws[2]] = "http500"
+    code, out = run(["pass"], world, wall, s)
+    assert code == lm.FAILED_READS and out.strip().splitlines()[-1].startswith("FAILED pass 2 "), out
+    assert [r["kind"] for r in changes(s)] == ["NEW", "EXIT"] and all(r["vouched"] for r in changes(s))
+    assert db(s).execute("SELECT count(*) FROM snapshots WHERE kind='baseline'").fetchone()[0] == 6
+    assert all("/v2/positions" in u for u in world.urls)
+    code, out = run(["report"], world, wall, s)
+    first = out.splitlines()[0]
+    assert code == 0 and "from a file (3 wallets, sha256 %s)" % _hashlib.sha256(wf.read_bytes()).hexdigest() in first
+    assert "store consistent" in first, out
+    for w in ws:
+        line = [l for l in out.splitlines() if l.startswith(w[:10])][0]
+        assert line.startswith("%s sports#- crypto#- " % w[:10]), line
+    assert "failed reads 1 of 6" in out and lm.consistency(db(s)) == []
+
+
+def test_no_command_adds_a_wallet_to_a_fixed_set_and_the_doc_says_one_store_one_source():
+    sub = [a for a in lm._parser()._actions if isinstance(a, __import__("argparse")._SubParsersAction)][0]
+    assert sorted(sub.choices) == ["fix-leaders", "pass", "report"]
+    assert [o for a in sub.choices["fix-leaders"]._actions for o in a.option_strings] == \
+        ["-h", "--help", "--store", "--wallets-file"]
+    doc = (Path(WORKTREE) / "docs" / "leaders-monitor.md").read_text()
+    for words in ("--wallets-file FILE --store PATH", "one store, one source", "no command adds a wallet",
+                  "the default store", "SHA-256"):
+        assert words in doc, words
+    assert "--wallets-file" in lm.__doc__
