@@ -39,6 +39,8 @@ nothing here repeats itself: `pass` reads once and ends; whether and how often i
   the end, rows of changes, snapshots, rejects, wallet_reads and passes dated more than RETENTION_DAYS before the pass are removed, DELETE_BATCH rows a
   statement, at most DELETE_STATEMENTS statements a pass; holdings_current, leaders and each wallet's last good
   read are never aged out.
+* A store whose tables, columns or indexes are not exactly this version's (made by another version of the
+  record, or not its store) is refused in words by every command, read only, with nothing written.
 * `report`: counts per leader and per kind over a window, each leader's carried holdings and the share of its good
   reads that carried any, the largest and median gap between good reads, the share of failed reads, the passes by
   status, and whether the store is consistent.
@@ -155,6 +157,38 @@ def _connect(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), timeout=BUSY_SECONDS, isolation_level=None)
     conn.executescript(SCHEMA)
     return conn
+
+
+def _shape(conn) -> dict:
+    """{table: its columns as PRAGMA table_info gives them} and the index names, of a store's own tables."""
+    tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE "
+                                         "'sqlite_%' ORDER BY name")]
+    out = {t: [tuple(r) for r in conn.execute("PRAGMA table_info(\"%s\")" % t.replace('"', '""'))] for t in tables}
+    out[" indexes"] = sorted(r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND "
+                                                        "name NOT LIKE 'sqlite_%'"))
+    return out
+
+
+def _shape_problem(path: Path) -> str | None:
+    """None when `path` is absent, holds no table, or has exactly this version's tables, columns and indexes; else
+    what differs. Read only: the store is opened read-only and nothing is written to it."""
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+    mem = sqlite3.connect(":memory:")
+    mem.executescript(SCHEMA)
+    want = _shape(mem)
+    mem.close()
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=BUSY_SECONDS)
+    try:
+        have = _shape(conn)
+    finally:
+        conn.close()
+    if len(have) == 1 and not have[" indexes"]:
+        return None
+    for name in sorted(set(want) | set(have)):
+        if want.get(name) != have.get(name):
+            return "indexes differ" if name == " indexes" else "table %s differs" % name[:40]
+    return None
 
 
 def _lock(path: Path, exclusive: bool):
@@ -501,8 +535,9 @@ def report(conn, wall, say, days: int) -> int:
     say("failed reads %d of %d (%.1f%%)%s" % (nf, total, 100.0 * nf / total if total else 0.0,
                                                "; " + ", ".join("%s=%d" % r for r in reasons) if reasons else ""))
     st = dict(conn.execute("SELECT status, count(*) FROM passes WHERE started_ts>=? GROUP BY status", (since,)))
-    say("passes %d in the window: done=%d died=%d stopped_memory=%d"
-        % (sum(st.values()), st.get("done", 0), st.get("died", 0), st.get("stopped_memory", 0)))
+    known = ("done", "died", "stopped_memory", "running")
+    say("passes %d in the window: %s" % (sum(st.values()), " ".join(
+        "%s=%d" % (k, st.get(k, 0)) for k in known + tuple(sorted(k for k in st if k not in known)))))
     return OK
 
 
@@ -533,6 +568,14 @@ def main(argv=None, *, client=None, wall: Callable[[], float] = time.time, out=N
         store.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         say("refused: the store's folder could not be made (%s); nothing done" % type(e).__name__)
+        return REFUSED
+    try:
+        why = _shape_problem(store)
+    except sqlite3.Error as e:
+        why = "not readable as a store: %s" % type(e).__name__
+    if why:
+        say("refused: the store %s was made by another version of the record, or is not its store (%s); nothing "
+            "done" % (store, why))
         return REFUSED
     if args.cmd == "fix-leaders":
         conn = _connect(store)
