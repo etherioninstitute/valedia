@@ -287,11 +287,12 @@ run beside MiroFish and Elephant-1):
   Lesson: a 27B with a 65,536 window working on a coding prompt cannot share this GPU with the collector. Not
   measured: a smaller model, a small window, short prompts (the hourly pick job's short requests to the same
   27B show no extra failed decisions in the record).
-- **OWNER** how coding workers run while the collector is under test: another machine, hours when the
-  collector is not scored, a much smaller model or window measured first, or hosted models for coding. Until
-  he decides: no local coding model is loaded beside the collector (the design session's launcher refuses to
-  load while its stop file is in place), and no Ornith build is downloaded (its replay test would load a
-  large model beside the collector too).
+- **DECIDED by the owner (2026-11-17 evening):** local coding models stay OFF this Mac while the collector's
+  scored test runs ("Yes, keep them off" here; in the design session: local coding only while the collector
+  is paused). The design session's launcher refuses to load while its stop file is in place. No Ornith build
+  is downloaded for now (its replay test would load a large model beside the collector too).
+- **IDEA** when the scored test ends (or on another machine): measure a small model, a small window and short
+  prompts beside the collector before any local coding worker is switched on again.
 - Not measured by the trial: a 27B loaded and IDLE beside the collector (no decision fell in those 43
   seconds); the two decisions made while it was loading were normal.
 
@@ -347,6 +348,8 @@ run beside MiroFish and Elephant-1):
 
 ## 14. Closed log (newest first)
 
+- 2026-11-17 local coding models beside the collector: tried once (the 27B, aborted after 43 seconds, two
+  late decisions), then decided by the owner: off while the scored test runs.
 - 2026-11-17 the master list as a hosted page: not now. Owner: "the file is enough right now".
 - 2026-11-17 the owner's cash account is shared with his own trading (his word); T51c follows from it.
 - 2026-11-17 T47c the copying-leaders analysis in bounded memory: merged (main `0172b3f`).
