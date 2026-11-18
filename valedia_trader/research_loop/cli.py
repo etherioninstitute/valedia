@@ -1099,6 +1099,19 @@ def main(argv=None) -> int:
                         help="with --live: print each lock of the go-live gate and, when locks 1 to 3 are met, the account")
     p.add_argument("--live", action="store_true",
                    help="real money: only with --propose or --approve and --capital, under the go-live gate's four locks")
+    owner = p.add_argument_group("the owner's entry (T51c; nothing in a run reads it yet)")
+    owner.add_argument("--owner-entry", choices=("cash_in", "cash_out", "units_out", "split"), default=None,
+                       help="write one entry of the owner's into the venue's state file instead of running; every "
+                            "figure is his own and none is defaulted")
+    owner.add_argument("--venue", default=None, help="the venue whose book it is, as in its state file's name")
+    owner.add_argument("--amount", default=None, help="cash_in, cash_out: the amount, digits and a decimal part")
+    owner.add_argument("--symbol", default=None, help="units_out, split: the symbol")
+    owner.add_argument("--units", default=None, help="units_out: the shares taken that the book counted as its own")
+    owner.add_argument("--ratio", default=None, help="split: new units per old unit")
+    owner.add_argument("--mark", action="append", default=None, metavar="SYMBOL=PRICE",
+                       help="the price of a symbol the book holds (one per symbol; for a split, the price after it)")
+    owner.add_argument("--who", default=None, help="who writes the entry")
+    owner.add_argument("--note", default=None, help="why")
     p = sub.add_parser("critic")
     p.add_argument("--narrate", help="backend that puts the findings into words, e.g. hermes:valedia-trading-auditor")
     p.add_argument("--days", type=int, default=7)
@@ -1116,6 +1129,9 @@ def main(argv=None) -> int:
     p.add_argument("--agent-timeout", type=float, default=None, help="seconds one research agent may take (default: no limit)")
     args = ap.parse_args(argv)
     venue = None
+    if args.cmd == "order-step" and args.owner_entry is not None:   # T51c S3: the owner's entry; no venue is built
+        from valedia_trader.execution_and_risk import order_step
+        return order_step.owner_entry_command(args, LoopPaths(Path(args.root).resolve()) if args.root else LoopPaths())
     if args.cmd == "order-step" and (args.live or args.check):  # live mode: its flags and locks before anything else
         from valedia_trader.venues import webull
         return live_order_step_command(args, LoopPaths(Path(args.root).resolve()) if args.root else LoopPaths(webull.LIVE_REPO))

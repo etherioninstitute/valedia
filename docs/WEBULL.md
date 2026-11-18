@@ -467,6 +467,46 @@ what settlement looks like.
   equation is meaningful as built in the paper Events account, where nothing else moves that cash. A
   `win_cash_observed` set in the paper account does not prove the live cash path.
 
+## The shared account (being built)
+
+The owner also trades the account the fund book is to trade in (T51c). What exists after slices S1 to S3, and what is
+not wired yet:
+
+- **The reconcile can compare one way** (`OrderLedger.reconcile(..., one_sided=True)`): what the account holds beyond
+  the book and its unapplied fills is listed under `owner_surplus` and is no difference; an account holding LESS than
+  the book is listed under `position_shortfalls`, naming the symbol, both figures and the two ordinary causes (the
+  owner sold shares the book counts as its own, or a split), and makes the reconcile unclean, which stops the whole
+  book until a person has looked. The default is unchanged: every run today compares both ways, as before.
+- **The book's own figures** (`book_figures` in `order_step.py`, pure): units per symbol from this ledger's own fills;
+  cash from the owner's entries less purchases plus sales less fees, in exact decimals, with a lower and an upper bound
+  and `cash_bounded` when a price or fee is not known (an unpriced piece is valued at its limit, a MARKET leg at its
+  collar; an unknown fee leaves the lower bound open); the cash usable for purchases today (the lower bound less the
+  proceeds of the book's sales of this New York day); the value, the value per unit and the units outstanding. A
+  deposit or withdrawal issues or redeems units at the value per unit, so it is never profit or loss.
+- **The owner's entries**: the order step's state file is now layout 2 (a layout-1 file is upgraded the first time it
+  is opened, every row kept; the order step before this build refuses a layout-2 file in words, so going back to it
+  needs the layout-1 file back). The new table `owner_entries` is append-only and hash-chained: an entry changed or
+  removed afterwards is found and refused in words. The old `equity` table is kept as it was.
+- **A local check** (`untracked_tags`): every tag the order step wrote to the journal, a ticket or its send record
+  must be in the ledger (a ledger put back from an older copy shows up here). Called by nothing yet.
+
+**Not wired** (slice S4, after the owner rules on the position limit's basis): no run reads the entries, the book's
+figures or the one-sided reconcile; limits, purchases and sales are still judged as before; `--capital` is unchanged.
+Still not seen by the book at all: a distribution paid on the book's shares, and any order the venue holds that the
+ledger never knew (the venue's order history is a later slice).
+
+**The owner's command.** Every figure is the owner's own; the command never proposes or defaults one, refuses a
+figure that is not a positive decimal written as digits, needs `--who` and `--note`, and prints the entry it wrote.
+Each symbol the book holds needs its price with `--mark` (for a split, the price after it). The kinds:
+`cash_in` and `cash_out` (`--amount`), `units_out` (`--symbol`, `--units`: shares he took that the book counted as its
+own, which clears exactly that much of a shortfall), `split` (`--symbol`, `--ratio`: new units per old unit; the value
+stays, the units change). The shape, with figures that are AN EXAMPLE ONLY and not a suggestion of any amount:
+
+    order-step --owner-entry cash_in --venue VENUE_NAME --amount 1234.56 --who owner --note "example only"
+
+`VENUE_NAME` is the name in the venue's state file, `memory/order_step-VENUE_NAME.sqlite` (under `--root` when one
+is given); the ledger beside it is only read, and the entry is refused while a run holds that file's lock.
+
 ## Not covered yet
 
 Options, futures and event-contract orders (the API supports them; the trader does not trade them), short selling,

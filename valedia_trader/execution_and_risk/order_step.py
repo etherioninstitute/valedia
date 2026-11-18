@@ -889,6 +889,145 @@ def next_entry(figures: BookFigures, kind: str, *, amount: Decimal | None = None
         return out
 
 
+def untracked_tags(ledger_tags, *, venue: str, journal=(), tickets=(), sends=()) -> list[dict]:
+    """T51c S3 (R3): the local check for what a one-sided reconcile cannot see, needing no venue read. Every tag this
+    code wrote to the journal (an `order_step` line of `venue` with a tag), to the state's send record (`sends`) or to
+    a ticket (`tickets`: (tag, the line's outcome) pairs) must be among `ledger_tags`; one that is not is listed, in
+    words (a ledger restored from an older copy, or a send the ledger lost), and is a fault that stops the run before
+    anything is sent once S4 wires it. A ticket line whose outcome is "not sent" or "left over" had its tag noted before
+    an intend that never happened, so it is not listed. Empty: nothing found. Pure; called by nothing yet."""
+    known = set(ledger_tags)
+    out, seen = [], set()
+
+    def miss(tag, where: str) -> None:
+        if tag in known or (tag, where) in seen:
+            return
+        seen.add((tag, where))
+        out.append({"tag": tag, "where": where,
+                    "reason": f"order {_cut(tag)} is in the {where} but not in the ledger: a ledger restored from an "
+                              "older copy, or a send the ledger lost; nothing may be sent until a person has looked"})
+    for e in journal:
+        if isinstance(e, dict) and e.get("type") == "order_step" and e.get("venue") == venue and _plain(_TAG, e.get("tag")):
+            miss(e["tag"], "journal")
+    for tag in sends:
+        miss(tag, "send record")
+    for tag, outcome in tickets:
+        if outcome in ("not sent", "left over"):
+            continue
+        miss(tag, "ticket")
+    return out
+
+
+_FIGURE = re.compile(r"[0-9]+(\.[0-9]+)?")       # the owner's figure as written: digits, an optional decimal part
+_OWNER_USES = {"cash_in": ("amount",), "cash_out": ("amount",), "units_out": ("symbol", "units"),
+               "split": ("symbol", "ratio")}
+
+
+def _owner_figure(text, what: str) -> Decimal:
+    if not isinstance(text, str) or not _FIGURE.fullmatch(text) or Decimal(text) <= 0:
+        raise BookError(f"{what} must be a positive decimal figure written as digits with an optional decimal part "
+                        f"(such as 1250.00), not {_cut(repr(text))}; nothing was written")
+    return Decimal(text)
+
+
+def owner_entry_command(args, paths, clock: Callable[[], float] | None = None) -> int:
+    """T51c S3 (R5): `order-step --owner-entry KIND --venue NAME --who WHO --note NOTE` and the figures of that kind,
+    which the OWNER runs: `cash_in`/`cash_out` take --amount; `units_out` takes --symbol and --units (shares he took
+    that the book counted as its own); `split` takes --symbol and --ratio (new units per old unit). Every symbol the
+    book holds needs `--mark SYMBOL=PRICE` (for a split, the price after it): his own figure, never looked up. The
+    entry is valued with book_figures and next_entry and appended to the venue's state file
+    (`state_path_for(ledger_path_for(memory, NAME), NAME)`; the ledger is only read), under the run lock. Prints what it
+    wrote and returns 0; refuses in words on stderr and returns 2, writing nothing: beside the run's own flags,
+    without who, note or venue, a figure that is not a positive decimal, a figure missing or one the kind does not use
+    (none is ever defaulted), a symbol held without its mark, more than the book holds, a book whose value is not
+    known, an entry changed or removed, or a run holding the lock. Nothing in a run reads the entries yet (S4)."""
+    import sys
+
+    def refuse(words: str) -> int:
+        print(f"refused: {words}", file=sys.stderr)
+        return 2
+    kind = args.owner_entry
+    if (getattr(args, "propose", False) or getattr(args, "approve", None) is not None or getattr(args, "live", False)
+            or getattr(args, "check", False) or getattr(args, "capital", None) is not None
+            or getattr(args, "fractional", False)):
+        return refuse("the owner's entry is written on its own, without --propose, --approve, --live, --check, "
+                      "--capital or --fractional; nothing was written")
+    venue = getattr(args, "venue", None)
+    if not isinstance(venue, str) or not venue or _safe_name(venue) != venue or venue.strip(".") == "":
+        return refuse("the owner's entry needs --venue, the plain name of the venue whose book it is (the name in its "
+                      "state file's name); nothing was written")
+    for what in ("who", "note"):
+        text = getattr(args, what, None)
+        if not isinstance(text, str) or not text.strip():
+            return refuse(f"the owner's entry needs --{what}; nothing was written")
+    if kind not in _OWNER_USES:
+        return refuse(f"an owner's entry is of kind {', '.join(ENTRY_KINDS)}; nothing was written")
+    for name in ("amount", "units", "ratio", "symbol"):
+        given = getattr(args, name, None) is not None
+        if name in _OWNER_USES[kind] and not given:
+            return refuse(f"a {kind} entry needs --{name}; no figure is ever assumed; nothing was written")
+        if name not in _OWNER_USES[kind] and given:
+            return refuse(f"a {kind} entry takes no --{name}; nothing was written")
+    try:
+        figs = {n: _owner_figure(getattr(args, n), f"--{n}") for n in ("amount", "units", "ratio")
+                if n in _OWNER_USES[kind]}
+        marks: dict[str, Decimal] = {}
+        for item in getattr(args, "mark", None) or []:
+            sym, eq, price = str(item).partition("=")
+            if not eq or not _plain(_SYMBOL, sym) or sym in marks:
+                raise BookError(f"--mark takes SYMBOL=PRICE, once per symbol, not {_cut(repr(item))}; nothing was written")
+            marks[sym] = _owner_figure(price, f"the mark of {sym}")
+    except BookError as exc:
+        return refuse(str(exc))
+    symbol = getattr(args, "symbol", None)
+    if symbol is not None and not _plain(_SYMBOL, symbol):
+        return refuse(f"--symbol names a plain symbol, not {_cut(repr(symbol))}; nothing was written")
+    if kind == "units_out" and symbol not in marks:
+        return refuse(f"a units_out entry needs --mark {symbol}=PRICE, the price its shares are valued at; nothing "
+                      "was written")
+    from valedia_trader.execution_and_risk.orders import open_read_only
+    ledger_path = ledger_path_for(paths.memory, venue)
+    state_path = state_path_for(ledger_path, venue)
+    clock = clock if clock is not None else wall_clock
+    lock = _RunLock(str(state_path))
+    if not lock.acquire():
+        return refuse("an order-step run holds this venue's state file now; write the entry once it has ended; "
+                      "nothing was written")
+    state = None
+    try:
+        fills, orders = [], []
+        if ledger_path.exists():
+            ro = open_read_only(ledger_path)
+            try:
+                fills, orders = ro.fills(), ro.orders()
+            finally:
+                ro.close()
+        state = OrderStepState(state_path, clock=clock)
+        entries = state.owner_entries()
+        now = float(clock())
+        day = _ny_day(now)
+        if kind == "split":                               # valued after the split, at the marks after it
+            last = entries[-1]["units_after"] if entries else "0"
+            entries = entries + [{"id": len(entries) + 1, "time": now, "kind": "split", "symbol": symbol,
+                                  "ratio": str(figs["ratio"]), "units_before": last, "units_after": last}]
+        figures = book_figures(fills, orders, entries, marks, day)
+        if figures.unmarked:
+            return refuse(f"the book holds {', '.join(figures.unmarked)}: give --mark SYMBOL=PRICE for each (the "
+                          "owner's own figure; none is looked up); nothing was written")
+        fields = next_entry(figures, kind, amount=figs.get("amount"), symbol=symbol, units=figs.get("units"),
+                            ratio=figs.get("ratio"), mark=marks.get(symbol) if kind == "units_out" else None)
+        row = state.add_owner_entry(fields, who=args.who, note=args.note)
+    except (OrderStepError, OrderError, sqlite3.Error) as exc:
+        return refuse(f"{_cut(str(exc), 600)}")
+    finally:
+        if state is not None:
+            state.close()
+        lock.release()
+    print(f"written: owner entry {row['id']}, {kind}, to {state_path.name}")
+    print(json.dumps(row, indent=2))
+    return 0
+
+
 UNATTRIBUTED = "(unattributed)"
 
 
@@ -1250,14 +1389,39 @@ def open_ledger(path: str | Path, clock: Callable[[], float] = time.time) -> Ord
     return OrderLedger(path, not_sent=NOT_SENT, clock=clock)
 
 
-STATE_LAYOUT = 1
-STATE_SCHEMA = [
+STATE_LAYOUT = 2                                  # T51c S3: layout 1 and the owner's entries
+STATE_SCHEMA = [                                  # layout 1, as every layout-1 file holds it
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS baseline (symbol TEXT PRIMARY KEY, units REAL NOT NULL)",
     "CREATE TABLE IF NOT EXISTS equity (id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL, time REAL NOT NULL, "
     "equity REAL NOT NULL)",
     "CREATE TABLE IF NOT EXISTS sends (tag TEXT PRIMARY KEY, day TEXT NOT NULL, time REAL NOT NULL, outcome TEXT)",
 ]
+_LAYOUT1_TABLES = frozenset({"meta", "baseline", "equity", "sends"})
+# T51c S3 (R5): layout 2 = layout 1 and these, run in that one write transaction whether the file is new or upgraded,
+# so a new file and an upgraded one have the same schema. The old `equity` table is kept as it is.
+_STATE_UPGRADE_1_TO_2 = [
+    "CREATE TABLE owner_entries (id INTEGER PRIMARY KEY AUTOINCREMENT, time REAL NOT NULL, day TEXT NOT NULL, "
+    "kind TEXT NOT NULL CHECK (kind IN ('cash_in', 'cash_out', 'units_out', 'split')), symbol TEXT, amount TEXT, "
+    "units TEXT, ratio TEXT, mark TEXT, units_before TEXT NOT NULL, units_after TEXT NOT NULL, "
+    "value_per_unit_before TEXT, value_per_unit_after TEXT, who TEXT NOT NULL CHECK (length(trim(who)) > 0), "
+    "note TEXT NOT NULL CHECK (length(trim(note)) > 0), prev_hash TEXT NOT NULL, hash TEXT NOT NULL UNIQUE)",
+    "CREATE TRIGGER owner_entries_no_update BEFORE UPDATE ON owner_entries "
+    "BEGIN SELECT RAISE(ABORT, 'owner entries are append-only'); END",
+    "CREATE TRIGGER owner_entries_no_delete BEFORE DELETE ON owner_entries "
+    "BEGIN SELECT RAISE(ABORT, 'owner entries are append-only'); END",
+]
+_LAYOUT2_TABLES = _LAYOUT1_TABLES | {"owner_entries"}
+_ENTRY_FIELDS = ("id", "time", "day", "kind", "symbol", "amount", "units", "ratio", "mark", "units_before",
+                 "units_after", "value_per_unit_before", "value_per_unit_after", "who", "note", "prev_hash")
+_GENESIS = "0" * 64
+MAX_WHO, MAX_NOTE = 200, 1000
+
+
+def _entry_hash(row: dict) -> str:
+    """The sha256 of an owner entry's every field but its own hash, the previous entry's hash among them."""
+    fields = [repr(float(row["time"])) if k == "time" else row[k] for k in _ENTRY_FIELDS]
+    return hashlib.sha256(json.dumps(fields, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
 NOT_COUNTED = ("refused", "not sent")             # outcomes that are not an order sent
 LEDGER_NOT_SENT = ("intended", "refused")         # T22d-1: the ledger's states of an order never sent (NOT_COUNTED there)
 
@@ -1274,7 +1438,13 @@ def _ny_day(t) -> str | None:
 class OrderStepState:
     """The order step's own small file: the baseline (recorded once), the equity at each run, and each order handed
     to the ledger for sending, with its outcome. Every write is one IMMEDIATE transaction, so a crash at any point
-    leaves the file as it was before that write or after it."""
+    leaves the file as it was before that write or after it.
+
+    T51c S3: layout 2 adds the owner's entries (R5: `owner_entries`, append-only by trigger, each hash-chained to the
+    one before it). A new file is created at layout 2. A layout-1 file is upgraded the first time it is opened, inside
+    that open's own write transaction (all of the upgrade or none of it), every row kept and the old `equity` table
+    left as it is; the code before this layout refuses a layout-2 file in words. Any other layout, or tables that are
+    not the layout's, is refused, never repaired. Nothing in a run reads the entries yet (S4)."""
 
     def __init__(self, path: str | Path, clock: Callable[[], float] = time.time) -> None:
         self.path, self.clock = str(path), clock
@@ -1287,17 +1457,81 @@ class OrderStepState:
                 version = self._db.execute("PRAGMA user_version").fetchone()[0]
                 tables = {r[0] for r in self._db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
                 tables.discard("sqlite_sequence")
-                if tables and (version != STATE_LAYOUT or not tables <= {"meta", "baseline", "equity", "sends"}):
-                    raise OrderStepError(f"{path} is not an order-step state file of layout {STATE_LAYOUT}; it is not opened")
+                if tables and not ((version == 1 and tables <= _LAYOUT1_TABLES)
+                                   or (version == STATE_LAYOUT and "owner_entries" in tables and tables <= _LAYOUT2_TABLES)):
+                    raise OrderStepError(f"{path} is not an order-step state file of layout 1 or {STATE_LAYOUT}; it is "
+                                         "not opened")
                 if not tables:
                     if version != 0:
                         raise OrderStepError(f"{path} is a database of another kind; it is not opened")
                     for statement in STATE_SCHEMA:
                         self._db.execute(statement)
+                if version != STATE_LAYOUT:               # new, or layout 1: in this transaction, or not at all
+                    for statement in _STATE_UPGRADE_1_TO_2:
+                        self._db.execute(statement)
                     self._db.execute(f"PRAGMA user_version = {STATE_LAYOUT}")
         except BaseException:
             self._db.close()
             raise
+
+    # ---- T51c S3 (R5): the owner's entries
+
+    def _entries_checked(self) -> list[dict]:
+        """Every owner entry in order, after checking the chain: ids 1 to n with none missing (the file's own counter
+        of ids given out says how many were ever written), each entry's previous hash the one before it, and each
+        hash its own fields'. Refused in words (OrderStepError) otherwise: an entry changed or removed."""
+        cur = self._db.execute(f"SELECT {', '.join(_ENTRY_FIELDS)}, hash FROM owner_entries ORDER BY id")
+        names = [c[0] for c in cur.description]
+        rows = [dict(zip(names, r)) for r in cur.fetchall()]
+        seq = self._db.execute("SELECT seq FROM sqlite_sequence WHERE name = 'owner_entries'").fetchone()
+        given = int(seq[0]) if seq else 0
+        after = "a person must look before the book is worked out again"
+        prev = _GENESIS
+        for n, row in enumerate(rows, start=1):
+            if row["id"] != n:
+                raise OrderStepError(f"owner entry {n} was removed (the entries left are {', '.join(str(r['id']) for r in rows)}"
+                                     f" of {given} written); {after}")
+            if row["prev_hash"] != prev or row["hash"] != _entry_hash(row):
+                raise OrderStepError(f"owner entry {n} was changed after it was written (its hash does not match what it "
+                                     f"holds, or the entry before it); {after}")
+            prev = row["hash"]
+        if given > len(rows):
+            raise OrderStepError(f"owner entry {len(rows) + 1} was removed ({given} were written, {len(rows)} are left); "
+                                 f"{after}")
+        return rows
+
+    def owner_entries(self) -> list[dict]:
+        """The owner's entries, oldest first, each a dict of its fields, once the chain is checked."""
+        return self._entries_checked()
+
+    def add_owner_entry(self, figures: dict, who: str, note: str) -> dict:
+        """Append one owner entry: `figures` as next_entry gives them, `who` and `note` (both required text), the
+        time and New York day from this file's clock, and the hash chained to the entry before it, all in one write
+        transaction after the chain is checked. Returns the entry as written. No figure is defaulted here."""
+        for what, text, most in (("who", who, MAX_WHO), ("note", note, MAX_NOTE)):
+            if not isinstance(text, str) or not text.strip() or len(text) > most or not text.isprintable():
+                raise OrderStepError(f"an owner's entry needs {what}: plain text of at most {most} characters, not "
+                                     f"{_cut(repr(text))}; nothing was written")
+        if figures.get("kind") not in ENTRY_KINDS:
+            raise OrderStepError(f"an owner's entry is of kind {', '.join(ENTRY_KINDS)}; nothing was written")
+        now = float(self.clock())
+        day = _ny_day(now)
+        if day is None:
+            raise OrderStepError("the clock gives no New York day; nothing was written")
+        with self._write():
+            rows = self._entries_checked()
+            row = {k: figures.get(k) for k in _ENTRY_FIELDS if k not in ("id", "time", "day", "who", "note", "prev_hash")}
+            row.update(id=len(rows) + 1, time=now, day=day, who=who, note=note,
+                       prev_hash=rows[-1]["hash"] if rows else _GENESIS)
+            row["hash"] = _entry_hash(row)
+            cols = (*_ENTRY_FIELDS, "hash")
+            self._db.execute(f"INSERT INTO owner_entries ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                             tuple(row[k] for k in cols))
+        return {k: row[k] for k in (*_ENTRY_FIELDS, "hash")}
+
+    def send_tags(self) -> set[str]:
+        """R3: every tag the send record holds."""
+        return {r[0] for r in self._db.execute("SELECT tag FROM sends")}
 
     @contextmanager
     def _write(self):
