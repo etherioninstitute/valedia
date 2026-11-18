@@ -219,3 +219,64 @@ resolution requests (their length and their first and last characters); and seve
 service's resolution route made to learn why it refused (one ordinary id, three short ids as stored, the same
 three padded: their status and the number of rows they returned, not what a row says). No trade, price or resolution has been set beside an outcome. Prices have not been
 pulled at all.
+
+## Fifth amendment of 2026-11-18, 21:40 UTC (after a first development run that produced NO trade; no copied trade has been analysed)
+
+**What happened.** The pull's second phase ended at 19:59 UTC (11,228 price windows, nothing unfinished). The
+first-stage run ended at 21:13 UTC and, by this document's letter, FAILED: 0 trades from 0 events. Every one of
+the 40 development months (2023-03 to 2026-06) was left out for having fewer than three leaders; of the
+wallet-months that were not leaders, 7,497 had fewer than 30 resolved positions, 43 failed the shares-per-dollar
+test and 20 had no profit. The sealed months were not opened.
+
+**Why, read from the store.** The resolutions service answers in TWO shapes. 490,698 rows carry payouts and a
+resolution time (`resolved_at`; the service marks them `reported`; they begin in 2025: 9,402 rows that year,
+481,296 in 2026). 467,532 rows carry neither: they are the oracle's own record (a `price`, a proposed price, a
+question id, a status, a `last_update_timestamp`) and exist in every year from late 2022 to November 2026. The
+reader stored those rows as received and read no result and no time from them. So the rule's "known resolution"
+was false for almost every market before mid-2026, no wallet reached thirty resolved positions in any
+three-month window of the development period, and the plan the second phase made holds all its 2,877 positions
+in sealed months (August 1, September 562, October 2,314). The lead's step-0 look sampled recent markets and
+never measured the share of rows without a time; that is the fault, and it is the lead's.
+
+**What was measured before this rule was written** (the resolutions table and the titles of trades only; no
+price point and no copied trade): among the 467,532 rows the field `price` takes exactly four values: 0
+(311,370 rows), 1000000000000000000 (126,605), 500000000000000000 (1,272) and 69 (28,285, which is exactly the
+count of the rows whose status is posed, proposed or challenged); 439,247 have the status resolved. Fourteen
+markets found by their titles, set beside public knowledge: "Will Donald Trump win the 2024 US Presidential
+Election?" has the price 1000000000000000000 and a last update on 2024-11-06; the same question for Harris,
+Biden, Sanders, Newsom and "any other Republican politician" has 0 on the same day; "Will the Eagles win Super
+Bowl 2025?" has 1000000000000000000 and "Will the Chiefs win Super Bowl 2025?" 0, both on 2025-02-10; five
+"Will Bitcoin reach $100,000 in <a month>?" have 0 on the first day after their month; one market still open is
+posed with 69. In the trades of those markets outcome index 0 is "Yes" and 1 is "No". Eight public results, all
+agreeing; the times are the day the result became final.
+
+**The rule added.** A resolution row of the oracle's shape (it has a `price` and no payouts) whose status is
+`resolved` is a KNOWN RESOLUTION: a price of 1000000000000000000 pays the first outcome (index 0) in full, 0
+pays the second (index 1) in full, 500000000000000000 pays each half; its resolution time is its
+`last_update_timestamp` in whole epoch seconds. Any other price, any other status, or a time that is missing or
+not a whole number of seconds in the span this document already allows: NOT a known resolution, exactly as a
+market with no row (counted, with the reason). Rows of the reported shape are read as before. The stored rows
+are read again as they were received; no resolution is asked for again.
+
+**Why this cannot look ahead.** The rule reads the service's own record of how a market resolved, the same fact
+it already used for the other half of the markets, and no price, trade result or wallet result. If a row's
+last update is later than the moment the result was final, a wallet's profit is counted LATER than it was known
+(against it being a leader sooner), and a price after the event but before that time is already kept out by
+this document's guard (a follower's price must be from 0.05 to 0.95). The direction of any error is against
+copying or neutral.
+
+**The first stage is run again, and why that is allowed.** The first run analysed no copied trade (0 of 0): it
+showed nothing about what the rule earns. It showed that the data had not been read. Under this amendment the
+second phase prices the positions the plan then holds, and the first stage is run ONCE more, with the result
+stated beside the first run's. The sealed months stay unopened until that run passes. The lead's expectation is
+unchanged: it fails at step 1.
+
+**What does not change.** Everything else: the candidate set, the leaders, the copied trade, the follower's
+price, the cost, the periods, the one rule and its p-value.
+
+**What has been read by now, in all:** everything listed above; the first development run's table (no trade in
+it); counts of resolution rows by shape, by year of their time, by status and by value of `price`; the number
+of positions the plan holds in each month (three sealed months: counts only, no price and no outcome of a
+sealed position); the resolution rows and trade outcome names of the fourteen markets named above; two requests
+to another public endpoint for close times, which returned nothing. No copied trade has been set beside an
+outcome.
