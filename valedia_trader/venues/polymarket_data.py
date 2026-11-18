@@ -18,7 +18,12 @@ Routes (field names from the service's published specification, /v2/openapi.json
   cursor pins the board and takes no parameters beside it.
 * /v2/resolutions is not paged: {"data": [...]} for at most 20 condition ids a request. `resolution_batches` asks
   any number of ids twenty at a time and records an answer per id: a short answer (fewer rows than ids) is the
-  per-id answer "no_row" (unresolved or unknown), never an error for the batch.
+  per-id answer "no_row" (unresolved or unknown), never an error for the batch. The service refuses with HTTP 400 a
+  whole request that holds one id it takes as invalid (fourth amendment, b55bc88): such a request is asked again in
+  halves, down to single ids; a single id refused with HTTP 400 is the per-id answer "refused" (REFUSED) and its walk
+  ends. A refused request of n ids costs at most 2n - 2 more requests (38 for twenty), each paced and checked like
+  any other and retried like any other. Any other failure, the first or one met while narrowing, raises as before
+  for the ids not yet answered. No id is ever altered.
 * /v2/prices-history?token_id=<outcome token>&start=<s>&end=<e> answers one token's price points in [s, e) (start
   inclusive, end exclusive), each {price, resolution_seconds, timestamp}: the service picks the grain, a point's
   timestamp is the start of the span it was observed in, and a terminal point has resolution_seconds 0. It is
@@ -57,7 +62,7 @@ from typing import Any, Callable
 __all__ = ["BASE_URL", "USER_AGENT", "HttpError", "PolymarketDataError", "PageCapHit", "Pacer", "urllib_get", "Walk",
            "PolymarketData", "is_number", "validate_board_row", "validate_trade", "validate_position",
            "validate_resolution", "validate_price_point", "trade_identity", "position_identity", "TS_MIN",
-           "BOARD_CATEGORIES"]
+           "BOARD_CATEGORIES", "REFUSED"]
 
 BASE_URL = "https://data-api.polymarket.com"
 USER_AGENT = "market-data-reader/1.0"
@@ -66,6 +71,7 @@ BOARD_WINDOWS = ("day", "week", "month", "all")
 BOARD_CATEGORIES = ("sports", "crypto")    # T52: a board per category; None is the overall board
 POSITION_STATUSES = (None, "CLOSED")
 MAX_CONDITIONS = 20
+REFUSED = "refused"                # the answer to a single condition id the service refuses (HTTP 400) as invalid
 TS_MIN = 1_577_836_800             # 2020-01-01T00:00:00Z: no time of this service is earlier
 TS_AFTER_START = 86_400            # a time may be at most one day after the client was made
 
@@ -700,27 +706,81 @@ class PolymarketData:
                   lambda good: json.dumps(good, sort_keys=True), ids)
         return w
 
-    def resolution_batches(self, conditions):
-        """Every id's resolution, twenty ids a request. Yields (batch, walk, answers) per request; `answers` holds one
-        word per id asked: "row" (exactly one valid row), "no_row" (none: unresolved or unknown), "rejected" (only
-        rows of the wrong shape), "row_and_reject" or "duplicate" (not trusted)."""
+    def resolution_batches(self, conditions, narrowed: Callable[[dict], Any] | None = None):
+        """Every id's resolution, twenty ids a request. Yields (batch, walk, answers) per request answered; `answers`
+        holds one word per id asked: "row" (exactly one valid row), "no_row" (none: unresolved or unknown),
+        "rejected" (only rows of the wrong shape), "row_and_reject" or "duplicate" (not trusted), or REFUSED.
+
+        A request answered with HTTP 400 is asked again in halves (the first half first), each half refused with
+        HTTP 400 again in halves, down to single ids; a single id refused with HTTP 400 is yielded alone, with an empty
+        walk of one page, as REFUSED. So a refused request of n ids costs at most 2n - 2 more requests. Every other
+        failure (and one met while narrowing) raises, as it always did, and the ids not yet yielded have no answer.
+        `narrowed`, when given, is called once per refused request with the counts only (no id): {"asked",
+        "answered", "refused", "requests" (the more requests made), "finished" (False when another failure stopped
+        the narrowing; it is called before that failure is raised)}."""
         conds = list(dict.fromkeys(conditions))
         for i in range(0, len(conds), MAX_CONDITIONS):
             batch = conds[i:i + MAX_CONDITIONS]
-            w = self.resolutions(batch)
-            good: Counter = Counter(r["condition_id"] for r in w.rows)
-            bad: Counter = Counter(raw.get("condition_id") for raw, why in w.raw
-                                   if why and why != "repeated_row" and isinstance(raw, dict)
-                                   and isinstance(raw.get("condition_id"), str))      # an answer only to a string id
-            answers = {}
-            for c in batch:
-                if good[c] > 1:
-                    answers[c] = "duplicate"
-                elif good[c] == 1:
-                    answers[c] = "row_and_reject" if bad[c] else "row"
-                else:
-                    answers[c] = "rejected" if bad[c] else "no_row"
-            yield batch, w, answers
+            try:
+                w = self.resolutions(batch)
+            except HttpError as e:
+                if e.status != 400:
+                    raise
+                w = None
+            if w is None:
+                yield from self._narrow(batch, narrowed)
+            else:
+                yield batch, w, self._answers(batch, w)
+
+    def _narrow(self, batch: list, narrowed):
+        """The ids of a request the service refused with HTTP 400, asked again in halves (see resolution_batches)."""
+        tally = {"asked": len(batch), "answered": 0, "refused": 0, "requests": 0, "finished": False}
+        stack = [(batch, True)]                    # (ids, already refused); popped last first
+        try:
+            while stack:
+                part, refused = stack.pop()
+                if not refused:
+                    tally["requests"] += 1
+                    try:
+                        w = self.resolutions(part)
+                    except HttpError as e:
+                        if e.status != 400:
+                            raise
+                        refused = True
+                    else:
+                        tally["answered"] += len(part)
+                        yield part, w, self._answers(part, w)
+                        continue
+                if len(part) == 1:
+                    tally["refused"] += 1
+                    read_at = self.now()
+                    yield part, Walk(pages=1, read_at=[read_at]), {part[0]: REFUSED}
+                    continue
+                half = len(part) // 2
+                stack += [(part[half:], False), (part[:half], False)]
+        except Exception:
+            if narrowed is not None:
+                narrowed(dict(tally))
+            raise
+        tally["finished"] = True
+        if narrowed is not None:
+            narrowed(dict(tally))
+
+    @staticmethod
+    def _answers(batch: list, w: Walk) -> dict:
+        good: Counter = Counter(r["condition_id"] for r in w.rows)
+        bad: Counter = Counter(raw.get("condition_id") for raw, why in w.raw
+                               if why and why != "repeated_row" and isinstance(raw, dict)
+                               and isinstance(raw.get("condition_id"), str))      # an answer only to a string id
+        answers = {}
+        for c in batch:
+            if good[c] > 1:
+                answers[c] = "duplicate"
+            elif good[c] == 1:
+                answers[c] = "row_and_reject" if bad[c] else "row"
+            else:
+                answers[c] = "rejected" if bad[c] else "no_row"
+        return answers
 
     def prices_history(self, token_id: str, start: int, end: int, page_cap: int = 100) -> Walk:
         """One outcome token's price points in the window [start, end) (epoch seconds: start inclusive, end exclusive;

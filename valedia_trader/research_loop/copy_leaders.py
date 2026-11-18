@@ -19,7 +19,10 @@ Rules the code holds:
 
 * The pull has two phases. Phase 1: the two profit boards ONCE (the candidate set, stored with its read time; a later
   pull never reads the boards into the same store), every candidate's full trade history, and the resolution of
-  every traded condition (twenty ids a request, one answer word per id). Phase 2 refuses while phase 1 is
+  every traded condition (twenty ids a request, one answer word per id; a request the service refuses with HTTP 400
+  is asked again in halves down to single ids, a single id it refuses is answered "refused", its walk finishes, and
+  the pull prints one line a refused request with the counts of ids asked, answered and refused, never an id: the
+  fourth amendment, b55bc88). Phase 2 refuses while phase 1 is
   unfinished; it computes from phase 1 the leaders of every month (standing uses only what precedes the month) and
   their new positions that pass the entry tests, records that plan, and reads for exactly those positions the
   price windows [t1 + 1 h, +12 h), [t1 + 6 h, +12 h) and [t1 + 24 h, +12 h); then, only for positions whose first
@@ -949,7 +952,8 @@ class Store:
 
     def finish_resolutions(self, conditions, w, answers: dict) -> None:
         """One batch of up to twenty ids and the answer word per id (see PolymarketData.resolution_batches). Only an
-        id answered "row" keeps a resolution; every other answer is unresolved or unknown to the analysis."""
+        id answered "row" keeps a resolution; every other answer is unresolved or unknown to the analysis ("refused",
+        an id the service refused alone, exactly as "no_row": no resolution row, its walk finished)."""
         good_raw = [raw for raw, why in w.raw if not why]
         read_at = w.read_at[0] if w.read_at else _now()
         for row, raw, at in zip(w.rows, good_raw, w.row_read_at):
@@ -1408,17 +1412,20 @@ class _Folded:
     conditions: set = field(default_factory=set)
     unanswered: list = field(default_factory=list)
     first_ts: int | None = None
+    refused: set = field(default_factory=set)        # `collect`: the markets read whose answer is "refused"
+    refused_rows: int = 0                            # and the trade rows read that name them
 
 
 def _fold(s: Store, wallets, end: int, spill: int, keep, counts: Counter | None = None, collect: bool = False,
           say=None, label: str = "", memory=None, guard=None) -> _Folded:
     """Every wallet of `wallets` read and folded in turn (see _WalletFold): the trades before `end` (and the next
     `spill` seconds' in tokens bought on the last day), each wallet's markets' resolutions fetched for it. One line a
-    wallet; `guard(memory MB, i, n)` after each. `collect`: the conditions read and the wallets lacking an answer."""
+    wallet; `guard(memory MB, i, n)` after each. `collect`: the conditions read and the wallets lacking an answer,
+    and the markets read that the service refused (answer "refused") with the trade rows read that name them."""
     out = _Folded()
     t0, n = time.monotonic(), len(wallets)
     for i, w in enumerate(wallets, 1):
-        rows, tokens_of = 0, {}
+        rows, tokens_of, rows_of = 0, {}, Counter()
         for r in s.trade_stream(w, end, spill):
             rows += 1
             t, why = trade_from_row(w, r["seq"], r)
@@ -1427,6 +1434,8 @@ def _fold(s: Store, wallets, end: int, spill: int, keep, counts: Counter | None 
                     counts["trade_" + why] += 1
                 continue
             tokens_of.setdefault(t.condition, {})[t.token] = t.outcome_index
+            if collect:
+                rows_of[t.condition] += 1
             if out.first_ts is None or t.ts < out.first_ts:
                 out.first_ts = t.ts
         res = _resolutions(s, tokens_of)
@@ -1435,6 +1444,10 @@ def _fold(s: Store, wallets, end: int, spill: int, keep, counts: Counter | None 
             if any(c not in answered for c in tokens_of):
                 out.unanswered.append(w)
             out.conditions.update(tokens_of)
+            refused = [c for c in tokens_of if answered.get(c) == pd.REFUSED]
+            out.refused.update(refused)
+            out.refused_rows += sum(rows_of[c] for c in refused)
+            del rows_of
         fold = _WalletFold(tokens_of, res, keep)
         for r in s.trade_stream(w, end, spill, by_time=True):
             t, why = trade_from_row(w, r["seq"], r)
@@ -1935,9 +1948,16 @@ def _pull_phase1(s: Store, client, run: _Run, errors, page_cap: int) -> None:
     for i in range(0, len(conds), pd.MAX_CONDITIONS):
         part = conds[i:i + pd.MAX_CONDITIONS]
 
+        def told(c, i=i):                          # a refused request: its counts only, never an id
+            say("resolutions %d of %d: the service refused a request of %d ids (HTTP 400); asked again in halves "
+                "with %d more requests: %d ids answered, %d ids refused as invalid when asked alone%s" % (
+                    i // pd.MAX_CONDITIONS + 1, n, c["asked"], c["requests"], c["answered"], c["refused"],
+                    "" if c["finished"] else "; stopped by another failure: %d ids stay unfinished"
+                    % (c["asked"] - c["answered"] - c["refused"])))
+
         def one(part=part, i=i):
             t = run.clock()
-            for batch, w, answers in client.resolution_batches(part):
+            for batch, w, answers in client.resolution_batches(part, narrowed=told):
                 s.finish_resolutions(batch, w, answers)
                 s.commit()
                 run.pages += 1
@@ -2034,6 +2054,10 @@ class Data:
     unfinished_left_out: list
     months: list
     store_counts: dict = field(default_factory=dict)
+    refused: dict = field(default_factory=dict)      # the two counts of the fourth amendment (see REFUSED_COUNTS)
+
+
+REFUSED_COUNTS = ("refused_markets", "trade_rows_naming_refused_markets")
 
 
 def _period_bounds(period: str) -> tuple[int, int]:
@@ -2100,7 +2124,8 @@ def load(store, period: str, leave_out=()) -> Data:
         else:
             store_counts = s.counts_by_reason()
     return Data(period, kept, books, f.positions, f.skipped, resolutions, points, counts, leave,
-                sorted(w for w in implicated if w in leave), months, store_counts)
+                sorted(w for w in implicated if w in leave), months, store_counts,
+                dict(zip(REFUSED_COUNTS, (len(f.refused), f.refused_rows))))
 
 
 # ---------------------------------------------------------------- the analysis
@@ -2318,7 +2343,9 @@ def _out_dir(out_dir, sid: str) -> Path:
 def _development_doc(path: Path, leave_out) -> dict:
     """The development document of this store (development months only; deterministic for one store and code)."""
     data = load(path, "development", leave_out)
-    return {"provenance": _provenance(path), "result": development_result(data)}
+    prov = _provenance(path)
+    prov.update(data.refused)
+    return {"provenance": prov, "result": development_result(data)}
 
 
 @contextlib.contextmanager
@@ -2494,6 +2521,7 @@ def _run_sealed(path: Path, out_dir, leave_out, develop_file) -> dict:
         data = load(path, "sealed", leave)
     prov = _provenance(path)
     prov.update({"development_file": str(dev), "development_sha256": dev_sha})
+    prov.update(data.refused)
     doc = {"provenance": prov, "result": sealed_result(data)}
     _write_bytes(od / "sealed.json", _dump(doc))
     return doc
@@ -2520,6 +2548,8 @@ def format_table(doc: dict) -> str:
              "rows rejected on load: %s; trade book: %s" % (r["load_rejects"] or "none", r["book_counts"] or "none"),
              "rows the store set aside, by kind and reason (repeats, conflicts, out-of-span times, rejects): %s"
              % (r.get("store_counts") or "none"),
+             "markets whose id the service refused as invalid (no known resolution, as no row): %s; trade rows read "
+             "that name them: %s" % tuple(_fmt(prov.get(k)) for k in REFUSED_COUNTS),
              "%d of %d wallets sold beyond what their trades show they held; in the leaders' standing windows %d of "
              "%d sells (%s) were such sells, and their excess earned nothing in the standing" % (
                  sb["wallets_with_sells_beyond_holding"], sb["candidates"], sb["leader_window_sells_beyond_holding"],
