@@ -983,6 +983,9 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None) -
     if not isinstance(venue, str) or not venue or _safe_name(venue) != venue or venue.strip(".") == "":
         return refuse("the owner's entry needs --venue, the plain name of the venue whose book it is (the name in its "
                       "state file's name); nothing was written")
+    if _production_venue_name(venue):                     # addendum 7 (R23): the live venue's state file, by name alone
+        return refuse(f"{_cut(repr(venue))} is a production venue's name: an owner's entry for a live venue is not open "
+                      "yet (it opens later, only together with --live); nothing was written")
     for what in ("who", "note"):                          # addendum 5 (R15): judged in full, before anything is read
         problem = _owner_text_problem(what, getattr(args, what, None))
         if problem is not None:
@@ -1488,6 +1491,18 @@ _ENTRY_FIELDS = ("id", "time", "day", "kind", "symbol", "amount", "units", "rati
 _GENESIS = "0" * 64
 MAX_WHO, MAX_NOTE = 200, 1000
 JOURNAL_NOT_WRITTEN = 3                           # addendum 4 (R12): the owner's entry is written, its journal line not
+
+
+_PRODUCTION_PREFIX = "webull-production"          # R23: webull.py names a venue f"webull-{environment}{suffix}" and
+                                                  # go_live.LIVE_VENUE is "webull-production" (not imported here)
+
+
+def _production_venue_name(venue: str) -> bool:
+    """Addendum 7 (R23): whether `venue` names (or nearly names) a production venue: compared without case (a case-
+    blind folder would open the same file) and without trailing dots or spaces, a name starting with
+    "webull-production" (the plain venue and its "-events" venue). "webull-sandbox..." and every other name are
+    practice names, as before."""
+    return venue.casefold().rstrip(". ").startswith(_PRODUCTION_PREFIX)
 
 
 def _owner_text_problem(what: str, text) -> str | None:

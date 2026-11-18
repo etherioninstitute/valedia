@@ -515,7 +515,9 @@ stays, the units change). The shape, with figures that are AN EXAMPLE ONLY and n
     order-step --owner-entry cash_in --venue VENUE_NAME --amount 1234.56 --who owner --note "example only"
 
 `VENUE_NAME` is the name in the venue's state file, `memory/order_step-VENUE_NAME.sqlite` (under `--root` when one
-is given); the ledger beside it is only read, and the entry is refused while a run holds that file's lock. A refusal
+is given); the ledger beside it is only read, and the entry is refused while a run holds that file's lock. A
+production venue's name (anything starting `webull-production`, compared without case and trailing dots) is refused
+for now: live entries open later, only together with `--live`. A refusal
 writes nothing: no folder, lock file or upgrade of the state file (it exits 2). An entry written whose journal line
 could not be written is said in words and exits 3; the entry stays in the state file, and the next owner's entry is
 refused until a person has looked.
