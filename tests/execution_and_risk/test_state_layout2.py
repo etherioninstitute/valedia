@@ -35,6 +35,7 @@ import test_order_step as T
 
 BASE = "cdd5371"
 VENUE = "webull-test-cash"
+NOW = 1_763_478_000.0 + 3_600          # handed to book_figures (addendum 7, R22): 2025-11-18, in New York
 
 
 @pytest.fixture(autouse=True)
@@ -209,7 +210,7 @@ def add(st, fig, kind, who="owner", note="a note", **kw):
 
 def test_stake_entries_append_only(tmp_path):
     st = OrderStepState(tmp_path / "s.sqlite", clock=lambda: 1_763_478_000.0)
-    e = add(st, book_figures([], [], [], {}, "2025-11-18"), "cash_in", amount=D("1000"))
+    e = add(st, book_figures([], [], [], {}, "2025-11-18", now=NOW), "cash_in", amount=D("1000"))
     assert e["id"] == 1 and e["kind"] == "cash_in" and e["amount"] == "1000" and e["day"] == "2025-11-18"
     assert e["units_before"] == "0" and e["units_after"] == "1000" and e["value_per_unit_after"] == "1"
     assert e["prev_hash"] == "0" * 64 and len(e["hash"]) == 64
@@ -225,16 +226,16 @@ def test_stake_entries_append_only(tmp_path):
 def test_an_entry_needs_who_and_note(tmp_path, who, note):
     st = OrderStepState(tmp_path / "s.sqlite")
     with pytest.raises(OrderStepError, match="who|note"):
-        add(st, book_figures([], [], [], {}, "2025-11-18"), "cash_in", who=who, note=note, amount=D("1"))
+        add(st, book_figures([], [], [], {}, "2025-11-18", now=NOW), "cash_in", who=who, note=note, amount=D("1"))
     assert st.owner_entries() == []
 
 
 def _three(path):
     st = OrderStepState(path, clock=lambda: 1_763_478_000.0)
-    fig = book_figures([], [], [], {}, "2025-11-18")
+    fig = book_figures([], [], [], {}, "2025-11-18", now=NOW)
     for amount in ("1000", "250.5", "40"):
         add(st, fig, "cash_in", amount=D(amount))
-        fig = book_figures([], [], st.owner_entries(), {}, "2025-11-18")
+        fig = book_figures([], [], st.owner_entries(), {}, "2025-11-18", now=NOW)
     st.close()
 
 
@@ -266,7 +267,7 @@ def test_a_changed_or_removed_entry_is_detected_and_refused_in_words(tmp_path, s
     with pytest.raises(OrderStepError, match=words):
         st.owner_entries()
     with pytest.raises(OrderStepError, match=words):
-        add(st, book_figures([], [], [], {}, "2025-11-18"), "cash_in", amount=D("1"))
+        add(st, book_figures([], [], [], {}, "2025-11-18", now=NOW), "cash_in", amount=D("1"))
     st.close()
 
 
@@ -339,7 +340,7 @@ def test_units_out_clears_exactly_the_shortfall_it_names(tmp_path, capsys):
     state = OrderStepState(osx.state_path_for(osx.ledger_path_for(mem, VENUE), VENUE))
 
     def book():
-        fig = book_figures(led.fills(), led.orders(), state.owner_entries(), {"SPY": 100.0}, "2025-11-18")
+        fig = book_figures(led.fills(), led.orders(), state.owner_entries(), {"SPY": 100.0}, "2025-11-18", now=NOW)
         return {s: float(u) for s, u in fig.units.items()}
     out = led.reconcile(v, book(), one_sided=True)
     assert out["position_shortfalls"]["SPY"]["short"] == 3.0
@@ -362,10 +363,10 @@ def test_split_keeps_the_value_and_changes_the_units(tmp_path, capsys):
     assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "1000", "--mark", "SPY=200",
                  "--who", "owner", "--note", "opening") == 0
     state = OrderStepState(osx.state_path_for(osx.ledger_path_for(mem, VENUE), VENUE))
-    before = book_figures(led.fills(), led.orders(), state.owner_entries(), {"SPY": 200.0}, "2025-11-18")
+    before = book_figures(led.fills(), led.orders(), state.owner_entries(), {"SPY": 200.0}, "2025-11-18", now=NOW)
     assert owner(tmp_path, "--owner-entry", "split", "--symbol", "SPY", "--ratio", "4", "--mark", "SPY=50",
                  "--who", "owner", "--note", "four for one") == 0
-    after = book_figures(led.fills(), led.orders(), state.owner_entries(), {"SPY": 50.0}, "2025-11-18")
+    after = book_figures(led.fills(), led.orders(), state.owner_entries(), {"SPY": 50.0}, "2025-11-18", now=NOW)
     assert after.units == {"SPY": D("16.0")} and after.value == before.value
     assert after.value_per_unit == before.value_per_unit and after.units_outstanding == before.units_outstanding
     split = state.owner_entries()[-1]                                   # recorded at the marks after the split
@@ -387,7 +388,7 @@ def test_second_run_same_day_same_book(tmp_path, capsys):
     for _ in range(2):                                                  # a restart, a second run the same day
         st = OrderStepState(path)
         ro = _orders.open_read_only(osx.ledger_path_for(mem, VENUE))
-        figs.append(book_figures(ro.fills(), ro.orders(), st.owner_entries(), {"SPY": 101.0}, "2025-11-18"))
+        figs.append(book_figures(ro.fills(), ro.orders(), st.owner_entries(), {"SPY": 101.0}, "2025-11-18", now=NOW))
         ro.close()
         st.close()
     assert figs[0] == figs[1] and figs[0].cash == D("5000") - D("500.0") - D("125.75")
@@ -1001,3 +1002,129 @@ def test_practice_runs_equal_cdd5371_but_for_the_state_layout(tmp_path, base, ca
         print(f"\nT51c-O4 {worlds} worlds equal to {BASE} but for the state layout; fractional drawn in {fractional}; "
               f"{sends} orders sent")
     assert worlds >= 30 and fractional >= 3 and worlds - fractional >= 3 and sends > 30
+
+
+# ---- addendum 7, R22: the owner's command on a book whose purchases the venue reported no fee for
+
+S4A_BASE = "3fe6268"                                    # the code before this slice, read from this checkout's history
+T0 = 1_763_478_000.0                                    # 2025-11-18 10:00 in New York
+
+
+def _ledger_trades(path, trades):
+    """A ledger file with one filled order per (units, price, fee) of SPY (units below 0: a sale), fee None meaning
+    the venue reported none; the ledger's clock starts at T0 and moves 30 s an order."""
+    clock = [T0]
+    led = _orders.OrderLedger(path, clock=lambda: clock[0])
+
+    class Venue:
+        name, book, held = "stand-in", {}, {}
+
+        def submit(self, symbol, units, tag, price=None, limit_price=None):
+            self.book[tag] = {"state": "open", "filled_units": 0.0, "avg_price": None, "fee": None}
+            return {"status": "accepted"}
+
+        def order_status(self, tag):
+            return dict(self.book[tag])
+
+        def positions(self):
+            return dict(self.held)
+    v = Venue()
+    led.reconcile(v, {})
+    for i, (u, price, fee) in enumerate(trades):
+        tag = f"{'b' if u > 0 else 's'}{i}-SPY"
+        led.intend(tag, "SPY", u, price, limit_price=price + (1 if u > 0 else -1))
+        led.submit_once(v, tag)
+        v.book[tag].update(state="filled", filled_units=abs(u), avg_price=price, fee=fee)
+        clock[0] += 30
+        v.held = {"SPY": v.held.get("SPY", 0.0) + u}
+        led.reconcile(v, {})
+        led.mark_applied([f["id"] for f in led.unapplied_fills()])
+    led.close()
+
+
+def _at(monkeypatch, t):
+    monkeypatch.setattr(osx, "wall_clock", lambda: t)
+
+
+def _old_module(tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    try:
+        src = subprocess.run(["git", "-C", str(root), "show",
+                              f"{S4A_BASE}:valedia_trader/execution_and_risk/order_step.py"],
+                             capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError) as e:
+        pytest.fail(f"the code before this slice, commit {S4A_BASE}, cannot be read from this checkout's history "
+                    f"({type(e).__name__}); the comparison cannot be made, so it fails")
+    path = tmp_path / "order_step_s4a_base.py"
+    path.write_bytes(src)
+    spec = importlib.util.spec_from_file_location("order_step_s4a_base_cmd", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["order_step_s4a_base_cmd"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _opening_then(tmp_path, monkeypatch, trades):
+    mem = tmp_path / "memory"
+    _at(monkeypatch, T0 - 600)
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5000", "--who", "owner", "--note", "opening") == 0
+    _ledger_trades(osx.ledger_path_for(mem, VENUE), trades)
+    return osx.state_path_for(osx.ledger_path_for(mem, VENUE), VENUE)
+
+
+@pytest.mark.parametrize("later, fee_taken", [(3_600.0, D("0.01")), (4 * 86_400.0, D("0"))])
+def test_r22_the_command_values_a_book_after_purchases_with_no_fee(tmp_path, capsys, monkeypatch, later, fee_taken):
+    """An opening, then two filled purchases the venue reported no fee for: a second entry is valued and written,
+    inside the window at the lower bound less B for each, after it at a fee of none."""
+    state_path = _opening_then(tmp_path, monkeypatch, [(10.0, 100.0, None), (5.0, 200.0, None)])
+    capsys.readouterr()
+    _at(monkeypatch, T0 + later)
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "100", "--mark", "SPY=150", "--who", "owner",
+                 "--note", "a second deposit") == 0, capsys.readouterr().err
+    st = OrderStepState(state_path)
+    first, second = st.owner_entries()
+    st.close()
+    value = D("5000") - D("1000.0") - D("1000.0") - 2 * fee_taken + D("15.0") * D("150")
+    import decimal
+    with decimal.localcontext() as ctx:
+        ctx.prec = 60                                                    # the book's own precision
+        assert D(second["value_per_unit_before"]) == value / D(first["units_after"])
+    assert second["kind"] == "cash_in" and second["amount"] == "100"
+
+
+def test_r22_the_code_before_this_slice_refuses_the_same_book_value_not_known(tmp_path, capsys, monkeypatch):
+    old = _old_module(tmp_path)
+    _opening_then(tmp_path, monkeypatch, [(10.0, 100.0, None)])
+    capsys.readouterr()
+    _at(monkeypatch, T0 + 3_600)
+    monkeypatch.setattr(osx, "book_figures", lambda *a, now=None, **k: old.book_figures(*a, **k))
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "100", "--mark", "SPY=150", "--who", "owner",
+                 "--note", "a second deposit") == 2
+    assert "value is not known" in capsys.readouterr().err
+
+
+def test_r22_a_sale_with_no_fee_still_refuses_in_words_that_say_why(tmp_path, capsys, monkeypatch):
+    state_path = _opening_then(tmp_path, monkeypatch, [(10.0, 100.0, 0.01), (-4.0, 110.0, None)])
+    before = state_path.read_bytes()
+    capsys.readouterr()
+    _at(monkeypatch, T0 + 3_600)
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "100", "--mark", "SPY=150", "--who", "owner",
+                 "--note", "a second deposit") == 2
+    err = capsys.readouterr().err
+    assert "value is not known" in err and "s1-SPY" in err and "sale" in err and "fee is not known" in err, err
+    assert state_path.read_bytes() == before
+
+
+def test_r22_the_command_hands_book_figures_its_one_clock_reading(tmp_path, capsys, monkeypatch):
+    _opening_then(tmp_path, monkeypatch, [(10.0, 100.0, None)])
+    seen = []
+    real = osx.book_figures
+
+    def spy(*a, **k):
+        seen.append((a[4], k.get("now")))
+        return real(*a, **k)
+    monkeypatch.setattr(osx, "book_figures", spy)
+    _at(monkeypatch, T0 + 1_234.5)
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "1", "--mark", "SPY=150", "--who", "owner",
+                 "--note", "n") == 0
+    assert seen == [("2025-11-18", T0 + 1_234.5)]
