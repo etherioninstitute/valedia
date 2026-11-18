@@ -100,8 +100,15 @@ trading (his word, 2026-11-17).
    book stops her until he says he took the shares); she never spends the day's own sale proceeds or more
    than the account's settled cash. SLICES S1 TO S3 BUILT 2026-11-18 (the one-way position check as an
    option, her book's own figures, the record of the owner's entries with his command; nothing wired): four
-   blind checks (two failed on the record of entries and on refusals that wrote to disk, then two passed
-   with notes); the merge, the lead's tests on main and the gate move follow at 11:00 PST. What the record
+   blind checks and a fifth on one last point (two failed on the record of entries and on refusals that
+   wrote to disk, then three passed with notes). MERGED 2026-11-18 11:07 PST (main `46b398d`); sixteen test
+   files pass on main (3,626 tests); the order-path gate moved to it; the real practice state files are
+   backed up in the deploy folder (the first run on the new gate, 19 Nov 06:55, upgrades the state file's
+   layout; code before this build then refuses it). The owner's command refuses a live venue's name until
+   live entries open with `--live`. **NEXT** S4 in slices (rulings in
+   `.foreman/tickets/T51c-addendum-7-S4-rulings.md`): S4a the fee rule, S4b the owner's command wired (marks
+   from the quote path, a preview and a confirm code), S4c practice shared mode, S4d live, S4e alerts and
+   the owner's page. What the record
    catches is written in `docs/WEBULL.md`: a change to the state file OR to the journal is found; both
    rewritten to match are not. FOR S4, found on the way: Webull reports no fee on a purchase (the book then
    calls the fee unknown: a rule is needed); the marks of an entry must come from the order step's quote
