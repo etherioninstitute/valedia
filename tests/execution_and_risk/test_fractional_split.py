@@ -295,10 +295,13 @@ def test_the_split_is_pure_and_deterministic():
         first[0].legs = ()                                          # frozen
 
 
-def test_nothing_in_the_order_step_calls_the_split_yet():
+def test_the_order_step_calls_the_split_once_in_its_differences_and_only_with_fractional_on():
     import inspect
-    source = inspect.getsource(order_step)
-    assert source.count("split_difference(") == 1                   # its own definition only (slice A1)
+    source = inspect.getsource(order_step)                          # T51 A2: its definition and one call
+    assert source.count("split_difference(") == 2
+    differences = inspect.getsource(order_step._Run._differences)
+    assert differences.count("split_difference(") == 1
+    assert differences.index("if self.fractional:") < differences.index("split_difference(")
 
 
 EXACT_FIVE = [(0.5, 10.0), (0.05, 100.0), (0.25, 20.0), (2.5, 2.0), (0.04, 125.0), (0.0125, 400.0), (1.0, 5.0),
