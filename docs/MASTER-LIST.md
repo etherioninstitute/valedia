@@ -285,7 +285,12 @@ run beside MiroFish and Elephant-1):
   measured: a smaller model, a small window, short prompts (the hourly pick job's short requests to the same
   27B show no extra failed decisions in the record).
 - **OWNER** how coding workers run while the collector is under test: another machine, hours when the
-  collector is not scored, a much smaller model or window measured first, or hosted models for coding.
+  collector is not scored, a much smaller model or window measured first, or hosted models for coding. Until
+  he decides: no local coding model is loaded beside the collector (the design session's launcher refuses to
+  load while its stop file is in place), and no Ornith build is downloaded (its replay test would load a
+  large model beside the collector too).
+- Not measured by the trial: a 27B loaded and IDLE beside the collector (no decision fell in those 43
+  seconds); the two decisions made while it was loading were normal.
 
 - **WATCH** Telegram is on and has dropped its connection before; Signal is parked (possible relink about
   11 Dec; its job is not installed).
