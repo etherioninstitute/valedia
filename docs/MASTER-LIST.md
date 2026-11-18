@@ -209,11 +209,11 @@ Items:
   piece of "lookahead" (the lead's suggestion to the owner, 2026-11-17).
 - **QUEUED** L-12 a pre-mortem with a prediction on every CHANGE: each ticket states what should be seen
   afterwards and when; the daily review checks it.
-- **OWNER** the division of work he asked about (2026-11-17): the master list is the one backlog; one board
-  holds approved work in flight, each card naming its master-list item (the lead suggests Hermes's Kanban as
-  that board and Paperclip as its display, not two sets of cards); bots file proposals into a create-only
-  inbox and never start a worker or patch code; RuFlo for coding outside the trader only, a fresh blind
-  checker as its acceptance; thinking roles on a hosted Claude model while the collector is scored.
+- **DECIDED by the owner (2026-11-17 late, as the design session relays his words "Yes, that split" and
+  "Yes, build it"):** the master list is the one backlog; Hermes's Kanban is the work board; Paperclip is the
+  approval desk; bots file proposals into a create-only inbox (one command, being built that night in the
+  design session's repository: at most 5 proposals a bot and 20 in all a day, nothing it files can start a
+  worker). Still his to decide: RuFlo's first supervised task; which bot and model do the daily review.
 - **QUEUED** L-2 lessons by idea family, and a stop on a family after N failures (roadmap 2.3).
 - **QUEUED** L-3 a check on the critic itself (roadmap 2.5).
 - **QUEUED** L-4 scores earn weight (roadmap 1.5).
