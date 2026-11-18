@@ -16,7 +16,7 @@ nothing here repeats itself: `pass` reads once and ends; whether and how often i
   (WALLET_RE: 0x and forty ASCII hex digits, either case). A wallet on both boards is one leader with both ranks; the list is not filled.
   Nothing ever re-ranks, replaces or drops a leader.
 * `pass`: under an exclusive lock on STORE.lock taken without waiting (a second pass exits at once, one line, code
-  LOCKED), each leader's open positions are read one wallet at a time (at most POSITION_PAGE_CAP pages). A good
+  LOCKED; the store's shape is checked under that lock), each leader's open positions are read one wallet at a time (at most POSITION_PAGE_CAP pages). A good
   read is compared with that wallet's last good read: a token not held then is NEW (`flip` when its opposite token
   was held), a size moved by more than SIZE_EPS is an INCREASE or a DECREASE, a token no longer held is an EXIT;
   each change carries the read time, the previous good read's time and the gap. A read with a rejected or
@@ -39,11 +39,31 @@ nothing here repeats itself: `pass` reads once and ends; whether and how often i
   the end, rows of changes, snapshots, rejects, wallet_reads and passes dated more than RETENTION_DAYS before the pass are removed, DELETE_BATCH rows a
   statement, at most DELETE_STATEMENTS statements a pass; holdings_current, leaders and each wallet's last good
   read are never aged out.
-* A store whose tables, columns or indexes are not exactly this version's (made by another version of the
-  record, or not its store) is refused in words by every command, read only, with nothing written.
+* A store whose whole schema as SQLite records it (type, name, table and statement text of every table, index,
+  view and trigger) is not exactly this version's, built in memory from SCHEMA, was made by another version of the
+  record or is not its store: every command refuses it in words, having opened it read only, with nothing written.
+  A file that SQLite cannot read as a database is refused as unreadable. A store held by a writer (SQLite's lock)
+  is refused as busy ("a pass is writing; try again") after at most WAIT_SECONDS; `report` and `fix-leaders` never
+  wait longer for SQLite's lock, and `report` refuses at once while a pass holds STORE.lock. When STORE.lock does
+  not exist yet (no pass ever ran here) the shape is checked before the lock is made, so a refused store's folder is
+  left as it was; a `fix-leaders` refused on an absent store leaves no file.
 * `report`: counts per leader and per kind over a window, each leader's carried holdings and the share of its good
   reads that carried any, the largest and median gap between good reads, the share of failed reads, the passes by
   status, and whether the store is consistent.
+
+The last line of every `pass` starts with one word for how it ended, and its exit code tells the ends apart:
+    DONE         0  every leader's read was good
+    LOCKED       2  another pass holds STORE.lock; nothing done
+    REFUSED      3  nothing done: no leaders fixed yet, or the store's folder, lock file or store cannot be
+                    made, opened or written
+    FAILED       4  the pass ran; at least one wallet's read failed (read_error, page_limit, rows_shrank)
+    STOPPED      5  the memory guard stopped the pass between wallets (--max-memory-mb)
+    INTERNAL     6  the pass ran; at least one wallet's read ended in internal_error
+    SHAPE        7  the store was made by another version of the record, or is not its store; nothing done
+    UNREADABLE   8  the file is not readable as a store; nothing done
+    BUSY         9  a writer holds SQLite's lock beyond WAIT_SECONDS ("a pass is writing; try again"); nothing done
+When several hold, STOPPED comes before INTERNAL and INTERNAL before FAILED. `fix-leaders` and `report` answer
+SHAPE, UNREADABLE and BUSY with the same codes and words (without the leading word).
 
 No line printed here names a title, an outcome, a token, a market or a price, nor a wallet beyond its first ten
 characters: what a leader holds is read from the store by whoever needs it.
@@ -77,12 +97,14 @@ DELETE_BATCH = 5000
 DELETE_STATEMENTS = 20
 SIZE_EPS = 1e-6
 RAW_MAX = 2000                              # characters of a rejected row kept in the store
-BUSY_SECONDS = 30.0
+BUSY_SECONDS = 30.0                         # a pass, under its own lock, waits this long for SQLite's lock
+WAIT_SECONDS = 5.0                          # every shape check, `report` and `fix-leaders` wait at most this long
 DAY = 86_400
 CLAIM_KEY = "leaders_fixed_at"
 WALLET_RE = re.compile(r"0x[0-9a-fA-F]{40}")   # a wallet address the record can store and print: 0x + 40 ASCII hex
 KINDS = ("NEW", "INCREASE", "DECREASE", "EXIT")
-OK, LOCKED, REFUSED, STOPPED_MEMORY, INTERNAL_ERROR = 0, 2, 3, 5, 6
+OK, LOCKED, REFUSED, FAILED_READS, STOPPED_MEMORY, INTERNAL_ERROR, OTHER_SHAPE, UNREADABLE, BUSY = 0, 2, 3, 4, 5, 6, 7, 8, 9
+BUSY_WORDS = "a pass is writing; try again"
 
 HOLDING_COLS = ("condition_id", "opposite_token_id", "outcome_index", "size", "avg_price", "current_value",
                 "first_entry_at", "last_event_at", "title", "outcome", "end_date", "current_price", "event_slug")
@@ -153,42 +175,75 @@ def _raw(row) -> str:
         return "(a row that could not be written out: %s)" % type(row).__name__
 
 
-def _connect(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(path), timeout=BUSY_SECONDS, isolation_level=None)
+def _connect(path: Path, timeout: float) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(path), timeout=timeout, isolation_level=None)
     conn.executescript(SCHEMA)
     return conn
 
 
-def _shape(conn) -> dict:
-    """{table: its columns as PRAGMA table_info gives them} and the index names, of a store's own tables."""
-    tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE "
-                                         "'sqlite_%' ORDER BY name")]
-    out = {t: [tuple(r) for r in conn.execute("PRAGMA table_info(\"%s\")" % t.replace('"', '""'))] for t in tables}
-    out[" indexes"] = sorted(r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND "
-                                                        "name NOT LIKE 'sqlite_%'"))
-    return out
+def _read_only(path: Path) -> sqlite3.Connection:
+    """The store opened read only, waiting at most WAIT_SECONDS for SQLite's lock."""
+    return sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=WAIT_SECONDS)
+
+
+def _master(conn) -> list:
+    """The whole schema as SQLite records it: (type, name, table, statement text) of every object, sorted."""
+    return sorted(tuple(r) for r in conn.execute("SELECT type, name, tbl_name, sql FROM sqlite_master"))
+
+
+def _safe(name) -> str:
+    return re.sub(r"[^0-9A-Za-z_.-]", "?", str(name))[:40]
 
 
 def _shape_problem(path: Path) -> str | None:
-    """None when `path` is absent, holds no table, or has exactly this version's tables, columns and indexes; else
-    what differs. Read only: the store is opened read-only and nothing is written to it."""
+    """None when `path` is absent, empty, holds no object, or has exactly the schema this version's statements build
+    (as orders.py compares the order ledger's); else the first object that differs. Read only: the store is opened
+    read-only, never through `_connect`, and nothing is written to it. Raises sqlite3.Error when it cannot be read."""
     if not path.exists() or path.stat().st_size == 0:
         return None
     mem = sqlite3.connect(":memory:")
-    mem.executescript(SCHEMA)
-    want = _shape(mem)
-    mem.close()
-    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=BUSY_SECONDS)
     try:
-        have = _shape(conn)
+        mem.executescript(SCHEMA)
+        want = {(r[0], r[1]): r for r in _master(mem)}
+    finally:
+        mem.close()
+    conn = _read_only(path)
+    try:
+        have = {(r[0], r[1]): r for r in _master(conn)}
     finally:
         conn.close()
-    if len(have) == 1 and not have[" indexes"]:
+    if not have:
         return None
-    for name in sorted(set(want) | set(have)):
-        if want.get(name) != have.get(name):
-            return "indexes differ" if name == " indexes" else "table %s differs" % name[:40]
+    for key in sorted(set(want) | set(have), key=lambda k: (str(k[0]), str(k[1]))):
+        if want.get(key) != have.get(key):
+            what = "an extra" if key not in want else "no" if key not in have else "a different"
+            return "%s %s %s" % (what, _safe(key[0]), _safe(key[1]))
     return None
+
+
+def _busy(e: BaseException) -> bool:
+    """SQLite's lock was held by another connection for longer than the wait."""
+    return isinstance(e, sqlite3.OperationalError) and \
+        (getattr(e, "sqlite_errorcode", 0) or 0) & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+
+
+def _check(store: Path):
+    """None when the store can be used; else (code, word, line) of its refusal."""
+    try:
+        why = _shape_problem(store)
+    except sqlite3.Error as e:
+        if _busy(e):
+            return _busy_refusal(store)
+        return (UNREADABLE, "UNREADABLE", "refused: the store %s is not readable as a store of the record (%s); "
+                "nothing done" % (store, type(e).__name__))
+    if why:
+        return (OTHER_SHAPE, "SHAPE", "refused: the store %s was made by another version of the record, or is not "
+                "its store (%s); nothing done" % (store, why))
+    return None
+
+
+def _busy_refusal(store) -> tuple:
+    return BUSY, "BUSY", "refused: the store %s is busy (%s); nothing done" % (store, BUSY_WORDS)
 
 
 def _lock(path: Path, exclusive: bool):
@@ -208,8 +263,22 @@ def _leaders(conn) -> list:
 
 
 # ---------------------------------------------------------------- fix-leaders
-def fix_leaders(conn, client, wall: Callable[[], float], say) -> int:
-    done = conn.execute("SELECT value FROM meta WHERE key=?", (CLAIM_KEY,)).fetchone()
+def _claimed(store: Path):
+    """The claim's row of a store that exists and holds the tables (read only), else None."""
+    if not store.exists() or store.stat().st_size == 0:
+        return None
+    conn = _read_only(store)
+    try:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone():
+            return None
+        return conn.execute("SELECT value FROM meta WHERE key=?", (CLAIM_KEY,)).fetchone()
+    finally:
+        conn.close()
+
+
+def fix_leaders(store: Path, client, wall: Callable[[], float], say) -> int:
+    """The store is made only once both boards are read: a refused run on an absent store leaves no file."""
+    done = _claimed(store)
     if done:
         say("fix-leaders refused: the leaders were already fixed at %s; nothing changes" % done[0])
         return REFUSED
@@ -241,6 +310,14 @@ def fix_leaders(conn, client, wall: Callable[[], float], say) -> int:
     for key, d in sorted(leaders.items()):
         s, c = d.get("sports", (None,) * 4), d.get("crypto", (None,) * 4)
         values.append((key, d["wallet"], *s, *c, fixed_ts))
+    conn = _connect(store, WAIT_SECONDS)
+    try:
+        return _claim(conn, leaders, values, fixed_ts, say)
+    finally:
+        conn.close()
+
+
+def _claim(conn, leaders: dict, values: list, fixed_ts: float, say) -> int:
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (CLAIM_KEY, _iso(fixed_ts)))
@@ -408,14 +485,21 @@ def age_out(conn, now: float) -> int:
 
 # ---------------------------------------------------------------- pass
 def run_pass(conn, client, wall, say, memory: Callable[[], float], max_mb: float) -> int:
-    leaders = _leaders(conn)
-    if not leaders:
-        say("pass refused: no leaders are fixed yet; run fix-leaders first")
+    try:
+        leaders = _leaders(conn)
+        if not leaders:
+            say("REFUSED pass refused: no leaders are fixed yet; run fix-leaders first")
+            return REFUSED
+        started, t0 = wall(), time.monotonic()
+        # this pass holds the exclusive lock, so no other can be running: one still marked so died
+        conn.execute("UPDATE passes SET status='died' WHERE status='running'")
+        pass_id = conn.execute("INSERT INTO passes (started_ts, status) VALUES (?, 'running')", (started,)).lastrowid
+    except sqlite3.Error as e:
+        if _busy(e):
+            say("BUSY pass refused: the store is busy (%s); nothing done" % BUSY_WORDS)
+            return BUSY
+        say("REFUSED pass refused: the store could not be written (%s); nothing done" % type(e).__name__)
         return REFUSED
-    started, t0 = wall(), time.monotonic()
-    # this pass holds the exclusive lock, so no other can be running: one still marked so died
-    conn.execute("UPDATE passes SET status='died' WHERE status='running'")
-    pass_id = conn.execute("INSERT INTO passes (started_ts, status) VALUES (?, 'running')", (started,)).lastrowid
     totals: Counter = Counter()
     good = failed = internal = 0
     status = "done"
@@ -451,12 +535,12 @@ def run_pass(conn, client, wall, say, memory: Callable[[], float], max_mb: float
     removed = age_out(conn, started)
     conn.execute("UPDATE passes SET finished_ts=?, status=?, good=?, failed=?, removed=? WHERE pass_id=?",
                  (wall(), status, good, failed, removed, pass_id))
-    say("pass %d %s: %d good, %d failed, internal_error=%d, new=%d increase=%d decrease=%d exit=%d, removed %d old "
-        "rows, %.1fs, mem=%.0fMB" % (pass_id, status, good, failed, internal, totals["NEW"], totals["INCREASE"],
+    word, code = (("STOPPED", STOPPED_MEMORY) if status == "stopped_memory" else ("INTERNAL", INTERNAL_ERROR)
+                  if internal else ("FAILED", FAILED_READS) if failed else ("DONE", OK))
+    say("%s pass %d %s: %d good, %d failed, internal_error=%d, new=%d increase=%d decrease=%d exit=%d, removed %d old "
+        "rows, %.1fs, mem=%.0fMB" % (word, pass_id, status, good, failed, internal, totals["NEW"], totals["INCREASE"],
                                      totals["DECREASE"], totals["EXIT"], removed, time.monotonic() - t0, mem))
-    if status == "stopped_memory":
-        return STOPPED_MEMORY
-    return INTERNAL_ERROR if internal else OK
+    return code
 
 
 # ---------------------------------------------------------------- consistency and report
@@ -564,41 +648,67 @@ def main(argv=None, *, client=None, wall: Callable[[], float] = time.time, out=N
         out.write(line + "\n")
         out.flush()
     store = Path(args.store)
+    is_pass = args.cmd == "pass"
+
+    def end(code: int, word: str, line: str) -> int:
+        """The last line: a pass's starts with the word for how it ended (see the module's doc text)."""
+        say(word + " " + line if is_pass else line)
+        return code
     try:
         store.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        say("refused: the store's folder could not be made (%s); nothing done" % type(e).__name__)
-        return REFUSED
-    try:
-        why = _shape_problem(store)
-    except sqlite3.Error as e:
-        why = "not readable as a store: %s" % type(e).__name__
-    if why:
-        say("refused: the store %s was made by another version of the record, or is not its store (%s); nothing "
-            "done" % (store, why))
-        return REFUSED
+        return end(REFUSED, "REFUSED", "refused: the store's folder could not be made (%s); nothing done"
+                   % type(e).__name__)
     if args.cmd == "fix-leaders":
-        conn = _connect(store)
+        bad = _check(store)
+        if bad:
+            return end(*bad)
         try:
-            return fix_leaders(conn, client or pd.PolymarketData(), wall, say)
-        finally:
-            conn.close()
+            return fix_leaders(store, client or pd.PolymarketData(), wall, say)
+        except sqlite3.OperationalError as e:
+            if not _busy(e):
+                raise
+            return end(*_busy_refusal(store))
+    if not Path(str(store) + ".lock").exists():
+        # no pass ever held the lock here, so none is writing: a refused store's folder is left as it was
+        bad = _check(store)
+        if bad:
+            return end(*bad)
     try:
-        fd = _lock(store, exclusive=args.cmd == "pass")
+        fd = _lock(store, exclusive=is_pass)
     except OSError as e:
-        say("refused: the lock file %s.lock could not be opened (%s); nothing done" % (store, type(e).__name__))
-        return REFUSED
+        return end(REFUSED, "REFUSED", "refused: the lock file %s.lock could not be opened (%s); nothing done"
+                   % (store, type(e).__name__))
     if fd is None:
-        say("refused: another run holds the lock %s.lock; nothing done" % store)
-        return LOCKED
+        if is_pass:
+            return end(LOCKED, "LOCKED", "refused: another run holds the lock %s.lock; nothing done" % store)
+        return end(LOCKED, "LOCKED", "refused: a pass holds the lock %s.lock (%s); nothing done" % (store, BUSY_WORDS))
     try:
-        conn = _connect(store)
-        try:
-            if args.cmd == "pass":
+        bad = _check(store)                         # the shape, checked under the lock
+        if bad:
+            return end(*bad)
+        if is_pass:
+            try:
+                conn = _connect(store, BUSY_SECONDS)
+            except sqlite3.Error as e:
+                if _busy(e):
+                    return end(*_busy_refusal(store))
+                return end(REFUSED, "REFUSED", "refused: the store %s could not be written (%s); nothing done"
+                           % (store, type(e).__name__))
+            try:
                 return run_pass(conn, client or pd.PolymarketData(), wall, say, memory, args.max_memory_mb)
-            return report(conn, wall, say, args.days)
-        finally:
-            conn.close()
+            finally:
+                conn.close()
+        try:
+            conn = _connect(store, WAIT_SECONDS)
+            try:
+                return report(conn, wall, say, args.days)
+            finally:
+                conn.close()
+        except sqlite3.OperationalError as e:
+            if not _busy(e):
+                raise
+            return end(*_busy_refusal(store))
     finally:
         os.close(fd)
 
