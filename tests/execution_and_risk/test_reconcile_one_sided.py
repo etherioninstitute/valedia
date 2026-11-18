@@ -117,6 +117,22 @@ def test_one_sided_surplus_is_clean_and_reported():
     assert "owner_surplus" not in two and "position_shortfalls" not in two
 
 
+def test_the_shortfalls_words_give_both_figures_in_full():
+    """Addendum 4, R14: the record's own figures, never rounded to six digits."""
+    clock = Clock()
+    led, venue = ledger(clock=clock), Venue()
+    ready(led, venue)
+    filled(led, venue, clock, "b-QQQ", "QQQ", 1234567.125)
+    led.mark_applied([f["id"] for f in led.unapplied_fills()])
+    venue.held = {"QQQ": 1234560.0625}
+    out = led.reconcile(venue, {"QQQ": 1234567.125}, one_sided=True)
+    short = out["position_shortfalls"]["QQQ"]
+    words = short["reason"]
+    for figure in (repr(short["venue"]), repr(short["book"] + short["unapplied"]), "1234560.0625", "1234567.125"):
+        assert figure in words, (figure, words)
+    assert "e+" not in words
+
+
 def test_one_sided_shortfall_is_unclean_and_named():
     clock = Clock()
     led, venue = ledger(clock=clock), Venue()

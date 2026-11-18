@@ -310,6 +310,93 @@ def test_prop_cash_entries_change_neither_value_per_unit_nor_any_other_figure(se
 
 
 @pytest.mark.parametrize("seed", SEEDS)
+def test_prop_a_cash_entry_keeps_the_value_per_unit_as_the_same_text(seed):
+    """Addendum 4, R14: by construction, the same decimal text before and after; not equal to sixty digits."""
+    rng = random.Random(9500 + seed)
+    o, f, _ = history(rng)
+    marks = marks_for(f, rng)
+    e = [opening(str(rng.choice((50000, 100000, 250000)))),]
+    base = book_figures(f, o, e, marks, DAY)
+    e.append(entry(2, T0 + 9_000, base, "cash_in", amount=D("333.33")))      # a value per unit with no short form
+    fig = book_figures(f, o, e, marks, DAY)
+    for kind in ("cash_in", "cash_out"):
+        amount = D(str(round(rng.uniform(1, 1000), 2)))
+        got = next_entry(fig, kind, amount=amount)
+        assert got["value_per_unit_before"] == str(fig.value_per_unit)
+        assert got["value_per_unit_after"] == got["value_per_unit_before"], (kind, got)
+
+
+def test_a_cash_entry_keeps_the_value_per_unit_where_division_would_move_the_sixtieth_digit():
+    fig = book_figures([], [], [opening("3")], {}, DAY)
+    fig = book_figures([], [], [opening("3"), entry(2, T0, fig, "cash_in", amount=D("1"))], {}, DAY)
+    import dataclasses
+    marks_moved = dataclasses.replace(fig, value=D(10) / D(3) * 4, value_high=D(10) / D(3) * 4,
+                                      value_per_unit=D(10) / D(3) * 4 / fig.units_outstanding)
+    for amount in ("1", "7", "0.01"):
+        got = next_entry(marks_moved, "cash_in", amount=D(amount))
+        assert got["value_per_unit_after"] == got["value_per_unit_before"] == str(marks_moved.value_per_unit)
+
+
+def _fee_fell_ledger():
+    """A real ledger whose venue reports a fee total of 3.0 on the first piece and 1.0 at the end: a fall."""
+    clock = [T0]
+    led = OrderLedger(":memory:", clock=lambda: clock[0])
+
+    class Venue:
+        name, book, held = "stand-in", {}, {}
+
+        def submit(self, symbol, units, tag, price=None, limit_price=None):
+            self.book[tag] = {"state": "open", "filled_units": 0.0, "avg_price": None, "fee": None}
+            return {"status": "accepted"}
+
+        def order_status(self, tag):
+            return dict(self.book[tag])
+
+        def positions(self):
+            return dict(self.held)
+    v = Venue()
+    led.reconcile(v, {})
+    led.intend("a-SPY", "SPY", 2.0, 100.0, limit_price=101.0)
+    led.submit_once(v, "a-SPY")
+    v.book["a-SPY"].update(state="partly_filled", filled_units=1.0, avg_price=100.0, fee=3.0)
+    clock[0] += 30
+    v.held = {"SPY": 1.0}
+    led.reconcile(v, {})
+    v.book["a-SPY"].update(state="filled", filled_units=2.0, avg_price=100.0, fee=1.0)
+    clock[0] += 30
+    v.held = {"SPY": 2.0}
+    led.reconcile(v, {})
+    return led
+
+
+def test_a_fee_total_that_falls_is_possible_with_the_ledger_as_built_and_the_bounds_hold_either_fee():
+    """Addendum 4, R14 (finding 6): the ledger keeps the rows' higher fees and the order's total follows the fall, so
+    the true fee is one of the two; the cash bounds hold the cash at either, and the cash is marked bounded."""
+    led = _fee_fell_ledger()
+    (o,) = led.orders()
+    rows = [r["fee"] for r in led.fills() if r["fee"] is not None]
+    assert o["fee"] == 1.0 and sum(rows) == 3.0                        # it happens: the rows keep 3, the total is 1
+    fig = book_figures(led.fills(), led.orders(), [opening()], {"SPY": 100.0}, DAY)
+    for fee in (D("1.0"), D("3.0")):
+        truth = D("10000") - D("200.0") - fee
+        assert fig.cash_low <= truth <= fig.cash_high, (fee, fig.cash_low, fig.cash_high)
+    assert fig.cash_bounded is True and any("fee" in b and "a-SPY" in b for b in fig.bounded_by)
+    led.close()
+
+
+@pytest.mark.parametrize("order_fee, row_fees", [(1.0, (3.0,)), (0.0, (0.5, 0.5)), (2.0, (2.0,)), (0.25, (0.25, 0.0))])
+def test_the_cash_bounds_hold_the_rows_fees_and_the_orders_total(order_fee, row_fees):
+    o = [order("a-SPY", "SPY", 2.0, limit=101.0, fee=order_fee)]
+    f = [fill(i + 1, "a-SPY", "SPY", 2.0 / len(row_fees), 100.0, fee=x, t=T0 + i) for i, x in enumerate(row_fees)]
+    fig = book_figures(f, o, [opening()], {"SPY": 100.0}, DAY)
+    for fee in {D(repr(order_fee)), sum((D(repr(x)) for x in row_fees), D(0))}:
+        truth = D("10000") - D("200.0") - fee
+        assert fig.cash_low <= truth <= fig.cash_high, (fee, fig.cash_low, fig.cash_high)
+    if D(repr(order_fee)) == sum((D(repr(x)) for x in row_fees), D(0)):
+        assert fig.cash_bounded is False and fig.cash_low == fig.cash_high   # no fall: exact, as before
+
+
+@pytest.mark.parametrize("seed", SEEDS)
 def test_prop_every_price_and_fee_known_gives_equal_bounds(seed):
     rng = random.Random(10_000 + seed)
     o, f, true_cash = history(rng)

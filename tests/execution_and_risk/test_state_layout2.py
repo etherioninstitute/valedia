@@ -30,6 +30,7 @@ from valedia_trader.execution_and_risk import order_step as osx
 from valedia_trader.execution_and_risk import orders as _orders
 from valedia_trader.execution_and_risk.order_step import OrderStepError, OrderStepState, book_figures
 from valedia_trader.research_loop import cli
+from valedia_trader.research_loop import paper as _paper
 import test_order_step as T
 
 BASE = "cdd5371"
@@ -491,19 +492,268 @@ def test_the_command_is_refused_when_the_clock_gives_no_new_york_day(tmp_path, c
     assert not (tmp_path / "memory").exists()
 
 
-def test_the_command_is_refused_when_the_clock_loses_its_day_after_the_first_reading(tmp_path, capsys, monkeypatch):
-    """The entry's own time is read once more after the lock is taken; a reading there with no New York day is
-    refused the same way, and no entry is written."""
+def test_the_clock_is_read_once_and_that_reading_is_the_entrys_time_and_day(tmp_path, capsys, monkeypatch):
+    """Addendum 4, R13: one reading of the clock; a clock that would give no day on a later reading changes nothing."""
     readings = iter([1_763_478_000.0])
     monkeypatch.setattr(osx, "wall_clock", lambda: next(readings, float("nan")))
-    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n") == 2
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n") == 0
+    st = OrderStepState(osx.state_path_for(osx.ledger_path_for(tmp_path / "memory", VENUE), VENUE))
+    (row,) = st.owner_entries()
+    st.close()
+    assert row["time"] == 1_763_478_000.0 and row["day"] == "2025-11-18"
+
+
+# ---- addendum 4, R12: the journal is the witness outside the file
+
+
+def state_of(root):
+    return Path(osx.state_path_for(osx.ledger_path_for(root / "memory", VENUE), VENUE))
+
+
+def journaled(root, venue=VENUE):
+    return [e for e in _paper.Journal(root / "journal").read() if e.get("type") == "owner_entry"
+            and e.get("venue") == venue] if (root / "journal").exists() else []
+
+
+def _entries_via_command(root, amounts=("1000", "250.5", "40")):
+    for a in amounts:
+        assert owner(root, "--owner-entry", "cash_in", "--amount", a, "--who", "owner", "--note", f"in {a}") == 0
+    st = OrderStepState(state_of(root))
+    rows = st.owner_entries()
+    st.close()
+    return rows
+
+
+def test_each_entry_is_journaled_through_the_journals_own_writer(tmp_path, capsys):
+    rows = _entries_via_command(tmp_path)
+    lines = journaled(tmp_path)
+    assert [ln["id"] for ln in lines] == [1, 2, 3]
+    for ln, row in zip(lines, rows):
+        assert ln["type"] == "owner_entry" and ln["venue"] == VENUE and ln["day"] == row["day"]
+        for k in ("id", "kind", "amount", "symbol", "units", "ratio", "mark", "units_before", "units_after",
+                  "value_per_unit_before", "value_per_unit_after", "who", "note", "prev_hash", "hash"):
+            assert ln[k] == row[k], k
+        assert all(isinstance(ln[k], str) for k in ("amount", "units_before", "units_after"))   # figures as text
+    assert osx.owner_entry_differences(rows, _paper.Journal(tmp_path / "journal").read(), venue=VENUE) == []
+
+
+def _rehash_from(rows, start, change):
+    """The chain rewritten from entry `start` on, every hash recomputed: what a rewrite of the file can do."""
+    out, prev = [], (rows[start - 2]["hash"] if start > 1 else "0" * 64)
+    for r in rows:
+        r = dict(r)
+        if r["id"] >= start:
+            if r["id"] == start:
+                r.update(change)
+            r["prev_hash"] = prev
+            r["hash"] = osx._entry_hash(r)
+        prev = r["hash"]
+        out.append(r)
+    return out
+
+
+def _put_rows(path, rows, seq):
+    """Replace the file's entries by `rows` and its id counter by `seq`, the triggers out of the way and put back."""
+    con = sqlite3.connect(path)
+    con.execute("DROP TRIGGER owner_entries_no_update")
+    con.execute("DROP TRIGGER owner_entries_no_delete")
+    con.execute("DELETE FROM owner_entries")
+    cols = (*osx._ENTRY_FIELDS, "hash")
+    for r in rows:
+        con.execute(f"INSERT INTO owner_entries ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                    tuple(r[k] for k in cols))
+    con.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = 'owner_entries'", (seq,))
+    for statement in osx._STATE_UPGRADE_1_TO_2:
+        if statement.startswith("CREATE TRIGGER owner_entries_"):
+            con.execute(statement)
+    con.commit()
+    con.close()
+
+
+def _appended_by_hand(rows):
+    extra = dict(rows[-1], id=rows[-1]["id"] + 1, amount="99", note="by hand", prev_hash=rows[-1]["hash"],
+                 units_before=rows[-1]["units_after"], units_after=str(D(rows[-1]["units_after"]) + 99))
+    extra["hash"] = osx._entry_hash(extra)
+    return rows + [extra]
+
+
+THREE_CHANGES = {
+    "the chain rewritten from entry 2, every hash recomputed": (lambda rows: _rehash_from(rows, 2, {"amount": "2500.5"}),
+                                                              3, "entry 2"),
+    "the last entry dropped and the id counter set back": (lambda rows: rows[:-1], 2, "entry 3"),
+    "a row appended by hand with a correct hash": (_appended_by_hand, 4, "entry 4"),
+}
+
+
+@pytest.mark.parametrize("change", list(THREE_CHANGES))
+def test_the_three_changes_the_chain_cannot_see_are_found_against_the_journal(tmp_path, capsys, change):
+    rows = _entries_via_command(tmp_path)
+    make, seq, words = THREE_CHANGES[change]
+    _put_rows(state_of(tmp_path), make(rows), seq)
+    st = OrderStepState(state_of(tmp_path))
+    changed = st.owner_entries()                                        # the chain inside the file reads it as good
+    st.close()
+    before = _listing(tmp_path)
+    capsys.readouterr()
+    code = owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n")
     err = capsys.readouterr().err
-    assert err.startswith("refused:") and "New York day" in err and "nothing was written" in err
-    path = Path(osx.state_path_for(osx.ledger_path_for(tmp_path / "memory", VENUE), VENUE))
-    if path.exists():
-        st = OrderStepState(path)
-        assert st.owner_entries() == []
-        st.close()
+    assert code == 2, (code, err)                                       # before addendum 4: written (code 0)
+    assert err.startswith("refused:") and words in err and "journal" in err and "nothing was written" in err
+    assert _listing(tmp_path) == before
+    diffs = osx.owner_entry_differences(changed, _paper.Journal(tmp_path / "journal").read(), venue=VENUE)
+    assert diffs and any(words in d for d in diffs), diffs
+
+
+def test_the_differences_in_words():
+    rows = [{"id": i, "prev_hash": f"p{i}", "hash": f"h{i}"} for i in (1, 2, 3)]
+    line = lambda i, h=None, venue=VENUE: {"type": "owner_entry", "venue": venue, "id": i, "prev_hash": f"p{i}",
+                                           "hash": h or f"h{i}"}
+    other = [{"type": "order_step", "venue": VENUE, "id": 9}, line(7, venue="another-venue")]
+    diff = osx.owner_entry_differences
+    assert diff(rows, other + [line(1), line(2), line(3)], venue=VENUE) == []
+    assert diff([], other, venue=VENUE) == []
+    got = diff(rows, [line(1), line(3)], venue=VENUE)
+    assert len(got) == 1 and "entry 2" in got[0] and "not in the journal" in got[0]
+    got = diff(rows[:2], [line(1), line(2), line(3)], venue=VENUE)    # a state file put back from an older copy
+    assert len(got) == 1 and "entry 3" in got[0] and "not in the state file" in got[0]
+    got = diff(rows, [line(1), line(2, "hx"), line(3)], venue=VENUE)
+    assert len(got) == 1 and "entry 2" in got[0] and "another hash" in got[0]
+    got = diff(rows, [line(1), line(3), line(2)], venue=VENUE)
+    assert len(got) == 1 and "order" in got[0]
+    got = diff(rows, [line(1), line(2), line(2), line(3)], venue=VENUE)
+    assert len(got) == 1 and "entry 2" in got[0] and "twice" in got[0]
+    assert diff(rows, [line(1), line(2), line(3), {"type": "owner_entry", "venue": VENUE, "id": "x"}], venue=VENUE)
+
+
+def test_only_the_command_calls_the_comparison_in_this_build():
+    src = Path(osx.__file__).read_text()
+    assert src.count("owner_entry_differences(") == 2                   # its definition and the command's own check
+    assert "owner_entry_differences" not in Path(cli.__file__).read_text()
+
+
+def test_a_journal_line_that_cannot_be_written_is_said_and_has_its_own_exit_code(tmp_path, capsys, monkeypatch):
+    def broken(self, day, entry):
+        raise OSError("the disk is full")
+    monkeypatch.setattr(_paper.Journal, "write", broken)
+    code = owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n")
+    assert code not in (0, 2, 1) and isinstance(code, int)
+    err = capsys.readouterr().err
+    assert "journal" in err and "the disk is full" in err and "state file" in err
+    st = OrderStepState(state_of(tmp_path))
+    assert len(st.owner_entries()) == 1                                 # the entry stays; the next command finds it
+    st.close()
+    monkeypatch.undo()
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n") == 2
+    assert "entry 1" in capsys.readouterr().err
+
+
+# ---- addendum 4, R13: a refusal writes nothing
+
+
+def _listing(root):
+    """Every path under `root` and every file's bytes."""
+    return {str(p.relative_to(root)): (p.read_bytes() if p.is_file() else "folder") for p in sorted(root.rglob("*"))}
+
+
+def _ok(*extra):
+    return ["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n", "--mark", "SPY=100", *extra]
+
+
+def _hold_lock(root, stack):
+    lock = osx._RunLock(str(state_of(root)))
+    assert lock.acquire()
+    stack.callback(lock.release)
+
+
+def _break_chain(root, stack):
+    if state_of(root).exists() and dump(state_of(root))["version"] == 2:
+        _bypass(state_of(root), "UPDATE owner_entries SET amount = '7' WHERE id = 1")
+    else:
+        pytest.skip("a layout-1 file has no entries to change")
+
+
+def _journal_only(root, stack):
+    _paper.Journal(root / "journal").write("2025-11-18", {"type": "owner_entry", "venue": VENUE, "id": 9,
+                                                          "prev_hash": "p", "hash": "h"})
+
+
+def _no_value(root, stack):
+    real = osx.book_figures
+    mp = stack.enter_context(pytest.MonkeyPatch.context())
+    mp.setattr(osx, "book_figures", lambda *a, **k: __import__("dataclasses").replace(
+        real(*a, **k), value=None, value_high=None, value_per_unit=None, cash_bounded=True,
+        bounded_by=("order b0-SPY: its fee is not known",)))
+
+
+def _no_day(root, stack):
+    mp = stack.enter_context(pytest.MonkeyPatch.context())
+    mp.setattr(osx, "wall_clock", lambda: float("nan"))
+
+
+def _other_layout(root, stack):
+    if state_of(root).exists():
+        con = sqlite3.connect(state_of(root))
+        con.execute("PRAGMA user_version = 7")
+        con.commit()
+        con.close()
+
+
+REFUSALS = {
+    "beside a run's own flag": (_ok("--propose"), None),
+    "without who": (["--owner-entry", "cash_in", "--amount", "5", "--note", "n", "--mark", "SPY=100"], None),
+    "without a note": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--mark", "SPY=100"], None),
+    "a figure missing": (["--owner-entry", "cash_in", "--who", "o", "--note", "n", "--mark", "SPY=100"], None),
+    "a figure the kind does not use": (_ok("--units", "3"), None),
+    "a figure that is not a positive decimal": (["--owner-entry", "cash_in", "--amount", "1e3", "--who", "o",
+                                                 "--note", "n", "--mark", "SPY=100"], None),
+    "a mark that is not SYMBOL=PRICE": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n",
+                                         "--mark", "SPY"], None),
+    "a symbol that is not plain": (["--owner-entry", "units_out", "--symbol", "a b", "--units", "1", "--who", "o",
+                                    "--note", "n", "--mark", "SPY=100"], None),
+    "units_out without its mark": (["--owner-entry", "units_out", "--symbol", "QQQ", "--units", "1", "--who", "o",
+                                    "--note", "n", "--mark", "SPY=100"], None),
+    "a held symbol without its mark": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n"], None),
+    "more than the book's cash": (["--owner-entry", "cash_out", "--amount", "999999999", "--who", "o", "--note", "n",
+                                   "--mark", "SPY=100"], None),
+    "more than the book holds": (["--owner-entry", "units_out", "--symbol", "SPY", "--units", "1000", "--who", "o",
+                                  "--note", "n", "--mark", "SPY=100"], None),
+    "the book's value not known": (_ok(), _no_value),
+    "a clock with no New York day": (_ok(), _no_day),
+    "a run holding the lock": (_ok(), _hold_lock),
+    "an entry changed in the file": (_ok(), _break_chain),
+    "the journal holding an entry the file does not": (_ok(), _journal_only),
+    "a state file of another layout": (_ok(), _other_layout),
+    "no venue": (None, None),
+}
+
+
+@pytest.mark.parametrize("layout", [1, 2])
+@pytest.mark.parametrize("refusal", list(REFUSALS))
+def test_prop_every_refusal_leaves_the_folder_and_every_file_as_they_were(tmp_path, capsys, base, layout, refusal):
+    """Addendum 4, R13: over every refusal the command has and both layouts, the listing of the root and every file's
+    bytes are the same before and after (the lock file, the state file's upgrade, the folder, the journal)."""
+    import contextlib
+    root = tmp_path / "root"
+    led, _ = _ledger_with(osx.ledger_path_for(root / "memory", VENUE), [10.0])
+    led.close()
+    if layout == 1:
+        layout1_state(base, state_of(root))
+    else:
+        assert owner(root, "--owner-entry", "cash_in", "--amount", "5000", "--mark", "SPY=100", "--who", "owner",
+                     "--note", "opening") == 0
+    args, prep = REFUSALS[refusal]
+    with contextlib.ExitStack() as stack:
+        if prep is not None:
+            prep(root, stack)
+        before = _listing(root)
+        capsys.readouterr()
+        if args is None:
+            code = cli.main(["--root", str(root), "order-step", *_ok()])
+        else:
+            code = owner(root, *args)
+        err = capsys.readouterr().err
+        assert code == 2 and err.startswith("refused:"), (code, err)
+        assert _listing(root) == before
 
 
 def test_the_order_step_without_the_owner_flag_is_called_as_before(tmp_path, monkeypatch):
