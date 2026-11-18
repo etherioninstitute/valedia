@@ -457,6 +457,15 @@ def resolution(cond, **kw):
     return r
 
 
+def oracle(cond, **kw):
+    """A resolution row of the oracle's own shape, as the lead read real ones (T47f): a price, no payouts."""
+    r = {"condition_id": cond, "extended_review": False, "last_update_timestamp": "1780104141", "log_index": "23",
+         "new_version_q": True, "price": "0", "proposed_price": "0", "question_id": "0xq" + cond[2:],
+         "reproposed_price": "69", "status": "resolved", "transaction_hash": "0xt", "was_disputed": False}
+    r.update(kw)
+    return r
+
+
 def test_resolutions_ask_up_to_twenty_conditions_in_one_get_with_no_pagination():
     def h(p, q):
         assert p == "/v2/resolutions"
@@ -840,6 +849,7 @@ VALIDATORS = {
     "position": (lambda r: pd.validate_position(r, "0xabc"), position(1)),
     "position_any_wallet": (lambda r: pd.validate_position(r), position(1)),
     "resolution": (lambda r: pd.validate_resolution(r, 1_800_000_000), resolution("0xc1")),
+    "resolution_oracle": (lambda r: pd.validate_resolution(r, 1_800_000_000), oracle("0xc1")),     # T47f
     "price_point": (lambda r: pd.validate_price_point(r, 1_800_000_000),
                     {"price": 0.5, "resolution_seconds": 60, "timestamp": 1_700_000_000}),
 }
@@ -1356,3 +1366,193 @@ def test_an_id_is_refused_if_and_only_if_its_single_request_got_the_exact_refusa
         seen["refused"] += len(refused)
         seen["other"] += sum(1 for v in alone.values() if v not in ("row", "refusal"))
     assert all(v > 20 for v in seen.values()), seen
+
+
+# ------------------------------------------------------------------ T47f: the oracle's own resolution rows (fifth amendment)
+BEFORE_T47F = "832977f"                              # the reader before T47f: the reference for every comparison
+TSMAX = 1_800_000_000
+ONE, HALF = "1000000000000000000", "500000000000000000"
+
+
+def _reader_before_t47f(tmp_path):
+    """polymarket_data.py at BEFORE_T47F, loaded as its own module from its own file. A missing history is a
+    failure that says so, never a skip; what is loaded is checked (it is the reader without the fifth amendment)."""
+    import subprocess
+    import sys
+    import types
+    root = Path(pd.__file__).resolve().parents[2]
+    got = subprocess.run(["git", "-C", str(root), "show", "%s:valedia_trader/venues/polymarket_data.py" % BEFORE_T47F],
+                         capture_output=True, text=True)
+    if got.returncode != 0:
+        pytest.fail("the reader at %s cannot be read from this checkout's history (git show: %s)"
+                    % (BEFORE_T47F, got.stderr.strip()[:200]), pytrace=False)
+    path = tmp_path / "pd_before_t47f.py"
+    path.write_text(got.stdout)
+    mod = types.ModuleType("pd_before_t47f")
+    mod.__file__ = str(path)
+    sys.modules["pd_before_t47f"] = mod
+    exec(compile(got.stdout, str(path), "exec"), mod.__dict__)
+    assert hasattr(mod, "REFUSED") and not hasattr(mod, "oracle_reading") and hasattr(pd, "oracle_reading")
+    return mod
+
+
+@pytest.mark.parametrize("price,payouts,word", [(ONE, [1_000_000, 0], "first"), ("0", [0, 1_000_000], "second"),
+                                                (HALF, [500_000, 500_000], "half")])
+def test_t47f_a_resolved_oracle_row_at_one_of_the_three_prices_is_a_known_resolution(price, payouts, word):
+    row, why = pd.validate_resolution(oracle("0x1", price=price), TSMAX)
+    assert why is None
+    assert row["payouts"] == payouts and all(type(x) is int for x in row["payouts"])     # the reported shape's form
+    assert row["resolved_ts"] == 1_780_104_141 and row["status"] == "resolved" and row["resolved_at"] is None
+    assert row["condition_id"] == "0x1" and row["reading"] == word
+    reported, _ = pd.validate_resolution(resolution("0x1", payouts=payouts), TSMAX)
+    assert json.dumps(row["payouts"]) == json.dumps(reported["payouts"])                # stored alike, byte for byte
+    extra = oracle("0x1", price=price, expected_settlement_time="1780100000", settlement_time_basis="x")
+    assert pd.validate_resolution(extra, TSMAX)[0]["payouts"] == payouts                # the 64 rows with two more keys
+
+
+NOT_KNOWN = [
+    ("69", "resolved", "1780104141", "not_resolved_price"), ("1", "resolved", "1780104141", "not_resolved_price"),
+    ("1000000000000000001", "resolved", "1780104141", "not_resolved_price"),
+    ("1e18", "resolved", "1780104141", "not_resolved_price"), (" 0", "resolved", "1780104141", "not_resolved_price"),
+    ("00", "resolved", "1780104141", "not_resolved_price"), (0, "resolved", "1780104141", "not_resolved_price"),
+    (10 ** 18, "resolved", "1780104141", "not_resolved_price"), (None, "resolved", "1780104141", "not_resolved_price"),
+    (1e18, "resolved", "1780104141", "not_resolved_price"), (True, "resolved", "1780104141", "not_resolved_price"),
+    ("0", "posed", "1780104141", "not_resolved_status"), ("69", "proposed", "1780104141", "not_resolved_status"),
+    (ONE, "challenged", "1780104141", "not_resolved_status"), ("0", "Resolved", "1780104141", "not_resolved_status"),
+    ("0", "resolved", None, "bad_time"), ("0", "resolved", "", "bad_time"), ("0", "resolved", "1780104141.0", "bad_time"),
+    ("0", "resolved", "-1780104141", "bad_time"), ("0", "resolved", "+1780104141", "bad_time"),
+    ("0", "resolved", "01780104141", "bad_time"), ("0", "resolved", "1780104141000", "bad_time"),
+    ("0", "resolved", " 1780104141", "bad_time"), ("0", "resolved", "1780104141\n", "bad_time"),
+    ("0", "resolved", "١٧٨٠١٠٤١٤١", "bad_time"),
+    ("0", "resolved", 1780104141, "bad_time"), ("0", "resolved", 1780104141.0, "bad_time"),
+    ("0", "resolved", "1577836799", "bad_time"), ("0", "resolved", str(TSMAX + 1), "bad_time"),
+    ("0", "resolved", "9" * 400, "bad_time"), ("0", "resolved", "2026-05-30T00:00:00Z", "bad_time")]
+
+
+@pytest.mark.parametrize("price,status,ts,word", NOT_KNOWN)
+def test_t47f_any_other_price_status_or_time_is_not_a_known_resolution_with_its_own_reason(price, status, ts, word):
+    row, why = pd.validate_resolution(oracle("0x1", price=price, status=status, last_update_timestamp=ts), TSMAX)
+    assert why is None and row["reading"] == word                                     # a row, never a reject
+    assert row["payouts"] is None and row["resolved_ts"] is None and row["status"] == status
+    missing = oracle("0x1", status=status)
+    del missing["last_update_timestamp"]
+    assert pd.validate_resolution(missing, TSMAX)[0]["reading"] == ("bad_time" if status == "resolved"
+                                                                      else "not_resolved_status")
+
+
+def test_t47f_the_span_edges_of_the_oracle_time_are_the_readers_own():
+    for ts, ok in ((1_577_836_800, True), (TSMAX, True), (1_577_836_799, False), (TSMAX + 1, False)):
+        row, _ = pd.validate_resolution(oracle("0x1", last_update_timestamp=str(ts)), TSMAX)
+        assert (row["resolved_ts"] == ts) is ok and row["reading"] == ("second" if ok else "bad_time")
+    now = 1_790_000_000                                                               # the client's own span
+    c, t, clock = client(lambda p, q: {"data": [oracle("0x1", last_update_timestamp=str(now + 86400)),
+                                                oracle("0x2", last_update_timestamp=str(now + 86401))]},
+                         wall=lambda: now)
+    w = c.resolutions(["0x1", "0x2"])
+    assert [r["reading"] for r in w.rows] == ["second", "bad_time"] and not w.rejects
+
+
+@pytest.mark.parametrize("extra", [{"payouts": [1_000_000, 0]}, {"payouts": None},
+                                   {"resolved_at": "2026-02-01T10:00:00Z"}, {"resolved_at": None},
+                                   {"payouts": [0, 1_000_000], "resolved_at": "2026-02-01T10:00:00Z"}])
+def test_t47f_a_row_that_mixes_the_two_shapes_is_not_a_known_resolution(extra):
+    row, why = pd.validate_resolution(oracle("0x1", price=ONE, **extra), TSMAX)
+    assert why is None and row["reading"] == "mixed_shape" and row["payouts"] is None and row["resolved_ts"] is None
+    assert row["resolved_at"] == extra.get("resolved_at")                             # what the row carried, kept
+    bad = pd.validate_resolution(oracle("0x1", payouts=[1, 2, 3]), TSMAX)             # a reject stays the reject
+    assert bad == (None, "bad_payouts")
+
+
+def test_t47f_a_row_of_neither_shape_reads_as_today_a_row_with_no_known_resolution(tmp_path):
+    old = _reader_before_t47f(tmp_path)
+    neither = {"condition_id": "0x1", "status": "resolved", "last_update_timestamp": "1780104141"}
+    assert pd.validate_resolution(neither, TSMAX) == old.validate_resolution(neither, TSMAX)
+    row, why = pd.validate_resolution(neither, TSMAX)
+    assert why is None and row["payouts"] is None and row["resolved_ts"] is None and "reading" not in row
+
+
+def _random_row(rng, oracle_share):
+    """A resolution row of either shape (or neither, or both), its fields drawn from plain and hostile values."""
+    values = [None, True, 0, -1, 1, 2 ** 63, 1.5, float("nan"), "", "x", "\ud800", "a\x00b", [], {}, [1, 2],
+              [1_000_000, 0], [0, 1_000_000], [500_000, 500_000], [1, 2, 3], [True, 0], "2026-02-01T10:00:00Z",
+              "2026-02-01T10:00:00", "1780104141", "0", ONE, HALF, "69", "resolved", "posed", 1780104141]
+    pick = lambda *xs: rng.choice(list(xs) + values) if rng.random() < 0.25 else rng.choice(xs)
+    r = {"condition_id": pick("0x%d" % rng.randrange(6)), "status": pick("resolved", "proposed", "posed")}
+    if rng.random() < oracle_share:
+        r.update(price=pick(ONE, "0", HALF, "69"), proposed_price="0", question_id="0xq",
+                 last_update_timestamp=pick("1780104141", "1700000000", str(TSMAX + 5)))
+        for k in ("payouts", "resolved_at"):
+            if rng.random() < 0.1:
+                r[k] = pick([1_000_000, 0], "2026-02-01T10:00:00Z")
+    else:
+        if rng.random() < 0.9:
+            r["payouts"] = pick([1_000_000, 0], [0, 1_000_000], [500_000, 500_000], None)
+        if rng.random() < 0.9:
+            r["resolved_at"] = pick("2026-02-01T10:00:00Z", "2025-07-01T00:00:00+00:00", None)
+        r.update(resolution_source="reported", last_update_timestamp=pick("2026-02-01T10:00:00Z", "1780104141"))
+    for k in list(r):
+        if rng.random() < 0.03:
+            del r[k]
+    return r
+
+
+def test_t47f_every_row_without_a_price_reads_byte_identical_to_the_reader_before_on_seeded_rows(tmp_path):
+    old = _reader_before_t47f(tmp_path)
+    import random
+    seen = {"kept": 0, "rejected": 0, "oracle": 0}
+    for seed in range(4000):
+        rng = random.Random(seed)
+        r = _random_row(rng, 0.5)
+        new_got, old_got = pd.validate_resolution(r, TSMAX), old.validate_resolution(r, TSMAX)
+        if "price" not in r:                                                          # reported or neither shape
+            assert repr(new_got) == repr(old_got), (seed, r)
+            seen["kept" if new_got[1] is None else "rejected"] += 1
+        else:                                                                         # the same rows kept, as before
+            assert new_got[1] == old_got[1], (seed, r)
+            if new_got[1] is None:
+                seen["oracle"] += 1
+                assert pd.resolution_identity(new_got[0]) == json.dumps(old_got[0], sort_keys=True), seed
+                assert {k: new_got[0][k] for k in ("condition_id", "status", "resolved_at")} == \
+                    {k: old_got[0][k] for k in ("condition_id", "status", "resolved_at")}
+    assert all(v > 300 for v in seen.values()), seen
+
+
+def test_t47f_batches_answer_store_and_set_aside_exactly_as_before_whatever_the_mix_of_shapes(tmp_path):
+    """Per id: the same answer word, the same rows set aside with the same reasons, and the same identities (a
+    row's identity is still the row as first read), on seeded services serving both shapes, repeats and conflicts."""
+    old = _reader_before_t47f(tmp_path)
+    import random
+    seen = {"duplicate": 0, "row_and_reject": 0, "repeated_row": 0, "conflicting_row": 0, "row": 0}
+    for seed in range(600):
+        rng = random.Random(seed)
+        ids = ["0x%d" % i for i in range(rng.randint(1, 20))]
+        rows = []
+        for x in ids:
+            for _ in range(rng.choice([0, 1, 1, 1, 2])):
+                r = _random_row(rng, 0.6)
+                r["condition_id"] = x
+                rows.append(r)
+                if rng.random() < 0.15:
+                    rows.append(dict(r))                                              # a true repeat
+                if rng.random() < 0.15 and "price" in r:
+                    rows.append(dict(r, price=rng.choice([ONE, "0", "69"])))           # alike as first read
+        rng.shuffle(rows)
+        got = {}
+        for mod in (old, pd):
+            c = mod.PolymarketData(lambda u: json.dumps({"data": rows}).encode(), sleep=lambda s: None,
+                                   clock=lambda: 0.0, now=lambda: "t", wall=lambda: TSMAX - 86400)
+            (batch, w, answers), = list(c.resolution_batches(ids))
+            got[mod] = (answers, [(json.dumps(raw, sort_keys=True, default=repr), why) for raw, why in w.raw],
+                        dict(w.rejects), len(w.rows))
+        assert got[old] == got[pd], seed
+        for a in got[pd][0].values():
+            seen[a] = seen.get(a, 0) + 1
+        for k, n in got[pd][2].items():
+            seen[k] = seen.get(k, 0) + n
+    assert all(seen[k] > 5 for k in ("duplicate", "row_and_reject", "repeated_row", "conflicting_row", "row")), seen
+
+
+def test_t47f_the_readings_are_named_and_the_three_prices_are_exact():
+    assert pd.ORACLE_READINGS == ("first", "second", "half", "not_resolved_status", "not_resolved_price", "bad_time",
+                                  "mixed_shape")
+    assert pd.ORACLE_PAYOUTS == {ONE: (1_000_000, 0), "0": (0, 1_000_000), HALF: (500_000, 500_000)}
