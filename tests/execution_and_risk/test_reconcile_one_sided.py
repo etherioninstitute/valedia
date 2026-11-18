@@ -110,7 +110,7 @@ def test_one_sided_surplus_is_clean_and_reported():
     assert out["position_differences"] == {} and out["position_shortfalls"] == {}
     assert out["owner_surplus"] == {"AAPL": {"book": 0.0, "venue": 4.0, "unapplied": 0.0, "surplus": 4.0},
                                     "SPY": {"book": 0.0, "venue": 13.5, "unapplied": 10.0, "surplus": 3.5}}
-    assert json.loads(led.last_reconcile()["summary"])["owner_surplus"]["SPY"]["surplus"] == 3.5
+    assert led.last_reconcile()["summary"]["owner_surplus"]["SPY"]["surplus"] == 3.5
     assert led.last_reconcile()["clean"] is True
     two = led.reconcile(venue, {})                           # the same answer two-sided: a difference, as on main
     assert two["clean"] is False and set(two["position_differences"]) == {"AAPL", "SPY"}

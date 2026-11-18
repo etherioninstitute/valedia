@@ -911,8 +911,17 @@ class OrderLedger:
     # ---- reconcile
 
     def reconcile(self, venue: LiveVenue, book_positions: dict[str, float], tolerance: float = 1e-6,
-                  settle_seconds: float = 120, recheck_seconds: float = 259200) -> dict:
+                  settle_seconds: float = 120, recheck_seconds: float = 259200, *, one_sided: bool = False) -> dict:
         """Ask the venue about every order still open on the ledger, write each new fill once, compare positions.
+
+        T51c S1 (R2): with `one_sided` (an account the owner also trades) a symbol is compared one way only: the
+        account holding the book plus its unapplied fills, or more, within `tolerance`, is clean, and what it holds
+        beyond that is listed under `owner_surplus` (the owner's, never a difference); the account holding less is
+        listed under `position_shortfalls`, in words naming the symbol, both figures and the two ordinary causes, and
+        makes the reconcile unclean (the ledger is then blocked as for any unclean reconcile). A figure that is not
+        finite stays a position difference. Without it (the default) nothing differs from before: no new key in the
+        record or the stored summary. `one_sided` must be True or False, or OrderError is raised and nothing is
+        recorded.
 
         Also asked, for `recheck_seconds` after they reached that state: every order marked never_arrived (one the
         venue now knows has turned up: an anomaly, moved to the venue's state, with its fills), and every order
@@ -929,10 +938,14 @@ class OrderLedger:
         when the write behind it was committed (an order whose write failed is unresolved). An order the venue
         reported cancelled or rejected with nothing filled is not asked again; if the venue later contradicts
         that, only the position comparison shows it."""
+        if type(one_sided) is not bool:
+            raise OrderError(f"one_sided must be True or False, not {_safe_repr(one_sided)}; nothing was recorded")
         now = self.clock()
         out = {"clean": False, "orders_checked": 0, "updated": [], "fills": [], "unresolved": [], "anomalies": [],
                "position_differences": {}, "positions_error": None, "positions_error_kind": None, "recheck_errors": [],
                "notices": [], "time": now}
+        if one_sided:                                     # T51c S1: these keys only in a one-sided record
+            out["owner_surplus"], out["position_shortfalls"] = {}, {}
         try:
             since = now - recheck_seconds
             todo = [(r["tag"], False) for r in self.orders(CHECKED)]
@@ -943,10 +956,10 @@ class OrderLedger:
             for tag, recheck in todo:
                 out["orders_checked"] += 1
                 self._reconcile_one(venue, tag, recheck, now, settle_seconds, out)
-            self._compare_positions(venue, book_positions, tolerance, out)
+            self._compare_positions(venue, book_positions, tolerance, out, one_sided)
             still = self.orders(UNSETTLED)
             out["clean"] = not (out["unresolved"] or still or out["anomalies"] or out["position_differences"]
-                                or out["positions_error"])
+                                or out["positions_error"] or out.get("position_shortfalls"))
         except Exception as exc:                          # the ledger's own failure: recorded, not clean
             out["clean"] = False
             out["anomalies"].append({"tag": None, "kind": "reconcile_failed",
@@ -962,7 +975,8 @@ class OrderLedger:
             self._db.execute("INSERT INTO reconciles (time, clean, summary) VALUES (?,?,?)", (now, int(out["clean"]), summary))
         return out
 
-    def _compare_positions(self, venue: LiveVenue, book_positions, tolerance: float, out: dict) -> None:
+    def _compare_positions(self, venue: LiveVenue, book_positions, tolerance: float, out: dict,
+                           one_sided: bool = False) -> None:
         try:
             held = dict(venue.positions())
         except Exception as exc:
@@ -985,6 +999,18 @@ class OrderLedger:
             unapplied[f["symbol"]] = unapplied.get(f["symbol"], 0.0) + f["units"]
         for sym in sorted(set(held) | set(book) | set(unapplied)):
             b, v, u = book.get(sym, 0.0), held.get(sym, 0.0), unapplied.get(sym, 0.0)
+            if one_sided and _finite(b) and _finite(v):   # T51c S1: the account may hold more; never less
+                gap = float(v) - (float(b) + u)
+                if gap > tolerance:
+                    out["owner_surplus"][sym] = {"book": b, "venue": v, "unapplied": u, "surplus": gap}
+                elif -gap > tolerance:
+                    out["position_shortfalls"][sym] = {
+                        "book": b, "venue": v, "unapplied": u, "short": -gap,
+                        "reason": f"the account holds {float(v):g} of {_one_line(sym)}, under the {float(b) + u:g} the "
+                                  f"book counts as its own (book {float(b):g}, unapplied {u:g}); the ordinary causes are "
+                                  "that the owner sold shares the book counts as its own, or a split; the whole book "
+                                  "stops until a person has looked"}
+                continue
             if not (_finite(b) and _finite(v)) or abs(float(b) + u - float(v)) > tolerance:
                 out["position_differences"][sym] = {"book": b, "venue": v, "unapplied": u}
 
