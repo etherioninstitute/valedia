@@ -9,14 +9,18 @@ local check of R3 (called by nothing yet).
   words. A `units_out` clears exactly the shortfall it names; a `split` keeps the value and changes the units.
 - The owner's command (`order-step --owner-entry KIND`): refuses without who and note, refuses a figure that is not a
   positive decimal, defaults no figure, prints what it wrote, and is refused beside the run's own flags and while a
-  run holds the lock.
+  run holds the lock. T51c S4b: its marks come from a stand-in of the order step's quote source (never typed), and
+  `owner()` runs it as the owner does: the preview, then the confirm with the code the preview printed.
 - R3: every tag this code wrote to the journal, a ticket or the state's send record must be in the ledger.
 - Outcome 4: practice runs (with and without fractional) equal cdd5371's order step, venue calls, journal, ledger,
   summary and files, apart from the state file's layout number and its new empty table.
 Nothing here opens a socket or names a real folder: every root is the test's own."""
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
+import re
 import socket
 import sqlite3
 import subprocess
@@ -66,6 +70,24 @@ def base(tmp_path_factory):
     spec.loader.exec_module(mod)
     assert mod.STATE_LAYOUT == 1 and not hasattr(mod, "book_figures")
     return mod
+
+
+PRICES: dict = {}                      # T51c S4b: the stand-in quote source's prices, reset for every test
+
+
+@pytest.fixture(autouse=True)
+def market(monkeypatch):
+    """T51c S4b: the order step's quote source stood in: each price in PRICES, stamped as the last one-minute bar is
+    (at the clock inside the session; outside it, at the start of the last session's last minute)."""
+    PRICES.clear()
+    PRICES["SPY"] = 100.0
+
+    def quotes(symbols):
+        now = osx.wall_clock()
+        inside, close, _ = osx.owner_mark_close(T.CAL, now)
+        at = now if inside else close - 60.0
+        return {s: (PRICES[s], at) for s in symbols if s in PRICES}
+    monkeypatch.setattr(osx, "minute_quotes", quotes)
 
 
 def dump(path):
@@ -328,13 +350,24 @@ def _ledger_with(path, fills_units, symbol="SPY", price=100.0):
 
 
 def owner(root, *args):
-    return cli.main(["--root", str(root), "order-step", "--venue", VENUE, *args])
+    """The owner's command as he runs it (T51c S4b): the preview, then the same command with --confirm and the code it
+    printed; a refused preview is the answer. Given --confirm, a repair or no kind, the one call as given."""
+    base = ["--root", str(root), "order-step", "--venue", VENUE, *args]
+    if "--confirm" in args or "--owner-entry-rejournal" in args or "--owner-entry" not in args:
+        return cli.main(base)
+    shown = io.StringIO()
+    with contextlib.redirect_stdout(shown):
+        code = cli.main(base)
+    if code != 0:
+        return code
+    (number,) = re.findall(r"^code: ([0-9]{6})$", shown.getvalue(), re.M)
+    return cli.main([*base, "--confirm", number])
 
 
 def test_units_out_clears_exactly_the_shortfall_it_names(tmp_path, capsys):
     mem = tmp_path / "memory"
     led, v = _ledger_with(osx.ledger_path_for(mem, VENUE), [10.0])
-    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "2000", "--mark", "SPY=100",
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "2000",
                  "--who", "owner", "--note", "opening") == 0
     v.held = {"SPY": 7.0}                                               # he took 3 of the book's shares
     state = OrderStepState(osx.state_path_for(osx.ledger_path_for(mem, VENUE), VENUE))
@@ -344,11 +377,11 @@ def test_units_out_clears_exactly_the_shortfall_it_names(tmp_path, capsys):
         return {s: float(u) for s, u in fig.units.items()}
     out = led.reconcile(v, book(), one_sided=True)
     assert out["position_shortfalls"]["SPY"]["short"] == 3.0
-    assert owner(tmp_path, "--owner-entry", "units_out", "--symbol", "SPY", "--units", "2", "--mark", "SPY=100",
+    assert owner(tmp_path, "--owner-entry", "units_out", "--symbol", "SPY", "--units", "2",
                  "--who", "owner", "--note", "took two") == 0
     out = led.reconcile(v, book(), one_sided=True)
     assert out["position_shortfalls"]["SPY"]["short"] == 1.0 and out["clean"] is False
-    assert owner(tmp_path, "--owner-entry", "units_out", "--symbol", "SPY", "--units", "1", "--mark", "SPY=100",
+    assert owner(tmp_path, "--owner-entry", "units_out", "--symbol", "SPY", "--units", "1",
                  "--who", "owner", "--note", "took one more") == 0
     out = led.reconcile(v, book(), one_sided=True)
     assert out["clean"] is True and out["position_shortfalls"] == {} and out["owner_surplus"] == {}
@@ -360,11 +393,13 @@ def test_units_out_clears_exactly_the_shortfall_it_names(tmp_path, capsys):
 def test_split_keeps_the_value_and_changes_the_units(tmp_path, capsys):
     mem = tmp_path / "memory"
     led, v = _ledger_with(osx.ledger_path_for(mem, VENUE), [4.0], price=200.0)
-    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "1000", "--mark", "SPY=200",
+    PRICES["SPY"] = 200.0
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "1000",
                  "--who", "owner", "--note", "opening") == 0
     state = OrderStepState(osx.state_path_for(osx.ledger_path_for(mem, VENUE), VENUE))
     before = book_figures(led.fills(), led.orders(), state.owner_entries(), {"SPY": 200.0}, "2025-11-18", now=NOW)
-    assert owner(tmp_path, "--owner-entry", "split", "--symbol", "SPY", "--ratio", "4", "--mark", "SPY=50",
+    PRICES["SPY"] = 50.0                                                # the quote after the split
+    assert owner(tmp_path, "--owner-entry", "split", "--symbol", "SPY", "--ratio", "4",
                  "--who", "owner", "--note", "four for one") == 0
     after = book_figures(led.fills(), led.orders(), state.owner_entries(), {"SPY": 50.0}, "2025-11-18", now=NOW)
     assert after.units == {"SPY": D("16.0")} and after.value == before.value
@@ -379,9 +414,10 @@ def test_split_keeps_the_value_and_changes_the_units(tmp_path, capsys):
 def test_second_run_same_day_same_book(tmp_path, capsys):
     mem = tmp_path / "memory"
     led, _ = _ledger_with(osx.ledger_path_for(mem, VENUE), [3.0, 2.0])
-    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5000", "--mark", "SPY=101",
+    PRICES["SPY"] = 101.0
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5000",
                  "--who", "owner", "--note", "opening") == 0
-    assert owner(tmp_path, "--owner-entry", "cash_out", "--amount", "125.75", "--mark", "SPY=101",
+    assert owner(tmp_path, "--owner-entry", "cash_out", "--amount", "125.75",
                  "--who", "owner", "--note", "a withdrawal") == 0
     path = osx.state_path_for(osx.ledger_path_for(mem, VENUE), VENUE)
     figs = []
@@ -432,8 +468,7 @@ def test_a_figure_that_is_not_a_positive_decimal_is_refused(tmp_path, capsys, fi
 @pytest.mark.parametrize("args, words", [
     (["--owner-entry", "cash_in"], "amount"),
     (["--owner-entry", "cash_out"], "amount"),
-    (["--owner-entry", "units_out", "--symbol", "SPY", "--mark", "SPY=100"], "units"),
-    (["--owner-entry", "units_out", "--symbol", "SPY", "--units", "1"], "mark"),
+    (["--owner-entry", "units_out", "--symbol", "SPY"], "units"),
     (["--owner-entry", "split", "--symbol", "SPY"], "ratio"),
     (["--owner-entry", "split", "--ratio", "2"], "symbol"),
     (["--owner-entry", "cash_in", "--amount", "5", "--units", "3"], "units"),
@@ -445,10 +480,12 @@ def test_no_figure_is_defaulted_and_none_is_taken_that_the_kind_does_not_use(tmp
 
 
 def test_a_symbol_the_book_holds_needs_its_mark(tmp_path, capsys):
+    """T51c S4b: a fund the book holds without a usable quote refuses, naming it; no figure is typed instead."""
     _ledger_with(osx.ledger_path_for(tmp_path / "memory", VENUE), [2.0])[0].close()
+    PRICES.clear()
     assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--who", "owner", "--note", "n") == 2
     err = capsys.readouterr().err
-    assert "SPY" in err and "--mark" in err
+    assert "SPY: no quote" in err and "no usable quote" in err
     st = OrderStepState(osx.state_path_for(osx.ledger_path_for(tmp_path / "memory", VENUE), VENUE))
     assert st.owner_entries() == []
     st.close()
@@ -514,7 +551,7 @@ def test_the_command_is_refused_when_the_clock_gives_no_new_york_day(tmp_path, c
 
 def test_the_clock_is_read_once_and_that_reading_is_the_entrys_time_and_day(tmp_path, capsys, monkeypatch):
     """Addendum 4, R13: one reading of the clock; a clock that would give no day on a later reading changes nothing."""
-    readings = iter([1_763_478_000.0])
+    readings = iter([1_763_478_000.0] * 2)                              # S4b: one reading a run, preview and confirm
     monkeypatch.setattr(osx, "wall_clock", lambda: next(readings, float("nan")))
     assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n") == 0
     st = OrderStepState(osx.state_path_for(osx.ledger_path_for(tmp_path / "memory", VENUE), VENUE))
@@ -714,14 +751,14 @@ def test_a_layout_1_file_is_read_as_no_entries_and_upgraded_only_by_an_entry_wri
     led.close()
     layout1_state(base, state_of(tmp_path))
     assert osx._owner_entries_read_only(state_of(tmp_path)) == [] and dump(state_of(tmp_path))["version"] == 1
-    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--mark", "SPY=100", "--who", "o",
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--who", "o",
                  "--note", "n") == 0
     assert dump(state_of(tmp_path))["version"] == 2 and [ln["id"] for ln in journaled(tmp_path)] == [1]
 
 
 def test_only_the_command_calls_the_comparison_in_this_build():
     src = Path(osx.__file__).read_text()
-    assert src.count("owner_entry_differences(") == 2                   # its definition and the command's own check
+    assert src.count("owner_entry_differences(") == 3                   # its definition, the command's check, its repair's
     assert "owner_entry_differences" not in Path(cli.__file__).read_text()
 
 
@@ -750,7 +787,7 @@ def _listing(root):
 
 
 def _ok(*extra):
-    return ["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n", "--mark", "SPY=100", *extra]
+    return ["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n", *extra]
 
 
 def _hold_lock(root, stack):
@@ -782,6 +819,11 @@ def _clock_behind(root, stack):
 def _needs_a_holding(root, stack):
     if not osx.ledger_path_for(root / "memory", VENUE).exists():
         pytest.skip("no ledger, so the book holds nothing to mark")
+    PRICES.clear()                                                      # T51c S4b: the quote source has none
+
+
+def _qqq_quoted(root, stack):
+    PRICES["QQQ"] = 100.0                                               # R21 judged, not the quote
 
 
 def _journal_only(root, stack):
@@ -814,38 +856,32 @@ def _other_layout(root, stack):
 
 REFUSALS = {
     "beside a run's own flag": (_ok("--propose"), None),
-    "without who": (["--owner-entry", "cash_in", "--amount", "5", "--note", "n", "--mark", "SPY=100"], None),
-    "without a note": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--mark", "SPY=100"], None),
-    "a figure missing": (["--owner-entry", "cash_in", "--who", "o", "--note", "n", "--mark", "SPY=100"], None),
+    "without who": (["--owner-entry", "cash_in", "--amount", "5", "--note", "n"], None),
+    "without a note": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o"], None),
+    "a figure missing": (["--owner-entry", "cash_in", "--who", "o", "--note", "n"], None),
     "a figure the kind does not use": (_ok("--units", "3"), None),
     "a figure that is not a positive decimal": (["--owner-entry", "cash_in", "--amount", "1e3", "--who", "o",
-                                                 "--note", "n", "--mark", "SPY=100"], None),
-    "a mark that is not SYMBOL=PRICE": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n",
-                                         "--mark", "SPY"], None),
+                                                 "--note", "n"], None),
+    "a mark typed (T51c S4b)": (_ok("--mark", "SPY=100"), None),
     "a symbol that is not plain": (["--owner-entry", "units_out", "--symbol", "a b", "--units", "1", "--who", "o",
-                                    "--note", "n", "--mark", "SPY=100"], None),
-    "units_out without its mark": (["--owner-entry", "units_out", "--symbol", "QQQ", "--units", "1", "--who", "o",
-                                    "--note", "n", "--mark", "SPY=100"], None),
-    "a held symbol without its mark": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n"],
-                                       _needs_a_holding),
-    "who over 200 characters": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o" * 201, "--note", "n",
-                                 "--mark", "SPY=100"], None),
-    "a note over 1000 characters": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n" * 1001,
-                                     "--mark", "SPY=100"], None),
-    "who holding a newline": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o\nx", "--note", "n",
-                               "--mark", "SPY=100"], None),
-    "a note holding a tab": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n\tx",
-                              "--mark", "SPY=100"], None),
+                                    "--note", "n"], None),
+    "units_out of a fund without a quote": (["--owner-entry", "units_out", "--symbol", "QQQ", "--units", "1", "--who", "o",
+                                    "--note", "n"], None),
+    "a held fund without a quote": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n"],
+                                    _needs_a_holding),
+    "who over 200 characters": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o" * 201, "--note", "n"], None),
+    "a note over 1000 characters": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n" * 1001], None),
+    "who holding a newline": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o\nx", "--note", "n"], None),
+    "a note holding a tab": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n\tx"], None),
     "a clock behind the last entry": (_ok(), _clock_behind),
     "a split of a symbol the book does not hold": (["--owner-entry", "split", "--symbol", "QQQ", "--ratio", "2",
-                                                    "--who", "o", "--note", "n", "--mark", "SPY=100"], None),   # R21
+                                                    "--who", "o", "--note", "n"], _qqq_quoted),   # R21
     **{f"a production venue's name {name!r}": (_ok("--venue", name), None)                         # addendum 7, R23
        for name in ("webull-production", "webull-production-events", "WEBULL-Production", "webull-production.",
                     "webull-production ")},
-    "more than the book's cash": (["--owner-entry", "cash_out", "--amount", "999999999", "--who", "o", "--note", "n",
-                                   "--mark", "SPY=100"], None),
+    "more than the book's cash": (["--owner-entry", "cash_out", "--amount", "999999999", "--who", "o", "--note", "n"], None),
     "more than the book holds": (["--owner-entry", "units_out", "--symbol", "SPY", "--units", "1000", "--who", "o",
-                                  "--note", "n", "--mark", "SPY=100"], None),
+                                  "--note", "n"], None),
     "the book's value not known": (_ok(), _no_value),
     "a clock with no New York day": (_ok(), _no_day),
     "a run holding the lock": (_ok(), _hold_lock),
@@ -871,7 +907,7 @@ def test_prop_every_refusal_leaves_the_folder_and_every_file_as_they_were(tmp_pa
     if layout == "layout 1":
         layout1_state(base, state_of(root))
     elif layout == "layout 2":
-        assert owner(root, "--owner-entry", "cash_in", "--amount", "5000", "--mark", "SPY=100", "--who", "owner",
+        assert owner(root, "--owner-entry", "cash_in", "--amount", "5000", "--who", "owner",
                      "--note", "opening") == 0
     args, prep = REFUSALS[refusal]
     lock = Path(str(state_of(root)) + ".lock")
@@ -1069,6 +1105,7 @@ def _opening_then(tmp_path, monkeypatch, trades):
     _at(monkeypatch, T0 - 600)
     assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5000", "--who", "owner", "--note", "opening") == 0
     _ledger_trades(osx.ledger_path_for(mem, VENUE), trades)
+    PRICES["SPY"] = 150.0
     return osx.state_path_for(osx.ledger_path_for(mem, VENUE), VENUE)
 
 
@@ -1079,7 +1116,7 @@ def test_r22_the_command_values_a_book_after_purchases_with_no_fee(tmp_path, cap
     state_path = _opening_then(tmp_path, monkeypatch, [(10.0, 100.0, None), (5.0, 200.0, None)])
     capsys.readouterr()
     _at(monkeypatch, T0 + later)
-    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "100", "--mark", "SPY=150", "--who", "owner",
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "100", "--who", "owner",
                  "--note", "a second deposit") == 0, capsys.readouterr().err
     st = OrderStepState(state_path)
     first, second = st.owner_entries()
@@ -1101,7 +1138,7 @@ def test_r22_the_code_before_this_slice_refuses_the_same_book_value_not_known(tm
     monkeypatch.setattr(osx, "book_figures", lambda *a, now=None, **k: osx.BookFigures(
         **{x.name: getattr(old.book_figures(*a, **k), x.name) for x in dataclasses.fields(old.BookFigures)},
         fees_taken_as_none=0, open_by=()))
-    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "100", "--mark", "SPY=150", "--who", "owner",
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "100", "--who", "owner",
                  "--note", "a second deposit") == 2
     assert "value is not known" in capsys.readouterr().err
 
@@ -1111,7 +1148,7 @@ def test_r22_a_sale_with_no_fee_still_refuses_in_words_that_say_why(tmp_path, ca
     before = state_path.read_bytes()
     capsys.readouterr()
     _at(monkeypatch, T0 + 3_600)
-    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "100", "--mark", "SPY=150", "--who", "owner",
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "100", "--who", "owner",
                  "--note", "a second deposit") == 2
     err = capsys.readouterr().err
     assert "the book's value is not known (order s1-SPY: its fee is not known)" in err, err    # why, as worded before
@@ -1128,9 +1165,9 @@ def test_r22_the_command_hands_book_figures_its_one_clock_reading(tmp_path, caps
         return real(*a, **k)
     monkeypatch.setattr(osx, "book_figures", spy)
     _at(monkeypatch, T0 + 1_234.5)
-    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "1", "--mark", "SPY=150", "--who", "owner",
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "1", "--who", "owner",
                  "--note", "n") == 0
-    assert seen == [("2025-11-18", T0 + 1_234.5)]
+    assert seen and set(seen) == {("2025-11-18", T0 + 1_234.5)}      # S4b: the held funds and the value, each run
 
 
 def test_r32_the_command_names_the_sale_not_the_bounded_purchase(tmp_path, capsys, monkeypatch):
@@ -1140,7 +1177,7 @@ def test_r32_the_command_names_the_sale_not_the_bounded_purchase(tmp_path, capsy
     before = state_path.read_bytes()
     capsys.readouterr()
     _at(monkeypatch, T0 + 3_600)
-    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "100", "--mark", "SPY=150", "--who", "owner",
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "100", "--who", "owner",
                  "--note", "a second deposit") == 2
     err = capsys.readouterr().err
     assert "the book's value is not known (order s1-SPY: its fee is not known" in err, err

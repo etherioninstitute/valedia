@@ -912,3 +912,48 @@ def test_r32_many_open_orders_are_named_first_and_the_count_survives_the_cut():
     words = str(got.value)
     assert f"the book's value is not known (order s00-QQQ-{'x' * 30}: its fee is not known" in words
     assert "1 other order is only bounded" in words and "a0-SPY" not in words
+
+
+# ---- T51c S4b: three follow-ups from the fee rule's check (book_figures and its refusal words)
+
+
+def test_s4b_a_refusal_names_the_second_and_later_open_orders_not_only_the_first():
+    f, o = _bounded_and(None)
+    tags = ("s1-QQQ", "s2-IWM", "s3-DIA")
+    for i, tag in enumerate(tags):
+        sym = tag.split("-")[1]
+        o.append(done(order(tag, sym, -1.0, limit=49.0, fee=None)))
+        f.append(fill(10 + i, tag, sym, -1.0, 50.0, fee=None, t=T0 + 10 + i))
+    fig = book_figures(f, o, [opening()], {"SPY": 100.0, "QQQ": 50.0, "IWM": 50.0, "DIA": 50.0}, DAY, now=NOW)
+    with pytest.raises(BookError) as got:
+        next_entry(fig, "cash_in", amount=D("1"))
+    words = str(got.value)
+    for tag in tags:                                              # each open order, the second and third too
+        assert f"order {tag}: its fee is not known" in words, (tag, words)
+    assert "1 other order is only bounded" in words and "a0-SPY" not in words
+
+
+def test_s4b_a_sales_units_without_a_price_under_a_limit_leave_the_upper_bound_open():
+    o = [done(order("b0-QQQ", "QQQ", 10.0, limit=51.0, fee=0.0)), done(order("s1-QQQ", "QQQ", -4.0, limit=49.0, fee=0.0))]
+    f = [fill(1, "b0-QQQ", "QQQ", 10.0, 50.0, fee=0.0), fill(2, "s1-QQQ", "QQQ", -4.0, None, fee=0.0, t=T0 + 1)]
+    fig = book_figures(f, o, [opening()], {"QQQ": 50.0}, DAY, now=NOW)
+    line = "order s1-QQQ: 4.0 units without a price, bounded by its limit 49.0"
+    assert fig.open_by == (line,) and fig.bounded_by == (line,) and fig.cash_bounded is True
+    assert fig.cash_high is None and fig.value_high is None             # the most it brought is not known
+    assert fig.cash_low == D("10000") - D("500.0") + D("4.0") * D("49.0")   # the least it brought: at its limit
+    assert fig.value == fig.cash_low + D("6.0") * D("50.0")
+
+
+def test_s4b_orders_are_grouped_by_their_whole_tag_not_by_the_cut_one():
+    """Two orders whose tags share their first 60 characters are two orders: one leaves a bound open (a sale with an
+    empty fee), one is only bounded (a purchase the venue reported no fee for); the refusal counts the second."""
+    stem = "x" * 60
+    a, b = f"{stem}-a-QQQ", f"{stem}-b-QQQ"
+    o = [done(order(a, "QQQ", 10.0, limit=51.0, fee=None)), done(order(b, "QQQ", -4.0, limit=49.0, fee=None))]
+    f = [fill(1, a, "QQQ", 10.0, 50.0, fee=None), fill(2, b, "QQQ", -4.0, 50.0, fee=None, t=T0 + 1)]
+    fig = book_figures(f, o, [opening()], {"QQQ": 50.0}, DAY, now=NOW)
+    assert len(fig.bounded_by) == 2 and len(fig.open_by) == 1 and fig.value is None
+    with pytest.raises(BookError) as got:
+        next_entry(fig, "cash_in", amount=D("1"))
+    assert "1 other order is only bounded" in str(got.value), str(got.value)
+    assert fig.bounded_orders == frozenset({a, b}) and fig.open_orders == frozenset({b})
