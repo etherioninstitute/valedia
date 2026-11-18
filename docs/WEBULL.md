@@ -486,7 +486,9 @@ not wired yet:
 - **The owner's entries**: the order step's state file is now layout 2 (a layout-1 file is upgraded the first time it
   is opened, every row kept; the order step before this build refuses a layout-2 file in words, so going back to it
   needs the layout-1 file back). The new table `owner_entries` is append-only and hash-chained: an entry changed or
-  removed afterwards is found and refused in words. The old `equity` table is kept as it was.
+  removed afterwards is found and refused in words. A second new table, `book_nav`, will hold the book's own value
+  per unit, its bounds, the marks it was valued at and the latest entry it includes, run by run, for the day's
+  loss and the drawdown of S4; nothing writes or reads it yet. The old `equity` table is kept as it was.
 - **A local check** (`untracked_tags`): every tag the order step wrote to the journal, a ticket or its send record
   must be in the ledger (a ledger put back from an older copy shows up here). Called by nothing yet.
 

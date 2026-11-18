@@ -989,6 +989,9 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None) -
     ledger_path = ledger_path_for(paths.memory, venue)
     state_path = state_path_for(ledger_path, venue)
     clock = clock if clock is not None else wall_clock
+    no_day = "the clock gives no New York day, so the entry has no day; nothing was written"
+    if _ny_day(clock()) is None:                          # before the lock, the folder or the state file
+        return refuse(no_day)
     lock = _RunLock(str(state_path))
     if not lock.acquire():
         return refuse("an order-step run holds this venue's state file now; write the entry once it has ended; "
@@ -1004,8 +1007,11 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None) -
                 ro.close()
         state = OrderStepState(state_path, clock=clock)
         entries = state.owner_entries()
-        now = float(clock())
+        now = clock()
         day = _ny_day(now)
+        if day is None:
+            return refuse(no_day)
+        now = float(now)
         if kind == "split":                               # valued after the split, at the marks after it
             last = entries[-1]["units_after"] if entries else "0"
             entries = entries + [{"id": len(entries) + 1, "time": now, "kind": "split", "symbol": symbol,
@@ -1410,8 +1416,18 @@ _STATE_UPGRADE_1_TO_2 = [
     "BEGIN SELECT RAISE(ABORT, 'owner entries are append-only'); END",
     "CREATE TRIGGER owner_entries_no_delete BEFORE DELETE ON owner_entries "
     "BEGIN SELECT RAISE(ABORT, 'owner entries are append-only'); END",
+    # The book's own value history for S4's day loss and drawdown, keyed like `equity` (an id, the New York day, the
+    # time; several runs a day): what book_figures yields (units outstanding, value per unit, the value's bounds,
+    # cash_bounded) as exact decimal text, the run's batch, the marks it was valued at (canonical JSON of decimal text)
+    # and their sha256, and the hash of the latest owner entry it includes, so that a restart, a second run the same
+    # day and a reader a year later can recompute it. Written and read by nothing in this build.
+    "CREATE TABLE book_nav (id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL, time REAL NOT NULL, "
+    "batch TEXT NOT NULL, units_outstanding TEXT NOT NULL, value_per_unit TEXT, value_low TEXT, value_high TEXT, "
+    "cash_bounded INTEGER NOT NULL CHECK (cash_bounded IN (0, 1)), marks TEXT NOT NULL, marks_hash TEXT NOT NULL, "
+    "entry_hash TEXT NOT NULL)",
 ]
-_LAYOUT2_TABLES = _LAYOUT1_TABLES | {"owner_entries"}
+_LAYOUT2_NEW = frozenset({"owner_entries", "book_nav"})
+_LAYOUT2_TABLES = _LAYOUT1_TABLES | _LAYOUT2_NEW
 _ENTRY_FIELDS = ("id", "time", "day", "kind", "symbol", "amount", "units", "ratio", "mark", "units_before",
                  "units_after", "value_per_unit_before", "value_per_unit_after", "who", "note", "prev_hash")
 _GENESIS = "0" * 64
@@ -1458,7 +1474,7 @@ class OrderStepState:
                 tables = {r[0] for r in self._db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
                 tables.discard("sqlite_sequence")
                 if tables and not ((version == 1 and tables <= _LAYOUT1_TABLES)
-                                   or (version == STATE_LAYOUT and "owner_entries" in tables and tables <= _LAYOUT2_TABLES)):
+                                   or (version == STATE_LAYOUT and _LAYOUT2_NEW <= tables <= _LAYOUT2_TABLES)):
                     raise OrderStepError(f"{path} is not an order-step state file of layout 1 or {STATE_LAYOUT}; it is "
                                          "not opened")
                 if not tables:
