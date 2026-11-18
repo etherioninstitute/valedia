@@ -81,9 +81,11 @@ trading (his word, 2026-11-17).
    MARKET sale accepted (SPY 0.31095; its fill is read at the next reconcile); a whole-share sale filled
    (XLK). Not seen, by design: a closing sale under 5 dollars (the step holds it back). Also seen: no fee
    is reported on a purchase and 0.02 on each sale; the venue's holding changes before the order's status
-   says filled, and the next reconcile settles it. **NEXT, before build B's rules:** MEASURE the age of the
-   quote for each of the fifteen funds over a session (the remainder leg of the XLK sale was held back
-   because its quote was over 120 s old; with most funds like that, fractional legs would rarely go).
+   says filled, and the next reconcile settles it. MEASURED the same morning (375 readings of the order step's
+   own quote for the fifteen funds over twenty minutes): 370 within the 120 s limit, median age 39 s; only
+   DBC (thinly traded) missed, 5 times in 25. The remainder leg of the XLK sale was held back for another
+   reason: it followed its own whole-share leg and was judged on the quote asked for before that leg went.
+   **For build B:** the remainder leg asks once more for its own quote right before it is judged.
 3. **NEXT** T51 build B: the proof reading (only fills of this code path count; one purchase and one sale in
    clean batches), the owner's consent field for live fractions, the live opening, and the FIRST-CONTACT RULE
    (in production one fractional order per run until one has filled and reconciled cleanly: practice is looser
