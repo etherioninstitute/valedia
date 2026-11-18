@@ -52,11 +52,11 @@ nothing here repeats itself: `pass` reads once and ends; whether and how often i
   status, and whether the store is consistent.
 
 The last line of every `pass` starts with one word for how it ended, and its exit code tells the ends apart:
-    DONE         0  every leader's read was good
+    DONE         0  every leader's read was good, or past the page limit (a known state: the line counts them)
     LOCKED       2  another pass holds STORE.lock; nothing done
     REFUSED      3  nothing done: no leaders fixed yet, or the store's folder, lock file or store cannot be
                     made, opened or written
-    FAILED       4  the pass ran; at least one wallet's read failed (read_error, page_limit, rows_shrank)
+    FAILED       4  the pass ran; at least one wallet's read failed (read_error, rows_shrank)
     STOPPED      5  the memory guard stopped the pass between wallets (--max-memory-mb)
     INTERNAL     6  the pass ran; at least one wallet's read ended in internal_error
     SHAPE        7  the store was made by another version of the record, or is not its store; nothing done
@@ -501,7 +501,7 @@ def run_pass(conn, client, wall, say, memory: Callable[[], float], max_mb: float
         say("REFUSED pass refused: the store could not be written (%s); nothing done" % type(e).__name__)
         return REFUSED
     totals: Counter = Counter()
-    good = failed = internal = 0
+    good = failed = internal = past = 0
     status = "done"
     mem = memory()
     for i, (key, wallet, _s, _c) in enumerate(leaders):
@@ -530,16 +530,18 @@ def run_pass(conn, client, wall, say, memory: Callable[[], float], max_mb: float
                                 " baseline" if n["baseline"] else "", time.monotonic() - t, mem))
         else:
             failed += 1
+            past += res["reason"] == "page_limit"     # a wallet past the page limit is a known state, not a failure
             say("wallet %s failed %s pages=%d %.1fs mem=%.0fMB" % (wallet[:10], res["reason"], res["pages"] or 0,
                                                                     time.monotonic() - t, mem))
     removed = age_out(conn, started)
     conn.execute("UPDATE passes SET finished_ts=?, status=?, good=?, failed=?, removed=? WHERE pass_id=?",
                  (wall(), status, good, failed, removed, pass_id))
     word, code = (("STOPPED", STOPPED_MEMORY) if status == "stopped_memory" else ("INTERNAL", INTERNAL_ERROR)
-                  if internal else ("FAILED", FAILED_READS) if failed else ("DONE", OK))
-    say("%s pass %d %s: %d good, %d failed, internal_error=%d, new=%d increase=%d decrease=%d exit=%d, removed %d old "
-        "rows, %.1fs, mem=%.0fMB" % (word, pass_id, status, good, failed, internal, totals["NEW"], totals["INCREASE"],
-                                     totals["DECREASE"], totals["EXIT"], removed, time.monotonic() - t0, mem))
+                  if internal else ("FAILED", FAILED_READS) if failed > past else ("DONE", OK))
+    say("%s pass %d %s: %d good, %d failed, %d past the page limit, internal_error=%d, new=%d increase=%d "
+        "decrease=%d exit=%d, removed %d old rows, %.1fs, mem=%.0fMB"
+        % (word, pass_id, status, good, failed, past, internal, totals["NEW"], totals["INCREASE"], totals["DECREASE"],
+           totals["EXIT"], removed, time.monotonic() - t0, mem))
     return code
 
 
