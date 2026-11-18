@@ -227,15 +227,17 @@ def check_run(w, out, mode, ticket, counts, before):
             assert prior and handed.index(prior[0]) < handed.index(a) and prior[0]["mode"] == "accept", \
                 ("a remainder after a LIMIT leg that was not accepted", a, prior)
         counts.add("v")
-    if batch:                                                             # (vii)
+    if batch:                                                             # (vii): the ledger's orders and the venue's
         book = book_without(w, batch)
-        sold = {}
-        for o in rows.values():
-            if o["units"] < 0:
-                sold[o["symbol"]] = sold.get(o["symbol"], Decimal(0)) + dec(-o["units"])
-        for sym, s in sold.items():
-            assert s <= dec(book.get(sym, 0.0)), ("a sale above the book", sym, s, book)
-            counts.add("vii")
+        for what, units in (("ledger", [(o["symbol"], o["units"]) for o in rows.values()]),
+                            ("handed", [(a["symbol"], a["units"]) for a in handed])):
+            sold = {}
+            for sym, u in units:
+                if u < 0:
+                    sold[sym] = sold.get(sym, Decimal(0)) + dec(-u)
+            for sym, s in sold.items():
+                assert s <= dec(book.get(sym, 0.0)), ("a sale above the book", what, sym, s, book)
+                counts.add("vii")
     if out.get("status") != "done":
         return
     if mode in ("scheduled", "propose"):                                  # (vi)
@@ -339,12 +341,16 @@ def test_r3_every_order_of_a_fractional_practice_run_has_the_ruled_shape_over_se
     for k in range(WORLDS_PER_KIND):
         seed = 5_130_000 + KINDS.index(kind) * 100 + k
         rng = random.Random(seed)
-        w = make_world(tmp_path / f"w{k}", rng, kind)
-        w.clock.t = ny(rng.choice(CLOCKS))
-        try:
-            drive(w, rng, kind, counts)
-        except AssertionError as e:
-            raise AssertionError(f"seed {seed} ({kind}): {e}") from None
+        urandom, numbers = random.Random(seed + 1), random.Random(seed + 2)
+        with pytest.MonkeyPatch.context() as mp:                         # batch ids and ticket numbers: seeded too,
+            mp.setattr("os.urandom", lambda n: bytes(urandom.getrandbits(8) for _ in range(n)))   # so a seed replays
+            mp.setattr("secrets.randbelow", lambda n: numbers.randrange(n))
+            w = make_world(tmp_path / f"w{k}", rng, kind)
+            w.clock.t = ny(rng.choice(CLOCKS))
+            try:
+                drive(w, rng, kind, counts)
+            except AssertionError as e:
+                raise AssertionError(f"seed {seed} ({kind}): {e}") from None
     print(f"T51-A4-R3 {kind}: worlds {WORLDS_PER_KIND}, {dict(sorted(counts.items()))}")
     if kind == "live":
         assert counts["live refused"] == WORLDS_PER_KIND
@@ -354,3 +360,15 @@ def test_r3_every_order_of_a_fractional_practice_run_has_the_ruled_shape_over_se
         assert counts["expired approvals"] >= WORLDS_PER_KIND, counts
     else:
         assert counts.get("iii", 0) > 0 and counts.get("vi", 0) > 0, counts
+
+
+def test_the_guard_fails_a_run_that_would_load_the_real_second_source_or_open_a_socket(tmp_path, guard):
+    w = make_world(tmp_path / "w", random.Random(1), "ordinary")
+    w.paper = paper({"a": {"SPY": 0.5}})                                 # one MARKET leg, no stand-in handed in
+    w.prices["SPY"] = 500.0
+    w.run(fractional=True, second_opinion=None)
+    assert guard == ["second source"]                                    # the teardown would fail the test
+    with pytest.raises(OSError):
+        socket.create_connection(("127.0.0.1", 9))
+    assert guard == ["second source", "socket"]
+    guard.clear()

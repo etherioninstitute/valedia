@@ -253,8 +253,84 @@ Lock 3 is `config/risk.json` (it must hold `max_orders_per_day`, 1 to 200) with 
 `ALPACA_API_KEY`, `ALPACA_SECRET_KEY` and `FINNHUB_API_KEY` in `trading.env`; lock 4 is the ticket (propose, then
 approve by number). Live mode follows only the strategies `config/broker_book.json` names.
 
-**Not built yet:** fractional live orders; the live kill switch and its reset; the stake ladder's use (the first stake,
-its steps and `ladder.json`); unattended live runs (live mode never runs from a job).
+**Not built yet:** fractional orders in live mode (they are built for practice only, below, and live still refuses
+`--fractional`); the live kill switch and its reset; the stake ladder's use (the first stake, its steps and
+`ladder.json`); unattended live runs (live mode never runs from a job).
+
+## Fractional orders, as built (practice path only)
+
+Webull's documentation says fractional trading is MARKET orders only, by quantity above 0 and at most 1 share, of at
+least 5 dollars, in core hours. With `--fractional`, the order step on the practice path follows that shape:
+
+    .venv/bin/python -m valedia_trader.research_loop order-step --fractional
+    .venv/bin/python -m valedia_trader.research_loop order-step --propose --fractional --capital C
+    .venv/bin/python -m valedia_trader.research_loop order-step --approve NUMBER --fractional --capital C
+
+**The split.** Each fund's difference between its target and the ledger's own book (never the baseline of holdings
+that were there before the first run, never the venue's holding) is rounded toward zero to 5 decimals, a sale capped
+at that book, and split into its whole shares and the rest of less than one share. A target of less than one share
+worth less than 5 dollars at the quote is taken as zero (a target of one share or more is never changed by this). The
+whole shares go as a day LIMIT order exactly as without `--fractional`. The rest goes as a MARKET order by quantity
+(never by dollar amount; the order is always `entrust_type` QTY, session CORE, no limit price) only when it is worth at
+least 5 dollars at the quote less a margin of 0.5% (`TICKET_QUOTE_MOVE`), so a small move still clears the minimum.
+
+**Two legs, two tags.** The LIMIT leg keeps today's tag `{batch}-{fund}`; the MARKET leg is `{batch}-{fund}.r`. On a
+fractional run the journal's `order` and `fill` lines carry `order_type` (LIMIT or MARKET) and `leg` (`whole` or
+`remainder`); without `--fractional` no line carries them and everything is written exactly as before. A fund whose own
+tag would equal another fund's remainder tag is refused in words before anything is sent for either. Each leg is one
+order against `max_orders_per_day` (sales first, as before). The MARKET leg goes only after its fund's LIMIT leg of the
+same run was accepted by the venue (or partly or wholly filled); when the LIMIT leg was refused, left over, dropped,
+cut by the day's cap or its outcome is unknown, the remainder is not sent in that run and its line says why. On a
+ticket, a remainder line holds the collar price in its limit column and its leg follows from its size alone (under one
+share); an approval sends each line as the leg, type and size it was proposed as, and is refused in words when its
+`--fractional` differs from the ticket's.
+
+**The collar.** Before a MARKET leg is sent, six checks, each of which holds the leg back with a line naming it
+(`collar` on its `left_over` entry) and is not a fault, not an attention item and not a stop (its LIMIT leg goes as
+usual):
+- `clock`: only from 30 minutes after the open to 30 minutes before the close (`MARKET_AFTER_OPEN`,
+  `MARKET_BEFORE_CLOSE`; a half-day's close as the calendar has it), judged again at the moment of sending;
+- `quote_age`: its quote at most 120 seconds old at the moment of sending (`MARKET_QUOTE_MAX_AGE_SECONDS`; the order
+  step asks again once for a fresher one first; LIMIT legs keep their 20 minutes), judged again at the moment of sending;
+- `quote_move`: the quote within 0.5% (`TICKET_QUOTE_MOVE`) of the quote the leg was decided at (an approval: the
+  ticket's quote);
+- `minimum`: still worth at least 5 dollars with its margin at that quote (`FRACTIONAL_MIN_VALUE`);
+- `second_source`: the second price source agrees on that very quote. On practice the run loads the same second
+  source live mode loads (read-only quotes, the keys of lock 3) the first time a MARKET leg needs it; if it cannot be
+  loaded, or it says anything but "agree", the leg is held back;
+- `value`: its collar price c, the price a LIMIT leg of that size would carry (a purchase: the quote plus 1% rounded
+  down to the cent; a sale: the quote less 2% rounded up), is stored with the order in the ledger (`collar_price`), and
+  the leg's units times c are charged against the purchase budget like a LIMIT order's.
+
+**The verdict on a MARKET fill.** Its average is judged against c with the rules a LIMIT fill is judged by against its
+limit: an average beyond c on the wrong side is a `breach` and writes the fault word `cap` (no new word), and more
+units filled than asked is judged as before. A MARKET leg's fill is never left unjudged for want of a limit.
+
+**The residual.** A rest too small to send (under the minimum with its margin) is not sent. It is written per fund
+on the run's summary under `residuals` (units, quote, value and why) and is never a fault, never an attention item and
+never drift.
+
+**What `--fractional` now sends on practice.** Whole-share LIMIT orders and MARKET orders of under one share, nothing
+else. Before this build `--fractional` sent one LIMIT order with decimals per fund (1.5 shares, say), which the test
+environment took but production refuses for fractions; those orders are gone: no LIMIT order carries decimals and no
+MARKET order carries 1 share or more. The ledger file is layout 4 (columns `order_type` and `collar_price`); a layout-3
+file is upgraded once, the first time it is opened for writing, every earlier row reading as a LIMIT order with
+no collar; the code before this build refuses a layout-4 file in words.
+
+**Live still refuses `--fractional`** (the command line and the order step both, before anything is read), and the
+live adapter still refuses any production order without a limit price. Live fractional orders wait for a later build:
+the practice proof below, read from the practice record, and your own consent to fractional live orders.
+
+**The practice proof (the lead runs it, in core hours, on the practice account).** Each item with what the design
+does if the answer is the unwelcome one:
+- a. A fractional MARKET purchase accepted, seen on the `order` and `fill` journal lines of a remainder leg. If it is
+  refused: whole shares only; the remainder stays a residual.
+- b. The decimals Webull reports for the fill and for the holding, seen on the fill line and a clean reconcile. If they
+  are not 5 decimals: the rounding step and the reconcile's tolerance follow Webull's.
+- c. A fractional sale, seen with a second approval at a lower capital. If it is refused: no fractional sales; what is
+  left under one share when a target goes to zero is dust.
+- d. A closing sale under 5 dollars, which comes up only when a target goes to zero (today the step holds such a piece
+  back by its minimum, so it shows as a residual). If Webull refuses it: the dust stays a residual.
 
 ## Event contracts: the Events account trades Kalshi's markets (seen 2026-11-13, test environment)
 
