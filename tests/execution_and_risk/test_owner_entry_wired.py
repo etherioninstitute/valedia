@@ -490,13 +490,15 @@ def _an_order_arrives(w):
 
 
 def _an_entry_arrives(w):
+    """Another owner's entry, written and journaled as the command writes one."""
     state = osx.OrderStepState(w.state)
     try:
         last = state.owner_entries()[-1]
-        state.add_owner_entry({"kind": "cash_in", "amount": "1", "units_before": last["units_after"],
-                               "units_after": last["units_after"]}, who="o", note="in between", now=w.t - 0.5)
+        row = state.add_owner_entry({"kind": "cash_in", "amount": "1", "units_before": last["units_after"],
+                                     "units_after": last["units_after"]}, who="o", note="in between", now=w.t - 0.5)
     finally:
         state.close()
+    _paper.Journal(w.root / "journal").write(row["day"], osx._owner_journal_line(VENUE, row))
 
 
 def _a_newer_preview(w):
@@ -1037,6 +1039,9 @@ CATALOGUE = {          # name: (args, prepare(w, mp) -> optional cleanup, a prev
                                    lambda w, mp: mp.setattr(osx, "_spend_preview",
                                                             lambda *a: "; a newer preview was made meanwhile"), True),
     "an entry in between": ((*CASH_IN, "--confirm", "CODE"), _intruder, True),
+    "the state file refuses the entry": ((*CASH_IN, "--confirm", "CODE"), lambda w, mp: mp.setattr(
+        osx.OrderStepState, "add_owner_entry",
+        lambda *a, **k: (_ for _ in ()).throw(osx.OrderStepError("the chain moved on"))), True),
     "the preview cannot be written": (CASH_IN, lambda w, mp: mp.setattr(
         osx, "_write_private", lambda *a: (_ for _ in ()).throw(OSError("read-only folder"))), False),
     "a repair with a figure": (("--owner-entry-rejournal", "1", "--hash", "0" * 64, "--amount", "1", "--who", "o",

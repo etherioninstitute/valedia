@@ -540,9 +540,11 @@ one-minute bar, stamped at the bar's start) and read with the run's own reader a
 its `_window` with no offsets) a quote more than `QUOTE_MAX_AGE_SECONDS` old, stamped more than
 `QUOTE_MAX_AHEAD_SECONDS` ahead, or missing refuses, naming the fund and why. Outside the session the last session's
 close serves: the latest close at or before the clock (today's once it has passed, else the calendar's own
-`previous_close`), and a quote is taken when the same age rule, judged AT that close, finds it usable (so the last
-bar of the session, stamped a minute before the close, serves; a quote from an earlier day, or one stamped after the
-close, does not); its time is shown. A book holding no units asks for no quote (the opening `cash_in` works with the
+`previous_close`), and a quote is taken when the same age rule, judged AT that close, finds it usable: at most
+`QUOTE_MAX_AGE_SECONDS` before the close, and, with the order step's own allowance for a stamp ahead, at most
+`QUOTE_MAX_AHEAD_SECONDS` after it (so the last bar of the session, stamped a minute before the close, serves; a bar
+stamped 30 seconds after the close is taken, and one stamped 61 seconds after it is refused; a quote from an earlier
+day does not serve); its time is shown. A book holding no units asks for no quote (the opening `cash_in` works with the
 network down). No new age limit, band or lifetime exists: only the order step's constants.
 
 *A preview, then a confirm.* Run without `--confirm`, the command PRINTS the kind and its figure, each mark with its
@@ -551,15 +553,29 @@ and the value per unit before and after, and a six-digit code; when the value is
 naming the order (R32). It writes NO byte of the state file, the journal or the ledger: only the one pending preview
 of that venue, `memory/order_step-VENUE_NAME.owner-preview.json`, beside the state file, written atomically and
 readable by its owner only (a new preview replaces the one before; no run, reconcile, ticket, journal reader, alert
-or owner's page reads that file, so it is never a fault). Run again with the same arguments and `--confirm CODE`
+or owner's page reads that file, so it is never a fault). A preview on a root with no `memory` folder yet creates
+that folder to hold the file. A pending file that is not a preview the command
+wrote (a field missing or of another type, a mark that is not an object with a finite price, a code that is not six
+digits: a file edited by hand) is "not an owner-entry preview": the confirm refuses in words, spends it and writes
+nothing. Run again with the same arguments and `--confirm CODE`
 within a ticket's life (`TICKET_LIFE_SECONDS`), it asks the quotes AGAIN and writes the entry, at the confirm's own
 marks, only when every mark is within `TICKET_QUOTE_MOVE` of the preview's and nothing else differs: the arguments
 (kind, figures, symbol, who, note), the chain's last hash (no entry since), the ledger's fills and orders as the
 book's figures read them (no fill or order arrived or changed), the funds held, and the marks' basis (the session has
-not opened or closed meanwhile). Otherwise it refuses in words saying what moved and writes nothing. A confirm that
-has read the pending preview and does not write SPENDS it, whatever the reason (a wrong or old code, expired, moved,
-another difference, a run holding the lock): the owner then runs the preview again and sees the figures before any
-entry is written, and no code is tried twice against one preview. The code checks against a stale or mistyped
+not opened or closed meanwhile). Otherwise it refuses in words saying what moved and writes nothing. Then, once it
+holds the run lock and before anything is written, it reads the ledger's fills and orders and the owner's entries
+AGAIN and writes only if the figures read what was valued (the same digest of the ledger as the book's figures read
+it, the same last hash of the chain, the same funds held); otherwise it refuses, "a fill or an order arrived while the
+entry was being confirmed" (or "an owner's entry arrived ..."), and writes nothing. No quote is asked under the lock:
+the marks are the confirm's own, and the lock is never held across the network. Nothing the figures read can arrive
+between that second read and the write: every writer of fill and order rows to the ledger (the order step's practice
+and live runs, and the event practice on a venue of the same name) writes them only while holding this same lock
+(`memory/order_step-VENUE_NAME.sqlite.lock`), and so does every writer of an owner's entry; the alerts and the
+owner's page only read the ledger. A confirm that has read the pending preview and does not write SPENDS it, whatever
+the reason (a wrong or old code, expired, moved, another difference, a run holding the lock, something that arrived
+under the lock), except that a newer preview made meanwhile (another code) is left pending and the refusal says so:
+the owner then runs the preview again and sees the figures before any entry is written, and no code is tried twice
+against one preview. The code checks against a stale or mistyped
 confirm; it is not a secret. The shape, with figures that are AN EXAMPLE ONLY and not a suggestion of any amount:
 
     order-step --owner-entry cash_in --venue VENUE_NAME --amount 1234.56 --who owner --note "example only"

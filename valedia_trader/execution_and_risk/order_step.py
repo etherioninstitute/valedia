@@ -1126,6 +1126,31 @@ def _ledger_digest(fills, orders) -> str:
     return hashlib.sha256(json.dumps(rows, default=repr, separators=(",", ":")).encode()).hexdigest()
 
 
+def _owner_arrived(ledger_path: Path, state_path: Path, day: str, now: float, valued: dict) -> str | None:
+    """T51c S4b addendum 1 (R35): under the run lock, the ledger's fills and orders and the owner's entries read AGAIN;
+    what arrived since the entry was valued (`valued`: its ledger digest, chain head and set of funds held), in words,
+    or None when the figures read what was valued. No quote is asked: the lock is never held across the network."""
+    from valedia_trader.execution_and_risk.orders import open_read_only
+    try:
+        fills, orders = [], []
+        if ledger_path.exists():
+            ro = open_read_only(ledger_path)
+            try:
+                fills, orders = ro.fills(), ro.orders()
+            finally:
+                ro.close()
+        entries = _owner_entries_read_only(Path(state_path))
+        head = entries[-1]["hash"] if entries else _GENESIS
+        held = sorted(book_figures(fills, orders, entries, {}, day, now=now).unmarked)
+    except (OrderStepError, OrderError, sqlite3.Error, OSError) as exc:
+        return f"the ledger and the owner's entries could not be read again under the lock ({_cut(str(exc), 300)})"
+    if head != valued["head"]:
+        return "an owner's entry arrived while the entry was being confirmed"
+    if _ledger_digest(fills, orders) != valued["ledger"] or held != valued["held"]:
+        return "a fill or an order arrived while the entry was being confirmed"
+    return None
+
+
 def owner_mark_close(calendar, now: float) -> tuple[bool, float | None, str | None]:
     """T51c S4b: which quotes may mark an owner's entry at `now`. (True, None, None) INSIDE the exchange's session:
     from its open to its close on `now`'s New York day, by `_window` (the order step's own reading of the calendar)
@@ -1200,9 +1225,18 @@ def _read_preview(path: Path, venue: str) -> dict | None:
         record = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
+    # addendum 1 (R36): every field a confirm reads is checked here, so a file edited by hand is refused, not a crash:
+    # the code (compared), created and expires (the life), each mark's price (the band), and the fields compared
+    # whole with the figures now (arguments, head, ledger, held, close), of the types the preview writes.
     if not (isinstance(record, dict) and record.get("what") == OWNER_PREVIEW_KIND and record.get("venue") == venue
-            and isinstance(record.get("code"), str) and _finite(record.get("created"))
-            and _finite(record.get("expires")) and isinstance(record.get("marks"), dict)):
+            and isinstance(record.get("code"), str) and _plain(_NUMBER, record["code"])
+            and _finite(record.get("created")) and _finite(record.get("expires"))
+            and isinstance(record.get("marks"), dict)
+            and all(isinstance(m, dict) and _finite(m.get("price")) for m in record["marks"].values())
+            and isinstance(record.get("arguments"), dict) and isinstance(record.get("head"), str)
+            and isinstance(record.get("ledger"), str) and isinstance(record.get("held"), list)
+            and all(isinstance(s, str) for s in record["held"])
+            and (record.get("close") is None or _finite(record.get("close")))):
         raise ValueError("it is not an owner-entry preview of this venue")
     return record
 
@@ -1398,6 +1432,13 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None, *
         spent = _spend_preview(*pending)                  # used once: spent before the entry is written
         if not spent.startswith("; the preview is spent"):
             return _owner_refuse(f"the pending preview could not be taken{spent}; nothing was written")
+        # addendum 1 (R35): judged again under the lock, as the last read before the write. Every writer of a fill
+        # or an order row (the order step's runs, practice and live, and the event practice) writes them only while
+        # holding this same lock (<state file>.lock), and so does every writer of an owner's entry; nothing the
+        # figures read can arrive between this read and the write below.
+        arrived = _owner_arrived(ledger_path, Path(state_path), day, now, now_record)
+        if arrived is not None:
+            return _owner_refuse(f"{arrived}; nothing was written{spent}")
         try:
             state = OrderStepState(state_path, clock=clock)
             row = state.add_owner_entry(fields, who=args.who, note=args.note, now=now, after=head)
