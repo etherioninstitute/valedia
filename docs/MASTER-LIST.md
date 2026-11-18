@@ -200,9 +200,11 @@ Items:
   supervised task end to end on something that is not the trader, then add only what that run shows missing.
   Trader coding stays on builder plus blind checker. Its `neural-trader` and `market-data` parts: a
   reading-only look for ideas, nothing run or copied.
-- **NEXT** L-0 (lead, 2026-11-18): read which model the Sunday 18:00 research cycle's idea-proposing agents
-  call. If it is the local 27B, the first Sunday of the scored period (22 Nov) would load a model beside the
-  collector: then the job is held or pointed elsewhere for those weeks, on the owner's word.
+- **DONE** L-0 (lead, read 2026-11-18 02:25 PST): the Sunday 18:00 research cycle asks the team file's
+  proposer, skeptic and narrator, which are the Hermes profiles `valedia-trading-decider` and
+  `valedia-trading-auditor`; both name Claude Sonnet on the subscription, not a local model. The cycle
+  loads nothing beside the collector on 22 Nov. (The scout profile names the local 27B by its plain key; the
+  cycle does not call it. Read again if the team file or a profile's model changes.)
 - **QUEUED** L-11 a register of known coming events and expiries, read by the alerts check so that it warns
   days ahead (the end of the scored period, the fund book's 21-session resets, half-days, the real-money
   confirmation's 31-day expiry, fixed test dates, credit, credential and licence dates). No model. The first
