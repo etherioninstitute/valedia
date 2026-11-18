@@ -217,10 +217,14 @@ Lessons so far (each is also a "do not repeat"):
 - Process: more than two test-running agents beside the collector cost 24 late decisions; a finished test was
   nearly repeated because the research folder was not read first; a pull was started without a trial run and
   reached 6.9 GB.
-- Process (2026-11-17 evening): the KIND of test matters. Inside a two-agent limit the collector still lost
-  eleven decisions in an hour, each where a kill-and-race suite was running (processes killed at every
-  database write, several processes racing); hours of ordinary test files beside it cost none. While the
-  scored test runs: no kill tests, race tests or many-process suites on this Mac.
+- Process (2026-11-17 evening): inside a two-agent limit the collector still lost eleven decisions in an
+  hour. The cause is NOT established. The three clusters share two test activities overlapping (in two of
+  them one was a suite that kills processes at every database write); a 16-minute test file alone, and a loop
+  of 130 short processes alone, cost none; two builders overlapping for hours earlier cost none. A candidate
+  not yet tested: forced disk writes on the same SSD as the collector's store. **OWNER** a small controlled
+  comparison before the scored period starts (2026-11-18 16:00 PST), to learn what rule the scored days need.
+  Until it is known: one test activity at a time on this Mac during the scored test, no kill or race suites,
+  and the collector's not-ok count read before and after every run.
 - A 27B coding worker cannot share this GPU with the collector (section 11).
 
 ## 8. Autonomy
