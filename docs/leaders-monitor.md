@@ -9,6 +9,7 @@ three requests a second, and the reader's allow-list (one host, `/v2/` paths onl
 
 ```
 python -m valedia_trader.research_loop.leaders_monitor fix-leaders [--store PATH]
+python -m valedia_trader.research_loop.leaders_monitor fix-leaders --wallets-file FILE --store PATH
 python -m valedia_trader.research_loop.leaders_monitor pass        [--store PATH] [--max-memory-mb 500]
 python -m valedia_trader.research_loop.leaders_monitor report      [--store PATH] [--days 30]
 ```
@@ -46,6 +47,37 @@ for each job.
 - A wallet on both boards is one leader with both ranks. The list is not filled up to ten.
 - Nothing ever re-ranks, replaces or drops a leader. A leader that holds nothing, or that cannot be read, stays in.
 - `pass` and `report` refuse, in words, until `fix-leaders` has run.
+- The meta key `leaders_source` says `boards`. A store fixed before T52c has no such key; it reads as boards and no
+  command writes the key into it.
+
+## The leaders from a file (`fix-leaders --wallets-file FILE --store PATH`, once)
+
+The forward test of the owner's copy method fixes its own set of up to 20 wallets by a screen of its own; the record
+is then pointed at exactly that set with this form of the command.
+
+- `--store` is required, and it may not name the default store (the same path, also in another case, or the same
+  file). The default store stays the boards' ten and is never made from a file.
+- The file: one wallet address a line, `0x` and 40 hex digits (either case) and nothing else on the line; a line may
+  end in CR LF. Blank lines (empty or spaces only) and lines whose first character is `#` are skipped. Addresses are
+  folded to lower case for the key, as a board's are; the wallet is kept as written.
+- Refused in words naming the line, with code 3: a malformed line (a leading space, a trailing comment, `0X`, a byte
+  that is not ASCII are malformed), a repeat after folding (the words name both lines), more than 50 wallets (the
+  words name the line of wallet 51). Refused too: a file that names no wallet, or that cannot be read. Every refusal
+  is made before anything is created: no folder, no store, no lock file.
+- It makes no request of any kind: no client is built and no board is read.
+- What is stored, in the claim's one transaction, with the schema and `user_version` unchanged:
+  - `leaders`: `wallet_key` (folded), `wallet` (as written), every board column (`sports_rank`, `sports_pnl`,
+    `sports_volume`, `sports_read_ts` and the same four for crypto) NULL, as the other board's columns of a leader
+    on one board only are; `fixed_ts` the moment of fixing. `pass` reads leaders by `wallet_key` (ordered as rankless,
+    by key), `report` prints a NULL rank as `-`, and the consistency check reads `wallet_key` only.
+  - `meta`: `leaders_fixed_at` (the claim), `leaders_source` `file`, `leaders_file_sha256` (the file's SHA-256, of
+    its bytes as read), `leaders_file_wallets` (its count of wallets) and `leaders_file_read_at` (when it was read).
+- A pass and a report work on such a store as on any other. `report` shows each such wallet as `sports#- crypto#-`
+  and its first line says `from a file (N wallets, sha256 ...)`; on a store from the boards it says
+  `from the boards`.
+- **The record never mixes sources: one store, one source.** A store that already holds leaders refuses either form
+  of `fix-leaders`, whatever their source, and no command adds a wallet to a fixed set, removes one or changes where
+  the set came from.
 
 ## A pass
 
@@ -119,8 +151,8 @@ for each job.
 
 | Table | What it holds |
 | --- | --- |
-| `meta` | The claim `leaders_fixed_at`. |
-| `leaders` | The wallet; rank, profit, volume and read time on each board; when the leaders were fixed. |
+| `meta` | The claim `leaders_fixed_at`; `leaders_source` (`boards` or `file`); for a file, `leaders_file_sha256`, `leaders_file_wallets`, `leaders_file_read_at`. |
+| `leaders` | The wallet; rank, profit, volume and read time on each board (all NULL for a wallet from a file); when the leaders were fixed. |
 | `passes` | One row per pass: start, end, status (`running`, `done`, `stopped_memory`, `died`), good, failed, rows removed. |
 | `wallet_reads` | One row per wallet read: good or failed with its reason, rows, pages, rejects and unread fields as JSON counts, baseline, the previous good read and the gap, the count of each kind of change, the carried holdings, and `snapshot_day` when it took the day's snapshot. |
 | `holdings_current` | Each wallet's holdings as of its last good read (`read_id`): its good rows, and its carried holdings (`carried` 1) with the read that last saw each (`seen_read_id`, `seen_read_ts`). |

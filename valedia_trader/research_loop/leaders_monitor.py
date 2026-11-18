@@ -1,6 +1,7 @@
 """The leaders' record (T52): what ten fixed Polymarket wallets hold, read in passes, and how it changes.
 
     python -m valedia_trader.research_loop.leaders_monitor fix-leaders [--store PATH]
+    python -m valedia_trader.research_loop.leaders_monitor fix-leaders --wallets-file FILE --store PATH
     python -m valedia_trader.research_loop.leaders_monitor pass        [--store PATH] [--max-memory-mb MB]
     python -m valedia_trader.research_loop.leaders_monitor report      [--store PATH] [--days N]
 
@@ -14,7 +15,17 @@ nothing here repeats itself: `pass` reads once and ends; whether and how often i
   BEGIN IMMEDIATE, with the leaders in the same transaction: of two runs at once exactly one fixes, and every later
   run refuses before any request. A board row counts as good only when its wallet id is a well-formed address
   (WALLET_RE: 0x and forty ASCII hex digits, either case). A wallet on both boards is one leader with both ranks; the list is not filled.
-  Nothing ever re-ranks, replaces or drops a leader.
+  Nothing ever re-ranks, replaces or drops a leader. The meta key `leaders_source` says `boards` (a store fixed
+  before T52c has no such key and reads as boards; no command writes it afterwards).
+* `fix-leaders --wallets-file FILE --store PATH`, once, the forward test's door: exactly the wallets FILE names, with
+  no request of any kind (no client is built). FILE holds one address a line (WALLET_RE; a line may end in CR LF),
+  blank lines and lines whose first character is `#` skipped; addresses are folded to lower case as a board's are.
+  A malformed line, a repeat after folding, no wallet, more than FILE_MAX_WALLETS wallets or a file that cannot be
+  read is a refusal in words naming the line, made before anything is created (no folder, store or lock file).
+  `--store` is required and may not name the default store, which holds the boards' leaders only. The leaders rows
+  keep every board column NULL (as a one-board leader's other board), `fixed_ts` the moment of fixing; meta says
+  `leaders_source` `file`, `leaders_file_sha256`, `leaders_file_wallets` and `leaders_file_read_at`, in the claim's
+  transaction. One store, one source: a store that holds leaders refuses either form, and no command adds a wallet.
 * `pass`: under an exclusive lock on STORE.lock taken without waiting (a second pass exits at once, one line, code
   LOCKED; the store's shape is checked under that lock), each leader's open positions are read one wallet at a time (at most POSITION_PAGE_CAP pages). A good
   read is compared with that wallet's last good read: a token not held then is NEW (`flip` when its opposite token
@@ -55,7 +66,8 @@ nothing here repeats itself: `pass` reads once and ends; whether and how often i
   left as it was; a `fix-leaders` refused on an absent store leaves no file.
 * `report`: counts per leader and per kind over a window, each leader's carried holdings and the share of its good
   reads that carried any, the largest and median gap between good reads, the share of failed reads, the passes by
-  status, and whether the store is consistent.
+  status, and whether the store is consistent; its first line says where the leaders came from (the boards, or a
+  file with its count of wallets and SHA-256). A wallet from a file shows no rank on either board.
 
 The last line of every `pass` starts with one word for how it ended, and its exit code tells the ends apart:
     DONE         0  every leader's read was good, or past the page limit (a known state: the line counts them)
@@ -80,6 +92,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -110,7 +123,11 @@ USER_VERSION = 0                            # the store's PRAGMA user_version, p
 WAIT_SECONDS = 5.0                          # every shape check, `report` and `fix-leaders` wait at most this long
 DAY = 86_400
 CLAIM_KEY = "leaders_fixed_at"
+SOURCE_KEY = "leaders_source"               # `boards` or `file`; a store without it was fixed from the boards
+FILE_KEYS = ("leaders_file_sha256", "leaders_file_wallets", "leaders_file_read_at")
+FILE_MAX_WALLETS = 50
 WALLET_RE = re.compile(r"0x[0-9a-fA-F]{40}")   # a wallet address the record can store and print: 0x + 40 ASCII hex
+_WALLET_LINE = re.compile(WALLET_RE.pattern.encode())      # the same rule on a line of a wallets file, as bytes
 KINDS = ("NEW", "INCREASE", "DECREASE", "EXIT")
 OK, LOCKED, REFUSED, FAILED_READS, STOPPED_MEMORY, INTERNAL_ERROR, OTHER_SHAPE, UNREADABLE, BUSY = 0, 2, 3, 4, 5, 6, 7, 8, 9
 BUSY_WORDS = "a pass is writing; try again"
@@ -279,6 +296,18 @@ def _lock(path: Path, exclusive: bool):
     return fd
 
 
+def _is_default(store: Path) -> bool:
+    """`store` names the default store: the same path (case aside: a case-insensitive disk takes either for the
+    other) or the same file."""
+    a, b = os.path.realpath(store), os.path.realpath(DEFAULT_STORE)
+    if a.lower() == b.lower():
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def _leaders(conn) -> list:
     return conn.execute("SELECT wallet_key, wallet, sports_rank, crypto_rank FROM leaders ORDER BY "
                         "min(coalesce(sports_rank, 99), coalesce(crypto_rank, 99)), wallet_key").fetchall()
@@ -332,20 +361,72 @@ def fix_leaders(store: Path, client, wall: Callable[[], float], say) -> int:
     for key, d in sorted(leaders.items()):
         s, c = d.get("sports", (None,) * 4), d.get("crypto", (None,) * 4)
         values.append((key, d["wallet"], *s, *c, fixed_ts))
+    both = sum(1 for d in leaders.values() if "sports" in d and "crypto" in d)
+    return _store_leaders(store, values, fixed_ts, [(SOURCE_KEY, "boards")],
+                          "leaders fixed at %s: %d wallets (sports %d, crypto %d, on both %d); nothing re-ranks them"
+                          % (_iso(fixed_ts), len(leaders), BOARD_ROWS, BOARD_ROWS, both), say)
+
+
+def read_wallets_file(path: Path):
+    """((wallets as written, in the file's order), the file's SHA-256) and None; or None and a refusal's words."""
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        return None, "the wallets file %s could not be read (%s)" % (path, type(e).__name__)
+    wallets, seen = [], {}
+    for n, line in enumerate(data.split(b"\n"), 1):
+        if line.endswith(b"\r"):
+            line = line[:-1]
+        if not line.strip() or line.startswith(b"#"):
+            continue
+        if not _WALLET_LINE.fullmatch(line):
+            return None, ("the wallets file %s, line %d, is not a wallet address (0x and 40 hex digits, nothing "
+                          "else on the line)" % (path, n))
+        wallet = line.decode("ascii")
+        if wallet.lower() in seen:
+            return None, "the wallets file %s, line %d, repeats the wallet of line %d" % (path, n, seen[wallet.lower()])
+        seen[wallet.lower()] = n
+        wallets.append(wallet)
+        if len(wallets) > FILE_MAX_WALLETS:
+            return None, ("the wallets file %s, line %d, is its wallet %d; a file names at most %d"
+                          % (path, n, len(wallets), FILE_MAX_WALLETS))
+    if not wallets:
+        return None, "the wallets file %s names no wallet" % path
+    return (wallets, hashlib.sha256(data).hexdigest()), None
+
+
+def fix_from_file(store: Path, wallets: list, sha256: str, read_ts: float, wall: Callable[[], float], say) -> int:
+    """The leaders are exactly `wallets` (checked by read_wallets_file), every board column NULL; no request."""
+    done = _claimed(store)
+    if done:
+        say("fix-leaders refused: the leaders were already fixed at %s; nothing changes" % done[0])
+        return REFUSED
+    fixed_ts = wall()
+    values = [(w.lower(), w) + (None,) * 8 + (fixed_ts,) for w in sorted(wallets, key=str.lower)]
+    source = [(SOURCE_KEY, "file"), (FILE_KEYS[0], sha256), (FILE_KEYS[1], str(len(wallets))),
+              (FILE_KEYS[2], _iso(read_ts))]
+    return _store_leaders(store, values, fixed_ts, source,
+                          "leaders fixed at %s: %d wallets from a file (sha256 %s); nothing re-ranks them, nothing "
+                          "adds to them" % (_iso(fixed_ts), len(wallets), sha256), say)
+
+
+def _store_leaders(store: Path, values: list, fixed_ts: float, source: list, said: str, say) -> int:
     new = not store.exists() or store.stat().st_size == 0
     conn = _connect(store, WAIT_SECONDS)
     try:
         if new:                                 # a new store is marked with this version's user_version
             conn.execute("PRAGMA user_version = %d" % USER_VERSION)
-        return _claim(conn, leaders, values, fixed_ts, say)
+        return _claim(conn, values, fixed_ts, source, said, say)
     finally:
         conn.close()
 
 
-def _claim(conn, leaders: dict, values: list, fixed_ts: float, say) -> int:
+def _claim(conn, values: list, fixed_ts: float, source: list, said: str, say) -> int:
+    """The claim, where the set came from and the leaders: one transaction."""
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (CLAIM_KEY, _iso(fixed_ts)))
+        conn.executemany("INSERT INTO meta (key, value) VALUES (?, ?)", source)
         conn.executemany("INSERT INTO leaders (wallet_key, wallet, sports_rank, sports_pnl, sports_volume, "
                          "sports_read_ts, crypto_rank, crypto_pnl, crypto_volume, crypto_read_ts, fixed_ts) "
                          "VALUES (?,?,?,?,?,?,?,?,?,?,?)", values)
@@ -358,9 +439,7 @@ def _claim(conn, leaders: dict, values: list, fixed_ts: float, say) -> int:
         if conn.in_transaction:
             conn.execute("ROLLBACK")
         raise
-    both = sum(1 for d in leaders.values() if "sports" in d and "crypto" in d)
-    say("leaders fixed at %s: %d wallets (sports %d, crypto %d, on both %d); nothing re-ranks them"
-        % (_iso(fixed_ts), len(leaders), BOARD_ROWS, BOARD_ROWS, both))
+    say(said)
     for key, wallet, srank, crank in _leaders(conn):
         say("  %s sports#%s crypto#%s" % (wallet[:10], srank or "-", crank or "-"))
     return OK
@@ -595,6 +674,18 @@ def consistency(conn) -> list:
     return problems
 
 
+def _source_words(conn) -> str:
+    """Where the leaders came from, as meta says: a store without SOURCE_KEY was fixed from the boards."""
+    meta = dict(conn.execute("SELECT key, value FROM meta WHERE key IN (?, ?, ?, ?)", (SOURCE_KEY, *FILE_KEYS)))
+    source = meta.get(SOURCE_KEY, "boards")
+    if source == "boards":
+        return "the boards"
+    if source == "file":
+        return "a file (%s wallets, sha256 %s)" % (_safe(meta.get(FILE_KEYS[1])),
+                                                    re.sub(r"[^0-9a-f]", "?", str(meta.get(FILE_KEYS[0])))[:64])
+    return "an unknown source (%s)" % _safe(source)
+
+
 def report(conn, wall, say, days: int) -> int:
     leaders = _leaders(conn)
     if not leaders:
@@ -604,8 +695,8 @@ def report(conn, wall, say, days: int) -> int:
     since = now - days * DAY
     fixed = conn.execute("SELECT value FROM meta WHERE key=?", (CLAIM_KEY,)).fetchone()
     problems = consistency(conn)
-    say("report over the last %d days (since %s); leaders fixed at %s; store %s"
-        % (days, _iso(since), fixed[0] if fixed else "?",
+    say("report over the last %d days (since %s); leaders fixed at %s from %s; store %s"
+        % (days, _iso(since), fixed[0] if fixed else "?", _source_words(conn),
            "consistent" if not problems else "INCONSISTENT (%d problems)" % len(problems)))
     for p in problems:
         say("  problem: %s" % p)
@@ -658,7 +749,9 @@ def _parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
     for name in ("fix-leaders", "pass", "report"):
         s = sub.add_parser(name)
-        s.add_argument("--store", default=str(DEFAULT_STORE))
+        s.add_argument("--store", default=None, help="default: the boards' store, DEFAULT_STORE")
+        if name == "fix-leaders":
+            s.add_argument("--wallets-file", default=None, help="fix exactly these wallets (needs --store)")
         if name == "pass":
             s.add_argument("--max-memory-mb", type=float, default=DEFAULT_MAX_MEMORY_MB)
         if name == "report":
@@ -674,7 +767,7 @@ def main(argv=None, *, client=None, wall: Callable[[], float] = time.time, out=N
     def say(line: str) -> None:
         out.write(line + "\n")
         out.flush()
-    store = Path(args.store)
+    store = Path(args.store) if args.store is not None else DEFAULT_STORE
     is_pass = args.cmd == "pass"
 
     def end(code: int, word: str, line: str) -> int:
@@ -682,6 +775,16 @@ def main(argv=None, *, client=None, wall: Callable[[], float] = time.time, out=N
         say(word + " " + line if is_pass else line)
         return code
     if args.cmd == "fix-leaders":
+        given = None
+        if args.wallets_file is not None:       # everything about the file is settled before anything is made
+            if args.store is None or _is_default(store):
+                return end(REFUSED, "REFUSED", "fix-leaders refused: --wallets-file needs --store PATH, a store of its "
+                           "own (the default store holds the boards' leaders and is never made from a file); nothing "
+                           "done")
+            got, why = read_wallets_file(Path(args.wallets_file))
+            if why:
+                return end(REFUSED, "REFUSED", "fix-leaders refused: %s; nothing done" % why)
+            given = (*got, wall())
         try:
             store.parent.mkdir(parents=True, exist_ok=True)
         except OSError as e:
@@ -691,6 +794,8 @@ def main(argv=None, *, client=None, wall: Callable[[], float] = time.time, out=N
         if bad:
             return end(*bad)
         try:
+            if given:
+                return fix_from_file(store, *given, wall, say)
             return fix_leaders(store, client or pd.PolymarketData(), wall, say)
         except sqlite3.OperationalError as e:
             if not _busy(e):
