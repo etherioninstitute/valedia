@@ -4,6 +4,7 @@ import fcntl
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -11,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -147,6 +149,11 @@ def fixed(store, world=None, wall=None):
     return world, wall
 
 
+def no_file_left(store):
+    """T52b: no store, no lock file and nothing else in the store's folder."""
+    return not store.exists() and (not store.parent.exists() or list(store.parent.iterdir()) == [])
+
+
 # ------------------------------------------------------------------ R4: the leaders
 def test_the_default_store_is_under_artifacts_leaders_monitor():
     assert lm.DEFAULT_STORE.parts[-3:] == ("artifacts", "leaders_monitor", "leaders.sqlite")
@@ -204,16 +211,14 @@ def test_a_board_with_fewer_good_rows_than_asked_refuses_and_stores_nothing(stor
         world.boards["crypto"][4]["user_id"] = wallet(5)
     code, out = run(["fix-leaders"], world, Wall(), store)
     assert code == lm.REFUSED and "nothing stored" in out
-    c = db(store)
-    assert c.execute("SELECT count(*) FROM leaders").fetchone()[0] == 0
-    assert c.execute("SELECT count(*) FROM meta WHERE key='leaders_fixed_at'").fetchone()[0] == 0
+    assert no_file_left(store)                              # T52b: a refused fix-leaders on an absent store
 
 
 def test_a_board_read_error_refuses_fix_leaders_and_stores_nothing(store):
     world = ErrWorld()                                      # every board read answers 503, retried, then an error
     code, out = run(["fix-leaders"], world, Wall(), store)
     assert code == lm.REFUSED and "nothing stored" in out and len(world.urls) == 5
-    assert db(store).execute("SELECT count(*) FROM leaders").fetchone()[0] == 0
+    assert no_file_left(store)
 
 
 class ErrWorld(World):
@@ -229,7 +234,7 @@ def test_nothing_ever_re_ranks_replaces_or_drops_a_leader(store):
     for k in range(3):
         wall.t += 300
         code, out = run(["pass"], world, wall, store)
-        assert code == 0, out
+        assert code == lm.FAILED_READS, out                 # T52b: a pass with a failed read says so in its code
     assert [tuple(r) for r in db(store).execute("SELECT * FROM leaders ORDER BY wallet_key")] == before
     code, out = run(["report"], world, wall, store)
     assert code == 0 and all(wallet(i)[:10] in out for i in range(10))
@@ -300,7 +305,7 @@ def test_a_failed_read_records_only_the_failure_and_the_next_good_read_compares_
     wall.t += 300
     world.fail[w] = mode
     code, out = run(["pass"], world, wall, store)
-    assert code == 0 and reason in out
+    assert code == lm.FAILED_READS and reason in out
     c = db(store)
     last = c.execute("SELECT * FROM wallet_reads WHERE wallet_key=? ORDER BY read_id DESC", (w,)).fetchone()
     assert (last["good"], last["reason"]) == (0, reason)
@@ -500,7 +505,7 @@ def test_pass_prints_one_line_per_wallet_and_one_summary_line(store):
         assert line.startswith("wallet 0x") and " good " in line and "rows=3" in line and "mem=" in line
         for k in ("new=", "increase=", "decrease=", "exit=", "rejects="):
             assert k in line
-    assert lines[10].startswith("pass ") and "10 good" in lines[10] and "0 failed" in lines[10]
+    assert lines[10].startswith("DONE pass ") and "10 good" in lines[10] and "0 failed" in lines[10]
 
 
 def test_report_counts_per_leader_and_kind_the_gaps_and_the_failed_share(store):
@@ -1194,9 +1199,7 @@ def test_fix_leaders_takes_a_board_row_only_with_a_well_formed_wallet_address(st
     code, out = run(["fix-leaders"], world, Wall(), store)
     assert code == lm.REFUSED and "nothing stored" in out
     assert "\x00" not in out and "\ud800" not in out
-    c = db(store)
-    assert c.execute("SELECT count(*) FROM leaders").fetchone()[0] == 0
-    assert c.execute("SELECT count(*) FROM meta").fetchone()[0] == 0
+    assert no_file_left(store)
 
 
 def test_a_mixed_case_wallet_address_is_well_formed(store):
@@ -1258,7 +1261,7 @@ def test_a_store_made_by_another_version_is_refused_in_words_with_nothing_writte
     for cmd in (["pass"], ["report"], ["fix-leaders"]):
         n = len(world.urls)
         code, out = run(cmd, world, wall, s)
-        assert code == lm.REFUSED and "another version of the record" in out and "nothing done" in out, (cmd, out)
+        assert code == lm.OTHER_SHAPE and "another version of the record" in out and "nothing done" in out, (cmd, out)
         assert len(out.strip().splitlines()) == 1 and len(world.urls) == n
         assert s.read_bytes() == before and sorted(os.listdir(s.parent)) == files
     assert run(["fix-leaders"], World(), Wall(), tmp_path / "fresh" / "leaders.sqlite")[0] == 0   # a new store: made
@@ -1287,3 +1290,238 @@ def test_no_test_here_skips_for_missing_history_and_the_old_store_is_a_fixture()
         assert ("pytest." + "skip(") not in src, name
     assert ("_record_at(" + '"c106abe"') not in sources[here.name]
     assert (here.parent / "leaders_store_c106abe.sql").is_file()
+
+
+# ------------------------------------------------------------------ T52b: the shape under the lock, the whole schema,
+# ------------------------------------------------------------------ a busy store, the folder and the job's line
+SHAPES = {   # what differs from this version's schema: (text in SCHEMA, its replacement, statements added)
+    "an index of the same name on other columns": ("ON changes (read_id)", "ON changes (read_id, kind)", ""),
+    "an index renamed": ("changes_read ON", "changes_by_read ON", ""),
+    "an index missing": (None, None, "DROP INDEX changes_read;"),
+    "a table missing": (None, None, "DROP TABLE rejects;"),
+    "an added UNIQUE": ("rejects (read_id INTEGER,", "rejects (read_id INTEGER UNIQUE,", ""),
+    "an added CHECK": ("status TEXT NOT NULL,", "status TEXT NOT NULL CHECK (status <> ''),", ""),
+    "AUTOINCREMENT removed": ("pass_id INTEGER PRIMARY KEY AUTOINCREMENT", "pass_id INTEGER PRIMARY KEY", ""),
+    "an extra trigger": (None, None, "CREATE TRIGGER t52b_extra AFTER INSERT ON passes BEGIN SELECT 1; END;"),
+    "an extra view": (None, None, "CREATE VIEW t52b_extra AS SELECT 1;"),
+    "this version's own schema": (None, None, ""),
+}
+WORDS = {"DONE": 0, "LOCKED": 2, "REFUSED": 3, "FAILED": 4, "STOPPED": 5, "INTERNAL": 6, "SHAPE": 7, "UNREADABLE": 8,
+         "BUSY": 9}
+
+
+def _shaped_store(s, change):
+    """A store built from this version's statements with one thing changed, its leaders fixed."""
+    old, new, extra = SHAPES[change]
+    schema = lm.SCHEMA
+    if old is not None:
+        assert schema.count(old) == 1, old
+        schema = schema.replace(old, new)
+    s.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(s))
+    c.executescript(schema + extra)
+    c.execute("INSERT INTO meta (key, value) VALUES ('leaders_fixed_at', '2026-11-19T00:00:00+00:00')")
+    c.executemany("INSERT INTO leaders (wallet_key, wallet, sports_rank, sports_pnl, sports_volume, sports_read_ts, "
+                  "fixed_ts) VALUES (?, ?, ?, 1.0, 2.0, ?, ?)", [(wallet(i), wallet(i), i + 1, T0, T0) for i in range(5)])
+    c.commit()
+    c.close()
+
+
+def _master(s):
+    c = sqlite3.connect(s.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        return sorted(tuple(r) for r in c.execute("SELECT type, name, tbl_name, sql FROM sqlite_master"))
+    finally:
+        c.close()
+
+
+@pytest.mark.parametrize("change", sorted(c for c in SHAPES if c != "this version's own schema"))
+def test_a_store_whose_schema_differs_in_anything_sqlite_records_is_refused_in_words(tmp_path, change):
+    s = tmp_path / "other" / "leaders.sqlite"
+    _shaped_store(s, change)
+    world, wall = World(), Wall()
+    world.held[wallet(0)] = [pos(wallet(0), 1)]
+    before, schema, files = s.read_bytes(), _master(s), sorted(os.listdir(s.parent))
+    for cmd in (["pass"], ["report"], ["fix-leaders"]):
+        code, out = run(cmd, world, wall, s)
+        assert code == lm.OTHER_SHAPE and "another version of the record" in out and "nothing done" in out, (cmd, out)
+        assert len(out.strip().splitlines()) == 1 and world.urls == []
+        assert s.read_bytes() == before and _master(s) == schema and sorted(os.listdir(s.parent)) == files
+
+
+def test_a_store_built_from_this_versions_own_statements_is_accepted(tmp_path):
+    s = tmp_path / "same" / "leaders.sqlite"
+    _shaped_store(s, "this version's own schema")
+    world, wall = World(), Wall()
+    code, out = run(["pass"], world, wall, s)
+    assert code == lm.OK and out.strip().splitlines()[-1].startswith("DONE pass "), out
+    assert run(["report"], world, wall, s)[0] == lm.OK
+
+
+def test_the_shape_check_opens_the_store_read_only_and_never_through_the_helper_that_creates(tmp_path, monkeypatch):
+    s = tmp_path / "other" / "leaders.sqlite"
+    _shaped_store(s, "an index missing")
+    schema = _master(s)
+    opened = []
+    real = sqlite3.connect
+
+    def spy(database, *a, **k):
+        opened.append((str(database), bool(k.get("uri"))))
+        return real(database, *a, **k)
+    monkeypatch.setattr(lm.sqlite3, "connect", spy)
+    for cmd in (["pass"], ["report"], ["fix-leaders"]):
+        code, out = run(cmd, World(), Wall(), s)
+        assert code == lm.OTHER_SHAPE, (cmd, out)
+    got = [(d, uri) for d, uri in opened if d != ":memory:"]
+    assert got and all(uri and d.startswith("file:") and d.endswith("?mode=ro") for d, uri in got), got
+    assert _master(s) == schema                              # the missing index was not made
+
+
+@pytest.mark.parametrize("how", ["not a database", "no read permission"])
+def test_an_unreadable_store_is_refused_in_words_by_every_command_and_leaves_no_lock_file(tmp_path, how):
+    s = tmp_path / "bad" / "leaders.sqlite"
+    s.parent.mkdir()
+    content = b"this is not a database\n" * 100
+    s.write_bytes(content)
+    world = World()
+    if how == "no read permission":
+        os.chmod(s, 0)
+    try:
+        for cmd in (["pass"], ["report"], ["fix-leaders"]):
+            code, out = run(cmd, world, Wall(), s)
+            assert code == lm.UNREADABLE and "not readable as a store" in out and "nothing done" in out, (cmd, out)
+            assert "another version" not in out and len(out.strip().splitlines()) == 1 and world.urls == []
+            assert os.listdir(s.parent) == ["leaders.sqlite"]
+    finally:
+        os.chmod(s, 0o644)
+    assert s.read_bytes() == content
+
+
+def test_a_pass_while_another_pass_writes_is_refused_at_once_with_the_lock_code(store):
+    world, wall = fixed(store)
+    run(["pass"], world, wall, store)
+    wall.t += 300
+    n = len(world.urls)
+    fd = os.open(str(store) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    w = sqlite3.connect(str(store), isolation_level=None)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)          # a running pass: its lock, and SQLite's exclusive
+        w.execute("BEGIN EXCLUSIVE")                             # lock as it holds it at a commit
+        outs = []
+        for cmd in (["pass"], ["report"]):
+            t = time.monotonic()
+            code, out = run(cmd, world, wall, store)
+            took = time.monotonic() - t
+            assert code == lm.LOCKED and took < 2.0, (cmd, code, took, out)
+            assert "another version" not in out and "not readable" not in out and len(out.strip().splitlines()) == 1
+            outs.append(out)
+        assert outs[0].startswith("LOCKED ") and "lock" in outs[0]
+        assert "a pass is writing; try again" in outs[1]
+    finally:
+        w.execute("ROLLBACK")
+        w.close()
+        os.close(fd)
+    assert len(world.urls) == n
+
+
+def test_report_fix_leaders_and_pass_tell_a_busy_store_from_another_shape_and_wait_a_few_seconds_at_most(
+        store, monkeypatch):
+    world, wall = fixed(store)
+    run(["pass"], world, wall, store)
+    assert 0 < lm.WAIT_SECONDS <= 5
+    monkeypatch.setattr(lm, "WAIT_SECONDS", 0.5)
+    n = len(world.urls)
+    w = sqlite3.connect(str(store), isolation_level=None)
+    try:
+        w.execute("BEGIN EXCLUSIVE")                             # SQLite's lock held by a writer, the pass lock free
+        for cmd in (["report"], ["fix-leaders"], ["pass"]):
+            t = time.monotonic()
+            code, out = run(cmd, world, wall, store)
+            took = time.monotonic() - t
+            assert code == lm.BUSY and "a pass is writing; try again" in out and took < 3.0, (cmd, code, took, out)
+            assert "another version" not in out and "not readable" not in out and len(out.strip().splitlines()) == 1
+    finally:
+        w.execute("ROLLBACK")
+        w.close()
+    assert len(world.urls) == n
+    assert run(["report"], world, wall, store)[0] == lm.OK
+
+
+def test_pass_in_a_folder_that_cannot_be_written_refuses_in_words_with_nothing_written(store):
+    world, wall = fixed(store)
+    run(["pass"], world, wall, store)
+    wall.t += 300
+    world.held[wallet(0)] = [pos(wallet(0), 1)]
+    assert Path(str(store) + ".lock").exists()
+    before, files, n = store.read_bytes(), sorted(os.listdir(store.parent)), len(world.urls)
+    os.chmod(store.parent, 0o555)
+    try:
+        code, out = run(["pass"], world, wall, store)
+    finally:
+        os.chmod(store.parent, 0o755)
+    assert code == lm.REFUSED and out.startswith("REFUSED ") and "could not be written" in out, out
+    assert "nothing done" in out and len(out.strip().splitlines()) == 1 and len(world.urls) == n
+    assert store.read_bytes() == before and sorted(os.listdir(store.parent)) == files
+
+
+@pytest.mark.parametrize("why", ["a short board", "a board read error", "a malformed wallet id"])
+def test_a_refused_fix_leaders_on_an_absent_store_leaves_no_file(store, why):
+    world = ErrWorld() if why == "a board read error" else World()
+    if why == "a short board":
+        world.boards["crypto"] = world.boards["crypto"][:4]
+    elif why == "a malformed wallet id":
+        world.boards["sports"][1]["user_id"] = "0x" + "a" * 39
+    code, out = run(["fix-leaders"], world, Wall(), store)
+    assert code == lm.REFUSED and "nothing stored" in out, out
+    assert no_file_left(store)
+    assert run(["fix-leaders"], World(), Wall(), store)[0] == lm.OK      # a later run still fixes them
+
+
+def test_every_way_a_pass_ends_prints_one_final_line_with_a_fixed_word_and_its_own_code(tmp_path, monkeypatch):
+    seen = {}
+
+    def end(name, code, out):
+        lines = out.strip().splitlines()
+        seen[name] = (code, lines[-1].split()[0])
+        assert not any(l.split()[0] in WORDS for l in lines[:-1]), (name, out)
+
+    s = tmp_path / "a" / "leaders.sqlite"
+    world, wall = fixed(s)
+    end("DONE", *run(["pass"], world, wall, s))
+    wall.t += 300
+    world.fail[wallet(3)] = "http500"
+    end("FAILED", *run(["pass"], world, wall, s))
+    del world.fail[wallet(3)]
+    wall.t += 300
+    end("STOPPED", *run(["pass"], world, wall, s, memory=lambda: 900.0))
+    fd = os.open(str(s) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        end("LOCKED", *run(["pass"], world, wall, s))
+    finally:
+        os.close(fd)
+    monkeypatch.setattr(lm, "WAIT_SECONDS", 0.2)
+    w = sqlite3.connect(str(s), isolation_level=None)
+    try:
+        w.execute("BEGIN EXCLUSIVE")
+        end("BUSY", *run(["pass"], world, wall, s))
+    finally:
+        w.execute("ROLLBACK")
+        w.close()
+    s2 = tmp_path / "b" / "leaders.sqlite"
+    rw = RaisingWorld()
+    rw, wall2 = fixed(s2, rw)
+    rw.bad = wallet(2)
+    end("INTERNAL", *run(["pass"], rw, wall2, s2))
+    s3 = tmp_path / "c" / "leaders.sqlite"
+    _shaped_store(s3, "an extra view")
+    end("SHAPE", *run(["pass"], World(), Wall(), s3))
+    s4 = tmp_path / "d" / "leaders.sqlite"
+    s4.parent.mkdir()
+    s4.write_bytes(b"this is not a database\n" * 100)
+    end("UNREADABLE", *run(["pass"], World(), Wall(), s4))
+    end("REFUSED", *run(["pass"], World(), Wall(), tmp_path / "e" / "leaders.sqlite"))     # no leaders fixed
+    assert seen == {word: (code, word) for word, code in WORDS.items()}
+    assert len(set(WORDS.values())) == len(WORDS)
+    for word, code in WORDS.items():                         # the module's doc text lists every word and code
+        assert re.search(r"^\s*%s\s+%d\s" % (word, code), lm.__doc__, re.M), word
