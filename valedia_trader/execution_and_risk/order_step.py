@@ -853,6 +853,11 @@ def split_difference(difference, quote, side: str, held) -> Split:
                      target_zeroed=zeroed, why="; ".join(why) if residual != 0 else None)
 
 
+def _leg_of(c: dict) -> dict:
+    """T51 R4: a fractional run's candidate (or ticket line) names its leg; a whole-share run's never does (ruling A)."""
+    return {"leg": c["leg"]} if "leg" in c else {}
+
+
 def max_orders_per_day(limits: dict | None) -> int:
     """The limits file's optional max_orders_per_day, else DEFAULT_MAX_ORDERS_PER_DAY."""
     if limits and "max_orders_per_day" in limits:
@@ -1719,6 +1724,8 @@ class _Run:
         self.working_stop: dict | None = None            # T34b-2 (S1, live): {"pct", "basis", "n"}, set once before any order
         self.wall: float | None = None                   # ... the limits' max_daily_loss_pct as this run loaded them
         self.day_stop: dict | None = None                # T34b-2 (S2, S4, live): set, the run is in the day stop
+        self.residuals: list[dict] = []                  # T51 R1 (fractional): what each fund's split held back
+        self.whole_passed: dict[str, float] = {}         # T51 R4: fund -> its LIMIT leg's units accepted (proposed) this run
 
     # -- helpers
     def _follow_view(self) -> dict:
@@ -2409,10 +2416,36 @@ class _Run:
             self._refuse_ticket("that ticket was made for another capital")
         if bool(t["fractional"]) != self.fractional:
             self._refuse_ticket("that ticket was made " + ("with" if t["fractional"] else "without") + " fractional units")
+        lines = [{"line": int(ln["line"]), "fund": ln["symbol"], "side": ln["side"], "units": float(ln["units"]),
+                  "quote": float(ln["quote"]), "limit": float(ln["limit_price"]), "value": float(ln["value"])}
+                 for ln in book.lines(t["day"], t["number"])]
+        legs = set()
+        for ln in lines:                                 # T51 ruling B: a line's leg is a function of its units alone
+            leg = self._line_leg(ln, bool(t["fractional"]))
+            if (ln["fund"], leg) in legs:
+                self._refuse_ticket(f"that ticket holds two lines of the {leg} leg of {ln['fund']}: it is malformed")
+            legs.add((ln["fund"], leg))
+            if self.fractional:
+                ln["leg"] = leg
         self.ticket = t
-        self.ticket_lines = [{"line": int(ln["line"]), "fund": ln["symbol"], "side": ln["side"], "units": float(ln["units"]),
-                              "quote": float(ln["quote"]), "limit": float(ln["limit_price"]), "value": float(ln["value"])}
-                             for ln in book.lines(t["day"], t["number"])]
+        self.ticket_lines = lines
+
+    def _line_leg(self, ln: dict, fractional: bool) -> str:
+        """T51 ruling B: a ticket line's leg from its units alone: under one unit in size the remainder leg (only on a
+        ticket made with fractional units), whole and at least one the whole leg; anything else is a malformed ticket,
+        refused in words."""
+        size = abs(ln["units"])
+        if not (_finite(size) and size > 0):
+            self._refuse_ticket(f"line {ln['line']} of that ticket holds no units ({ln['units']!r}): it is malformed")
+        if size < 1:
+            if not fractional:
+                self._refuse_ticket(f"line {ln['line']} of that ticket holds {ln['units']:+g} units, under one unit, on a "
+                                    "ticket made without fractional units: it is malformed")
+            return "remainder"
+        if size != math.floor(size):
+            self._refuse_ticket(f"line {ln['line']} of that ticket holds {ln['units']:+g} units, one or more with "
+                                "decimals, which is no leg of the split: it is malformed")
+        return "whole"
 
     def _make_ticket(self) -> None:
         """Propose: write the ticket of this run's lines (none: no ticket), superseding every earlier unused one of
@@ -2464,12 +2497,12 @@ class _Run:
     def _ticket_candidates(self, candidates: list[dict]) -> list[dict]:
         """Approve: the fresh candidates that match a line of the ticket, each carrying its line; every other line is
         dropped with its reason, every other candidate is not sent ("not on the ticket")."""
-        fresh = {c["symbol"]: c for c in candidates}
+        fresh = {(c["symbol"], c.get("leg", "whole")): c for c in candidates}   # T51 R4: keyed by (fund, leg)
         why_not = {x["symbol"]: x["reason"] for x in self.skipped + self.refused}
         out = []
         for ln in self.ticket_lines:
-            c = fresh.pop(ln["fund"], None)
-            stub = {"symbol": ln["fund"], "units": ln["units"], "line": ln["line"]}
+            c = fresh.pop((ln["fund"], ln.get("leg", "whole")), None)
+            stub = {"symbol": ln["fund"], "units": ln["units"], **_leg_of(ln), "line": ln["line"]}
             if c is None:
                 why = why_not.get(ln["fund"])
                 self._drop(stub, "the order is no longer wanted by the fresh targets" + (f" ({why})" if why else ""))
@@ -2479,7 +2512,7 @@ class _Run:
             else:
                 out.append({**c, "line": ln["line"]})
         for c in fresh.values():
-            self.skipped.append({"symbol": c["symbol"], "units": c["units"], "reason": "not on the ticket"})
+            self.skipped.append({"symbol": c["symbol"], "units": c["units"], **_leg_of(c), "reason": "not on the ticket"})
         return out
 
     def _ticket_held(self) -> str | None:
@@ -2513,7 +2546,7 @@ class _Run:
         self.ticket_out[c["line"]] = {"outcome": outcome, "tag": tag, "reason": reason}
 
     def _drop(self, c: dict, reason: str) -> None:
-        item = {"symbol": c["symbol"], "units": c["units"], "reason": reason}
+        item = {"symbol": c["symbol"], "units": c["units"], **_leg_of(c), "reason": reason}
         self.dropped.append(item)
         self._write({"event": "dropped", **item})
         self._ticket_note(c, "not sent", reason=reason)
@@ -2562,7 +2595,7 @@ class _Run:
         words = {"sent": "sent", "not sent": "dropped", "left over": "left over", "unknown": "unknown"}
         out = []
         for ln in self.ticket_lines:
-            item = {"line": ln["line"], "fund": ln["fund"], "side": ln["side"], "units": ln["units"]}
+            item = {"line": ln["line"], "fund": ln["fund"], "side": ln["side"], "units": ln["units"], **_leg_of(ln)}
             got = final.get(ln["line"]) or self.ticket_out.get(ln["line"])
             if got is not None:
                 item.update(outcome=words.get(got["outcome"], got["outcome"]), **({"tag": got["tag"]} if got["tag"] else {}),
@@ -2788,6 +2821,12 @@ class _Run:
         self._settle_unjudged()
         return result
 
+    def _order_type_of(self, tag) -> str | None:
+        """T51 R4: the order type the ledger holds for `tag` (LIMIT or MARKET), or None when it holds no such order."""
+        order = self.ledger.order(tag) if type(tag) is str and tag else None
+        kind = order.get("order_type") if isinstance(order, dict) else None
+        return kind if kind in ("LIMIT", "MARKET") else None
+
     def _journal_fills(self) -> None:
         """Each fill of the ledger not yet applied: journaled once (by fill_id), with `judged_avg` (and `judged_on`
         when the stored average stood in for the replay) and its verdict as the line's last field, judged before the
@@ -2808,6 +2847,9 @@ class _Run:
                          "units": _number_or_none(f["units"]), "price": _number_or_none(f["price"]),
                          "price_covers_units": _number_or_none(f["price_covers_units"]),
                          "fee": _number_or_none(f["fee"]), "judged_avg": _number_or_none(judged["judged_avg"])}
+                if self.fractional:                      # T51 R4, ruling A: keyed by leg on a fractional run only
+                    kind = self._order_type_of(f["tag"])
+                    entry["order_type"], entry["leg"] = kind, {"MARKET": "remainder", "LIMIT": "whole"}.get(kind)
                 if judged["judged_on"] is not None:
                     entry["judged_on"] = judged["judged_on"]
                 entry["verdict"] = judged["verdict"]
@@ -3156,14 +3198,44 @@ class _Run:
             try:
                 if not netted:
                     raise OrderError("no strategy has a part in this order")
-                parts = order_parts(netted[0]["parts"], units)
-            except OrderError as exc:
-                self.refused.append({"symbol": sym, "units": units, "by": "order step",
-                                     "reason": f"the strategies' parts could not be worked out: {_describe(exc)}"})
+                if self.fractional:                      # T51 R4: the split decides the legs, and nothing else
+                    split = split_difference(delta, quote, "buy" if delta > 0 else "sell", max(owned, 0.0))
+                    if float(split.difference) != units:
+                        raise OrderStepError(f"the split's difference {split.difference} is not the order step's "
+                                             f"{units!r}")
+                    shares = netted[0]["parts"]
+                    if split.target_zeroed and split.legs:   # the target taken as zero: each strategy sells its own
+                        zeroed = net_orders([{"strategy": s, "symbol": sym, "units": -h[sym]} for s, h in holdings.items()
+                                             if sym in h])
+                        if not zeroed:
+                            raise OrderError("no strategy holds a part of this fund to sell")
+                        shares = zeroed[0]["parts"]
+                    legs = [(leg, order_parts(shares, float(leg.units))) for leg in split.legs]
+                else:
+                    parts = order_parts(netted[0]["parts"], units)
+            except (OrderError, OrderStepError) as exc:
+                if isinstance(exc, OrderStepError) and not self.fractional:
+                    raise                                # whole shares: as before
+                what ="the fund's difference could not be split" if isinstance(exc, OrderStepError) else \
+                    "the strategies' parts could not be worked out"
+                self.refused.append({"symbol": sym, "units": units, "by": "order step", "reason": f"{what}: {_describe(exc)}"})
                 self._write({"event": "refused", "symbol": sym, "units": units, "by": "order step",
                              "reason": self.refused[-1]["reason"]})
                 continue
-            out.append({"symbol": sym, "units": units, "quote": quote, "value": value, "parts": parts, "owned": owned})
+            if not self.fractional:
+                out.append({"symbol": sym, "units": units, "quote": quote, "value": value, "parts": parts, "owned": owned})
+                continue
+            if split.residual != 0:                      # T51 R1: on the summary; never a fault, an attention item or drift
+                self.residuals.append({"symbol": sym, "units": float(split.residual), "quote": quote,
+                                       "value": float(split.residual_value), "why": split.why})
+            whole = any(leg.leg == "whole" for leg in split.legs)
+            for leg, parts in legs:
+                u = float(leg.units)
+                c = {"symbol": sym, "units": u, "quote": quote, "value": abs(u) * quote, "parts": parts, "owned": owned,
+                     "leg": leg.leg, "order_type": leg.order_type}
+                if leg.leg == "remainder":
+                    c["after_whole"] = whole             # sent only after this fund's LIMIT leg of this run passed
+                out.append(c)
         return out
 
     # -- 8, 9, 10
@@ -3251,12 +3323,21 @@ class _Run:
         if self.live is not None:                        # live: the money this ledger has at work, at the quotes in hand
             self.live_book, self.live_marks, self.live_buys = book, in_hand, []   # worked out again at each order
             self.live_exposure = self._exposure_now()
-        sales = sorted((c for c in candidates if c["units"] < 0), key=lambda c: (-c["value"], c["symbol"]))
-        buys = sorted((c for c in candidates if c["units"] > 0), key=lambda c: (-c["value"], c["symbol"]))
+        def order_key(c):                                # T51 R9: every leg is one order, sales first, by value;
+            return -c["value"], c["symbol"], c.get("leg") == "remainder"   # a fund's LIMIT leg before its remainder
+        sales = sorted((c for c in candidates if c["units"] < 0), key=order_key)
+        buys = sorted((c for c in candidates if c["units"] > 0), key=order_key)
         for c in sales + buys:
             sym, units = c["symbol"], c["units"]
             owned_here = held.get(sym, 0.0)
+            if c.get("leg") == "remainder":              # T51 R4: judged on top of its fund's LIMIT leg of this run
+                owned_here = math.fsum((owned_here, self.whole_passed.get(sym, 0.0)))
             reduces = units < 0 and owned_here > 0 and abs(owned_here + units) < abs(owned_here)
+            if c.get("leg") == "remainder" and c["after_whole"] and sym not in self.whole_passed:
+                self._leave(c, "its fund's whole-share LIMIT leg of this run "               # T51 R4, R9
+                               + ("did not become a line of this ticket" if self.mode == "propose" else
+                                  "was not accepted by the venue") + ", so the remainder is not sent in this run")
+                continue
             if self._now() > self.window_end:
                 self._leave(c, "the session window closed during the run")
                 continue
@@ -3324,7 +3405,8 @@ class _Run:
                 if why is not None:
                     self._drop(c, why)
                     continue
-            tag = f"{self.batch}-{sym}"
+            market = c.get("order_type") == "MARKET"     # T51 R4: the remainder leg, by quantity, behind its collar
+            tag = f"{self.batch}-{sym}" + (".r" if c.get("leg") == "remainder" else "")
             watch = _SubmitWatch(self.venue)
             if self.mode == "approve":                   # the line's tag, on file before its intend
                 self.tickets.note_tag(self.ticket["day"], self.ticket["number"], c["line"], tag, self.batch)
@@ -3337,15 +3419,24 @@ class _Run:
                 self._drop(c, "the ticket expired before the order was intended")
                 continue
             if self.mode == "propose":                   # a line of the ticket instead of intend: nothing is intended
-                self.ticket_lines.append({"line": len(self.ticket_lines), "fund": sym, "side": order["side"], "units": units,
-                                          "quote": quote, "limit": limit, "value": abs(units) * quote})
+                line = {"line": len(self.ticket_lines), "fund": sym, "side": order["side"], "units": units,
+                        "quote": quote, "limit": limit, "value": abs(units) * quote}
+                if self.fractional:                      # ruling B: a remainder line holds its collar as its limit
+                    line["leg"] = c["leg"]
+                self.ticket_lines.append(line)
                 sent_today += 1                          # counted against the caps as if it were sent
                 spent += cost
                 if units > 0 and owned_here <= UNITS_EPS:
                     opened += 1
+                if c.get("leg") == "whole":
+                    self.whole_passed[sym] = units
                 continue
             try:
-                self.ledger.intend(tag, sym, units, quote, limit_price=limit, batch=self.batch, parts=c["parts"])
+                if market:                               # no limit price; its collar is the price a LIMIT leg would carry
+                    self.ledger.intend(tag, sym, units, quote, batch=self.batch, parts=c["parts"], order_type="MARKET",
+                                       collar_price=limit)
+                else:
+                    self.ledger.intend(tag, sym, units, quote, limit_price=limit, batch=self.batch, parts=c["parts"])
                 self.state.note_sending(tag, self.day)
                 self._check_environment()                # 6. the environment and host again ...
                 late = self._last_look(sym, reduces)     # ... the quote's age, the halt and latch files ...
@@ -3386,15 +3477,22 @@ class _Run:
                     why = f"the venue answered {_status_word(watch.answer)}, not 'accepted'"
                 else:
                     why = "the venue was not called"
-                self._write({"event": "unknown", "tag": tag, "symbol": sym, "units": units, "state": outcome, "reason": why})
+                self._write({"event": "unknown", "tag": tag, "symbol": sym, "units": units, **_leg_of(c), "state": outcome,
+                             "reason": why})
                 raise _Stop("send", f"the outcome of order {tag} ({sym} {units:+g}) is {outcome}: {why}; nothing more is "
                                     "sent until a reconcile settles it")
             sent_today += 1
             spent += cost
             if units > 0 and owned_here <= UNITS_EPS:
                 opened += 1
+            if c.get("leg") == "whole":
+                self.whole_passed[sym] = units
             entry = {"symbol": sym, "units": units, "side": order["side"], "limit_price": limit, "quote": quote,
                      "value": abs(units) * quote, "tag": tag, "parts": c["parts"], "reduces_risk": bool(reduces)}
+            if self.fractional:                          # ruling A: these fields only on a fractional run
+                if market:
+                    entry["limit_price"], entry["collar_price"] = None, limit
+                entry["order_type"], entry["leg"] = c["order_type"], c["leg"]
             self.sent.append(entry)
             self._write({"event": "order", **entry, "state": outcome})
             self._ticket_note(c, "sent", tag=tag)
@@ -3418,7 +3516,7 @@ class _Run:
         return None
 
     def _leave(self, c: dict, reason: str) -> None:
-        item = {"symbol": c["symbol"], "units": c["units"], "reason": reason}
+        item = {"symbol": c["symbol"], "units": c["units"], **_leg_of(c), "reason": reason}
         self.left_over.append(item)
         self._write({"event": "left_over", **item})
         self._ticket_note(c, "not sent", reason=reason)
@@ -3436,7 +3534,7 @@ class _Run:
         return why
 
     def _refuse(self, c: dict, by: str, reason: str, **extra) -> None:
-        item = {"symbol": c["symbol"], "units": c["units"], "by": by, "reason": str(reason)[:MAX_TEXT * 2]}
+        item = {"symbol": c["symbol"], "units": c["units"], **_leg_of(c), "by": by, "reason": str(reason)[:MAX_TEXT * 2]}
         self.refused.append(item)
         self._write({"event": "refused", **item, **extra})
         self._ticket_note(c, "not sent", reason=f"refused by the {by}: {item['reason']}")
@@ -3477,6 +3575,8 @@ class _Run:
                    "paper_equity": self.paper_equity, "gaps": gaps, "torn_lines": self.torn_lines,
                    "cash": self.cash_read, "settled_cash": self.settled_cash,
                    "purchases_left_unsettled": self.purchases_left_unsettled}
+        if self.fractional:                              # T51 R1: each fund's residual (ruling A: fractional runs only)
+            summary["residuals"] = [dict(r) for r in self.residuals]
         if self.follow_names is not None:                # T32: which strategies the broker book followed
             summary["follow"] = self._follow_view()
         corrections = []
