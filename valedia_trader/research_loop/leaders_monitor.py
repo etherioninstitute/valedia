@@ -87,19 +87,21 @@ CREATE INDEX IF NOT EXISTS passes_ts ON passes (started_ts);
 CREATE TABLE IF NOT EXISTS wallet_reads (read_id INTEGER PRIMARY KEY AUTOINCREMENT, pass_id INTEGER,
     wallet_key TEXT NOT NULL, good INTEGER NOT NULL, reason TEXT, detail TEXT, rows INTEGER, pages INTEGER,
     rejects TEXT, unread TEXT, baseline INTEGER, prev_read_id INTEGER, prev_read_ts REAL, gap REAL,
-    n_new INTEGER, n_increase INTEGER, n_decrease INTEGER, n_exit INTEGER, read_ts REAL NOT NULL);
+    n_new INTEGER, n_increase INTEGER, n_decrease INTEGER, n_exit INTEGER, carried INTEGER, read_ts REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS wallet_reads_wallet ON wallet_reads (wallet_key, good, read_id);
 CREATE INDEX IF NOT EXISTS wallet_reads_ts ON wallet_reads (read_ts);
 CREATE TABLE IF NOT EXISTS holdings_current (wallet_key TEXT NOT NULL, token_id TEXT NOT NULL,
-    read_id INTEGER NOT NULL, %(h)s, PRIMARY KEY (wallet_key, token_id));
+    read_id INTEGER NOT NULL, carried INTEGER NOT NULL, seen_read_id INTEGER NOT NULL, seen_read_ts REAL NOT NULL,
+    %(h)s, PRIMARY KEY (wallet_key, token_id));
 CREATE TABLE IF NOT EXISTS snapshots (read_id INTEGER NOT NULL, wallet_key TEXT NOT NULL, token_id TEXT NOT NULL,
-    kind TEXT NOT NULL, utc_day TEXT NOT NULL, read_ts REAL NOT NULL, %(h)s);
+    kind TEXT NOT NULL, utc_day TEXT NOT NULL, read_ts REAL NOT NULL, carried INTEGER NOT NULL,
+    seen_read_id INTEGER NOT NULL, %(h)s);
 CREATE INDEX IF NOT EXISTS snapshots_day ON snapshots (wallet_key, utc_day);
 CREATE INDEX IF NOT EXISTS snapshots_ts ON snapshots (read_ts);
 CREATE TABLE IF NOT EXISTS changes (change_id INTEGER PRIMARY KEY AUTOINCREMENT, read_id INTEGER NOT NULL,
     wallet_key TEXT NOT NULL, token_id TEXT NOT NULL, kind TEXT NOT NULL, flip INTEGER NOT NULL,
     size_before REAL NOT NULL, size_after REAL NOT NULL, first_entry_at INTEGER, read_ts REAL NOT NULL,
-    prev_read_ts REAL, gap REAL);
+    prev_read_ts REAL, gap REAL, last_seen_ts REAL);
 CREATE INDEX IF NOT EXISTS changes_ts ON changes (read_ts);
 CREATE INDEX IF NOT EXISTS changes_read ON changes (read_id);
 CREATE TABLE IF NOT EXISTS rejects (read_id INTEGER, wallet_key TEXT, reason TEXT, raw TEXT, read_ts REAL NOT NULL);
@@ -246,8 +248,9 @@ def read_wallet(client, wallet: str) -> dict:
     return {"good": True, "rows": rows, "pages": len(sizes), "rejects": rejects, "bad": bad, "unread": unread}
 
 
-def _diff(prev: dict, new: dict) -> list:
-    """(token, kind, flip, size_before, size_after, row) for every change from `prev` {token: size} to `new`."""
+def _diff(prev: dict, new: dict, exits: bool = True) -> list:
+    """(token, kind, flip, size_before, size_after, row) for every change from `prev` {token: size} to `new`; an
+    EXIT only when `exits` (a clean read)."""
     out = []
     for tok, r in new.items():
         size = float(r["current_size"])
@@ -257,7 +260,8 @@ def _diff(prev: dict, new: dict) -> list:
             out.append((tok, "INCREASE", 0, prev[tok], size, r))
         elif prev[tok] - size > SIZE_EPS:
             out.append((tok, "DECREASE", 0, prev[tok], size, r))
-    out.extend((tok, "EXIT", 0, size, 0.0, None) for tok, size in prev.items() if tok not in new)
+    if exits:
+        out.extend((tok, "EXIT", 0, size, 0.0, None) for tok, size in prev.items() if tok not in new)
     return sorted(out, key=lambda c: (KINDS.index(c[1]), c[0]))
 
 
@@ -274,42 +278,52 @@ def write_wallet(conn, pass_id: int, key: str, res: dict, read_ts: float) -> dic
             return {"baseline": False}
         last = conn.execute("SELECT read_id, read_ts FROM wallet_reads WHERE wallet_key=? AND good=1 "
                             "ORDER BY read_id DESC LIMIT 1", (key,)).fetchone()
-        prev = dict(conn.execute("SELECT token_id, size FROM holdings_current WHERE wallet_key=?", (key,)))
+        cols = ", ".join(HOLDING_COLS)
+        marks = ", ".join("?" * len(HOLDING_COLS))
+        prev = {r[0]: r[1:] for r in conn.execute("SELECT token_id, seen_read_id, seen_read_ts, %s FROM "
+                                                  "holdings_current WHERE wallet_key=?" % cols, (key,))}
+        size_at = HOLDING_COLS.index("size") + 2
         new = {r["token_id"]: r for r in res["rows"]}
         baseline = last is None
-        found = [] if baseline else _diff(prev, new)
+        # a read with a rejected or conflicting row cannot say a held token is gone: it is carried, not an EXIT
+        clean = not any(v for why, v in res["rejects"].items() if why != "repeated_row")
+        carry = {} if baseline or clean else {tok: p for tok, p in prev.items() if tok not in new}
+        found = [] if baseline else _diff({tok: p[size_at] for tok, p in prev.items()}, new, exits=clean)
         prev_id, prev_ts = (None, None) if baseline else last
         gap = None if baseline else read_ts - prev_ts
         n = Counter(c[1] for c in found)
         cur = conn.execute(
             "INSERT INTO wallet_reads (pass_id, wallet_key, good, rows, pages, rejects, unread, baseline, prev_read_id,"
-            " prev_read_ts, gap, n_new, n_increase, n_decrease, n_exit, read_ts) "
-            "VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " prev_read_ts, gap, n_new, n_increase, n_decrease, n_exit, carried, read_ts) "
+            "VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (pass_id, key, len(new), res["pages"], json.dumps(dict(res["rejects"]), sort_keys=True),
              json.dumps(dict(res["unread"]), sort_keys=True), int(baseline), prev_id, prev_ts, gap,
-             n["NEW"], n["INCREASE"], n["DECREASE"], n["EXIT"], read_ts))
+             n["NEW"], n["INCREASE"], n["DECREASE"], n["EXIT"], len(carry), read_ts))
         read_id = cur.lastrowid
-        cols = ", ".join(HOLDING_COLS)
-        marks = ", ".join("?" * len(HOLDING_COLS))
+        held = [(tok, 0, read_id, read_ts, *_holding(r)) for tok, r in new.items()] + \
+               [(tok, 1, *p) for tok, p in carry.items()]          # a carried holding keeps the read that saw it
         conn.execute("DELETE FROM holdings_current WHERE wallet_key=?", (key,))
-        conn.executemany("INSERT INTO holdings_current (wallet_key, token_id, read_id, %s) VALUES (?, ?, ?, %s)"
-                         % (cols, marks), [(key, tok, read_id, *_holding(r)) for tok, r in new.items()])
+        conn.executemany("INSERT INTO holdings_current (wallet_key, read_id, token_id, carried, seen_read_id, "
+                         "seen_read_ts, %s) VALUES (?, ?, ?, ?, ?, ?, %s)" % (cols, marks),
+                         [(key, read_id, *h) for h in held])
         conn.executemany("INSERT INTO changes (read_id, wallet_key, token_id, kind, flip, size_before, size_after,"
-                         " first_entry_at, read_ts, prev_read_ts, gap) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         " first_entry_at, read_ts, prev_read_ts, gap, last_seen_ts) "
+                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                          [(read_id, key, tok, kind, flip, before, after,
-                           _int(r.get("first_entry_at")) if r else None, read_ts, prev_ts, gap)
+                           _int(r.get("first_entry_at")) if r else None, read_ts, prev_ts, gap,
+                           prev[tok][1] if tok in prev else None)
                           for tok, kind, flip, before, after, r in found])
         day = _utc_day(read_ts)
         have = conn.execute("SELECT 1 FROM snapshots WHERE wallet_key=? AND utc_day=? LIMIT 1", (key, day)).fetchone()
         if baseline or not have:
-            conn.executemany("INSERT INTO snapshots (read_id, wallet_key, token_id, kind, utc_day, read_ts, %s) "
-                             "VALUES (?, ?, ?, ?, ?, ?, %s)" % (cols, marks),
-                             [(read_id, key, tok, "baseline" if baseline else "daily", day, read_ts, *_holding(r))
-                              for tok, r in new.items()])
+            conn.executemany("INSERT INTO snapshots (read_id, wallet_key, kind, utc_day, read_ts, token_id, carried, "
+                             "seen_read_id, %s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, %s)" % (cols, marks),
+                             [(read_id, key, "baseline" if baseline else "daily", day, read_ts, h[0], h[1], h[2],
+                               *h[4:]) for h in held])
         conn.executemany("INSERT INTO rejects (read_id, wallet_key, reason, raw, read_ts) VALUES (?, ?, ?, ?, ?)",
                          [(read_id, key, why, _raw(raw), read_ts) for why, raw in res["bad"]])
         conn.execute("COMMIT")
-        return {"baseline": baseline, **n}
+        return {"baseline": baseline, "carried": len(carry), **n}
     except BaseException:
         if conn.in_transaction:
             conn.execute("ROLLBACK")
@@ -368,10 +382,10 @@ def run_pass(conn, client, wall, say, memory: Callable[[], float], max_mb: float
         if res["good"]:
             good += 1
             totals.update({k: n.get(k, 0) for k in KINDS})
-            say("wallet %s good rows=%d rejects=%d new=%d increase=%d decrease=%d exit=%d%s %.1fs mem=%.0fMB"
-                % (wallet[:10], len(res["rows"]), sum(res["rejects"].values()), n.get("NEW", 0),
-                   n.get("INCREASE", 0), n.get("DECREASE", 0), n.get("EXIT", 0),
-                   " baseline" if n["baseline"] else "", time.monotonic() - t, mem))
+            say("wallet %s good rows=%d rejects=%d new=%d increase=%d decrease=%d exit=%d carried=%d%s %.1fs "
+                "mem=%.0fMB" % (wallet[:10], len(res["rows"]), sum(res["rejects"].values()), n.get("NEW", 0),
+                                n.get("INCREASE", 0), n.get("DECREASE", 0), n.get("EXIT", 0), n["carried"],
+                                " baseline" if n["baseline"] else "", time.monotonic() - t, mem))
         else:
             failed += 1
             say("wallet %s failed %s pages=%d %.1fs mem=%.0fMB" % (wallet[:10], res["reason"], res["pages"] or 0,
@@ -390,19 +404,22 @@ def run_pass(conn, client, wall, say, memory: Callable[[], float], max_mb: float
 # ---------------------------------------------------------------- consistency and report
 def consistency(conn) -> list:
     """Every way the store breaks the one-write rule: a wallet's holdings that are not exactly its last good read's
-    rows, or that read's changes not all present. An empty list is a consistent store."""
+    rows and carried holdings, or that read's changes not all present. An empty list is a consistent store."""
     problems = []
     keys = [r[0] for r in conn.execute("SELECT wallet_key FROM leaders UNION SELECT wallet_key FROM holdings_current")]
     for key in keys:
-        last = conn.execute("SELECT read_id, rows, n_new + n_increase + n_decrease + n_exit FROM wallet_reads "
-                            "WHERE wallet_key=? AND good=1 ORDER BY read_id DESC LIMIT 1", (key,)).fetchone()
-        held, reads, top = conn.execute("SELECT count(*), count(DISTINCT read_id), max(read_id) FROM "
-                                        "holdings_current WHERE wallet_key=?", (key,)).fetchone()
+        last = conn.execute("SELECT read_id, rows, n_new + n_increase + n_decrease + n_exit, coalesce(carried, 0) "
+                            "FROM wallet_reads WHERE wallet_key=? AND good=1 ORDER BY read_id DESC LIMIT 1",
+                            (key,)).fetchone()
+        held, reads, top, n_carried, bad_seen = conn.execute(
+            "SELECT count(*), count(DISTINCT read_id), max(read_id), coalesce(sum(carried), 0), "
+            "coalesce(sum(CASE WHEN carried THEN seen_read_id >= read_id ELSE seen_read_id != read_id END), 0) "
+            "FROM holdings_current WHERE wallet_key=?", (key,)).fetchone()
         if last is None:
             if held:
                 problems.append("%s: holdings without a good read" % key[:10])
             continue
-        if held != last[1] or (held and (reads != 1 or top != last[0])):
+        if held != last[1] + last[3] or n_carried != last[3] or bad_seen or (held and (reads != 1 or top != last[0])):
             problems.append("%s: holdings are not exactly the last good read" % key[:10])
         if conn.execute("SELECT count(*) FROM changes WHERE read_id=?", (last[0],)).fetchone()[0] != last[2]:
             problems.append("%s: the last good read's changes are not all stored" % key[:10])
@@ -431,9 +448,14 @@ def report(conn, wall, say, days: int) -> int:
                                   (key, since)))
         totals.update(kinds)
         last = conn.execute("SELECT max(read_ts) FROM wallet_reads WHERE wallet_key=? AND good=1", (key,)).fetchone()[0]
-        say("%s sports#%s crypto#%s good=%d failed=%d new=%d increase=%d decrease=%d exit=%d last good read %s"
+        carried = conn.execute("SELECT count(*) FROM holdings_current WHERE wallet_key=? AND carried=1",
+                               (key,)).fetchone()[0]
+        carrying = conn.execute("SELECT count(*) FROM wallet_reads WHERE wallet_key=? AND good=1 AND carried>0 AND "
+                                "read_ts>=?", (key, since)).fetchone()[0]
+        say("%s sports#%s crypto#%s good=%d failed=%d new=%d increase=%d decrease=%d exit=%d carried=%d reads "
+            "carrying=%.1f%% last good read %s"
             % (wallet[:10], srank or "-", crank or "-", g, f, kinds.get("NEW", 0), kinds.get("INCREASE", 0),
-               kinds.get("DECREASE", 0), kinds.get("EXIT", 0),
+               kinds.get("DECREASE", 0), kinds.get("EXIT", 0), carried, 100.0 * carrying / g if g else 0.0,
                "never" if last is None else "%.0fs ago" % (now - last)))
     flips = conn.execute("SELECT count(*) FROM changes WHERE flip=1 AND read_ts>=?", (since,)).fetchone()[0]
     say("changes in the window: new=%d increase=%d decrease=%d exit=%d (flip=%d)"
