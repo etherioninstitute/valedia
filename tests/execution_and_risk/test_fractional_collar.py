@@ -284,6 +284,23 @@ def test_b3_an_approval_bands_a_market_leg_on_the_tickets_quote_as_today(tmp_pat
         assert out["sent"] == [] and [(e["leg"], e["reason"][:13]) for e in out["dropped"]] == [("remainder", "the fresh quo")]
 
 
+@pytest.mark.parametrize("check", ["second_source", "quote_age"])
+def test_an_approval_holds_a_market_leg_back_by_the_collar_as_an_ordinary_run_does(tmp_path, check):
+    w = leg_world(tmp_path / "w")
+    w.paper = paper({"a": {"SPY": 0.5}})                              # a remainder leg alone
+    p = propose(w, fractional=True)
+    assert w.second.calls == []                                       # a proposal sends nothing: no collar yet
+    w.later(1)
+    if check == "second_source":
+        w.second.verdicts["SPY"] = "disagree"
+    else:
+        w.quote_age["SPY"] = 121.0
+    out = approve(w, p["ticket_number"], fractional=True)
+    assert out["status"] == "done" and "faults" not in out and out["sent"] == [] and w.venue.args == [], out
+    (left,) = held_back(out)
+    assert left["collar"] == check, left
+
+
 # ---- B5: the collar price, stored with the order and charged to the purchase budget
 
 @pytest.mark.parametrize("cash, sent", [(1273.74, False), (1275.26, True)])
