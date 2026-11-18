@@ -1270,3 +1270,14 @@ def test_report_prints_every_pass_status_present_running_included(store):
     assert line.startswith("passes 4 in the window:")
     for word in ("done=1", "running=2", "an_unknown_status=1", "died=0", "stopped_memory=0"):
         assert word in line, (word, line)
+
+
+def test_no_test_here_skips_for_missing_history_and_the_old_store_is_a_fixture():
+    """Addendum 4: an old commit can be collected by git one day; a test must then fail in words, never skip, and
+    the old-shape store comes from a fixture kept in the repository, not from a commit."""
+    here = Path(__file__).resolve()
+    sources = {p.name: p.read_text() for p in (here, here.parents[1] / "venues" / "test_polymarket_data.py")}
+    for name, src in sources.items():
+        assert ("pytest." + "skip(") not in src, name
+    assert ("_record_at(" + '"c106abe"') not in sources[here.name]
+    assert (here.parent / "leaders_store_c106abe.sql").is_file()
