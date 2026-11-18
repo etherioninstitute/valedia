@@ -82,12 +82,25 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   the wallets it picks; (3) each open position matched to a Webull contract with the same resolution rule;
   (4) paper copies under a rule locked BEFORE the first copy; (5) its result against a bar stated in that
   locked document. Real orders only after it passes, the event order step (T45-2) and his event limits.
-  **NOW** T53 step 0 (a study, at work since 13:45): what the leaders hold, which positions have a Kalshi
-  market with the SAME resolution rule (Webull lists Kalshi's tickers), one day's prices and fees, the
-  consistency screen designed WITHOUT reading T47's sealed months, the forward test sketched. The lead's
-  first look at the baseline pass: 281 of the 1,942 open positions are priced between 3 and 97 cents (about
-  3.0 million dollars); 175 of those are crypto and commodity price-level questions. Then the lead writes the
-  locked forward document.
+  **DONE 2026-11-18 14:02 PST** T53 step 0, a study of ONE day (report
+  `claude-tmp/valedia-trader1/t53-scratch/step0-report.md`; the lead re-checked its main counts). AS SHOWN,
+  THE METHOD CARRIES LITTLE ONTO WEBULL: of the ten fixed leaders' 274 live positions (3.0 million dollars),
+  165 have no Kalshi market at all (and Webull lists only Kalshi's); the 10 game positions had resolved
+  before a read 17 hours later (a daily pass cannot copy a game); 85 crypto price positions have a NEAR
+  market with another price source and tie rule, and 3 of those pairs have ALREADY resolved differently on
+  the two venues; 14 (one wallet's season futures and one politics question) look like the same event.
+  Verified same rule: none yet (Polymarket's rule texts sit on a host the reader may not ask). Webull's
+  listing is verified for 1 of the 28 matched series. The leaders disagree: 45 of the 69 markets held by
+  more than one of them have leaders on opposite sides. Kalshi's ask was at or below the leader's own entry
+  for 37 of 91. Three of the ten fixed leaders are the multi-million-trade machines. Cost on Webull: 0.02 a
+  contract a trade, so a copy held to the result needs a chance above its ask plus 0.02. One day's prices:
+  not evidence of profit or loss. **NEXT**, in this order: (1) the lead's locked forward document (the
+  screen's parameters fixed before it runs; the copy, the price, the close, the bar); (2) Webull's listing
+  of the 27 unverified series by the project's own probe; (3) a reader for Polymarket's rule texts and the
+  lead's rule map, family by family; (4) the screen over the 189 wallets' histories once T47 is closed;
+  (5) the record pointed at the wallets it picks; (6) the paper copier with a slow Kalshi reader.
+  **OWNER** whether the leaders' pass runs more often than once a day (game positions resolve within the
+  day; a change to his job's schedule is his to allow).
 - **WATCH** the order-book collector (roadmap 1.16). 2026-11-18, the last development day: 33 decisions lost,
   3 at 03:14 (the pull's start read its 70 GB store on the collector's SSD) and 30 from 07:20 to 07:33 (the
   LEAD's own copy of that store off the SSD at 100 MB/s made the collector overrun whole minutes). What is
