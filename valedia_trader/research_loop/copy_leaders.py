@@ -14,8 +14,25 @@ finer grain), and never a point at or after the market's resolution time, which 
     python -m valedia_trader.research_loop.copy_leaders develop [--store FILE] [--out-dir DIR] [--leave-out W ...]
     python -m valedia_trader.research_loop.copy_leaders sealed  --i-am-opening-the-sealed-period [--store FILE]
         [--out-dir DIR] [--develop-file FILE] [--leave-out W ...]
+    python -m valedia_trader.research_loop.copy_leaders reread-resolutions [--store FILE]
 
 Rules the code holds:
+
+* The fifth amendment (f40bc41). The resolutions route answers in two shapes; the reader reads both (see
+  pd.validate_resolution): a row of the oracle's shape (it carries a `price`) with status resolved and a price of
+  exactly 10**18, 0 or 5 * 10**17 pays the first outcome, the second, or half each, at its `last_update_timestamp`;
+  every other such row is no known resolution, with its own reason. `reread-resolutions` reads a store's stored rows
+  again as they were received (the `raw` column), with no request, and sets for each row of the oracle's shape the
+  status, payouts, resolved_at and resolved_ts the rule gives, in transactions of REREAD_CHUNK rows, a line every
+  REREAD_EVERY rows, a final count by reading, and the marker `resolution_reading` in `meta` (it changes no `raw`, no
+  other table, no row of the reported shape; stopped, it is run again; a second complete run changes nothing). A
+  pull that stores rows of the oracle's shape in a store that held none keeps that marker's counts itself; in a
+  store that holds such rows from before the rule, it makes no marker. Phase 2, `develop` and `sealed` refuse in
+  words a store with rows of the oracle's shape not read under the rule (or a marker whose counts are not the
+  store's rows); `develop` and `sealed` also refuse a store whose plan is older than its reading, and phase 2 makes
+  the plan again from the stored trades and resolutions, keeps every price window already read that the new plan
+  holds (never asked again), reads the new ones and says how many it kept and leaves unused. Every output's
+  provenance carries the counts and whether the plan was made after the reading.
 
 * The pull has two phases. Phase 1: the two profit boards ONCE (the candidate set, stored with its read time; a later
   pull never reads the boards into the same store), every candidate's full trade history, and the resolution of
@@ -771,6 +788,15 @@ CREATE TABLE IF NOT EXISTS rejects (kind TEXT, key TEXT, reason TEXT, raw TEXT, 
 """
 
 
+FIFTH_AMENDMENT_COMMIT = "f40bc41"
+READING_KEY = "resolution_reading"        # meta: the store's rows of the oracle's shape read under the fifth amendment
+READING_RULE = "fifth amendment (%s)" % FIFTH_AMENDMENT_COMMIT
+ORACLE_ROWS_SQL = ("SELECT COUNT(*) FROM resolutions WHERE (CASE WHEN json_valid(raw) THEN json_type(raw, '$.price') "
+                   "END) IS NOT NULL")
+REREAD_CHUNK = 10_000                     # rows a transaction of reread-resolutions
+REREAD_EVERY = 100_000                    # a line every this many rows
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
@@ -957,6 +983,10 @@ class Store:
         an id the service refused alone, exactly as "no_row": no resolution row, its walk finished)."""
         good_raw = [raw for raw, why in w.raw if not why]
         read_at = w.read_at[0] if w.read_at else _now()
+        pulled = Counter(row["reading"] for row in w.rows
+                         if "reading" in row and answers.get(row["condition_id"]) == "row")
+        if pulled:                                 # rows of the oracle's shape, read under the fifth amendment
+            self._may_mark_readings()
         for row, raw, at in zip(w.rows, good_raw, w.row_read_at):
             cond = row["condition_id"]
             if answers.get(cond) == "row":
@@ -975,6 +1005,54 @@ class Store:
         for cond in conditions:
             self.db.execute("INSERT OR REPLACE INTO resolution_answers VALUES (?,?,?)", (cond, answers[cond], read_at))
             self._finish("resolutions", cond, w, rejects=False)
+        if pulled:
+            self._add_readings(pulled)
+
+    # ------------------------------------------------------------ the fifth amendment's reading (bookkeeping only)
+    def oracle_rows(self) -> int:
+        """The resolution rows of the oracle's shape (their raw row carries a `price`), counted in the query."""
+        return self.db.execute(ORACLE_ROWS_SQL).fetchone()[0]
+
+    def reading_marker(self):
+        """(present, the marker as a dict or None when it is malformed)."""
+        present, raw = self.meta_raw(READING_KEY)
+        if not present:
+            return False, None
+        try:
+            m = json.loads(raw)
+        except (TypeError, ValueError):
+            return True, None
+        return True, m if isinstance(m, dict) else None
+
+    def _may_mark_readings(self) -> None:
+        """Decided once a session, before the first row of the oracle's shape is stored: a pull may make the marker
+        only in a store that holds no such row yet (an older one would be a row stored before the rule)."""
+        if getattr(self, "_may_mark", None) is None:
+            self._may_mark = self.reading_marker()[0] or self.oracle_rows() == 0
+
+    def _add_readings(self, pulled: Counter) -> None:
+        """A pull stored rows of the oracle's shape, read under the rule: the marker counts them and the plan, if
+        any, is now older than the reading. No marker is made in a store that held such rows before (see above)."""
+        present, m = self.reading_marker()
+        if not present:
+            if not self._may_mark:
+                return
+            m = {"rule": READING_RULE, "by": "pull", "complete": True, "counts": {k: 0 for k in pd.ORACLE_READINGS},
+                 "plan_after_reading": False}
+        elif m is None:
+            return                                 # malformed: develop and sealed refuse it; reread rewrites it
+        if isinstance(m.get("counts"), dict):
+            m["counts"] = {k: (m["counts"].get(k) if isinstance(m["counts"].get(k), int) else 0) + pulled[k]
+                           for k in pd.ORACLE_READINGS}
+        m["plan_after_reading"] = False
+        self.set_meta(READING_KEY, m)
+
+    def plan_made_after_reading(self) -> None:
+        """Phase 2 made the plan from the rows as now read (written with the plan, in its transaction)."""
+        present, m = self.reading_marker()
+        if present and m is not None:
+            m["plan_after_reading"] = True
+            self.set_meta(READING_KEY, m)
 
     def resolution_answers(self, conditions=None) -> dict:
         """Every answer, or (selected in the query) those of `conditions`."""
@@ -1540,6 +1618,47 @@ def phase1_problems(s: Store, leave_out=()) -> list:
     return out
 
 
+def reading_problems(s: Store, plan: bool = True) -> list:
+    """What the fifth amendment's reading still lacks, from bookkeeping alone (a counting query and the marker): rows
+    of the oracle's shape stored and not read under the rule (no marker, or a re-reading that did not finish), a
+    marker whose counts are not the store's rows, and (`plan`) a plan older than the reading."""
+    n = s.oracle_rows()
+    present, m = s.reading_marker()
+    again = "run `copy_leaders reread-resolutions` on this store, then `pull --phase 2`"
+    if present and m is None:
+        return ["the store's resolution reading marker is malformed: %s" % again]
+    out = []
+    if n and (m is None or m.get("complete") is not True):
+        out.append("%d resolution rows of the oracle's shape (rows that carry a price) are not yet read under the "
+                   "fifth amendment (stored before it, or by a re-reading that did not finish): %s" % (n, again))
+    elif m is not None:
+        counts = m.get("counts")
+        counted = sum(counts.values()) if isinstance(counts, dict) and all(
+            isinstance(v, int) and not isinstance(v, bool) for v in counts.values()) else None
+        if counted != n:
+            out.append("the store holds %d resolution rows of the oracle's shape but its reading counted %s: %s"
+                       % (n, counted, again))
+    if plan and m is not None and m.get("plan_after_reading") is not True:
+        out.append("the store's plan is older than its resolution reading (it was made before the resolution rows "
+                   "were read under the fifth amendment, or no plan was made since): run pull --phase 2 to make it "
+                   "again")
+    return out
+
+
+def reading_provenance(s: Store) -> dict:
+    """The fifth amendment's counts as the store's marker holds them (zeros without one), whether the rows were read
+    again by reread-resolutions, and whether the plan was made after the reading (None without a marker)."""
+    present, m = s.reading_marker()
+    counts = {k: 0 for k in pd.ORACLE_READINGS}
+    if m is not None and isinstance(m.get("counts"), dict):
+        for k in counts:
+            v = m["counts"].get(k)
+            counts[k] = v if isinstance(v, int) and not isinstance(v, bool) else 0
+    return {"rule": READING_RULE, "rows_read_again": bool(m and m.get("by") == "reread" and m.get("complete") is True),
+            "counts": counts, "plan_made_after_reading": None if not present else bool(m and m.get(
+                "plan_after_reading") is True)}
+
+
 def plan_store(s: Store, leave_out=(), say=None, memory=None, guard=None) -> dict:
     """Compute from phase 1 the leaders' qualifying positions (and their base price windows) of every development
     and sealed month, record them as the plan, and return them. Wallet by wallet (see _fold): one line a wallet
@@ -2015,10 +2134,27 @@ def _pull_phase2(s: Store, client, run: _Run, leave_out, errors) -> None:
     problems = phase1_problems(s, leave_out)
     if problems:
         raise Refused("phase 1 is unfinished: %s; finish it (or name the wallets with --leave-out)" % "; ".join(problems))
+    unread = reading_problems(s, plan=False)
+    if unread:
+        raise Refused("phase 2 is not started (nothing asked): %s" % "; ".join(unread))
+    marked = s.reading_marker()[0]
+    before = s.finished_keys("prices")             # the windows read before this run
+    _phase2_windows(s, client, run, leave_out, errors, marked)
+    if marked:                                     # the plan made again after the reading: what it kept
+        plan = set(s.plan_windows())
+        run.say("phase 2: the plan made from the resolution rows as now read holds %d price windows: %d were read "
+                "before this run (kept, not asked again) and %d are new to it; %d windows read before are left unused "
+                "(no longer in the plan; their rows stay in the store)" % (
+                    len(plan), len(plan & before), len(plan - before), len(before - plan)))
+
+
+def _phase2_windows(s: Store, client, run: _Run, leave_out, errors, marked: bool) -> None:
     def guard(mb, i, n):
         if mb > run.limit:
             raise _MemoryOver(mb)
     plan = plan_store(s, leave_out, say=run.say, memory=run.memory, guard=guard)
+    if marked:
+        s.plan_made_after_reading()                # with the plan, in its transaction
     s.commit()
     done = s.finished_keys("prices")
     todo = {k: wd for k, wd in s.plan_windows().items() if k not in done}
@@ -2035,6 +2171,101 @@ def _pull_phase2(s: Store, client, run: _Run, leave_out, errors) -> None:
             "so at least that many requests (more if a window has more than one page); %s"
             % (len(ten), run.estimate(s, len(ten))))
     _read_windows(s, client, run, ten, errors)
+
+
+# ---------------------------------------------------------------- the stored resolution rows read again (no request)
+def reread_resolutions(store_path, say=None, wall=None) -> dict:
+    """reread-resolutions: every resolution row of the store read again AS IT WAS RECEIVED (its `raw` column) by the
+    reader's own rule (pd.validate_resolution, the fifth amendment): for each row of the oracle's shape the stored
+    status, payouts, resolved_at and resolved_ts become what the rule gives. No request is made (no client exists
+    here); no `raw`, no row of another table and no row of the reported shape (or of neither) is changed. It holds the
+    store's exclusive lock for its whole life (it refuses while a pull, develop or sealed holds it), refuses a store
+    whose sealed period was spent, works in transactions of REREAD_CHUNK rows with a line every REREAD_EVERY rows,
+    can be stopped at any point and run again (a second complete run changes nothing and says so), and leaves in
+    `meta` the marker READING_KEY: the counts by reading, that it finished, and whether the plan was made after it.
+    The time span is the reader's own: one day after this run started."""
+    path = Path(store_path)
+    out = say or _say
+    if not path.is_file():
+        raise Refused("the store %s is missing (nothing written)" % path)
+    with _store_lock(path, exclusive=True):
+        with Store(path, own=True) as s:
+            sid = s.checked_id()
+            if s.meta_raw("sealed_marker")[0]:
+                raise Refused("the sealed period of store %s was already run: its resolution rows are not read again "
+                              "(nothing written)" % sid)
+            return _reread(s, out, int((wall or time.time)()) + pd.TS_AFTER_START)
+
+
+def _reread(s: Store, say, ts_max: int) -> dict:
+    total = s.db.execute("SELECT COUNT(*) FROM resolutions").fetchone()[0]
+    present, prev = s.reading_marker()
+    say("reread-resolutions: reading again the %s resolution rows of this store as they were received, under the "
+        "fifth amendment (%s); no request is made; %s rows a transaction, a line every %s rows"
+        % (format(total, ","), FIFTH_AMENDMENT_COMMIT, format(REREAD_CHUNK, ","), format(REREAD_EVERY, ",")))
+    t0 = time.monotonic()
+    counts, other, unreadable, changed, seen, last, lines, marked = Counter(), 0, 0, 0, 0, 0, 0, False
+    while True:
+        rows = s.db.execute("SELECT rowid, status, payouts, resolved_at, resolved_ts, raw FROM resolutions WHERE "
+                            "rowid > ? ORDER BY rowid LIMIT ?", (last, REREAD_CHUNK)).fetchall()
+        if not rows:
+            break
+        updates = []
+        for rowid, status, payouts, resolved_at, resolved_ts, raw in rows:
+            try:
+                doc = json.loads(raw)
+            except (TypeError, ValueError, RecursionError):
+                unreadable += 1
+                continue
+            if not isinstance(doc, dict) or "price" not in doc:
+                other += 1                         # the reported shape, or neither: left exactly as it is
+                continue
+            good, why = pd.validate_resolution(doc, ts_max)
+            if why is not None:                    # kept when it was stored, not now: left as it is, and counted
+                unreadable += 1
+                continue
+            counts[good["reading"]] += 1
+            new = (good["status"], _j(good["payouts"]), good["resolved_at"], good["resolved_ts"])
+            if new != (status, payouts, resolved_at, resolved_ts):
+                updates.append(new + (rowid,))
+        seen += len(rows)
+        last = rows[-1][0]
+        if updates:
+            s.db.executemany("UPDATE resolutions SET status=?, payouts=?, resolved_at=?, resolved_ts=? WHERE rowid=?",
+                             updates)
+            changed += len(updates)
+            if not marked:                         # with the first change: the reading is unfinished, the plan old
+                s.set_meta(READING_KEY, {"rule": READING_RULE, "by": "reread", "complete": False, "counts": None,
+                                         "plan_after_reading": False})
+                marked = True
+        s.commit()
+        if seen // REREAD_EVERY > lines:
+            lines = seen // REREAD_EVERY
+            say("reread-resolutions: %s of %s rows read again, %s of the oracle's shape, %s changed, %d s" % (
+                format(seen, ","), format(total, ","), format(sum(counts.values()), ","), format(changed, ","),
+                time.monotonic() - t0))
+    if changed:                                    # the plan was made from the rows as first read
+        plan_after = False
+    elif not present:                              # nothing changed: any plan was made from the rows as they are
+        plan_after = True
+    else:
+        plan_after = prev is not None and prev.get("plan_after_reading") is True
+    final = {"rule": READING_RULE, "by": "reread", "complete": True,
+             "counts": {k: counts[k] for k in pd.ORACLE_READINGS}, "plan_after_reading": plan_after}
+    if not (prev is not None and {k: v for k, v in prev.items() if k != "finished_at"} == final):
+        s.set_meta(READING_KEY, dict(final, finished_at=_now()))
+        s.commit()
+    c = final["counts"]
+    say("reread-resolutions ended: %s rows read again, no request made; of the oracle's shape %d: first %d, second "
+        "%d, half %d, not resolved by status %d, not resolved by price %d, bad time %d, mixing the two shapes %d; "
+        "reported or neither shape, left as they were: %d; %schanged this run: %d; %d s%s" % (
+            format(seen, ","), sum(c.values()), c["first"], c["second"], c["half"], c["not_resolved_status"],
+            c["not_resolved_price"], c["bad_time"], c["mixed_shape"], other,
+            "rows that could not be read, left as they were (develop and sealed refuse until they are): %d; "
+            % unreadable if unreadable else "", changed, time.monotonic() - t0,
+            "; nothing changed: the rows were already read under the fifth amendment" if not changed else
+            "; the plan is now older than the reading: run pull --phase 2 to make it again"))
+    return {"rows": seen, "counts": c, "changed": changed, "other": other, "unreadable": unreadable}
 
 
 # ---------------------------------------------------------------- loading, with the period wall
@@ -2325,11 +2556,12 @@ def store_sealed_marker(store):
 def _provenance(store: Path) -> dict:
     with Store(store, own=True) as s:
         boards, sid = s.board_read_at(), s.checked_id()
+        reading = reading_provenance(s)
     return {"prediction_commit": PREDICTION_COMMIT, "time_correction_commit": TIME_CORRECTION_COMMIT,
             "amendment_commit": AMENDMENT_COMMIT, "second_amendment_commit": SECOND_AMENDMENT_COMMIT,
             "prediction_doc": PREDICTION_DOC, "code_sha256": code_sha256(),
             "store": str(Path(store).resolve()), "store_id": sid, "boards_read_at": boards,
-            "readings": list(READINGS)}
+            "readings": list(READINGS), "resolution_reading": reading}
 
 
 def _store_path(store) -> Path:
@@ -2342,7 +2574,13 @@ def _out_dir(out_dir, sid: str) -> Path:
 
 
 def _development_doc(path: Path, leave_out) -> dict:
-    """The development document of this store (development months only; deterministic for one store and code)."""
+    """The development document of this store (development months only; deterministic for one store and code).
+    Refused, with nothing written, while the store's rows of the oracle's shape are not read under the fifth
+    amendment or its plan is older than that reading (reading_problems)."""
+    with Store(path, own=True) as s:
+        problems = reading_problems(s)
+    if problems:
+        raise Refused("%s (nothing written)" % "; ".join(problems))
     data = load(path, "development", leave_out)
     prov = _provenance(path)
     prov.update(data.refused)
@@ -2474,10 +2712,13 @@ def _run_sealed(path: Path, out_dir, leave_out, develop_file) -> dict:
     with Store(path, own=True) as s:
         sid = s.checked_id()
         spent, raw = s.meta_raw("sealed_marker")
+        reading = reading_problems(s)
     if spent:                                      # the key present, whatever its value, means spent
         raise Refused("the sealed period of store %s was already run (its marker in the store reads %r): it is "
                       "spent. If its result is missing it must be recomputed by hand from the store by the lead, never "
                       "run again" % (sid, (raw or "")[:80]))
+    if reading:                                    # bookkeeping only, before anything else is read
+        raise Refused("the sealed run is not started (nothing written): %s" % "; ".join(reading))
     od = _out_dir(out_dir, sid)
     marker = od / "sealed.used"
     if marker.exists():
@@ -2550,7 +2791,19 @@ def format_table(doc: dict) -> str:
              "rows the store set aside, by kind and reason (repeats, conflicts, out-of-span times, rejects): %s"
              % (r.get("store_counts") or "none"),
              "markets whose id the service refused as invalid (no known resolution, as no row): %s; trade rows read "
-             "that name them: %s" % tuple(_fmt(prov.get(k)) for k in REFUSED_COUNTS),
+             "that name them: %s" % tuple(_fmt(prov.get(k)) for k in REFUSED_COUNTS)]
+    rr = prov.get("resolution_reading")
+    if isinstance(rr, dict):
+        c = rr["counts"]
+        lines.append("resolution rows of the oracle's shape (%s): first %d, second %d, half %d, not resolved by "
+                     "status %d, not resolved by price %d, bad time %d, mixing the two shapes %d; rows read again: %s; "
+                     "plan made after the reading: %s" % (
+                         rr["rule"], c["first"], c["second"], c["half"], c["not_resolved_status"],
+                         c["not_resolved_price"], c["bad_time"], c["mixed_shape"],
+                         "yes" if rr["rows_read_again"] else "no",
+                         "-" if rr["plan_made_after_reading"] is None else
+                         "yes" if rr["plan_made_after_reading"] else "no"))
+    lines += [
              "%d of %d wallets sold beyond what their trades show they held; in the leaders' standing windows %d of "
              "%d sells (%s) were such sells, and their excess earned nothing in the standing" % (
                  sb["wallets_with_sells_beyond_holding"], sb["candidates"], sb["leader_window_sells_beyond_holding"],
@@ -2607,8 +2860,23 @@ def main(argv=None) -> int:
         if name == "sealed":
             p.add_argument("--i-am-opening-the-sealed-period", dest="flag", action="store_true")
             p.add_argument("--develop-file", default=None)
+    p = sub.add_parser("reread-resolutions", help="read the store's resolution rows again as they were received, "
+                       "under the fifth amendment (no request is made)")
+    p.add_argument("--store", default=None)
     a = ap.parse_args(argv)
     try:
+        if a.cmd == "reread-resolutions":
+            try:
+                sys.stdout.reconfigure(line_buffering=True)
+            except (AttributeError, ValueError):
+                pass
+            try:
+                reread_resolutions(_store_path(a.store))
+            except KeyboardInterrupt:
+                print("STOPPED: reread-resolutions was stopped; every committed transaction stands; run it again to "
+                      "finish (develop and sealed refuse until it has)", file=sys.stderr)
+                return 4
+            return 0
         if a.cmd == "pull":
             try:
                 sys.stdout.reconfigure(line_buffering=True)

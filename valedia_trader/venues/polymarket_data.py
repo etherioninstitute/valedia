@@ -26,6 +26,14 @@ Routes (field names from the service's published specification, /v2/openapi.json
   never printed. A refused request of n ids costs at most 2n - 2 more requests (38 for twenty), each paced and checked like
   any other and retried like any other. Any other failure, the first or one met while narrowing, raises as before
   for the ids not yet answered. No id is ever altered.
+  The route answers in two shapes (fifth amendment, f40bc41). A "reported" row carries payouts and `resolved_at`
+  and reads as it always did. A row that carries a `price` is the oracle's own record: kept or set aside by the same
+  checks as before, then read by `oracle_reading`: status "resolved" and a price of exactly "1000000000000000000",
+  "0" or "500000000000000000" pay the first outcome in full, the second in full or half each (payouts in the
+  reported form), at the time of its `last_update_timestamp` (text of whole epoch seconds in the reader's span);
+  any other price, status or time, or a row that also carries payouts or `resolved_at`, is no known resolution,
+  with its own reason (`reading`). A row of neither shape reads as before (a row with no known resolution). A
+  resolution row's identity stays the row as read before the amendment, so repeats and conflicts are as before.
 * /v2/prices-history?token_id=<outcome token>&start=<s>&end=<e> answers one token's price points in [s, e) (start
   inclusive, end exclusive), each {price, resolution_seconds, timestamp}: the service picks the grain, a point's
   timestamp is the start of the span it was observed in, and a terminal point has resolution_seconds 0. It is
@@ -64,7 +72,8 @@ from typing import Any, Callable
 __all__ = ["BASE_URL", "USER_AGENT", "HttpError", "PolymarketDataError", "PageCapHit", "Pacer", "urllib_get", "Walk",
            "PolymarketData", "is_number", "validate_board_row", "validate_trade", "validate_position",
            "validate_resolution", "validate_price_point", "trade_identity", "position_identity", "TS_MIN",
-           "BOARD_CATEGORIES", "REFUSED", "refuses_id"]
+           "BOARD_CATEGORIES", "REFUSED", "refuses_id", "oracle_reading", "resolution_identity", "ORACLE_PAYOUTS",
+           "ORACLE_READINGS"]
 
 BASE_URL = "https://data-api.polymarket.com"
 USER_AGENT = "market-data-reader/1.0"
@@ -385,10 +394,59 @@ def position_identity(p: dict) -> tuple:
     return (p["proxy_wallet"].lower(), p["token_id"])
 
 
+ORACLE_PAYOUTS = {"1000000000000000000": (1_000_000, 0),       # the first outcome (index 0) in full
+                  "0": (0, 1_000_000),                           # the second (index 1) in full
+                  "500000000000000000": (500_000, 500_000)}      # half each
+ORACLE_READINGS = ("first", "second", "half", "not_resolved_status", "not_resolved_price", "bad_time", "mixed_shape")
+_ORACLE_WORD = {"1000000000000000000": "first", "0": "second", "500000000000000000": "half"}
+_WHOLE_SECONDS = re.compile(r"[1-9][0-9]{0,18}")
+
+
+def oracle_reading(row: dict, ts_max: int | None = None) -> tuple[str, list | None, int | None]:
+    """The fifth amendment (f40bc41) on a resolution row that carries a `price` (the oracle's own record):
+    (reading, payouts, resolution time). Checked in this order: a row that also carries `payouts` or `resolved_at`
+    (whatever their value) mixes the two shapes ("mixed_shape"); a status other than exactly "resolved"
+    ("not_resolved_status"); a price other than exactly one of the three texts of ORACLE_PAYOUTS
+    ("not_resolved_price": a number, 69 or any other text); a `last_update_timestamp` that is not the text of whole
+    epoch seconds (decimal digits only, no sign, space or leading zero) from 2020-01-01 to `ts_max` ("bad_time").
+    Each of these is NOT a known resolution: (word, None, None). Otherwise ("first", "second" or "half") the payouts
+    in micro-USDC a share as the reported shape gives them, and the time."""
+    if "payouts" in row or "resolved_at" in row:
+        return "mixed_shape", None, None
+    if row.get("status") != "resolved":
+        return "not_resolved_status", None, None
+    price = row.get("price")
+    if not isinstance(price, str) or price not in ORACLE_PAYOUTS:
+        return "not_resolved_price", None, None
+    ts = row.get("last_update_timestamp")
+    if not isinstance(ts, str) or _WHOLE_SECONDS.fullmatch(ts) is None or _ts_why(int(ts), ts_max):
+        return "bad_time", None, None
+    return _ORACLE_WORD[price], list(ORACLE_PAYOUTS[price]), int(ts)
+
+
+def resolution_identity(good: dict) -> str:
+    """A validated resolution row's identity within a request: the row as the reader before the fifth amendment read
+    it (`first_read` when the row carries a price), so repeats and conflicts are decided exactly as before."""
+    return json.dumps(good.get("first_read", good), sort_keys=True)
+
+
 def validate_resolution(row, ts_max: int | None = None) -> tuple[dict | None, str | None]:
     """A condition-keyed resolution row: condition_id and status strings; payouts None or exactly two integers
     (micro-USDC a share) not below 0; resolved_at None or an RFC3339 time with its zone from 2020-01-01 to `ts_max`,
-    also given as `resolved_ts`."""
+    also given as `resolved_ts`. These checks decide a reject, for every row as before. A row of the reported shape
+    (no `price` key), or of neither shape, reads exactly as before. A kept row that carries a `price` (the oracle's
+    own record) is read by `oracle_reading`: its payouts and resolved_ts are what that gives (None when not a known
+    resolution), `reading` names the outcome (ORACLE_READINGS), resolved_at is what the row carried, and
+    `first_read` is the row as read before (its identity, see resolution_identity)."""
+    good, why = _validate_reported(row, ts_max)
+    if why is not None or "price" not in row:
+        return good, why
+    word, payouts, ts = oracle_reading(row, ts_max)
+    return dict(good, payouts=payouts, resolved_ts=ts, reading=word, first_read=good), None
+
+
+def _validate_reported(row, ts_max: int | None = None) -> tuple[dict | None, str | None]:
+    """The reader's checks and reading of a resolution row before the fifth amendment, unchanged."""
     if not isinstance(row, dict):
         return None, "not_an_object"
     if not _is_str(row.get("condition_id")):
@@ -711,8 +769,7 @@ class PolymarketData:
             raise PolymarketDataError("/v2/resolutions answered a paged list; this reader cannot page it")
         w, ids = Walk(pages=1, read_at=[read_at]), {}
         for row in ans["data"]:
-            w.add(row, lambda r: validate_resolution(r, self.ts_max), read_at,
-                  lambda good: json.dumps(good, sort_keys=True), ids)
+            w.add(row, lambda r: validate_resolution(r, self.ts_max), read_at, resolution_identity, ids)
         return w
 
     def resolution_batches(self, conditions, narrowed: Callable[[dict], Any] | None = None):
