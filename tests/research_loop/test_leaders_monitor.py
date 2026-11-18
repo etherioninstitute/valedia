@@ -1222,32 +1222,38 @@ def test_a_refused_pass_marks_no_earlier_pass_died(store):
     assert [r[0] for r in db(store).execute("SELECT status FROM passes ORDER BY pass_id")] == ["done", "running"]
 
 
-def _record_at(commit, tmp_path):
-    """The record's module as it was at `commit`, from this repository's history, under a name of its own."""
-    import importlib.util
-    got = subprocess.run(["git", "-C", WORKTREE, "show",
-                          "%s:valedia_trader/research_loop/leaders_monitor.py" % commit], capture_output=True, text=True)
-    if got.returncode != 0:
-        pytest.skip("commit %s is not in this checkout's history" % commit)
-    f = tmp_path / ("record_%s.py" % commit)
-    f.write_text(got.stdout)
-    name = "record_at_%s" % commit
-    spec = importlib.util.spec_from_file_location(name, f)
-    m = importlib.util.module_from_spec(spec)
-    sys.modules[name] = m
-    spec.loader.exec_module(m)
-    return m
+OLD_SHAPE_SQL = Path(__file__).with_name("leaders_store_c106abe.sql")     # the schema as it was at c106abe
+
+
+def _old_store(s, made_by):
+    """A store of c106abe's shape, from the fixture, with the rows that version's fix-leaders (and a pass) wrote."""
+    s.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(s))
+    c.executescript(OLD_SHAPE_SQL.read_text())
+    c.execute("INSERT INTO meta (key, value) VALUES ('leaders_fixed_at', '2026-11-19T00:00:00+00:00')")
+    c.executemany("INSERT INTO leaders (wallet_key, wallet, sports_rank, sports_pnl, sports_volume, sports_read_ts, "
+                  "fixed_ts) VALUES (?, ?, ?, 1.0, 2.0, ?, ?)", [(wallet(i), wallet(i), i + 1, T0, T0) for i in range(5)])
+    if made_by != "fix-leaders":
+        c.execute("INSERT INTO passes (started_ts, finished_ts, status, good, failed, removed) "
+                  "VALUES (?, ?, 'done', 5, 0, 0)", (T0, T0 + 5))
+        c.execute("INSERT INTO wallet_reads (pass_id, wallet_key, good, rows, pages, rejects, unread, baseline, n_new, "
+                  "n_increase, n_decrease, n_exit, read_ts) VALUES (1, ?, 1, 1, 1, '{}', '{}', 1, 0, 0, 0, 0, ?)",
+                  (wallet(0), T0 + 1))
+        c.execute("INSERT INTO holdings_current (wallet_key, token_id, read_id, size) VALUES (?, ?, 1, 10.0)",
+                  (wallet(0), token(1)))
+        c.execute("INSERT INTO snapshots (read_id, wallet_key, token_id, kind, utc_day, read_ts, size) "
+                  "VALUES (1, ?, ?, 'baseline', '2026-11-19', ?, 10.0)", (wallet(0), token(1), T0 + 1))
+        Path(str(s) + ".lock").touch()
+    c.commit()
+    c.close()
 
 
 @pytest.mark.parametrize("made_by", ["fix-leaders", "fix-leaders and a pass"])
 def test_a_store_made_by_another_version_is_refused_in_words_with_nothing_written(tmp_path, made_by):
-    old = _record_at("c106abe", tmp_path)
     s = tmp_path / "old" / "leaders.sqlite"
+    _old_store(s, made_by)
     world, wall = World(), Wall()
     world.held[wallet(0)] = [pos(wallet(0), 1)]
-    for cmd in (["fix-leaders"], ["pass"])[:1 if made_by == "fix-leaders" else 2]:
-        assert old.main(cmd + ["--store", str(s)], client=make_client(world, wall), wall=wall, out=io.StringIO(),
-                        memory=lambda: 50.0) == 0
     before, files = s.read_bytes(), sorted(os.listdir(s.parent))
     for cmd in (["pass"], ["report"], ["fix-leaders"]):
         n = len(world.urls)

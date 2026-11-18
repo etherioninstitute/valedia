@@ -965,8 +965,9 @@ def _reader_at(commit, tmp_path):
     root = Path(__file__).resolve().parents[2]
     got = subprocess.run(["git", "-C", str(root), "show", "%s:valedia_trader/venues/polymarket_data.py" % commit],
                          capture_output=True, text=True)
-    if got.returncode != 0:
-        pytest.skip("commit %s is not in this checkout's history" % commit)
+    if got.returncode != 0:                  # never a skip: a missing reference is a failure that says so
+        pytest.fail("the reader at commit %s cannot be read from this checkout's history (git show: %s); this "
+                    "property needs it" % (commit, got.stderr.strip()[:200]), pytrace=False)
     f = tmp_path / ("reader_%s.py" % commit)
     f.write_text(got.stdout)
     name = "reader_at_%s" % commit
