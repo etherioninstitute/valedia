@@ -40,8 +40,16 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   proven copy; the phase-1 original is a cold spare at `/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-data/`):
   off the collector's SSD and out of the folders the nightly backup takes. Resumed again 07:38 under the
   lead's wrapper and a guard that stops it if the collector shows strain. Three wallets with more than five
-  million trades each are left out by name, as the locked rule says. Then phase 2 (prices), then the
-  first-stage test. Lead's locked expectation: it fails. Roadmap 1.26. **QUEUED** T47d items 8 to 12 (among
+  million trades each are left out by name, as the locked rule says. THE PULL IS COMPLETE (2026-11-18
+  11:59 PST: 35.3 million trades, a resolution answer for every one of 962,935 markets, 11,228 price
+  windows). FIRST STAGE RUN 13:13 PST: **FAIL by the letter, with ZERO trades**: no development month has a
+  leader, because 467,532 of 958,230 resolution rows are in an OLDER SHAPE of the service with no resolution
+  time and no payouts (everything resolved before about mid-2025), which the reader stores but does not
+  interpret. The sealed months are NOT opened. This is NOT evidence about copy-trading either way; the lead
+  did not measure that field before writing the rule. **NEXT** T47f: measure what the older rows hold (a last
+  update time and a price), write a FIFTH amendment before any trade is analysed (none has been), read the
+  stored rows again without a new pull of resolutions, price the development months' positions, run the
+  first stage again. The same reading feeds the consistency screen of the owner's method below. Roadmap 1.26. **QUEUED** T47d items 8 to 12 (among
   them: a reader of the store must not end the pull; the pull's start must not read the store at full speed
   beside the collector).
 - **NOW** T47c (the analysis in bounded memory): passed its blind check and is on main (`0172b3f`,
