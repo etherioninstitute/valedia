@@ -231,6 +231,12 @@ Items:
   the keys himself. Build window offered: 2026-11-18 09:45 to 11:00 PST, on the lead's word at the time.
   Whether Ollama's hosted service may be one of the providers is his to say (his "no Ollama" rule was made
   about local models).
+- **UPDATE 2026-11-18 01:20 PST (that session's report):** the owner chose differently on the first point: he
+  opened the vendor's signed, notarized menu-bar app himself (version 0.16.34, the commit that was read; it
+  listens on 127.0.0.1:31415 only) and entered his premium licence himself. His providers: Groq, Cerebras,
+  Cloudflare, and Ollama's hosted service by name, for FreeLLMAPI only. No build is needed any more. Left to
+  do there (light, 09:45 to 11:00 PST): the guard code and its tests, the separate Hermes root for the one
+  coding profile, one toy prompt. The app can read his files like any app he runs; that was his choice.
 - **QUEUED** L-2 lessons by idea family, and a stop on a family after N failures (roadmap 2.3).
 - **QUEUED** L-3 a check on the critic itself (roadmap 2.5).
 - **QUEUED** L-4 scores earn weight (roadmap 1.5).
