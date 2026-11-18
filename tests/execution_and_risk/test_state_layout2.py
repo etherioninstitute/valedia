@@ -108,6 +108,28 @@ def test_book_nav_holds_what_s4_needs_as_text_and_nothing_writes_it(tmp_path):
     assert "CREATE TABLE book_nav " in src
     for verb in ("FROM book_nav", "INTO book_nav", "UPDATE book_nav", "JOIN book_nav"):
         assert verb not in src, verb                                    # nothing in this build writes or reads it
+    con = sqlite3.connect(tmp_path / "s.sqlite")
+    row = ("2025-11-18", 1.0, "b1", "10", "1", "1", "1")
+    for flag in (2, -1, "yes"):                                         # cash_bounded is 0 or 1, nothing else
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute("INSERT INTO book_nav (day, time, batch, units_outstanding, value_per_unit, value_low, "
+                        "value_high, cash_bounded, marks, marks_hash, entry_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, "
+                        "'{}', 'h', 'e')", (*row, flag))
+    con.rollback()
+    con.close()
+
+
+def test_a_layout_2_file_without_one_of_its_new_tables_is_not_opened(tmp_path):
+    path = tmp_path / "s.sqlite"
+    OrderStepState(path).close()
+    con = sqlite3.connect(path)
+    con.execute("DROP TABLE book_nav")
+    con.commit()
+    con.close()
+    before = dump(path)
+    with pytest.raises(osx.OrderStepError, match="is not an order-step state file of layout 1 or 2; it is not opened"):
+        OrderStepState(path)
+    assert dump(path) == before
 
 
 def test_state_layout1_upgrade_keeps_rows_and_ignores_old_equity(tmp_path, base):
@@ -469,6 +491,21 @@ def test_the_command_is_refused_when_the_clock_gives_no_new_york_day(tmp_path, c
     assert not (tmp_path / "memory").exists()
 
 
+def test_the_command_is_refused_when_the_clock_loses_its_day_after_the_first_reading(tmp_path, capsys, monkeypatch):
+    """The entry's own time is read once more after the lock is taken; a reading there with no New York day is
+    refused the same way, and no entry is written."""
+    readings = iter([1_763_478_000.0])
+    monkeypatch.setattr(osx, "wall_clock", lambda: next(readings, float("nan")))
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n") == 2
+    err = capsys.readouterr().err
+    assert err.startswith("refused:") and "New York day" in err and "nothing was written" in err
+    path = Path(osx.state_path_for(osx.ledger_path_for(tmp_path / "memory", VENUE), VENUE))
+    if path.exists():
+        st = OrderStepState(path)
+        assert st.owner_entries() == []
+        st.close()
+
+
 def test_the_order_step_without_the_owner_flag_is_called_as_before(tmp_path, monkeypatch):
     seen = []
     monkeypatch.setattr(cli, "_order_step_build", lambda: seen.append("built") or None)
@@ -537,6 +574,15 @@ def test_the_layout1_view_masks_only_the_layout_number_and_the_new_empty_tables(
     before = layout1_state(base, path)
     OrderStepState(path).close()
     assert layout1_view(dump(path)) == before
+    whole = dump(path)
+    for table in ("owner_entries", "book_nav"):                         # each new table must be there, and empty
+        with pytest.raises(AssertionError):
+            layout1_view({**whole, "rows": {**whole["rows"], table: [("a row",)]}})
+        with pytest.raises(AssertionError):
+            layout1_view({**whole, "rows": {k: v for k, v in whole["rows"].items() if k != table}})
+    for statement in osx._STATE_UPGRADE_1_TO_2:                         # and every statement of the upgrade in it
+        with pytest.raises(AssertionError):
+            layout1_view({**whole, "schema": [s for s in whole["schema"] if s != statement]})
     con = sqlite3.connect(path)
     con.execute("INSERT INTO book_nav (day, time, batch, units_outstanding, cash_bounded, marks, marks_hash, entry_hash) "
                 "VALUES ('2025-11-18', 1.0, 'b', '1', 0, '{}', 'h', 'e')")
