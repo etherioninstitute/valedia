@@ -384,6 +384,7 @@ class FillVenue(LegVenue):
         super().__init__(**kw)
         self.prng, self.rounding, self.beyond = rng, rounding, beyond
         self.meta, self.pieces, self.how = {}, [], "at once"
+        self.day, self.cancelled_on = 0, {}
 
     def submit(self, symbol, units, tag, price=None, limit_price=None, session="CORE"):
         market = limit_price is None
@@ -426,6 +427,7 @@ class FillVenue(LegVenue):
         if o is not None and o["state"] in ("open", "partly_filled") and self.prng.random() < 0.3:
             self.how = "racing a cancel"
             self.fill(tag, abs(o["units"]) * 0.5)
+        self.cancelled_on.setdefault(tag, self.day)
         return super().cancel(tag)
 
     def market(self, how):
@@ -433,7 +435,10 @@ class FillVenue(LegVenue):
             self.how = how
             if o["state"] in ("open", "partly_filled") and self.prng.random() < 0.5:
                 self.fill(tag, abs(o["units"]) * self.prng.choice([0.25, 0.5, 1.0]))
-            elif o["state"] == "cancelled" and 0 < o["filled"] < abs(o["units"]) - 1e-9 and self.prng.random() < 0.5:
+            elif (o["state"] == "cancelled" and 0 < o["filled"] < abs(o["units"]) - 1e-9
+                  and self.cancelled_on.get(tag) == self.day and self.prng.random() < 0.5):
+                # a larger amount the day of the cancel: the ledger rechecks a finished order for three days
+                # (orders.reconcile's recheck_seconds), so a later one is the position comparison's to show
                 self.how = "after a cancel"
                 o["state"] = "partly_filled"                          # a larger amount reported after the cancel
                 self.fill(tag, abs(o["units"]) * 0.25)
@@ -446,6 +451,7 @@ def _fill_world(tmp, rng, beyond):
     w.limits.write_text(json.dumps({**GENEROUS, "max_orders_per_day": 40}))
     outs = []
     for day in range(3):
+        v.day = day
         for run in range(rng.randint(1, 3)):
             if rng.random() < 0.8 or not outs:
                 w.paper = paper({s: {sym: rng.choice([0.0, 0.5, 1.37, 2.5, 3.99999, 7.3, 0.2])
@@ -579,7 +585,8 @@ class ModeVenue(LegVenue):
 
 
 def read_after_submit(w, states, in_flight=()):
-    """A ledger patch: right after each submit, an order filled at once is read by a concurrent reconcile; the
+    """A ledger patch: right after each submit, an order filled at once is read (and its fills applied) by a
+    concurrent reconcile, as another order step would; the
     ledger's state of each order right after its submit is kept in `states`. A tag in `in_flight` is taken by
     another process first, which dies with the order sent and no answer."""
     def patch(led):
@@ -602,6 +609,7 @@ def read_after_submit(w, states, in_flight=()):
             rec = real(venue, tag, *a, **k)
             if w.venue.last in ("fill_part", "fill_all") and rec["state"] == "accepted":
                 led.reconcile(w.venue, osx.broker_book(led.fills()))
+                led.mark_applied([f["id"] for f in led.unapplied_fills()])   # as the other step applies them
                 rec = led.order(tag)
             states[tag] = rec["state"]
             return rec
@@ -728,10 +736,10 @@ def test_point_b_a_fund_whose_tag_equals_another_funds_remainder_tag_refuses_bot
 def test_point_b_over_seeded_symbol_sets_no_two_orders_share_a_tag_and_only_clashing_funds_are_refused(tmp_path):
     pool = ["AB", "AB.r", "AB.r.r", "CD", "CD.R", "EF.r", "GH", "GH.rr", "IJ.r", "IJ"]
     clashes = runs = 0
-    for k in range(40):
+    for k in range(50):
         rng = random.Random(62_000 + k)
         w = leg_world(tmp_path / f"w{k}", fill=rng.choice([0.0, 1.0]))
-        syms = rng.sample(pool, rng.randint(2, 6))
+        syms = rng.sample(pool, rng.randint(3, 7))
         w.prices.update({s: rng.choice([20.0, 55.5, 101.25]) for s in pool})
         w.paper = paper({"a": {s: rng.choice([2.5, 1.37, 3.0, 0.5]) for s in syms}})
         out = w.run(fractional=True)
