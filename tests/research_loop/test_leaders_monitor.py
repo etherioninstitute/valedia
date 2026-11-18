@@ -1082,3 +1082,102 @@ def test_consistency_names_a_carried_holding_that_is_not_marked_as_its_read_says
         assert lm.consistency(c) != [], corrupt
         c.close()
         s.unlink()
+
+
+# ------------------------------------------------------------------ addendum 3: a NEW must be vouched for
+def test_a_new_after_a_read_with_a_rejected_row_is_unvouched_and_after_a_clean_read_vouched(store):
+    world, wall = fixed(store)
+    w = wallet(0)
+    world.held[w] = [pos(w, 1), pos(w, 2, current_size="x")]           # a baseline with an unreadable row
+    run(["pass"], world, wall, store)
+    assert changes(store) == []                                         # a baseline still writes no change
+    wall.t += 300
+    world.held[w] = [pos(w, 1, 12.0), pos(w, 2)]                        # t2 readable at last: maybe held all along
+    run(["pass"], world, wall, store)
+    wall.t += 300
+    world.held[w] = [pos(w, 1, 12.0), pos(w, 2), pos(w, 3)]             # after a clean read: t3 seen to open
+    run(["pass"], world, wall, store)
+    wall.t += 300
+    world.held[w] = [pos(w, 2), pos(w, 3), pos(w, 4), pos(w, 4, current_size=1.0)]   # t4 in conflict: carried none
+    run(["pass"], world, wall, store)
+    wall.t += 300
+    world.held[w] = [pos(w, 2), pos(w, 3), pos(w, 4)]
+    run(["pass"], world, wall, store)
+    got = [(r["kind"], r["token_id"], r["vouched"]) for r in changes(store)]
+    assert got == [("NEW", token(2), 0), ("INCREASE", token(1), 1), ("NEW", token(3), 1),
+                   ("NEW", token(4), 0), ("EXIT", token(1), 1)]
+    code, out = run(["report"], world, wall, store)
+    line0 = [l for l in out.splitlines() if l.startswith(wallet(0)[:10])][0]
+    assert "new vouched=1 unvouched=2" in line0
+
+
+def _render_any(w, truth, rng):
+    """Like `_render`, but any row (also at the baseline, also a token just bought) may be unreadable."""
+    rows, unreadable = [], set()
+    for n, size in sorted(truth.items()):
+        x = rng.random()
+        if x < 0.6:
+            rows.append(pos(w, n, size))
+        elif x < 0.8:
+            rows.append(pos(w, n, size, avg_price=rng.choice(["x", None, False])))
+            unreadable.add(n)
+        elif x < 0.95:
+            rows += [pos(w, n, size), pos(w, n, size + 1.0)]
+            unreadable.add(n)
+        else:
+            rows += [pos(w, n, size), pos(w, n, size)]
+    if rng.random() < 0.1:
+        rows.append("not a row")
+    rng.shuffle(rows)
+    return rows, unreadable
+
+
+@pytest.mark.parametrize("seed", range(12))
+@pytest.mark.parametrize("clean", [False, True])
+def test_property_no_vouched_new_for_a_token_unreadable_in_the_read_before(tmp_path, seed, clean):
+    rng = _random.Random(1000 + seed)
+    store = tmp_path / ("v%d" % seed) / "leaders.sqlite"
+    world, wall = fixed(store)
+    ws = [wallet(i) for i in range(3)]
+    truth = {w: {100 * i + k: float(rng.randint(1, 9)) for k in range(rng.randint(0, 5))} for i, w in enumerate(ws)}
+    nxt = {w: 100 * i + 50 for i, w in enumerate(ws)}
+    before = {w: None for w in ws}            # (unreadable tokens, truth) at the wallet's last good read
+    for p in range(10):
+        shown = {}
+        for w in ws:
+            if clean:
+                world.held[w], shown[w] = [pos(w, n, s) for n, s in sorted(truth[w].items())], set()
+            else:
+                world.held[w], shown[w] = _render_any(w, truth[w], rng)
+            world.fail[w] = "http500" if p and rng.random() < 0.1 else None
+        n_before = len(changes(store))
+        run(["pass"], world, wall, store)
+        for r in changes(store)[n_before:]:
+            w, n = r["wallet_key"], int(r["token_id"][1:])
+            assert r["vouched"] in (0, 1)
+            if r["kind"] != "NEW":
+                assert r["vouched"] == 1
+                continue
+            unread_before, truth_before = before[w]
+            if n in unread_before:
+                assert r["vouched"] == 0, (seed, p, "a vouched NEW for a token unreadable in the read before")
+            if r["vouched"]:
+                assert n not in truth_before, (seed, p, "a vouched NEW for a token held at the read before")
+            if clean:
+                assert r["vouched"] == 1, (seed, p, "an unvouched NEW in a clean world")
+        for w in ws:
+            if last_read(store, w)["good"] and last_read(store, w)["pass_id"] == db(store).execute(
+                    "SELECT max(pass_id) FROM passes").fetchone()[0]:
+                before[w] = (shown[w], dict(truth[w]))
+        assert lm.consistency(db(store)) == []
+        wall.t += 300
+        for w in ws:
+            for n in list(truth[w]):
+                x = rng.random()
+                if x < 0.15:
+                    del truth[w][n]
+                elif x < 0.3:
+                    truth[w][n] = float(rng.randint(1, 9))
+            if rng.random() < 0.4:
+                truth[w][nxt[w]] = float(rng.randint(1, 9))
+                nxt[w] += 1
