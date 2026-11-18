@@ -480,7 +480,7 @@ not wired yet:
 - **The book's own figures** (`book_figures` in `order_step.py`, pure): units per symbol from this ledger's own fills;
   cash from the owner's entries less purchases plus sales less fees, in exact decimals, with a lower and an upper bound
   and `cash_bounded` when a price or fee is not known (an unpriced piece is valued at its limit, a MARKET leg at its
-  collar; an unknown fee leaves the lower bound open); the cash usable for purchases today (the lower bound less the
+  collar; an unknown fee leaves the lower bound open, except on the purchases below); the cash usable for purchases today (the lower bound less the
   proceeds of the book's sales of this New York day); the value, the value per unit and the units outstanding. A
   deposit or withdrawal issues or redeems units at the value per unit, so it is never profit or loss.
 - **The owner's entries**: the order step's state file is now layout 2 (a layout-1 file is upgraded the first time it
@@ -497,6 +497,28 @@ not wired yet:
   this build; the nightly copies and the venue's own record are what would show it. A second new table, `book_nav`, will hold the book's own value
   per unit, its bounds, the marks it was valued at and the latest entry it includes, run by run, for the day's
   loss and the drawdown of S4; nothing writes or reads it yet. The old `equity` table is kept as it was.
+- **A purchase the venue reports no fee for** (T51c S4a, addendum 7, R22). Seen on the practice account on
+  2026-11-18: a filled purchase has no fee on the order or its fills (empty, not zero), while each sale reports its
+  fee. The rule's source: Webull's pricing page, read 2026-11-18: no commission on stocks and funds, and a
+  Consolidated Audit Trail fee of 0.000003 per unit of total trade volume on buys and sells; the page does not say
+  whether the volume is shares or dollars. That rate, its source and its date are ONE constant
+  (`PUBLISHED_PURCHASE_FEE` in `order_step.py`); a change of the page changes it by a commit, never by a run. For a
+  filled purchase whose fee total is empty and none of whose fill rows carries a fee: while the ledger still asks the
+  venue about it (its recheck window: the ledger's own `recheck_seconds`, 72 hours from when it finished; an order
+  not known to have finished counts as inside it), its fee is taken as between 0 and B, B being the rate times the
+  LARGER of its filled units and their value at its limit (a MARKET leg: its collar), rounded up to the cent: the
+  lower cash bound subtracts B, the upper nothing, the order is named in `bounded_by` with the source, and the value
+  and the usable cash are known. Once that window has closed with the fee still empty, the fee is taken as none for
+  both bounds and the order is counted in `fees_taken_as_none`. A fee that arrives is the fee (the earlier rules
+  decide, as before). A sale with no fee, a purchase with fee rows but no total, or one with no limit or collar
+  stays as before: the lower bound open, so the value is not known and the owner's command refuses, naming the
+  order. `book_figures` is handed the present time (`now`, the reading its New York day was taken from; a reading on
+  another day, or in milliseconds, is refused) and reads no clock; the owner's command hands it its one clock
+  reading. Nothing in a run uses this yet. **KNOWN GAP:** a fee the venue charges later outside the order (a monthly
+  CAT charge, say), or reports only after the window has closed, is never seen by the book. Also: the ledger cannot
+  tell a fee the venue left empty from fee entries the adapter could not read (both are stored empty), so a purchase
+  whose fee entries could not be read is bounded by B too; and a fee of 0 reported only at a recheck is not stored by
+  the ledger as built (no rise), so such an order stays bounded until its window closes.
 - **A local check** (`untracked_tags`): every tag the order step wrote to the journal, a ticket or its send record
   must be in the ledger (a ledger put back from an older copy shows up here). Called by nothing yet.
 

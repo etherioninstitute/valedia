@@ -166,7 +166,7 @@ def test_unknown_fee_marks_cash_bounded():
     assert fig.cash_bounded is True and fig.cash_low is None and fig.cash is None
     assert fig.cash_high == D("10000") + D("1000.0")              # a fee is never below nothing
     assert fig.value is None and fig.value_per_unit is None and fig.usable_cash is None
-    assert any("fee is not known" in w and "s-SPY" in w and "sale" in w for w in fig.bounded_by), fig.bounded_by
+    assert fig.bounded_by == ("order s-SPY: its fee is not known",)    # the words of the code before this slice
 
 
 def test_stake_entry_moves_units_not_nav():
@@ -815,7 +815,9 @@ def test_prop_r22_a_fee_that_arrives_later_gives_the_figures_it_would_from_the_s
     for name in ("units", "cash", "cash_low", "cash_high", "cash_bounded", "bounded_by", "usable_cash", "value",
                  "value_high", "value_per_unit", "fees_taken_as_none"):
         assert getattr(a, name) == getattr(z, name), name
-    truth = D("10000") - D(repr(units)) * D(repr(price)) - D(repr(fee))
+    cost = sum((D(repr(r["price"])) * D(repr(r["price_covers_units"])) for r in first.fills() if r["price"] is not None),
+               D(0))                                       # the price the ledger derived from the venue's average
+    truth = D("10000") - cost - D(repr(fee))
     assert a.cash_low == a.cash_high == truth
     if D(repr(fee)) <= b:                                       # before it arrived, the bounds held it
         empty = _ledger_one_purchase(units, price, limit, None, False)

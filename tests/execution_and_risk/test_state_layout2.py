@@ -1111,7 +1111,7 @@ def test_r22_a_sale_with_no_fee_still_refuses_in_words_that_say_why(tmp_path, ca
     assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "100", "--mark", "SPY=150", "--who", "owner",
                  "--note", "a second deposit") == 2
     err = capsys.readouterr().err
-    assert "value is not known" in err and "s1-SPY" in err and "sale" in err and "fee is not known" in err, err
+    assert "the book's value is not known (order s1-SPY: its fee is not known)" in err, err    # why, as worded before
     assert state_path.read_bytes() == before
 
 

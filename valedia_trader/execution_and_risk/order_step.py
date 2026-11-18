@@ -264,7 +264,7 @@ from typing import Callable
 
 import pandas as pd
 
-from valedia_trader.execution_and_risk.orders import (NOTICE_KINDS, RECONCILE_NOTICE_KINDS, REL_TOL, STATES,
+from valedia_trader.execution_and_risk.orders import (FINISHED, NOTICE_KINDS, RECONCILE_NOTICE_KINDS, REL_TOL, STATES,
                                                       OrderError, OrderLedger, OrdersBlocked, allocate, net_orders)
 from valedia_trader.research_loop import risk_gate
 from valedia_trader.venues.webull import EVENTS_CLASS, NotTransmitted, OrderRejected
@@ -676,7 +676,8 @@ class BookFigures:
     or later, which are unsettled until the next session. `value` is `cash_low` plus every unit at its mark (None
     when the cash has no lower bound or a symbol held has no mark: `unmarked`); `value_high` is the same at
     `cash_high`. `units_outstanding` are the book's units issued and redeemed by the owner's entries;
-    `value_per_unit` is `value` over them (None with none outstanding)."""
+    `value_per_unit` is `value` over them (None with none outstanding). `fees_taken_as_none` counts the purchases
+    whose fee the venue left empty and whose recheck window has closed (addendum 7, R22 (b))."""
     units: dict
     cash: Decimal | None
     cash_low: Decimal | None
@@ -689,6 +690,23 @@ class BookFigures:
     units_outstanding: Decimal
     value_per_unit: Decimal | None
     unmarked: tuple
+    fees_taken_as_none: int                       # addendum 7 (R22): purchases whose empty fee was taken as none
+
+
+@dataclass(frozen=True)
+class PublishedFee:
+    rate: Decimal
+    source: str
+    note: str
+
+
+# addendum 7 (R22): the venue's published fee, the only figure ever assumed for a purchase whose fee it left empty. ONE
+# constant with its citation; a change of the page changes it by a commit, never by a run.
+PUBLISHED_PURCHASE_FEE = PublishedFee(
+    rate=Decimal("0.000003"),
+    source="Webull pricing page, Consolidated Audit Trail fee, read 2026-11-18: 0.000003 per unit of total trade "
+           "volume, buys and sells (no commission on stocks and funds)",
+    note="the page does not say whether the volume is in shares or dollars, so the larger of the two is taken")
 
 
 def _dec(x, what: str) -> Decimal:
@@ -714,12 +732,35 @@ def _opt_dec(x, what: str) -> Decimal | None:
     return None if x is None or x == "" else _dec(x, what)
 
 
-def book_figures(fills, orders, entries, marks, day: str) -> BookFigures:
+def _published_fee_bound(units: Decimal, bound: Decimal) -> Decimal:
+    """Addendum 7 (R22): B, the most the published rate can charge a purchase of `units` at a limit (or collar) of
+    `bound`: the rate times the larger of the units and their value at it, rounded UP to the cent."""
+    return (PUBLISHED_PURCHASE_FEE.rate * max(units, units * bound)).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+
+
+def _fee_window_closed(o: dict, now: float) -> bool:
+    """Addendum 7 (R22): whether the ledger has stopped asking the venue about this order, judged at `now` as its
+    reconcile judges it, over the ledger's own `recheck_seconds` (LEDGER_RECHECK_SECONDS, its default): an order that
+    reached filled, cancelled or expired is asked while `finished_at >= now - recheck_seconds`, one marked never
+    arrived while `never_arrived_at` is. Closed only when that is KNOWN: any other state, or a time missing or not a
+    finite number, is an open window (the cautious side)."""
+    state = o.get("state")
+    at = o.get("finished_at") if state in FINISHED else (
+        o.get("never_arrived_at") if state == "never_arrived" else None)
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at):
+        return False
+    return at < now - LEDGER_RECHECK_SECONDS
+
+
+def book_figures(fills, orders, entries, marks, day: str, *, now: float) -> BookFigures:
     """T51c S2 (R4, R5, R8a): the book's figures from this ledger's own `fills` and `orders` rows (as
     OrderLedger.fills() and .orders() give them), the owner's `entries` (as the state file holds them, each with the
     figures next_entry gave it) and `marks` {symbol: price}; `day` is today's New York day (YYYY-MM-DD), for the
-    unsettled proceeds of R8a. Pure: it reads no file, clock, venue or global, and the order in which rows are given
-    changes nothing (fills and entries are taken by time, a fill before an entry of the same time, then by id).
+    unsettled proceeds of R8a; `now` is the present time in seconds on that day (addendum 7, R22: the reading `day`
+    was taken from; one that is not a finite reading on `day` is refused), against which each order's recheck window
+    is judged. Pure: it reads no file, clock, venue or global (the window's length is the ledger's own
+    `recheck_seconds` default), and the order in which rows are given changes nothing (fills and entries are taken by
+    time, a fill before an entry of the same time, then by id).
 
     Units per symbol: the signed sum of the fill rows (applied or not), times the ratio of each later `split` of that
     symbol, less each later `units_out`. Cash: the `cash_in` entries less the `cash_out` ones, less the cost of every
@@ -727,13 +768,22 @@ def book_figures(fills, orders, entries, marks, day: str) -> BookFigures:
     read. A fill row's price covers `price_covers_units` units; what an order filled beyond the units its rows price
     is valued at the order's limit (a MARKET leg: its collar price), the most a purchase can have cost and the least a
     sale can have brought; it bounds the cash: a purchase's upper bound counts it at nothing, a sale's has no upper
-    bound. An order with fills whose fee total is not known (the order's `fee` None) leaves the lower bound open (no
-    fee bound is assumed) and its known row fees in the upper one. An order whose fee total is known and none of whose
+    bound. An order with fills whose fee total is not known (the order's `fee` None), addendum 7 (R22): a PURCHASE none
+    of whose rows carries a fee either, while its recheck window is open (or not known closed), has a fee between 0
+    and B (PUBLISHED_PURCHASE_FEE's rate times the larger of its filled units and their value at its limit, a MARKET
+    leg's collar, rounded up to the cent): the lower bound subtracts B, the upper nothing, and it is named in
+    `bounded_by`; once its window has closed its fee is none for both bounds, counted in `fees_taken_as_none`; any
+    other such order (a sale, a purchase with fee rows but no total, or one without a limit or collar) leaves the
+    lower bound open (no fee bound is assumed), said in words, with its known row fees in the upper one. An order whose fee total is known and none of whose
     rows carries a fee has that total as its fee in both bounds. An order with a known total and at least one row
     fee (rows without one counting 0) takes the two figures as a pair: the larger in the lower bound, the smaller in
     the upper, and the cash marked bounded only when they differ by more than REL_TOL (a total that fell under the
     rows, which the ledger keeps). Units outstanding are the last entry's
     `units_after`; every entry must start where the one before it ended, or BookError names it."""
+    if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now) or _ny_day(now) != day:
+        raise BookError(f"the present time {_cut(repr(now))} is not a finite reading in seconds on the New York day "
+                        f"{_cut(repr(day))} the figures are asked for, so no fee window can be judged (a reading in "
+                        "milliseconds or another day's clock is a caller's mistake); no figure is given")
     with localcontext() as ctx:
         ctx.prec = _BOOK_PREC
         by_tag = {}
@@ -747,6 +797,7 @@ def book_figures(fills, orders, entries, marks, day: str) -> BookFigures:
         low: Decimal | None = Decimal(0)
         high: Decimal | None = Decimal(0)
         today_low = Decimal(0)
+        none_taken = 0
         bounded: list[str] = []
         for tag in sorted(rows):
             o, rs = by_tag[tag], rows[tag]
@@ -789,9 +840,23 @@ def book_figures(fills, orders, entries, marks, day: str) -> BookFigures:
                     fees_least, fees_most = min(told, fees), max(told, fees)
                 if fees_most - fees_least > Decimal(repr(REL_TOL)) * max(Decimal(1), fees_most):
                     bounded.append(f"order {_cut(tag)}: its fee total {told} and its rows' {fees} differ")
-            if o.get("fee") is None and total != 0:
-                bounded.append(f"order {_cut(tag)}: its fee is not known")
-                low = None
+            if o.get("fee") is None and total != 0:      # addendum 7 (R22): a purchase the venue reported no fee for
+                silent = not any(r.get("fee") is not None for r in rs)
+                if buy and silent and _fee_window_closed(o, now):
+                    none_taken += 1                       # (b) its window has closed: none, for both bounds
+                elif buy and silent and bound is not None:
+                    most = _published_fee_bound(abs(total), bound)        # (a) between 0 and B
+                    bounded.append(
+                        f"order {_cut(tag)}: the venue reported no fee and may still report one (its recheck window is "
+                        f"open), so its fee is taken as between 0 and {most}: the published rate "
+                        f"{PUBLISHED_PURCHASE_FEE.rate} times the larger of its {abs(total)} units and their value at "
+                        f"its {'collar' if o.get('order_type') == 'MARKET' else 'limit'} {bound}, rounded up to the "
+                        f"cent ({PUBLISHED_PURCHASE_FEE.source})")
+                    if low is not None:
+                        low -= most
+                else:                                     # (d) as built, in its words: a sale, a purchase with fee rows
+                    bounded.append(f"order {_cut(tag)}: its fee is not known")   # but no total, or no limit or collar
+                    low = None
             elif low is not None:
                 low -= fees_most
             if high is not None:
@@ -834,7 +899,8 @@ def book_figures(fills, orders, entries, marks, day: str) -> BookFigures:
         per_unit = None if value is None or outstanding <= 0 else value / outstanding
         return BookFigures(units=units, cash=low, cash_low=low, cash_high=high, cash_bounded=bool(bounded),
                            bounded_by=tuple(sorted(bounded)), usable_cash=usable, value=value, value_high=value_high,
-                           units_outstanding=outstanding, value_per_unit=per_unit, unmarked=unmarked)
+                           units_outstanding=outstanding, value_per_unit=per_unit, unmarked=unmarked,
+                           fees_taken_as_none=none_taken)
 
 
 def _positive(x, what: str) -> Decimal:
@@ -1051,7 +1117,7 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None) -
             last = entries[-1]["units_after"] if entries else "0"
             valued = entries + [{"id": len(entries) + 1, "time": now, "kind": "split", "symbol": symbol,
                                  "ratio": str(figs["ratio"]), "units_before": last, "units_after": last}]
-        figures = book_figures(fills, orders, valued, marks, day)
+        figures = book_figures(fills, orders, valued, marks, day, now=now)
         if figures.unmarked:
             return refuse(f"the book holds {', '.join(figures.unmarked)}: give --mark SYMBOL=PRICE for each (the "
                           "owner's own figure; none is looked up); nothing was written")
