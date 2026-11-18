@@ -727,7 +727,9 @@ def book_figures(fills, orders, entries, marks, day: str) -> BookFigures:
     is valued at the order's limit (a MARKET leg: its collar price), the most a purchase can have cost and the least a
     sale can have brought; it bounds the cash: a purchase's upper bound counts it at nothing, a sale's has no upper
     bound. An order with fills whose fee total is not known (the order's `fee` None) leaves the lower bound open (no
-    fee bound is assumed) and its known row fees in the upper one. Units outstanding are the last entry's
+    fee bound is assumed) and its known row fees in the upper one. An order whose fee total fell under its rows' sum
+    (the ledger keeps the rows and the order's total follows the venue's) counts the rows' sum in the lower bound and
+    the total in the upper one, and marks the cash bounded. Units outstanding are the last entry's
     `units_after`; every entry must start where the one before it ended, or BookError names it."""
     with localcontext() as ctx:
         ctx.prec = _BOOK_PREC
@@ -775,13 +777,19 @@ def book_figures(fills, orders, entries, marks, day: str) -> BookFigures:
                     today_low += least
             fees = sum((_dec(r["fee"], f"the fee of fill row {r.get('id')}") for r in rs if r.get("fee") is not None),
                        Decimal(0))
+            fees_least = fees                            # addendum 4 (R14): a venue fee total that fell under the rows'
+            if o.get("fee") is not None and total != 0:  # sum (the ledger keeps the rows, the order's total follows):
+                told = _dec(o["fee"], f"the fee of order {_cut(tag)}")   # the truth is one of the two, so the bounds
+                if told < fees - Decimal(repr(REL_TOL)) * max(Decimal(1), abs(fees)):   # hold both
+                    fees_least = told
+                    bounded.append(f"order {_cut(tag)}: its fee total fell to {told} under its rows' {fees}")
             if o.get("fee") is None and total != 0:
                 bounded.append(f"order {_cut(tag)}: its fee is not known")
                 low = None
             elif low is not None:
                 low -= fees
             if high is not None:
-                high -= fees
+                high -= fees_least
         units: dict[str, Decimal] = {}
         steps = [((_dec(f["time"], "a fill's time"), 0, int(f.get("id") or 0)), "fill", f) for f in fills]
         steps += [((_dec(e["time"], "an entry's time"), 1, int(e["id"])), "entry", e) for e in entries]
@@ -882,7 +890,12 @@ def next_entry(figures: BookFigures, kind: str, *, amount: Decimal | None = None
                 after, value_after = before - units * mark / per_unit, value - units * mark
             else:
                 after, value_after = before, value
-            per_after = None if after <= 0 else value_after / after
+            if after <= 0:
+                per_after = None
+            elif kind in ("cash_in", "cash_out"):         # addendum 4 (R14): issued or redeemed AT the value per unit,
+                per_after = per_unit                      # so it is the same decimal, by construction
+            else:
+                per_after = value_after / after
         out.update(units_before=str(before), units_after=str(after),
                    value_per_unit_before=None if before == 0 else str(per_unit),
                    value_per_unit_after=None if per_after is None else str(per_after))
@@ -936,11 +949,16 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None) -
     that the book counted as its own); `split` takes --symbol and --ratio (new units per old unit). Every symbol the
     book holds needs `--mark SYMBOL=PRICE` (for a split, the price after it): his own figure, never looked up. The
     entry is valued with book_figures and next_entry and appended to the venue's state file
-    (`state_path_for(ledger_path_for(memory, NAME), NAME)`; the ledger is only read), under the run lock. Prints what it
-    wrote and returns 0; refuses in words on stderr and returns 2, writing nothing: beside the run's own flags,
-    without who, note or venue, a figure that is not a positive decimal, a figure missing or one the kind does not use
-    (none is ever defaulted), a symbol held without its mark, more than the book holds, a book whose value is not
-    known, an entry changed or removed, or a run holding the lock. Nothing in a run reads the entries yet (S4)."""
+    (`state_path_for(ledger_path_for(memory, NAME), NAME)`; the ledger is only read), under the run lock, and then
+    journaled (one `owner_entry` line, by the journal's own writer: the witness outside the file, addendum 4 R12).
+    Prints what it wrote and returns 0; refuses in words on stderr and returns 2, writing nothing: beside the run's own
+    flags, without who, note or venue, a figure that is not a positive decimal, a figure missing or one the kind does
+    not use (none is ever defaulted), a symbol held without its mark, more than the book holds, a book whose value is
+    not known, a clock with no New York day, an entry that breaks the file's chain, a state file and journal that
+    differ on the entries (owner_entry_differences), or a run holding the lock. Every refusal is decided before
+    anything is created, taken or opened for writing (R13): the clock is read once, the state file through a
+    read-only open; only an entry that will be written takes the lock. An entry written whose journal line could not
+    be written is said in words and returns JOURNAL_NOT_WRITTEN (3). Nothing in a run reads the entries yet (S4)."""
     import sys
 
     def refuse(words: str) -> int:
@@ -989,47 +1007,76 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None) -
     ledger_path = ledger_path_for(paths.memory, venue)
     state_path = state_path_for(ledger_path, venue)
     clock = clock if clock is not None else wall_clock
-    no_day = "the clock gives no New York day, so the entry has no day; nothing was written"
-    if _ny_day(clock()) is None:                          # before the lock, the folder or the state file
-        return refuse(no_day)
-    lock = _RunLock(str(state_path))
-    if not lock.acquire():
-        return refuse("an order-step run holds this venue's state file now; write the entry once it has ended; "
-                      "nothing was written")
-    state = None
-    try:
-        fills, orders = [], []
+    reading = clock()                                     # addendum 4 (R13): read ONCE; the entry's time and day
+    day = _ny_day(reading)
+    if day is None:
+        return refuse("the clock gives no New York day, so the entry has no day; nothing was written")
+    now = float(reading)
+    from valedia_trader.research_loop.paper import Journal
+    journal_dir = Path(paths.journal)
+    try:                                                  # every refusal is decided here, before anything is created,
+        fills, orders = [], []                            # taken or opened for writing
         if ledger_path.exists():
             ro = open_read_only(ledger_path)
             try:
                 fills, orders = ro.fills(), ro.orders()
             finally:
                 ro.close()
-        state = OrderStepState(state_path, clock=clock)
-        entries = state.owner_entries()
-        now = clock()
-        day = _ny_day(now)
-        if day is None:
-            return refuse(no_day)
-        now = float(now)
+        entries = _owner_entries_read_only(Path(state_path))
+        lines: list[dict] = []
+        if journal_dir.is_dir():                          # (the Journal makes its folder; only one that is there is read)
+            reader = Journal(journal_dir)
+            lines = reader.read()
+            if reader.skipped_lines:
+                return refuse(f"the journal has lines that are not a complete entry "
+                              f"({', '.join(str(s.get('file')) + ' line ' + str(s.get('line')) for s in reader.skipped_lines[:5])}), so "
+                              "the owner's entries cannot be compared with it; a person must look; nothing was written")
+        differences = owner_entry_differences(entries, lines, venue=venue)
+        if differences:
+            return refuse(f"the state file and the journal differ on the owner's entries: {_cut('; '.join(differences), 600)};"
+                          " a person must look; nothing was written")
+        valued = entries
         if kind == "split":                               # valued after the split, at the marks after it
             last = entries[-1]["units_after"] if entries else "0"
-            entries = entries + [{"id": len(entries) + 1, "time": now, "kind": "split", "symbol": symbol,
-                                  "ratio": str(figs["ratio"]), "units_before": last, "units_after": last}]
-        figures = book_figures(fills, orders, entries, marks, day)
+            valued = entries + [{"id": len(entries) + 1, "time": now, "kind": "split", "symbol": symbol,
+                                 "ratio": str(figs["ratio"]), "units_before": last, "units_after": last}]
+        figures = book_figures(fills, orders, valued, marks, day)
         if figures.unmarked:
             return refuse(f"the book holds {', '.join(figures.unmarked)}: give --mark SYMBOL=PRICE for each (the "
                           "owner's own figure; none is looked up); nothing was written")
         fields = next_entry(figures, kind, amount=figs.get("amount"), symbol=symbol, units=figs.get("units"),
                             ratio=figs.get("ratio"), mark=marks.get(symbol) if kind == "units_out" else None)
-        row = state.add_owner_entry(fields, who=args.who, note=args.note)
-    except (OrderStepError, OrderError, sqlite3.Error) as exc:
+    except (OrderStepError, OrderError, sqlite3.Error, OSError) as exc:
         return refuse(f"{_cut(str(exc), 600)}")
+    lock = _RunLock(str(state_path))                      # only an entry that will be written takes the lock
+    if not lock.acquire():
+        return refuse("an order-step run holds this venue's state file now; write the entry once it has ended; "
+                      "nothing was written")
+    state = None
+    try:
+        try:
+            state = OrderStepState(state_path, clock=clock)
+            row = state.add_owner_entry(fields, who=args.who, note=args.note, now=now,
+                                        after=entries[-1]["hash"] if entries else _GENESIS)
+        except (OrderStepError, OrderError, sqlite3.Error) as exc:
+            return refuse(f"{_cut(str(exc), 600)}")
+        finally:
+            if state is not None:
+                state.close()
+        line = {"type": "owner_entry", "venue": venue, **{k: row[k] for k in _JOURNALED_ENTRY},
+                "time": repr(float(row["time"]))}
+        try:                                              # R12: the witness outside the file, by the journal's writer
+            Journal(journal_dir).write(row["day"], line)
+            _sync_file(journal_dir / f"{row['day']}.jsonl")
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"written: owner entry {row['id']}, {kind}, to {state_path.name}; but its journal line could not be "
+                  f"written ({_cut(str(exc), 300)}): the entry stays in the state file, and the next owner's entry "
+                  "(and, from S4, every run) finds the state file and the journal differ until a person has looked",
+                  file=sys.stderr)
+            return JOURNAL_NOT_WRITTEN
     finally:
-        if state is not None:
-            state.close()
         lock.release()
-    print(f"written: owner entry {row['id']}, {kind}, to {state_path.name}")
+    print(f"written: owner entry {row['id']}, {kind}, to {state_path.name}, and journaled")
     print(json.dumps(row, indent=2))
     return 0
 
@@ -1432,6 +1479,7 @@ _ENTRY_FIELDS = ("id", "time", "day", "kind", "symbol", "amount", "units", "rati
                  "units_after", "value_per_unit_before", "value_per_unit_after", "who", "note", "prev_hash")
 _GENESIS = "0" * 64
 MAX_WHO, MAX_NOTE = 200, 1000
+JOURNAL_NOT_WRITTEN = 3                           # addendum 4 (R12): the owner's entry is written, its journal line not
 
 
 def _entry_hash(row: dict) -> str:
@@ -1440,6 +1488,96 @@ def _entry_hash(row: dict) -> str:
     return hashlib.sha256(json.dumps(fields, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
 NOT_COUNTED = ("refused", "not sent")             # outcomes that are not an order sent
 LEDGER_NOT_SENT = ("intended", "refused")         # T22d-1: the ledger's states of an order never sent (NOT_COUNTED there)
+
+
+def _checked_entries(db) -> list[dict]:
+    """Every owner entry of a layout-2 file open on `db`, in order, after checking the chain: ids 1 to n with none
+    missing (the file's own counter of ids given out says how many were ever written), each entry's previous hash the
+    one before it, and each hash its own fields'. Refused in words (OrderStepError) otherwise: an entry changed or
+    removed. What a rewrite of the file that recomputes the hashes does is found only against the journal
+    (owner_entry_differences)."""
+    cur = db.execute(f"SELECT {', '.join(_ENTRY_FIELDS)}, hash FROM owner_entries ORDER BY id")
+    names = [c[0] for c in cur.description]
+    rows = [dict(zip(names, r)) for r in cur.fetchall()]
+    seq = db.execute("SELECT seq FROM sqlite_sequence WHERE name = 'owner_entries'").fetchone()
+    given = int(seq[0]) if seq else 0
+    after = "a person must look before the book is worked out again"
+    prev = _GENESIS
+    for n, row in enumerate(rows, start=1):
+        if row["id"] != n:
+            raise OrderStepError(f"owner entry {n} was removed (the entries left are {', '.join(str(r['id']) for r in rows)}"
+                                 f" of {given} written); {after}")
+        if row["prev_hash"] != prev or row["hash"] != _entry_hash(row):
+            raise OrderStepError(f"owner entry {n} was changed after it was written (its hash does not match what it "
+                                 f"holds, or the entry before it); {after}")
+        prev = row["hash"]
+    if given > len(rows):
+        raise OrderStepError(f"owner entry {len(rows) + 1} was removed ({given} were written, {len(rows)} are left); "
+                             f"{after}")
+    return rows
+
+
+def _owner_entries_read_only(path: Path) -> list[dict]:
+    """Addendum 4 (R13): the owner's entries of a state file, read through a read-only open that never creates,
+    upgrades or changes anything: no file is no entries, a layout-1 file is no entries, a layout-2 file its checked
+    entries. Anything else is refused in words (OrderStepError), as the writing open refuses it."""
+    if not path.exists():
+        return []
+    db = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=30.0)
+    try:
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        tables.discard("sqlite_sequence")
+        if not tables and version == 0:
+            return []
+        if version == 1 and tables <= _LAYOUT1_TABLES:
+            return []
+        if not (version == STATE_LAYOUT and _LAYOUT2_NEW <= tables <= _LAYOUT2_TABLES):
+            raise OrderStepError(f"{path} is not an order-step state file of layout 1 or {STATE_LAYOUT}; it is not "
+                                 "opened")
+        return _checked_entries(db)
+    finally:
+        db.close()
+
+
+_JOURNALED_ENTRY = ("id", "kind", "symbol", "amount", "units", "ratio", "mark", "units_before", "units_after",
+                    "value_per_unit_before", "value_per_unit_after", "who", "note", "prev_hash", "hash")
+
+
+def owner_entry_differences(entries, journal, *, venue: str) -> list[str]:
+    """Addendum 4 (R12): every difference, in words, between the owner's entries a state file holds (`entries`, as
+    owner_entries gives them) and the journal's `owner_entry` lines of `venue` (`journal`: the journal's entries, any
+    type, in the order read): an entry in the state file and not in the journal, a journal line whose entry the state
+    file does not hold, the same id with another hash (or previous hash), an id journaled twice or not a whole number,
+    and lines in another order than their ids. Pure. Called only by the owner's command in this build (S4 wires it into
+    every run). It finds a change to ONE of the two records; two changed to match, or both put back from one older
+    copy, agree and are not found here."""
+    state = {int(e["id"]): e for e in entries}
+    lines = [x for x in journal if isinstance(x, dict) and x.get("type") == "owner_entry" and x.get("venue") == venue]
+    out: list[str] = []
+    seen: dict[int, dict] = {}
+    order: list[int] = []
+    for x in lines:
+        n = x.get("id")
+        if isinstance(n, bool) or not isinstance(n, int):
+            out.append(f"a journal line of an owner's entry has the id {_cut(repr(n))}, not a whole number")
+            continue
+        if n in seen:
+            out.append(f"owner entry {n} is journaled twice")
+            continue
+        seen[n] = x
+        order.append(n)
+    for n in sorted(set(state) | set(seen)):
+        if n not in seen:
+            out.append(f"owner entry {n} is in the state file and not in the journal")
+        elif n not in state:
+            out.append(f"the journal holds owner entry {n}, which is not in the state file")
+        elif (seen[n].get("hash"), seen[n].get("prev_hash")) != (state[n]["hash"], state[n]["prev_hash"]):
+            out.append(f"owner entry {n} has another hash in the journal ({_cut(str(seen[n].get('hash')), 16)}) than in "
+                       f"the state file ({state[n]['hash'][:16]})")
+    if order != sorted(order):
+        out.append(f"the journal holds the owner's entries in the order {', '.join(map(str, order))}, not their ids' order")
+    return out
 
 
 def _ny_day(t) -> str | None:
@@ -1493,49 +1631,36 @@ class OrderStepState:
     # ---- T51c S3 (R5): the owner's entries
 
     def _entries_checked(self) -> list[dict]:
-        """Every owner entry in order, after checking the chain: ids 1 to n with none missing (the file's own counter
-        of ids given out says how many were ever written), each entry's previous hash the one before it, and each
-        hash its own fields'. Refused in words (OrderStepError) otherwise: an entry changed or removed."""
-        cur = self._db.execute(f"SELECT {', '.join(_ENTRY_FIELDS)}, hash FROM owner_entries ORDER BY id")
-        names = [c[0] for c in cur.description]
-        rows = [dict(zip(names, r)) for r in cur.fetchall()]
-        seq = self._db.execute("SELECT seq FROM sqlite_sequence WHERE name = 'owner_entries'").fetchone()
-        given = int(seq[0]) if seq else 0
-        after = "a person must look before the book is worked out again"
-        prev = _GENESIS
-        for n, row in enumerate(rows, start=1):
-            if row["id"] != n:
-                raise OrderStepError(f"owner entry {n} was removed (the entries left are {', '.join(str(r['id']) for r in rows)}"
-                                     f" of {given} written); {after}")
-            if row["prev_hash"] != prev or row["hash"] != _entry_hash(row):
-                raise OrderStepError(f"owner entry {n} was changed after it was written (its hash does not match what it "
-                                     f"holds, or the entry before it); {after}")
-            prev = row["hash"]
-        if given > len(rows):
-            raise OrderStepError(f"owner entry {len(rows) + 1} was removed ({given} were written, {len(rows)} are left); "
-                                 f"{after}")
-        return rows
+        """Every owner entry in order, after checking the chain (_checked_entries)."""
+        return _checked_entries(self._db)
 
     def owner_entries(self) -> list[dict]:
         """The owner's entries, oldest first, each a dict of its fields, once the chain is checked."""
         return self._entries_checked()
 
-    def add_owner_entry(self, figures: dict, who: str, note: str) -> dict:
+    def add_owner_entry(self, figures: dict, who: str, note: str, *, now: float | None = None,
+                        after: str | None = None) -> dict:
         """Append one owner entry: `figures` as next_entry gives them, `who` and `note` (both required text), the
-        time and New York day from this file's clock, and the hash chained to the entry before it, all in one write
-        transaction after the chain is checked. Returns the entry as written. No figure is defaulted here."""
+        time and New York day of `now` (the one clock reading its caller took; this file's clock when None), and the
+        hash chained to the entry before it, all in one write transaction after the chain is checked. With `after`
+        (the hash of the last entry its caller valued the book with, or the genesis hash for none), refused when the
+        entries are no longer those. Returns the entry as written. No figure is defaulted here."""
         for what, text, most in (("who", who, MAX_WHO), ("note", note, MAX_NOTE)):
             if not isinstance(text, str) or not text.strip() or len(text) > most or not text.isprintable():
                 raise OrderStepError(f"an owner's entry needs {what}: plain text of at most {most} characters, not "
                                      f"{_cut(repr(text))}; nothing was written")
         if figures.get("kind") not in ENTRY_KINDS:
             raise OrderStepError(f"an owner's entry is of kind {', '.join(ENTRY_KINDS)}; nothing was written")
-        now = float(self.clock())
-        day = _ny_day(now)
+        reading = self.clock() if now is None else now
+        day = _ny_day(reading)
         if day is None:
             raise OrderStepError("the clock gives no New York day; nothing was written")
+        now = float(reading)
         with self._write():
             rows = self._entries_checked()
+            if after is not None and (rows[-1]["hash"] if rows else _GENESIS) != after:
+                raise OrderStepError("the owner's entries changed while this entry was being worked out (another "
+                                     "owner's entry was written meanwhile); nothing was written")
             row = {k: figures.get(k) for k in _ENTRY_FIELDS if k not in ("id", "time", "day", "who", "note", "prev_hash")}
             row.update(id=len(rows) + 1, time=now, day=day, who=who, note=note,
                        prev_hash=rows[-1]["hash"] if rows else _GENESIS)

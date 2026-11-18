@@ -1006,8 +1006,8 @@ class OrderLedger:
                 elif -gap > tolerance:
                     out["position_shortfalls"][sym] = {
                         "book": b, "venue": v, "unapplied": u, "short": -gap,
-                        "reason": f"the account holds {float(v):g} of {_one_line(sym)}, under the {float(b) + u:g} the "
-                                  f"book counts as its own (book {float(b):g}, unapplied {u:g}); the ordinary causes are "
+                        "reason": f"the account holds {float(v)!r} of {_one_line(sym)}, under the {float(b) + u!r} the "
+                                  f"book counts as its own (book {float(b)!r}, unapplied {float(u)!r}); the ordinary causes are "
                                   "that the owner sold shares the book counts as its own, or a split; the whole book "
                                   "stops until a person has looked"}
                 continue

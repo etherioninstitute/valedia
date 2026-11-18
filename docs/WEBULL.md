@@ -485,8 +485,12 @@ not wired yet:
   deposit or withdrawal issues or redeems units at the value per unit, so it is never profit or loss.
 - **The owner's entries**: the order step's state file is now layout 2 (a layout-1 file is upgraded the first time it
   is opened, every row kept; the order step before this build refuses a layout-2 file in words, so going back to it
-  needs the layout-1 file back). The new table `owner_entries` is append-only and hash-chained: an entry changed or
-  removed afterwards is found and refused in words. A second new table, `book_nav`, will hold the book's own value
+  needs the layout-1 file back). The new table `owner_entries` is append-only and hash-chained, and each entry is
+  also written as one `owner_entry` line in the journal. A change to ONE of the two (an entry changed, removed or
+  added by hand in the state file, its hashes recomputed or not, or the state file put back from an older copy; or
+  a journal line changed, removed or added) makes them differ, and the owner's command finds that before it writes
+  and refuses in words. Someone who rewrites BOTH to match, or puts both back from one older copy, is not caught by
+  this build; the nightly copies and the venue's own record are what would show it. A second new table, `book_nav`, will hold the book's own value
   per unit, its bounds, the marks it was valued at and the latest entry it includes, run by run, for the day's
   loss and the drawdown of S4; nothing writes or reads it yet. The old `equity` table is kept as it was.
 - **A local check** (`untracked_tags`): every tag the order step wrote to the journal, a ticket or its send record
@@ -507,7 +511,10 @@ stays, the units change). The shape, with figures that are AN EXAMPLE ONLY and n
     order-step --owner-entry cash_in --venue VENUE_NAME --amount 1234.56 --who owner --note "example only"
 
 `VENUE_NAME` is the name in the venue's state file, `memory/order_step-VENUE_NAME.sqlite` (under `--root` when one
-is given); the ledger beside it is only read, and the entry is refused while a run holds that file's lock.
+is given); the ledger beside it is only read, and the entry is refused while a run holds that file's lock. A refusal
+writes nothing: no folder, lock file or upgrade of the state file (it exits 2). An entry written whose journal line
+could not be written is said in words and exits 3; the entry stays in the state file, and the next owner's entry is
+refused until a person has looked.
 
 ## Not covered yet
 
