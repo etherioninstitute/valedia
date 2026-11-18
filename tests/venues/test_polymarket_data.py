@@ -8,6 +8,7 @@ import socket
 import urllib.parse
 import urllib.request
 import urllib.response
+from pathlib import Path
 
 import pytest
 
@@ -930,26 +931,154 @@ def test_a_lone_surrogate_title_through_the_wire_is_none_and_counted():
 
 
 @pytest.mark.parametrize("value", BAD_TEXT)
-def test_a_string_that_decides_a_reject_and_cannot_be_stored_is_that_fields_reject(value):
+def test_a_position_string_that_decides_a_reject_and_cannot_be_stored_is_that_fields_reject(value):
     for f in ("proxy_wallet", "token_id", "condition_id", "status"):
         assert pd.validate_position(position(0, **{f: value})) == (None, "bad_" + f)
-    for f in ("proxy_wallet", "token_id", "condition_id", "event_slug", "transaction_hash"):
-        assert pd.validate_trade(dict(trade(1), **{f: value})) == (None, "bad_" + f)
-    assert pd.validate_board_row(board_row(1, value)) == (None, "bad_user_id")
-    assert pd.validate_resolution(resolution(value)) == (None, "bad_condition_id")
-    assert pd.validate_resolution(resolution("c", status=value)) == (None, "bad_status")
-    assert pd.validate_resolution(resolution("c", resolved_at="2026-02-01T10:00:00" + value + "Z")) == \
-        (None, "bad_resolved_at")
 
 
 @pytest.mark.parametrize("value", BAD_TEXT)
-def test_a_kept_string_that_cannot_be_stored_is_none(value):
+def test_a_kept_position_string_that_cannot_be_stored_is_none(value):
     good, why = pd.validate_position(position(0, event_slug=value, event_id=value, opposite_token_id=value))
     assert why is None and (good["event_slug"], good["event_id"], good["opposite_token_id"]) == (None, None, None)
-    good, why = pd.validate_trade(dict(trade(1), title=value, slug=value, outcome=value))
-    assert why is None and (good["title"], good["slug"], good["outcome"]) == (None, None, None)
 
 
+@pytest.mark.parametrize("value", BAD_TEXT)
+def test_the_string_rule_is_for_positions_only_other_rows_answer_as_before(value):
+    """Addendum 4: trades, board rows and resolutions keep such strings exactly as the reader always did."""
+    for f in ("proxy_wallet", "token_id", "condition_id", "event_slug", "transaction_hash", "title", "slug",
+              "outcome"):
+        good, why = pd.validate_trade(dict(trade(1), **{f: value}))
+        assert why is None and good[f] == value, f
+    assert pd.validate_board_row(board_row(1, value))[0]["user_id"] == value
+    assert pd.validate_resolution(resolution(value))[0]["condition_id"] == value
+    assert pd.validate_resolution(resolution("c", status=value))[0]["status"] == value
+
+
+F747911 = "f747911"
+
+
+def _reader_at(commit, tmp_path):
+    """The reader as it was at `commit`, from this repository's history, imported under a name of its own."""
+    import importlib.util
+    import subprocess
+    import sys
+    root = Path(__file__).resolve().parents[2]
+    got = subprocess.run(["git", "-C", str(root), "show", "%s:valedia_trader/venues/polymarket_data.py" % commit],
+                         capture_output=True, text=True)
+    if got.returncode != 0:
+        pytest.skip("commit %s is not in this checkout's history" % commit)
+    f = tmp_path / ("reader_%s.py" % commit)
+    f.write_text(got.stdout)
+    name = "reader_at_%s" % commit
+    spec = importlib.util.spec_from_file_location(name, f)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[name] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+SEED_VALUES = [0, 1, -1, 0.0, 0.5, 1.0, 1.5, -0.1, 1e308, 2 ** 53, 2 ** 63 - 1, 2 ** 63, -2 ** 63 - 1, 10 ** 30,
+               float("nan"), float("inf"), True, False, None, "", "x", "BUY", "SELL", "resolved", "0xabc", "0xABC",
+               "0xother", "Yes", "2026-02-01T10:00:00Z", "2026-02-01T10:00:00+01:00", "2026-02-01T10:00:00",
+               "2019-01-01T00:00:00Z", "caf\u00e9 \U0001f600", "z" * 3000, [], {}, [1], [0, 1], [1_000_000, 0],
+               [1, 2, 3], [-1, 0], [2 ** 63, 0], {"a": 1}, [[[1]]], 1_700_000_000, 1_577_836_799, 60, 1700,
+               "\ud800", "ok\udc00", "a\x00b", "\x00", "2026-02-01T10:00:00\x00Z", "2026-02-01T10:00:00\ud800Z",
+               10 ** 400, -10 ** 400]
+
+
+def _seeded_rows(base, rng, n):
+    rows = [dict(base, **{f: v}) for f in list(base) + ["extra"] for v in SEED_VALUES]
+    for _ in range(n):
+        r = dict(base)
+        for _ in range(rng.randint(1, 4)):
+            f = rng.choice(list(base) + ["extra"])
+            if rng.random() < 0.1:
+                r.pop(f, None)
+            else:
+                r[f] = rng.choice(SEED_VALUES)
+        rows.append(r)
+    return rows + list(SEED_VALUES)
+
+
+def _answer(f, *a):
+    try:
+        return "ok", json.dumps(f(*a), sort_keys=True, default=repr)
+    except Exception as e:
+        return "raise", type(e).__name__
+
+
+def test_property_trades_price_points_resolutions_and_board_rows_answer_as_the_reader_at_f747911(tmp_path):
+    import random
+    old = _reader_at(F747911, tmp_path)
+    rng = random.Random(20261117)
+    bases = {
+        "board": (lambda m: m.validate_board_row, {"rank": 1, "user_id": "0xabc", "pnl": 5.0, "volume": 1.0}),
+        "trade": (lambda m: (lambda r: m.validate_trade(r, "0xabc", 1_800_000_000)), trade(1)),
+        "trade_any": (lambda m: m.validate_trade, trade(1)),
+        "resolution": (lambda m: (lambda r: m.validate_resolution(r, 1_800_000_000)), resolution("0xc1")),
+        "price_point": (lambda m: (lambda r: m.validate_price_point(r, 1_800_000_000)),
+                        {"price": 0.5, "resolution_seconds": 60, "timestamp": 1_700_000_000}),
+    }
+    compared = differ = 0
+    for name, (mk, base) in bases.items():
+        fo, fn = mk(old), mk(pd)
+        for r in _seeded_rows(base, rng, 4000):
+            a = _answer(fo, r)
+            if a[0] == "raise":                  # the old reader crashed here: addendum 2 makes it a counted row
+                assert _answer(fn, r)[0] == "ok"
+                continue
+            compared += 1
+            differ += _answer(fn, r) != a
+    assert compared > 20_000 and differ == 0, (compared, differ)
+    for v in SEED_VALUES:
+        a = _answer(old.is_number, v)
+        assert a[0] == "raise" or _answer(pd.is_number, v) == a
+
+
+def test_property_every_walk_but_positions_answers_as_the_reader_at_f747911(tmp_path):
+    import random
+    old = _reader_at(F747911, tmp_path)
+    rng = random.Random(4)
+    tr, pp, br = trade(1), {"price": 0.5, "resolution_seconds": 60, "timestamp": 1_700_000_000}, board_row(1, "0xa")
+    compared = differ = 0
+    for world in range(60):
+        rows = {"/v2/trades": [dict(tr, transaction_hash="0xt%d" % rng.randint(0, 9)) for _ in range(30)],
+                "/v2/prices-history": [dict(pp, timestamp=1_700_000_000 + 60 * rng.randint(0, 9)) for _ in range(30)],
+                "/v2/leaderboard": [dict(br, rank=i + 1, user_id="0x%d" % i) for i in range(30)]}
+        for path in rows:
+            rows[path] = [r if rng.random() < 0.6 else _seeded_rows(r, rng, 1)[-len(SEED_VALUES) - 1]
+                          for r in rows[path]]
+            rows[path] += [dict(rows[path][0])] if rows[path] else []
+        res = [resolution("0xc%d" % i) if rng.random() < 0.7 else
+               _seeded_rows(resolution("0xc%d" % i), rng, 1)[-len(SEED_VALUES) - 1] for i in range(45)]
+
+        def handler(p, q):
+            if p == "/v2/resolutions":
+                return {"data": res}
+            half = len(rows[p]) // 2
+            return page(rows[p][:half], True, "c1") if "cursor" not in q else page(rows[p][half:])
+
+        def walks(m):
+            c = m.PolymarketData(FakeTransport(handler), sleep=lambda s: None, clock=lambda: 0.0,
+                                 wall=lambda: 1_790_000_000.0)
+            out = []
+            for call in (lambda: c.trades("0xabc"), lambda: c.prices_history("111", 1, 2),
+                         lambda: c.leaderboard("all", rows=50),
+                         lambda: list(c.resolution_batches(["0xc%d" % i for i in range(45)]))):
+                try:
+                    w = call()
+                    out.append(("ok", json.dumps(w if isinstance(w, list) else
+                                                 [w.rows, w.raw, sorted(w.rejects.items()), w.pages],
+                                                 sort_keys=True, default=repr)))
+                except Exception as e:
+                    out.append(("raise", type(e).__name__))
+            return out
+        for a, b in zip(walks(old), walks(pd)):
+            if a[0] == "raise":
+                continue
+            compared += 1
+            differ += a != b
+    assert compared > 150 and differ == 0, (compared, differ)
 def test_a_resolution_row_whose_condition_is_not_a_string_is_an_answer_not_an_error():
     rows = [resolution("0x1"), {"condition_id": ["0x2"], "status": "r"}, {"condition_id": {"a": 1}, "status": "r"}]
     c, t, clock = client(lambda p, q: {"data": rows})

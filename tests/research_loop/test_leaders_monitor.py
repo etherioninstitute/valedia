@@ -1182,3 +1182,25 @@ def test_property_no_vouched_new_for_a_token_unreadable_in_the_read_before(tmp_p
             if rng.random() < 0.4:
                 truth[w][nxt[w]] = float(rng.randint(1, 9))
                 nxt[w] += 1
+
+
+# ------------------------------------------------------------------ addendum 4
+@pytest.mark.parametrize("bad", ["0xabc", "0x" + "a" * 39, "0x" + "a" * 41, "0x" + "g" * 40, "1x" + "a" * 40,
+                                 "0x" + "a" * 39 + "\x00", "0x" + "a" * 39 + "\ud800", "0x" + "a" * 39 + "١",
+                                 " 0x" + "a" * 40, "0x" + "a" * 40 + "\n", "0X" + "a" * 40])
+def test_fix_leaders_takes_a_board_row_only_with_a_well_formed_wallet_address(store, bad):
+    world = World()
+    world.boards["crypto"][2]["user_id"] = bad
+    code, out = run(["fix-leaders"], world, Wall(), store)
+    assert code == lm.REFUSED and "nothing stored" in out
+    assert "\x00" not in out and "\ud800" not in out
+    c = db(store)
+    assert c.execute("SELECT count(*) FROM leaders").fetchone()[0] == 0
+    assert c.execute("SELECT count(*) FROM meta").fetchone()[0] == 0
+
+
+def test_a_mixed_case_wallet_address_is_well_formed(store):
+    world = World()
+    world.boards["sports"][0]["user_id"] = "0x" + "AbCdEf0123" * 4
+    fixed(store, world)
+    assert db(store).execute("SELECT count(*) FROM leaders").fetchone()[0] == 10
