@@ -21,7 +21,9 @@ nothing here repeats itself: `pass` reads once and ends; whether and how often i
   each change carries the read time, the previous good read's time and the gap. A wallet's first good read is a
   baseline and creates no change. A failed read (an error after the reader's retries: `read_error`; the page cap:
   `page_limit`; a page short of the first while more were promised: `rows_shrank`) records only the failure and
-  infers nothing. ONE WRITE PER WALLET: the read, its holdings, its changes, its snapshot and its rejects are one
+  infers nothing. An error of any other kind while one wallet is read or written (not a memory error, not an
+  interrupt) is that wallet's failed read `internal_error`, with the error's class name only; the pass goes on and
+  ends with code INTERNAL_ERROR, its summary line counting such wallets. ONE WRITE PER WALLET: the read, its holdings, its changes, its snapshot and its rejects are one
   transaction, so a kill leaves the old holding or the new one with its changes, never one without the other.
   A full snapshot is kept at the baseline and once per UTC day. Memory is read at each wallet; above
   --max-memory-mb the pass stops between wallets (code STOPPED_MEMORY). At the end, rows of changes, snapshots,
@@ -66,7 +68,7 @@ BUSY_SECONDS = 30.0
 DAY = 86_400
 CLAIM_KEY = "leaders_fixed_at"
 KINDS = ("NEW", "INCREASE", "DECREASE", "EXIT")
-OK, LOCKED, REFUSED, STOPPED_MEMORY = 0, 2, 3, 5
+OK, LOCKED, REFUSED, STOPPED_MEMORY, INTERNAL_ERROR = 0, 2, 3, 5, 6
 
 HOLDING_COLS = ("condition_id", "opposite_token_id", "outcome_index", "size", "avg_price", "current_value",
                 "first_entry_at", "last_event_at", "title", "outcome", "end_date", "current_price", "event_slug")
@@ -129,8 +131,8 @@ def _holding(r: dict) -> tuple:
 def _raw(row) -> str:
     try:
         return json.dumps(row, sort_keys=True, default=str)[:RAW_MAX]
-    except (TypeError, ValueError):
-        return repr(row)[:RAW_MAX]
+    except (TypeError, ValueError, RecursionError):
+        return "(a row that could not be written out: %s)" % type(row).__name__
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -343,7 +345,7 @@ def run_pass(conn, client, wall, say, memory: Callable[[], float], max_mb: float
     started, t0 = wall(), time.monotonic()
     pass_id = conn.execute("INSERT INTO passes (started_ts, status) VALUES (?, 'running')", (started,)).lastrowid
     totals: Counter = Counter()
-    good = failed = 0
+    good = failed = internal = 0
     status = "done"
     mem = memory()
     for i, (key, wallet, _s, _c) in enumerate(leaders):
@@ -353,8 +355,15 @@ def run_pass(conn, client, wall, say, memory: Callable[[], float], max_mb: float
             status = "stopped_memory"
             break
         t = time.monotonic()
-        res = read_wallet(client, wallet)
-        n = write_wallet(conn, pass_id, key, res, wall())
+        try:
+            res = read_wallet(client, wallet)
+            n = write_wallet(conn, pass_id, key, res, wall())
+        except MemoryError:
+            raise
+        except Exception as e:                  # this wallet's failed read; the class name only, never a row
+            res = {"good": False, "reason": "internal_error", "detail": type(e).__name__, "pages": None}
+            n = write_wallet(conn, pass_id, key, res, wall())
+            internal += 1
         mem = memory()
         if res["good"]:
             good += 1
@@ -370,10 +379,12 @@ def run_pass(conn, client, wall, say, memory: Callable[[], float], max_mb: float
     removed = age_out(conn, started)
     conn.execute("UPDATE passes SET finished_ts=?, status=?, good=?, failed=?, removed=? WHERE pass_id=?",
                  (wall(), status, good, failed, removed, pass_id))
-    say("pass %d %s: %d good, %d failed, new=%d increase=%d decrease=%d exit=%d, removed %d old rows, %.1fs, mem=%.0fMB"
-        % (pass_id, status, good, failed, totals["NEW"], totals["INCREASE"], totals["DECREASE"], totals["EXIT"],
-           removed, time.monotonic() - t0, mem))
-    return STOPPED_MEMORY if status == "stopped_memory" else OK
+    say("pass %d %s: %d good, %d failed, internal_error=%d, new=%d increase=%d decrease=%d exit=%d, removed %d old "
+        "rows, %.1fs, mem=%.0fMB" % (pass_id, status, good, failed, internal, totals["NEW"], totals["INCREASE"],
+                                     totals["DECREASE"], totals["EXIT"], removed, time.monotonic() - t0, mem))
+    if status == "stopped_memory":
+        return STOPPED_MEMORY
+    return INTERNAL_ERROR if internal else OK
 
 
 # ---------------------------------------------------------------- consistency and report

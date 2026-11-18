@@ -25,7 +25,10 @@ Routes (field names from the service's published specification, /v2/openapi.json
   paged like the list routes. `prices_history` asks for one window; an empty window is a finished walk.
 * every row is validated; a row of the wrong shape is a counted reject (reason in `Walk.rejects`), never a guess.
   A bool, None, NaN, infinity or a string where a number belongs is wrong. A time must be whole epoch seconds from
-  2020-01-01 to one day after the client was made (a time in milliseconds is out of that span).
+  2020-01-01 to one day after the client was made (a time in milliseconds is out of that span). No validator
+  raises, whatever value of whatever size or type sits in whatever field: a whole number beyond a float's range
+  takes the too-large reason where that rule applies, else its field's own reason; a string that cannot be stored
+  or printed (it holds a NUL, or a lone surrogate that UTF-8 cannot encode) is malformed (T52 addendum 2).
 * one identity per row within a walk. A true repeat (the whole row equal) is dropped and counted ("repeated_row");
   rows alike in identity and different elsewhere are a conflict ("conflicting_row"): a trade keeps the first and
   counts the rest; a price point in conflict is never kept (all its rows are counted as conflicts), so it can never
@@ -43,6 +46,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -147,21 +151,41 @@ def urllib_get(url: str, timeout: float = 60.0) -> tuple[bytes, str | None]:
 
 # ---------------------------------------------------------------- shapes
 def is_number(v) -> bool:
-    """A finite int or float that is not a bool."""
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    """A finite int or float that is not a bool. Never raises: every whole number is finite whatever its size (one
+    beyond a float's range is a number here, and each field's own rule says what becomes of it)."""
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, int):
+        return True
+    return isinstance(v, float) and math.isfinite(v)
+
+
+def _floats(v) -> bool:
+    """A number that a float can hold (a whole number beyond a float's range cannot)."""
+    try:
+        float(v)
+    except OverflowError:
+        return False
+    return True
 
 
 TOO_LARGE = "number_too_large_for_store"      # a whole number outside SQLite's 64-bit integers (2**63 or more)
 
 
 def _fits_store(values) -> bool:
-    """Every whole number among `values` (and inside lists among them) fits SQLite's 64-bit integer; a row with one
-    that does not is malformed (writing it would end the pull with an OverflowError)."""
-    for v in values:
-        if isinstance(v, list) and not _fits_store(v):
-            return False
-        if isinstance(v, int) and not isinstance(v, bool) and not -2 ** 63 <= v < 2 ** 63:
-            return False
+    """Every whole number among `values` (and inside lists among them, at any depth: walked without recursion)
+    fits SQLite's 64-bit integer; a row with one that does not is malformed (writing it would end the pull with an
+    OverflowError)."""
+    stack = [iter(values)]
+    while stack:
+        for v in stack[-1]:
+            if isinstance(v, list):
+                stack.append(iter(v))
+                break
+            if isinstance(v, int) and not isinstance(v, bool) and not -2 ** 63 <= v < 2 ** 63:
+                return False
+        else:
+            stack.pop()
     return True
 
 
@@ -171,6 +195,28 @@ def _is_int(v) -> bool:
 
 def _is_str(v, nonempty: bool = True) -> bool:
     return isinstance(v, str) and (bool(v) or not nonempty)
+
+
+def _storable(v: str) -> bool:
+    """A string that can be stored and printed: no NUL character, and encodable as UTF-8 (no lone surrogate)."""
+    if "\x00" in v:
+        return False
+    if v.isascii():
+        return True
+    try:
+        v.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _is_text(v, nonempty: bool = True) -> bool:
+    """A row's string field: a string (non-empty unless allowed) that can be stored and printed."""
+    return _is_str(v, nonempty) and _storable(v)
+
+
+def _text_or_none(v):
+    return v if _is_text(v, nonempty=False) else None
 
 
 def _ts_max(ts_max: int | None) -> int:
@@ -192,11 +238,11 @@ def rfc3339_to_ts(v) -> int | None:
         return None
     try:
         dt = datetime.fromisoformat(v.replace("Z", "+00:00") if v.endswith("Z") else v)
-    except ValueError:
+        if dt.tzinfo is None:
+            return None
+        return int(dt.timestamp())
+    except (ValueError, OverflowError):
         return None
-    if dt.tzinfo is None:
-        return None
-    return int(dt.timestamp())
 
 
 def validate_board_row(row) -> tuple[dict | None, str | None]:
@@ -205,7 +251,7 @@ def validate_board_row(row) -> tuple[dict | None, str | None]:
         return None, "not_an_object"
     if not _is_int(row.get("rank")):
         return None, "bad_rank"
-    if not _is_str(row.get("user_id")):
+    if not _is_text(row.get("user_id")):
         return None, "bad_user_id"
     for k in ("pnl", "volume"):
         if not is_number(row.get(k)):
@@ -225,14 +271,14 @@ def validate_trade(row, user: str | None = None, ts_max: int | None = None) -> t
     (case folded)."""
     if not isinstance(row, dict):
         return None, "not_an_object"
-    if not _is_str(row.get("proxy_wallet")):
+    if not _is_text(row.get("proxy_wallet")):
         return None, "bad_proxy_wallet"
     if user is not None and row["proxy_wallet"].lower() != user.lower():
         return None, "other_wallet"
     if row.get("side") not in ("BUY", "SELL"):
         return None, "bad_side"
     for k in TRADE_STR:
-        if not _is_str(row.get(k)):
+        if not _is_text(row.get(k)):
             return None, "bad_" + k
     size, price, ts, oi = row.get("size"), row.get("price"), row.get("timestamp"), row.get("outcome_index")
     if not is_number(size) or size <= 0:
@@ -245,12 +291,12 @@ def validate_trade(row, user: str | None = None, ts_max: int | None = None) -> t
     if not _is_int(oi) or oi not in (0, 1):
         return None, "bad_outcome_index"
     for k in ("event_slug", "transaction_hash"):
-        if not _is_str(row.get(k), nonempty=False):
+        if not _is_text(row.get(k), nonempty=False):
             return None, "bad_" + k
     out = {k: row[k] for k in ("proxy_wallet", "side", "token_id", "condition_id", "size", "price", "timestamp",
                                "event_slug", "outcome_index", "transaction_hash")}
     for k in ("slug", "title", "outcome"):
-        out[k] = row.get(k) if isinstance(row.get(k), str) else None
+        out[k] = _text_or_none(row.get(k))
     if not _fits_store(out.values()):
         return None, TOO_LARGE
     return out, None
@@ -276,8 +322,8 @@ def _info_fields(row: dict) -> dict:
     OUTCOME_MAX characters, end_date a real calendar date YYYY-MM-DD other than the service's 1970-01-01 for none,
     current_price a number from 0 to 1. A missing or malformed one is None; none of them can reject a row."""
     title, outcome, end, price = (row.get(k) for k in POSITION_INFO)
-    out = {"title": title if _is_str(title) and len(title) <= TITLE_MAX else None,
-           "outcome": outcome if _is_str(outcome) and len(outcome) <= OUTCOME_MAX else None,
+    out = {"title": title if _is_text(title) and len(title) <= TITLE_MAX else None,
+           "outcome": outcome if _is_text(outcome) and len(outcome) <= OUTCOME_MAX else None,
            "end_date": None, "current_price": float(price) if is_number(price) and 0 <= price <= 1 else None}
     if isinstance(end, str) and _END_DATE.fullmatch(end) and end != "1970-01-01":
         try:
@@ -294,19 +340,19 @@ def validate_position(row, user: str | None = None) -> tuple[dict | None, str | 
     that were None. A first entry of 0 (the service's "none recorded") is None."""
     if not isinstance(row, dict):
         return None, "not_an_object"
-    if not _is_str(row.get("proxy_wallet")):
+    if not _is_text(row.get("proxy_wallet")):
         return None, "bad_proxy_wallet"
     if user is not None and row["proxy_wallet"].lower() != user.lower():
         return None, "other_wallet"
     for k in ("token_id", "condition_id", "status"):
-        if not _is_str(row.get(k)):
+        if not _is_text(row.get(k)):
             return None, "bad_" + k
     for k in POSITION_NUM:
-        if not is_number(row.get(k)):
+        if not is_number(row.get(k)) or not _floats(row[k]):       # beyond a float's range: that field's reject
             return None, "bad_" + k
     out = {k: row[k] for k in ("proxy_wallet", "token_id", "condition_id", "status") + POSITION_NUM}
     for k in ("event_slug", "event_id", "opposite_token_id"):
-        out[k] = row.get(k) if isinstance(row.get(k), str) else None
+        out[k] = _text_or_none(row.get(k))
     for k in ("first_entry_at", "last_event_at", "outcome_index"):
         out[k] = row.get(k) if _is_int(row.get(k)) else None
     if out["first_entry_at"] == 0:
@@ -328,9 +374,9 @@ def validate_resolution(row, ts_max: int | None = None) -> tuple[dict | None, st
     also given as `resolved_ts`."""
     if not isinstance(row, dict):
         return None, "not_an_object"
-    if not _is_str(row.get("condition_id")):
+    if not _is_text(row.get("condition_id")):
         return None, "bad_condition_id"
-    if not _is_str(row.get("status")):
+    if not _is_text(row.get("status")):
         return None, "bad_status"
     pay = row.get("payouts")
     if pay is not None and not (isinstance(pay, list) and len(pay) == 2 and all(_is_int(x) and x >= 0 for x in pay)):
@@ -338,7 +384,7 @@ def validate_resolution(row, ts_max: int | None = None) -> tuple[dict | None, st
     ra = row.get("resolved_at")
     ts = None
     if ra is not None:
-        ts = rfc3339_to_ts(ra)
+        ts = rfc3339_to_ts(ra) if _is_text(ra) else None
         if ts is None:
             return None, "bad_resolved_at"
         if _ts_why(ts, ts_max):
@@ -444,8 +490,13 @@ def _now() -> str:
 
 
 def _signature(raw) -> str:
-    """The whole row, for telling a true repeat from a conflict."""
-    return json.dumps(raw, sort_keys=True, default=repr)
+    """The whole row, for telling a true repeat from a conflict. A row nested too deep to write out gets a mark of
+    its own (no JSON text starts with "u"), equal to no other row's, in this process or another: a second row of its
+    identity is then a conflict, never a repeat."""
+    try:
+        return json.dumps(raw, sort_keys=True, default=repr)
+    except RecursionError:
+        return "unsigned:" + uuid.uuid4().hex
 
 
 # ---------------------------------------------------------------- the client
@@ -657,7 +708,8 @@ class PolymarketData:
             w = self.resolutions(batch)
             good: Counter = Counter(r["condition_id"] for r in w.rows)
             bad: Counter = Counter(raw.get("condition_id") for raw, why in w.raw
-                                   if why and why != "repeated_row" and isinstance(raw, dict))
+                                   if why and why != "repeated_row" and isinstance(raw, dict)
+                                   and isinstance(raw.get("condition_id"), str))      # an answer only to a string id
             answers = {}
             for c in batch:
                 if good[c] > 1:
