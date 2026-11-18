@@ -60,11 +60,19 @@ trading (his word, 2026-11-17).
    clean batches), the owner's consent field for live fractions, the live opening, and the FIRST-CONTACT RULE
    (in production one fractional order per run until one has filled and reconciled cleanly: practice is looser
    than production, so practice cannot prove what production refuses).
-4. **QUEUED** T51c book-level accounting in a SHARED account (ticket not yet written). The owner trades the
-   same cash account by hand and holds event positions in it. Today's code would report a fault on every run
-   after any trade of his, count his shares against Valedia's position limit, read his withdrawals as her
-   losses and let a deposit hide one. Capital, exposure, day loss and reconcile must be judged on her own
-   book. PRECONDITION of the first real order.
+4. **NEXT** T51c book-level accounting in a SHARED account. The owner trades the same cash account by hand
+   and holds event positions in it. STUDY DONE 2026-11-18 (`.foreman/tickets/T51c-shared-account-book-step0.md`,
+   rulings in `T51c-addendum-1-rulings-and-slices.md`): today's code would STOP the book at every run after
+   any trade of his (not merely log a fault), judge her position limit on the whole account's equity, read
+   his withdrawals as her losses and let a deposit hide one. Decided shape: a shared mode of the order step,
+   always on for live; her book is her own fills; her capital is the owner's stake entries plus her results;
+   every limit on her book; positions checked one way (his surplus is his; an account holding LESS than her
+   book stops her until he says he took the shares); she never spends the day's own sale proceeds or more
+   than the account's settled cash. Slices S1 to S3 can be built now; **OWNER** S4 waits for his answer:
+   does her position limit count only her own book, or his own holdings of the same fund too. Known gaps of
+   the first build: fund distributions on her shares; the venue's order history read (before unattended mode
+   or any step up of the stake); a per-fund hold instead of a whole-book stop. PRECONDITION of the first
+   real order. Until S4 runs on practice, a hand order in the PRACTICE account would stop the practice runs.
 5. **OWNER** his live key pair in `~/.hermes/secrets/webull-live.env` (two lines, mode 600, placed by him).
 6. **OWNER** his three files: the real-money confirmation (`config/webull_live.json`), the go-live figures
    (`config/go_live.json`), a daily order cap in `config/risk.json`. The numbers are his. A full rebalance is
