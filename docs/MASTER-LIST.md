@@ -50,9 +50,19 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   ten leaders FIXED (five Sports, five Crypto, none on both) and the first pass taken as the baseline in
   `artifacts/leaders_monitor/leaders.sqlite`: 9 wallets read, 1,942 open positions; two of the Sports leaders
   hold nothing open; Sports #2 holds more than 20,000 open positions and is past the page limit (it stays in
-  the list as unread; a wallet of that size is a market maker). Passes are run BY HAND until the owner allows a
-  job; each later pass records what is new, grown, shrunk or gone. **QUEUED** T52b (three follow-ups) before
-  any job; the forward document before any paper trade.
+  the list as unread; a wallet of that size is a market maker). Each later pass records what is new, grown,
+  shrunk or gone. THE OWNER ALLOWED A DAILY JOB for the pass on 2026-11-18 ("Yes, daily job"), to be added
+  once T52b's three follow-ups are built and blind-checked; its schedule is told to him before it is
+  installed. **NEXT** T52b, then the job. The forward document before any paper trade.
+- **NEXT** THE OWNER'S COPY-TRADING METHOD (his video, 2026-11-18; analysis in `~/Downloads/Copytrade_analysis.md`):
+  from Polymarket's board pick CONSISTENT, low-volatility leaders (not the top by profit), check their closed
+  positions for wins, copy what they hold NOW, place it on Webull, repeat daily. What exists: the boards, 189
+  wallets' full histories, the daily-able record of open positions. What is missing, as its own FORWARD
+  paper test: (1) a consistency screen from the store (variability of monthly realized profit, drawdown,
+  share of resolved positions won, a floor on resolved positions, machines out); (2) the record pointed at
+  the wallets it picks; (3) each open position matched to a Webull contract with the same resolution rule;
+  (4) paper copies under a rule locked BEFORE the first copy; (5) its result against a bar stated in that
+  locked document. Real orders only after it passes, the event order step (T45-2) and his event limits.
 - **WATCH** the order-book collector (roadmap 1.16). 2026-11-18, the last development day: 33 decisions lost,
   3 at 03:14 (the pull's start read its 70 GB store on the collector's SSD) and 30 from 07:20 to 07:33 (the
   LEAD's own copy of that store off the SSD at 100 MB/s made the collector overrun whole minutes). What is
