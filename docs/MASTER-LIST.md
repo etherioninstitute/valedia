@@ -277,10 +277,15 @@ run beside MiroFish and Elephant-1):
   2026-11-17): LM Studio then loads it on demand, which is how the 27B comes and goes. A second 16 GB copy can
   load if the same weights are already loaded under another name. Make the job check what is loaded first, or
   give the model one name for every user of it. The job itself stays on (owner's rule).
-- **OWNER** one 30-minute trial of the 27B generating beside the collector (asked 2026-11-17 16:40); the rule
-  for reading it is written in the ledger before the trial. The collector's own record already hints at a
-  small effect in the minutes after each hour's pick run (90th-percentile decision time 4.1 s against 3.87 s;
-  no more failed decisions).
+- **DONE, result: AN EFFECT.** The trial of the 27B as a coding worker beside the collector (2026-11-17, on
+  the owner's yes, the rule written beforehand) was aborted 43 seconds after the coding task started: the
+  collector's first two decisions both hit their 10-second limit and were late (3.9 s before; back to 3.8 to
+  3.9 s within a minute of the unload). The two decisions made while the model merely LOADED were normal.
+  Lesson: a 27B with a 65,536 window working on a coding prompt cannot share this GPU with the collector. Not
+  measured: a smaller model, a small window, short prompts (the hourly pick job's short requests to the same
+  27B show no extra failed decisions in the record).
+- **OWNER** how coding workers run while the collector is under test: another machine, hours when the
+  collector is not scored, a much smaller model or window measured first, or hosted models for coding.
 
 - **WATCH** Telegram is on and has dropped its connection before; Signal is parked (possible relink about
   11 Dec; its job is not installed).
