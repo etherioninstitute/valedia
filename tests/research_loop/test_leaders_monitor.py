@@ -999,3 +999,33 @@ def test_one_write_per_wallet_survives_a_real_kill_at_every_statement_with_carri
         c.close()
         shutil.rmtree(s.parent)
     assert killed == total
+
+
+# ------------------------------------------------------------------ addendum 2, item 3: one snapshot a UTC day
+def test_one_snapshot_a_wallet_a_utc_day_also_when_it_holds_nothing(store):
+    day0 = T0 - T0 % DAY
+    world, wall = fixed(store, wall=Wall(day0 + 3600))       # 01:00 UTC
+    w, e = wallet(0), wallet(1)
+    world.held[w] = [pos(w, 1), pos(w, 2)]
+    run(["pass"], world, wall, store)                        # w: baseline of two; e: baseline of nothing
+    wall.t = day0 + 5 * 3600
+    world.held[e] = [pos(e, 7)]
+    run(["pass"], world, wall, store)                        # e's day-one snapshot (empty) was already taken
+    wall.t = day0 + DAY + 3600
+    world.held[w] = []
+    run(["pass"], world, wall, store)                        # w's day-two snapshot: it holds nothing
+    wall.t = day0 + DAY + 5 * 3600
+    world.held[w] = [pos(w, 3)]
+    run(["pass"], world, wall, store)
+    c = db(store)
+
+    def snaps(k, day):
+        return c.execute("SELECT count(*) FROM snapshots WHERE wallet_key=? AND utc_day=?", (k, day)).fetchone()[0]
+    d1, d2 = lm._utc_day(day0 + 1), lm._utc_day(day0 + DAY + 1)
+    assert (snaps(w, d1), snaps(w, d2)) == (2, 0)            # the empty day-two snapshot is the day's one
+    assert (snaps(e, d1), snaps(e, d2)) == (0, 1)
+    taken = c.execute("SELECT wallet_key, snapshot_day, count(*) FROM wallet_reads WHERE snapshot_day IS NOT NULL "
+                      "AND wallet_key IN (?, ?) GROUP BY wallet_key, snapshot_day ORDER BY 1, 2", (w, e)).fetchall()
+    assert sorted(tuple(r) for r in taken) == sorted([(w, d1, 1), (w, d2, 1), (e, d1, 1), (e, d2, 1)])
+    assert all(r[0] == lm._utc_day(r[1]) for r in c.execute(
+        "SELECT snapshot_day, read_ts FROM wallet_reads WHERE snapshot_day IS NOT NULL"))
