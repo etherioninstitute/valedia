@@ -460,6 +460,10 @@ def test_with_fractional_off_no_line_carries_a_new_field_no_tag_a_suffix_and_eve
             for out in outs:
                 text = json.dumps(out)
                 assert not any(f'"{f}"' in text for f in NEW_FIELDS), out
+                assert out["status"] == "done", out                     # the whole run, not one cut short
+                for e in out.get("sent", []):
+                    assert set(e) == {"symbol", "units", "side", "limit_price", "quote", "value", "tag", "parts",
+                                      "reduces_risk"}, e
                 runs += 1
             w.later(30)
         for e in w.entries():
