@@ -183,3 +183,39 @@ follower's price, the cost, the periods, the one rule and its p-value.
 this pull its own bookkeeping only (wallets finished, pages, rows stored, rows set aside by reason, the size of
 the store, the process's memory). No trade, price or resolution has been set beside an outcome. Resolutions and
 prices have not been pulled at all.
+
+## Fourth amendment of 2026-11-18, 09:20 UTC (after the pull's first phase ended; no trade has been analysed)
+
+**What happened.** The first phase ended at 09:15 UTC after 13.9 hours: 189 of the 192 candidate wallets read
+(35,262,529 trade rows in this run; 97,737 requests), three wallets past the limit of five million trades and
+so left out by the third amendment (their first ten characters: `0x2005d16a`, `0x204f72f3`, `0x63ce3421`), and
+the resolutions of 954,395 of the 962,935 markets those trades name. The program ended as INCOMPLETE: the
+service refused 427 of the 48,147 resolution requests (twenty markets each) with "invalid resolution condition
+id". Of the 8,540 ids in those requests, 4,705 are one byte short of a market id (31 bytes where every other id
+has 32; they begin `0x0300` and end in a run of zeros) and 3,835 are ordinary ids that merely shared a request
+with one of them. Measured on the service with single requests (2026-11-18): an ordinary id from a refused
+request, asked alone, is answered; each of three short ids, asked alone, is refused with the same words; the
+same three padded with zeros to full length are answered with an empty list.
+
+**The rule added.** A market whose id the data service itself refuses as invalid, when asked alone for its
+resolution, is a market WITHOUT A KNOWN RESOLUTION. It is treated exactly as a market for which the service
+returns no resolution row: no position in it is copied (the rule already requires a known resolution), no
+position in it counts as a resolved position of a wallet, and the number of such markets and of the trades
+that name them is reported in every output. The pull asks again, alone or in smaller requests, for every
+ordinary id that shared a refused request. Nothing is guessed about what the short ids are, and none is
+altered to make the service answer.
+
+**Why this cannot look ahead.** The decision reads the service's own refusal of an id and nothing else: not a
+price, not an outcome, not a wallet's result. It was fixed before any trade, price or resolution was set beside
+an outcome.
+
+**What does not change.** Everything else: the candidate set, the leaders, the copied trade, the follower's
+price, the cost, the periods, the one rule and its p-value.
+
+**What has been read by now, in all:** the boards; the shapes and counts in the earlier sections; the pull's
+own bookkeeping (wallets finished, pages, rows stored, rows set aside by reason, requests finished and
+unfinished by kind, the size of the store, the process's memory); the SHAPE of the ids of the unfinished
+resolution requests (their length and their first and last characters); and seven single requests to the
+service's resolution route made to learn why it refused (one ordinary id, three short ids as stored, the same
+three padded: their status and the number of rows they returned, not what a row says). No trade, price or resolution has been set beside an outcome. Prices have not been
+pulled at all.
