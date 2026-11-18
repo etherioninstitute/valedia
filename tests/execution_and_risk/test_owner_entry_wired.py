@@ -474,6 +474,121 @@ def test_no_preview_pending_or_one_that_cannot_be_read_refuses(w):
     assert code == 2 and "cannot be read" in err and not w.pending.exists()
 
 
+# ---- addendum 1 (R35): the entry is judged again under the lock; (R36) a preview edited by hand is not one
+
+
+def _a_fill_arrives(w):
+    trades(w.ledger, [("SPY", 1.0, 100.0, 0.01)], start=w.t - 70.0)      # a filled purchase, as V212's stand-in
+
+
+def _an_order_arrives(w):
+    led = _orders.OrderLedger(w.ledger, clock=lambda: w.t - 0.5)
+    try:
+        led.intend("b99-IWM", "IWM", 1.0, 50.0, limit_price=51.0)
+    finally:
+        led.close()
+
+
+def _an_entry_arrives(w):
+    state = osx.OrderStepState(w.state)
+    try:
+        last = state.owner_entries()[-1]
+        state.add_owner_entry({"kind": "cash_in", "amount": "1", "units_before": last["units_after"],
+                               "units_after": last["units_after"]}, who="o", note="in between", now=w.t - 0.5)
+    finally:
+        state.close()
+
+
+def _a_newer_preview(w):
+    rec = json.loads(w.pending.read_text())
+    rec.update(code=f"{(int(rec['code']) + 1) % 1_000_000:06d}", created=w.t - 0.5)
+    w.pending.write_text(json.dumps(rec))
+
+
+ARRIVES = {            # what the stand-in lock's acquire does first: (change, the refusal's words, the preview spent?)
+    "a fill": (_a_fill_arrives, "a fill or an order arrived while the entry was being confirmed", True),
+    "an order row": (_an_order_arrives, "a fill or an order arrived while the entry was being confirmed", True),
+    "a fee arriving": (_order_changed, "a fill or an order arrived while the entry was being confirmed", True),
+    "an owner's entry": (_an_entry_arrives, "an owner's entry arrived while the entry was being confirmed", True),
+    "a newer preview": (_a_newer_preview, "a newer preview was made meanwhile and stays pending", False),
+}
+
+
+@pytest.mark.parametrize("what", list(ARRIVES))
+def test_r35_what_arrives_as_the_lock_is_taken_is_refused_and_nothing_of_ours_is_written(w, monkeypatch, what):
+    """A stand-in lock whose acquire first makes the change (no second process): refused, the state file, the journal
+    and the ledger byte-identical to just after that change, the preview spent (a newer one stays pending)."""
+    change, words, spent = ARRIVES[what]
+    opened(w)
+    number, _ = w.preview(*CASH_IN)
+    w.t += 1.0
+    before, after, kept = w.files(), {}, {}
+    real = osx._RunLock.acquire
+
+    def acquire(self):
+        change(w)
+        after.update(w.files())
+        kept["pending"] = w.pending.read_bytes()
+        return real(self)
+    monkeypatch.setattr(osx._RunLock, "acquire", acquire)
+    asked = len(w.asked)
+    code, _, err = w.cmd(*CASH_IN, "--confirm", number)
+    assert len(w.asked) == asked + 1                                    # the confirm's own quotes; none under the lock
+    assert code == 2 and err.startswith("refused:") and words in err, err
+    assert after and w.files() == after
+    assert (after != before) == (what != "a newer preview")
+    if spent:
+        assert "the preview is spent" in err and not w.pending.exists()
+    else:
+        assert w.pending.read_bytes() == kept["pending"]
+    monkeypatch.setattr(osx._RunLock, "acquire", real)
+    lock = osx._RunLock(str(w.state))                                   # the lock was let go
+    assert lock.acquire()
+    lock.release()
+    if what != "a newer preview":                                       # the owner looks again: the book on disk
+        code, out, err = w.write(*CASH_IN)
+        assert code == 0, err
+
+
+def _mark_of_first(value):
+    def edit(rec):
+        rec["marks"][sorted(rec["marks"])[0]] = value
+    return edit
+
+
+HAND_EDITS = {
+    "a mark that is a number": _mark_of_first(5),
+    "a mark that is words": _mark_of_first("x"),
+    "a mark that is a list": _mark_of_first([1]),
+    "a mark that is null": _mark_of_first(None),
+    "a mark with no price": _mark_of_first({}),
+    "a price in words": _mark_of_first({"price": "100", "time": 1.0}),
+    "a price not finite": _mark_of_first({"price": float("nan"), "time": 1.0}),
+    "a price that is true": _mark_of_first({"price": True, "time": 1.0}),
+    "a code not six digits": lambda rec: rec.update(code="\ud800"),
+    "arguments not an object": lambda rec: rec.update(arguments=[]),
+    "a head not words": lambda rec: rec.update(head=5),
+    "a ledger digest not words": lambda rec: rec.update(ledger=None),
+    "held not a list": lambda rec: rec.update(held="SPY"),
+    "held not of symbols": lambda rec: rec.update(held=[1]),
+    "a close not a time": lambda rec: rec.update(close="x"),
+    "a close that is true": lambda rec: rec.update(close=True),
+}
+
+
+@pytest.mark.parametrize("what", list(HAND_EDITS))
+def test_r36_a_preview_edited_by_hand_is_not_one_refused_spent_and_nothing_written(w, what):
+    opened(w)
+    number, _ = w.preview(*CASH_IN)
+    rec = json.loads(w.pending.read_text())
+    HAND_EDITS[what](rec)
+    w.pending.write_text(json.dumps(rec))
+    before = w.files()
+    code, _, err = w.cmd(*CASH_IN, "--confirm", number)
+    assert code == 2 and "not an owner-entry preview" in err, err
+    assert w.files() == before and not w.pending.exists()
+
+
 def test_only_the_owners_command_knows_the_pending_preview():
     """R34 as built: the pending preview lives in its own file, which no other code names: not the runs, the
     reconcile, the ticket book, untracked_tags, owner_entry_differences, the alerts or the owner's page."""
