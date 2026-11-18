@@ -87,7 +87,8 @@ CREATE INDEX IF NOT EXISTS passes_ts ON passes (started_ts);
 CREATE TABLE IF NOT EXISTS wallet_reads (read_id INTEGER PRIMARY KEY AUTOINCREMENT, pass_id INTEGER,
     wallet_key TEXT NOT NULL, good INTEGER NOT NULL, reason TEXT, detail TEXT, rows INTEGER, pages INTEGER,
     rejects TEXT, unread TEXT, baseline INTEGER, prev_read_id INTEGER, prev_read_ts REAL, gap REAL,
-    n_new INTEGER, n_increase INTEGER, n_decrease INTEGER, n_exit INTEGER, carried INTEGER, read_ts REAL NOT NULL);
+    n_new INTEGER, n_increase INTEGER, n_decrease INTEGER, n_exit INTEGER, carried INTEGER, snapshot_day TEXT, read_ts REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS wallet_reads_snapshot ON wallet_reads (wallet_key, snapshot_day);
 CREATE INDEX IF NOT EXISTS wallet_reads_wallet ON wallet_reads (wallet_key, good, read_id);
 CREATE INDEX IF NOT EXISTS wallet_reads_ts ON wallet_reads (read_ts);
 CREATE TABLE IF NOT EXISTS holdings_current (wallet_key TEXT NOT NULL, token_id TEXT NOT NULL,
@@ -292,13 +293,17 @@ def write_wallet(conn, pass_id: int, key: str, res: dict, read_ts: float) -> dic
         prev_id, prev_ts = (None, None) if baseline else last
         gap = None if baseline else read_ts - prev_ts
         n = Counter(c[1] for c in found)
+        day = _utc_day(read_ts)
+        # the day's snapshot is marked on the read that took it, so a read holding nothing still takes the day's one
+        take = baseline or conn.execute("SELECT 1 FROM wallet_reads WHERE wallet_key=? AND snapshot_day=? LIMIT 1",
+                                        (key, day)).fetchone() is None
         cur = conn.execute(
             "INSERT INTO wallet_reads (pass_id, wallet_key, good, rows, pages, rejects, unread, baseline, prev_read_id,"
-            " prev_read_ts, gap, n_new, n_increase, n_decrease, n_exit, carried, read_ts) "
-            "VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " prev_read_ts, gap, n_new, n_increase, n_decrease, n_exit, carried, snapshot_day, read_ts) "
+            "VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (pass_id, key, len(new), res["pages"], json.dumps(dict(res["rejects"]), sort_keys=True),
              json.dumps(dict(res["unread"]), sort_keys=True), int(baseline), prev_id, prev_ts, gap,
-             n["NEW"], n["INCREASE"], n["DECREASE"], n["EXIT"], len(carry), read_ts))
+             n["NEW"], n["INCREASE"], n["DECREASE"], n["EXIT"], len(carry), day if take else None, read_ts))
         read_id = cur.lastrowid
         held = [(tok, 0, read_id, read_ts, *_holding(r)) for tok, r in new.items()] + \
                [(tok, 1, *p) for tok, p in carry.items()]          # a carried holding keeps the read that saw it
@@ -313,9 +318,7 @@ def write_wallet(conn, pass_id: int, key: str, res: dict, read_ts: float) -> dic
                            _int(r.get("first_entry_at")) if r else None, read_ts, prev_ts, gap,
                            prev[tok][1] if tok in prev else None)
                           for tok, kind, flip, before, after, r in found])
-        day = _utc_day(read_ts)
-        have = conn.execute("SELECT 1 FROM snapshots WHERE wallet_key=? AND utc_day=? LIMIT 1", (key, day)).fetchone()
-        if baseline or not have:
+        if take:
             conn.executemany("INSERT INTO snapshots (read_id, wallet_key, kind, utc_day, read_ts, token_id, carried, "
                              "seen_read_id, %s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, %s)" % (cols, marks),
                              [(read_id, key, "baseline" if baseline else "daily", day, read_ts, h[0], h[1], h[2],
