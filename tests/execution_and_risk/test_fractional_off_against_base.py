@@ -8,9 +8,14 @@ How it is shown: seeded worlds of every kind of day (ordinary days, partial fill
 left over by the day's cap, a fill through its limit, a stopped run, a ticket proposed and approved, a ticket that
 expires, a second run the same day, a baseline of holdings that are not the book's, and live mode on a stand-in
 production venue, propose and approve, its confirmation files in the test's own folder) are each driven twice from
-the same seed: once through 33ace6f's order step and order ledger (taken with `git archive 33ace6f` into the test's
-temporary folder, loaded under their own names), once through this revision. After every run the whole world
-folder is compared, file by file.
+the same seed: once by a fresh interpreter that imports ONLY 33ace6f's whole `valedia_trader` package (taken with
+`git archive 33ace6f` into the test's temporary folder), once by a fresh interpreter that imports ONLY this tree's.
+Each side reports the file of every `valedia_trader` module it imported: none may come from the other side, and
+every one of them must be byte-identical between the two sides except `execution_and_risk/order_step.py`,
+`execution_and_risk/orders.py` and (when imported) `core/alerts.py`. A later change on main to a module the run
+imports fails these tests in words naming it (the base must then be re-pinned on purpose); a changed module that no
+run imports does not matter. If 33ace6f cannot be read from this checkout's history the tests fail in words. After
+every run the whole world folder is compared, file by file.
 
 What is masked, and why (nothing else is):
 - M1 the journal's `"timestamp": "..."` field: the journal stamps each line with the wall clock
@@ -31,6 +36,8 @@ Nothing here opens a socket or reaches the real second price source (the autouse
 import hashlib
 import io
 import json
+import os
+import pickle
 import random
 import re
 import socket
@@ -39,7 +46,6 @@ import subprocess
 import sys
 import tarfile
 import zlib
-import importlib.util
 from pathlib import Path
 
 import pytest
@@ -52,7 +58,9 @@ from test_order_step import Booked, GENEROUS, LiveVenue, _dump, _run_with, _t51_
     ticket_world
 
 BASE = "33ace6f"
-OLD_ORDERS, OLD_STEP = "orders_t51_base_33ace6f", "order_step_t51_base_33ace6f"
+MAY_DIFFER = ("valedia_trader/execution_and_risk/order_step.py", "valedia_trader/execution_and_risk/orders.py",
+              "valedia_trader/core/alerts.py")             # T51's own write set; alerts.py only matters if imported
+TESTS = Path(__file__).resolve().parent
 KINDS = ("ordinary", "partial", "refusal", "cap", "breach", "stopped", "approved", "expired", "second_run",
          "baseline", "live")
 WORLDS_PER_KIND = 8
@@ -82,52 +90,167 @@ def guard(monkeypatch):
     assert seen == [], seen
 
 
-@pytest.fixture(scope="module")
-def base(tmp_path_factory):
-    """33ace6f's order step and order ledger, from `git archive 33ace6f`, extracted into this test's temporary folder
-    and loaded under their own names (the base order step imports the base ledger). Every other module they import
-    is unchanged since 33ace6f (checked)."""
-    root = Path(__file__).resolve().parents[2]
-    step_rel, orders_rel = "valedia_trader/execution_and_risk/order_step.py", "valedia_trader/execution_and_risk/orders.py"
-    changed = subprocess.run(["git", "-C", str(root), "diff", "--name-only", BASE, "HEAD", "--", "valedia_trader"],
-                             capture_output=True, check=True, text=True).stdout.split()
-    assert set(changed) <= {step_rel, orders_rel, "valedia_trader/core/alerts.py"}, changed   # alerts: not imported
-    data = subprocess.run(["git", "-C", str(root), "archive", "--format=tar", BASE, step_rel, orders_rel],
-                          capture_output=True, check=True).stdout
-    folder = tmp_path_factory.mktemp("base_33ace6f")
+def _archive(folder, commit=BASE):
+    """(folder, None) with `commit`'s whole `valedia_trader` package (and `src/`, the legacy flat modules
+    core/legacy.py loads from beside it) taken by `git archive` into `folder`; or (None, why) in words when this
+    checkout's history cannot give it. Every test then FAILS with those words (check_pinned); none skips."""
+    root = TESTS.parents[1]
+    try:
+        data = subprocess.run(["git", "-C", str(root), "archive", "--format=tar", commit, "valedia_trader", "src"],
+                              capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError) as e:
+        why = (getattr(e, "stderr", b"") or b"").decode("utf-8", "replace").strip()[:200]
+        return None, (f"T51 R2's base, commit {commit}, cannot be read from this checkout's history "
+                      f"({type(e).__name__}: {why}); the comparison cannot be made, so it fails")
+    folder.mkdir(parents=True, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(data)) as tar:
         tar.extractall(folder, filter="data")
-    mods = {}
-    for name, rel, fix in ((OLD_ORDERS, orders_rel, None),
-                           (OLD_STEP, step_rel, lambda s: s.replace(
-                               b"from valedia_trader.execution_and_risk.orders import", f"from {OLD_ORDERS} import".encode()))):
-        src = (folder / rel).read_bytes()
-        if fix:
-            assert src.count(b"from valedia_trader.execution_and_risk.orders import") == 1
-            src = fix(src)
-        path = folder / f"{name}.py"
-        path.write_bytes(src)
-        spec = importlib.util.spec_from_file_location(name, path)
-        mods[name] = importlib.util.module_from_spec(spec)
-        sys.modules[name] = mods[name]
-        spec.loader.exec_module(mods[name])
-    step = mods[OLD_STEP]
-    assert step.OrderLedger is mods[OLD_ORDERS].OrderLedger and mods[OLD_ORDERS].LAYOUT_VERSION == 3
-    assert not hasattr(step, "split_difference") and hasattr(osx, "split_difference")
-    return step
+    if not (folder / "valedia_trader" / "execution_and_risk" / "order_step.py").is_file():
+        return None, f"T51 R2's base, commit {commit}, has no valedia_trader/execution_and_risk/order_step.py"
+    return folder, None
 
 
-def test_the_base_is_imported_from_its_archive_copy_and_this_revision_from_its_own_tree(base, capsys):
-    root = Path(__file__).resolve().parents[2]
-    old = [Path(sys.modules[OLD_ORDERS].__file__), Path(base.__file__)]
+def run_side(root, work, worlds, cent=False):
+    """Drive `worlds` [(name, kind, seed)] in a fresh interpreter whose only `valedia_trader` is the one under `root`
+    (this file and test_order_step from TESTS drive it). Returns its snapshots, the file of every `valedia_trader`
+    module it imported, and what its guard saw."""
+    work.mkdir(parents=True, exist_ok=True)
+    spec, out = work / "spec.json", work / "out.pickle"
+    spec.write_text(json.dumps({"root": str(root), "tmp": str(work / "worlds"), "out": str(out), "worlds": worlds,
+                                "cent": cent}))
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    code = ("import sys; sys.path[:0] = [%r, %r]; import test_fractional_off_against_base as T; T.side_main(%r)"
+            % (str(root), str(TESTS), str(spec)))
+    done = subprocess.run([sys.executable, "-B", "-c", code], cwd=work, env=env, capture_output=True, text=True)
+    assert done.returncode == 0, ("a side's run failed", str(root), done.stdout[-2000:], done.stderr[-4000:])
+    return pickle.loads(out.read_bytes())
+
+
+def side_main(spec_path):
+    """In the side's own interpreter: guards (no socket, no real second price source), the worlds, and the files of
+    every `valedia_trader` module imported by then."""
+    spec = json.loads(Path(spec_path).read_text())
+    seen = []
+
+    def no_socket(*a, **k):
+        seen.append("socket")
+        raise OSError("the T51 A4 tests open no socket")
+    for owner, name in ((socket.socket, "connect"), (socket.socket, "connect_ex"), (socket, "create_connection"),
+                        (socket, "getaddrinfo")):
+        setattr(owner, name, no_socket)
+
+    def tripwire(*a, **k):
+        seen.append("second source")
+        raise AssertionError("the real second price source would be loaded or asked")
+    second_quote.second_opinion = tripwire
+    if hasattr(osx, "_load_second_source"):
+        osx._load_second_source = tripwire
+    if spec["cent"]:                                                     # the sanity pair: one input off by a cent
+        real = osx.limit_price
+        osx.limit_price = lambda *a, **k: round(real(*a, **k) - 0.01, 2)
+    runs = {name: world_runs(osx, Path(spec["tmp"]) / name, seed, kind) for name, kind, seed in spec["worlds"]}
+    modules = {n: getattr(m, "__file__", None) for n, m in list(sys.modules.items())
+               if n == "valedia_trader" or n.startswith("valedia_trader.")}
+    Path(spec["out"]).write_bytes(pickle.dumps({"runs": runs, "modules": modules, "seen": seen}))
+
+
+def _worlds():
+    return [(f"{kind}-{k}", kind, 5_140_000 + KINDS.index(kind) * 100 + k) for kind in KINDS for k in range(WORLDS_PER_KIND)]
+
+
+@pytest.fixture(scope="module")
+def sides(tmp_path_factory):
+    """Both sides, every world, each in its own interpreter: 33ace6f's from its archive, this tree's (the package
+    this test process imports, so a mutant copy when one is run) from its own folder."""
+    folder = tmp_path_factory.mktemp("r2")
+    old_root, why = _archive(folder / "base_33ace6f")
+    if why is not None:
+        return {"error": why}
+    new_root = Path(osx.__file__).resolve().parents[2]
+    return {"old_root": old_root, "new_root": new_root,
+            "old": run_side(old_root, folder / "old", _worlds()),
+            "new": run_side(new_root, folder / "new", _worlds()),
+            "cent": run_side(new_root, folder / "cent", [("ordinary-0", "ordinary", 5_140_000)], cent=True)}
+
+
+def check_pinned(sides):
+    """Rule 1: no module crossed over. Rule 2: every `valedia_trader` module either side imported is byte-identical
+    between 33ace6f and this tree, or is one of MAY_DIFFER. Fails in words naming every module that breaks either
+    (and, first, when the base could not be read)."""
+    if "error" in sides:
+        pytest.fail(sides["error"])
+    crossed, changed = [], []
+    for side, root in (("old", sides["old_root"]), ("new", sides["new_root"])):
+        for name, f in sides[side]["modules"].items():
+            if f is None or not Path(f).resolve().is_relative_to(root.resolve()):
+                crossed.append(f"{side}: {name} from {f}")
+    rels = set()
+    for side, root in (("old", sides["old_root"]), ("new", sides["new_root"])):
+        for f in sides[side]["modules"].values():
+            if f is not None and Path(f).resolve().is_relative_to(root.resolve()):
+                rels.add(str(Path(f).resolve().relative_to(root.resolve())))
+    for rel in sorted(rels):
+        if rel in MAY_DIFFER:
+            continue
+        a, b = sides["old_root"] / rel, sides["new_root"] / rel
+        if not (a.is_file() and b.is_file() and a.read_bytes() == b.read_bytes()):
+            changed.append(rel)
+    for side in ("old", "new", "cent"):
+        if sides[side]["seen"]:
+            crossed.append(f"{side}: its guard saw {sides[side]['seen']}")
+    if crossed or changed:
+        pytest.fail("T51 R2 cannot compare with its base: "
+                    + (f"modules imported from outside their side: {crossed}; " if crossed else "")
+                    + (f"modules the runs import that changed since {BASE} (re-pin the base on purpose): {changed}"
+                       if changed else ""))
+    return sorted(rels)
+
+
+def test_each_side_imports_only_its_own_package_and_every_shared_module_is_unchanged_since_the_base(sides, capsys):
+    rels = check_pinned(sides)
     with capsys.disabled():
-        for label, f in (("this revision's order_step", osx.__file__), ("this revision's orders", _orders.__file__),
-                         ("33ace6f order_step", old[1]), ("33ace6f orders", old[0])):
-            print(f"\nT51-A4-IMPORT {label}: {f}")
-    assert all(p.parent.name.startswith("base_33ace6f") for p in old), old
-    assert not any(str(p).startswith(str(root / "valedia_trader")) for p in old)
-    assert sys.modules[base.OrderLedger.__module__].__file__ == str(old[0])
-    assert osx.OrderLedger is _orders.OrderLedger and Path(osx.__file__).name == "order_step.py"
+        for side in ("old", "new"):
+            mods = sides[side]["modules"]
+            print(f"\nT51-A4-IMPORT {side} side, root {sides[side + '_root']}: {len(mods)} valedia_trader modules")
+            for name in sorted(mods):
+                print(f"T51-A4-IMPORT   {side} {name}: {mods[name]}")
+        print(f"T51-A4-IMPORT modules compared byte for byte: {len([r for r in rels if r not in MAY_DIFFER])}; "
+              f"allowed to differ and imported: {[r for r in rels if r in MAY_DIFFER]}")
+    old_step = sides["old"]["modules"]["valedia_trader.execution_and_risk.order_step"]
+    assert b"def split_difference" not in Path(old_step).read_bytes()
+    assert b"def split_difference" in Path(sides["new"]["modules"]["valedia_trader.execution_and_risk.order_step"]).read_bytes()
+
+
+def test_a_base_this_checkout_cannot_read_fails_every_test_in_words(tmp_path):
+    folder, why = _archive(tmp_path / "x", commit="0000000000000000000000000000000000000000")
+    assert folder is None and "cannot be read from this checkout's history" in why, why
+    with pytest.raises(pytest.fail.Exception, match="cannot be read from this checkout's history"):
+        check_pinned({"error": why})
+
+
+def test_the_pin_fails_in_words_when_an_imported_module_changed_or_crossed_over(sides, tmp_path):
+    """The check above is a check: a shared module that differs, or a module from the other side, fails it."""
+    check_pinned(sides)
+    fake = dict(sides, old=dict(sides["old"], modules=dict(sides["old"]["modules"])))
+    other = tmp_path / "valedia_trader" / "venues" / "webull.py"
+    other.parent.mkdir(parents=True)
+    other.write_bytes(b"# not the base's\n")
+    fake["old_root"] = tmp_path
+    with pytest.raises(pytest.fail.Exception, match=r"modules imported from outside their side"):
+        check_pinned(fake)
+    fake = dict(sides)
+    root = tmp_path / "copy"
+    for rel in sorted({str(Path(f).resolve().relative_to(sides["old_root"].resolve()))
+                       for f in sides["old"]["modules"].values()}):
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes((sides["old_root"] / rel).read_bytes())
+    (root / "valedia_trader/venues/webull.py").write_bytes(b"# changed after the base\n")
+    fake["old_root"] = root
+    fake["old"] = dict(sides["old"], modules={n: str(root / Path(f).resolve().relative_to(sides["old_root"].resolve()))
+                                              for n, f in sides["old"]["modules"].items()})
+    with pytest.raises(pytest.fail.Exception, match=r"changed since 33ace6f .*valedia_trader/venues/webull.py"):
+        check_pinned(fake)
 
 
 # ---- the stand-ins
@@ -350,12 +473,12 @@ def _seen(snaps, kind):
 
 
 @pytest.mark.parametrize("kind", KINDS)
-def test_r2_a_run_with_fractional_off_writes_exactly_what_33ace6f_writes(tmp_path, base, kind):
+def test_r2_a_run_with_fractional_off_writes_exactly_what_33ace6f_writes(sides, kind):
+    check_pinned(sides)
     shown, runs, submits, faults = 0, 0, 0, 0
     for k in range(WORLDS_PER_KIND):
-        seed = 5_140_000 + KINDS.index(kind) * 100 + k
-        b = world_runs(base, tmp_path / f"base{k}", seed, kind)
-        m = world_runs(osx, tmp_path / f"mine{k}", seed, kind)
+        name, seed = f"{kind}-{k}", 5_140_000 + KINDS.index(kind) * 100 + k
+        b, m = sides["old"]["runs"][name], sides["new"]["runs"][name]
         assert differences(b, m) == [], (kind, seed, differences(b, m))
         shown += _seen(m, kind)
         runs += len(m)
@@ -368,18 +491,11 @@ def test_r2_a_run_with_fractional_off_writes_exactly_what_33ace6f_writes(tmp_pat
         assert submits > 0
 
 
-def test_r2_sanity_the_comparison_finds_two_different_worlds_and_a_one_cent_change_different(tmp_path, base, monkeypatch):
-    b = world_runs(base, tmp_path / "b", 5_140_000, "ordinary")
-    other = world_runs(osx, tmp_path / "m", 5_140_001, "ordinary")
-    assert differences(b, other) != []                                   # two different worlds
-    same = world_runs(osx, tmp_path / "same", 5_140_000, "ordinary")
-    assert differences(b, same) == []                                     # the same world: no difference
-    real = osx.limit_price
-
-    def a_cent_off(*a, **k):                                             # one input to the order changed by a cent
-        return round(real(*a, **k) - 0.01, 2)
-    monkeypatch.setattr(osx, "limit_price", a_cent_off)
-    cent = world_runs(osx, tmp_path / "cent", 5_140_000, "ordinary")
-    found = differences(b, cent)
+def test_r2_sanity_the_comparison_finds_two_different_worlds_and_a_one_cent_change_different(sides):
+    check_pinned(sides)
+    b = sides["old"]["runs"]["ordinary-0"]
+    assert differences(b, sides["new"]["runs"]["ordinary-1"]) != []   # two different worlds
+    assert differences(b, sides["new"]["runs"]["ordinary-0"]) == []   # the same world: no difference
+    found = differences(b, sides["cent"]["runs"]["ordinary-0"])        # every limit a cent lower, nothing else
     assert found and {k for _, k in found} >= {"handed", "summary"}, found
     assert any(isinstance(k, str) and k.startswith("journal/") for _, k in found), found
