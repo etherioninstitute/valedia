@@ -254,6 +254,9 @@ run beside MiroFish and Elephant-1):
   result, not yet checked by the trader's lead: Hermes's Kanban can be the one board AND the dispatcher, with
   a local-model profile as the coder and the Live page watching it; Paperclip and RuFlo are not needed for
   that. Ten decisions wait on him in that session.
+- Later the same evening, by that session's own report (not checked by the trader's lead): 8 of his 10
+  decisions done and checked there; a Paperclip plugin installed and working in Hermes Desktop, its "Send to
+  coder" not pressed; the Ornith download and six fixes to its trial launcher on hold; nothing local loaded.
 - Found on 2026-11-17: the Paperclip SERVER is not installed on this Mac (no checkout, no command, no data
   folder); only its agent skill sits in four Hermes profiles (scout, decider, auditor, CTO), talking to a
   control plane that is not running. RuFlo is here as Claude Code plugins (core 0.2.11) plus a source backup
