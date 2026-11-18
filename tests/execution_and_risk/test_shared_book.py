@@ -845,3 +845,70 @@ def test_r22_a_fee_of_nothing_reported_late_is_not_stored_and_the_window_then_ta
     assert shut.fees_taken_as_none == 1 and z.fees_taken_as_none == 0
     late.close()
     first.close()
+
+
+# ---- T51c S4a addendum 1, R32: the refusal names the order that makes the value unknown
+
+
+def _bounded_and(other):
+    """A purchase bounded only by the published rate (its tag sorts first, its line is long) and `other`."""
+    o = [done(order("a0-SPY", "SPY", 10.0, limit=101.0, fee=None))]
+    f = [fill(1, "a0-SPY", "SPY", 10.0, 100.0, fee=None)]
+    if other == "sale":                                        # a sale with an empty fee: the lower bound open
+        o.append(done(order("z1-QQQ", "QQQ", -4.0, limit=49.0, fee=None)))
+        f.append(fill(2, "z1-QQQ", "QQQ", -4.0, 50.0, fee=None, t=T0 + 1))
+    elif other == "rows without a total":                      # a purchase with fee rows but no total
+        o.append(done(order("z1-QQQ", "QQQ", 4.0, limit=51.0, fee=None)))
+        f += [fill(2, "z1-QQQ", "QQQ", 2.0, 50.0, fee=0.01, t=T0 + 1),
+              fill(3, "z1-QQQ", "QQQ", 2.0, 50.0, fee=None, t=T0 + 2)]
+    elif other == "no limit":                                  # units without a price and no limit to bound them
+        o.append(done({**order("z1-QQQ", "QQQ", 4.0, fee=0.0), "limit_price": None}))
+        f.append(fill(2, "z1-QQQ", "QQQ", 4.0, None, fee=0.0, t=T0 + 1))
+    return f, o
+
+
+@pytest.mark.parametrize("other, named", [
+    ("sale", "order z1-QQQ: its fee is not known"),
+    ("rows without a total", "order z1-QQQ: its fee is not known"),
+    ("no limit", "order z1-QQQ: 4.0 units without a price, with no limit to bound them"),
+])
+def test_r32_the_refusal_names_the_order_that_leaves_a_bound_open(other, named):
+    f, o = _bounded_and(other)
+    fig = book_figures(f, o, [opening()], {"SPY": 100.0, "QQQ": 50.0}, DAY, now=NOW)
+    assert fig.value is None and fig.open_by == (named,)
+    assert len(fig.bounded_by) == 2 and fig.bounded_by[0].startswith("order a0-SPY: the venue reported no fee")
+    with pytest.raises(BookError) as got:
+        next_entry(fig, "cash_in", amount=D("1"))
+    words = str(got.value)
+    assert f"the book's value is not known ({named}" in words, words      # main's words stay findable, first
+    assert "a0-SPY" not in words                                  # a bounded order is never given as the reason
+    assert "1 other order is only bounded" in words, words
+
+
+def test_r32_a_missing_mark_is_named_and_the_bounded_orders_counted():
+    f, o = _bounded_and(None)
+    o.append(done(order("a1-SPY", "SPY", 1.0, limit=101.0, fee=None)))
+    f.append(fill(2, "a1-SPY", "SPY", 1.0, 100.0, fee=None, t=T0 + 1))
+    f.append(fill(3, "b2-QQQ", "QQQ", 1.0, 50.0, fee=0.0, t=T0 + 2))
+    o.append(done(order("b2-QQQ", "QQQ", 1.0, limit=51.0, fee=0.0)))
+    fig = book_figures(f, o, [opening()], {"SPY": 100.0}, DAY, now=NOW)
+    assert fig.value is None and fig.open_by == () and fig.unmarked == ("QQQ",)
+    with pytest.raises(BookError) as got:
+        next_entry(fig, "cash_in", amount=D("1"))
+    words = str(got.value)
+    assert "the book's value is not known (no mark for QQQ" in words and "2 other orders are only bounded" in words
+    assert "a0-SPY" not in words and "a1-SPY" not in words
+
+
+def test_r32_many_open_orders_are_named_first_and_the_count_survives_the_cut():
+    f, o = _bounded_and(None)
+    for i in range(12):
+        tag = f"s{i:02d}-QQQ-{'x' * 30}"
+        o.append(done(order(tag, "QQQ", -1.0, limit=49.0, fee=None)))
+        f.append(fill(10 + i, tag, "QQQ", -1.0, 50.0, fee=None, t=T0 + 10 + i))
+    fig = book_figures(f, o, [opening()], {"SPY": 100.0, "QQQ": 50.0}, DAY, now=NOW)
+    with pytest.raises(BookError) as got:
+        next_entry(fig, "cash_in", amount=D("1"))
+    words = str(got.value)
+    assert f"the book's value is not known (order s00-QQQ-{'x' * 30}: its fee is not known" in words
+    assert "1 other order is only bounded" in words and "a0-SPY" not in words

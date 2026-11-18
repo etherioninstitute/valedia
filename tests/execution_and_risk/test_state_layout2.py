@@ -1128,3 +1128,18 @@ def test_r22_the_command_hands_book_figures_its_one_clock_reading(tmp_path, caps
     assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "1", "--mark", "SPY=150", "--who", "owner",
                  "--note", "n") == 0
     assert seen == [("2025-11-18", T0 + 1_234.5)]
+
+
+def test_r32_the_command_names_the_sale_not_the_bounded_purchase(tmp_path, capsys, monkeypatch):
+    """T51c S4a addendum 1, R32: a purchase bounded by the published rate (its long line sorts first) and a sale with
+    an empty fee: the refusal names the sale, in main's words, and only counts the purchase."""
+    state_path = _opening_then(tmp_path, monkeypatch, [(10.0, 100.0, None), (-4.0, 110.0, None)])
+    before = state_path.read_bytes()
+    capsys.readouterr()
+    _at(monkeypatch, T0 + 3_600)
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "100", "--mark", "SPY=150", "--who", "owner",
+                 "--note", "a second deposit") == 2
+    err = capsys.readouterr().err
+    assert "the book's value is not known (order s1-SPY: its fee is not known" in err, err
+    assert "b0-SPY" not in err and "1 other order is only bounded" in err, err
+    assert state_path.read_bytes() == before
