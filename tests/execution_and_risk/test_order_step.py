@@ -3638,19 +3638,28 @@ def _dump(path):
 
 
 def test_the_state_files_layout_is_unchanged_and_the_base_reads_and_continues_it(tmp_path, base_osx):
+    """T51c S3 changed this rule on purpose: the state file is now layout 2. A file the base wrote is continued here
+    (upgraded once, every row of the base's kept), and the base then refuses it in words, changing nothing."""
     w = ticket_world(tmp_path / "w")
     w.paper = paper({"a": {"SPY": 2.0}})
     _run_with(base_osx, w)                                                 # a state file written by the base ...
+    written = _dump(w.state_path)
+    assert written["version"] == 1
     w.later(5)
     _, number = _proposed(w, {"a": {"SPY": 10.0}})                        # ... continued by tickets
     approve(w, number)
-    assert _dump(w.state_path)["version"] == 1
-    assert set(_dump(w.state_path)["rows"]) <= {"meta", "baseline", "equity", "sends", "sqlite_sequence"}
-    st = base_osx.OrderStepState(w.state_path)                             # ... and read by the base again
-    st.close()
+    now = _dump(w.state_path)
+    assert now["version"] == 2 and now["rows"]["owner_entries"] == []
+    assert set(now["rows"]) <= {"meta", "baseline", "equity", "sends", "owner_entries", "sqlite_sequence"}
+    for table, rows in written["rows"].items():
+        if table != "sqlite_sequence":                                     # sqlite's own counter moves on
+            assert now["rows"][table][:len(rows)] == rows, table
+    with pytest.raises(base_osx.OrderStepError, match="is not an order-step state file of layout 1; it is not opened"):
+        base_osx.OrderStepState(w.state_path)                              # ... and refused by the base, in words
+    assert _dump(w.state_path) == now
     w.later(30)
     w.paper = paper({"a": {"SPY": 12.0}})
-    out = _run_with(base_osx, w)
+    out = _run_with(osx, w)
     assert out["status"] == "done" and out["orders_sent"] == 1
 
 
@@ -8049,9 +8058,24 @@ def _t34_same_but(b, m, keys, where, skip=(), counts=None):
                     extra = [k for k in e if k in keys]
                     assert extra and e.get("event") == "summary" and list(e)[-len(extra):] == extra, (where, name)
                     assert json.dumps({k: v for k, v in e.items() if k not in keys}, default=str).encode() == x, (where, name)
+        elif key == "state" and isinstance(b[key], dict) and b[key].get("version") == 1:
+            assert _t51c_layout1_view(m[key]) == b[key], (where, key)   # T51c S3: layout 2, its new table empty
         else:
             assert b[key] == m[key], (where, key)
     return added
+
+
+def _t51c_layout1_view(dump):
+    """T51c S3: a layout-2 state dump seen as layout 1, after asserting that it IS layout 2 with the owner's entries
+    table empty and every statement of the upgrade in its schema: that table's rows and those statements left out, the
+    layout number 1. Everything else as it is. None stays None."""
+    if dump is None:
+        return None
+    assert dump["version"] == 2 and dump["rows"].get("owner_entries") == [], (dump["version"], dump["rows"].get("owner_entries"))
+    added = set(osx._STATE_UPGRADE_1_TO_2)
+    assert added <= set(dump["schema"]), dump["schema"]
+    return {**dump, "version": 1, "schema": sorted(s for s in dump["schema"] if s not in added),
+            "rows": {k: v for k, v in dump["rows"].items() if k != "owner_entries"}}
 
 
 def _t34_practice_marks(added, where):
