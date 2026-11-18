@@ -396,6 +396,43 @@ def test_the_cash_bounds_hold_the_rows_fees_and_the_orders_total(order_fee, row_
         assert fig.cash_bounded is False and fig.cash_low == fig.cash_high   # no fall: exact, as before
 
 
+@pytest.mark.parametrize("seed", range(80))
+def test_prop_the_bounds_hold_the_cash_at_either_fee_figure_whatever_the_floats_do(seed):
+    """Addendum 5, R17: fee rows as the ledger keeps them (floats, each what the total rose by) against the order's
+    total (a float the venue gave): the true cash from either figure lies inside the bounds, the upper bound is never
+    under the lower, and a fee is named as bounding the cash only when the two differ by more than the tolerance."""
+    rng = random.Random(77_000 + seed)
+    orders, fills, cash_rows, cash_total, fid = [], [], D(10000), D(10000), 0
+    for i in range(rng.randint(1, 6)):
+        sym = rng.choice(SYMS)
+        tag = f"f{i}-{sym}"
+        pieces = rng.randint(1, 4)
+        totals, total = [], 0.0
+        for _ in range(pieces):
+            total = total + rng.choice((0.1, 0.2, 0.35, 0.07, 1.0 / 3.0, 0.01))
+            totals.append(total)
+        if rng.random() < 0.3:                                       # the venue's total fell at the end
+            totals[-1] = round(totals[-1] * rng.uniform(0.2, 0.9), 2)
+        rows_fee, seen = [], 0.0
+        for t in totals:
+            rows_fee.append(max(t - seen, 0.0))                      # a row's fee is what the total rose by
+            seen = max(seen, t)
+        price = round(rng.uniform(10, 300), 2)
+        for rf in rows_fee:
+            fid += 1
+            fills.append(fill(fid, tag, sym, 1.0, price, fee=rf, t=T0 + fid))
+        orders.append(order(tag, sym, float(pieces), limit=price, fee=totals[-1]))
+        cost = D(repr(price)) * pieces
+        cash_rows -= cost + sum((D(repr(x)) for x in rows_fee), D(0))
+        cash_total -= cost + D(repr(totals[-1]))
+    fig = book_figures(fills, orders, [opening()], {}, DAY)
+    assert fig.cash_low <= fig.cash_high
+    for truth in (cash_rows, cash_total):
+        assert fig.cash_low <= truth <= fig.cash_high, (seed, truth, fig.cash_low, fig.cash_high)
+    if abs(cash_rows - cash_total) <= D("1e-12"):
+        assert not any("fee total" in b for b in fig.bounded_by), fig.bounded_by
+
+
 @pytest.mark.parametrize("seed", SEEDS)
 def test_prop_every_price_and_fee_known_gives_equal_bounds(seed):
     rng = random.Random(10_000 + seed)

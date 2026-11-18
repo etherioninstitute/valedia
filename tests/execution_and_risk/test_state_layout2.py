@@ -537,6 +537,32 @@ def test_each_entry_is_journaled_through_the_journals_own_writer(tmp_path, capsy
     assert osx.owner_entry_differences(rows, _paper.Journal(tmp_path / "journal").read(), venue=VENUE) == []
 
 
+COMPARED = ("id", "kind", "symbol", "amount", "units", "ratio", "mark", "units_before", "units_after",
+            "value_per_unit_before", "value_per_unit_after", "prev_hash", "hash")
+
+
+@pytest.mark.parametrize("field", [f for f in COMPARED if f != "id"] + ["who", "note"])
+def test_the_comparison_holds_every_journaled_field_but_who_and_note(tmp_path, capsys, field):
+    """Addendum 5, R16: a journal line changed in any figure, its hash kept, differs; who and note are not compared
+    (the journal's writer may redact them)."""
+    rows = _entries_via_command(tmp_path, ("1000", "20"))
+    lines = _paper.Journal(tmp_path / "journal").read()
+    changed = [dict(x, **{field: "999"}) if x.get("type") == "owner_entry" and x.get("id") == 2 else x for x in lines]
+    got = osx.owner_entry_differences(rows, changed, venue=VENUE)
+    if field in ("who", "note"):
+        assert got == []
+    else:
+        assert len(got) == 1 and "entry 2" in got[0] and field in got[0], got
+    day_file = next((tmp_path / "journal").glob("????-??-??.jsonl"))
+    day_file.write_text("".join(json.dumps(x) + "\n" for x in changed))
+    before = _listing(tmp_path)
+    capsys.readouterr()
+    code = owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n")
+    assert code == (0 if field in ("who", "note") else 2)
+    if code == 2:
+        assert field in capsys.readouterr().err and _listing(tmp_path) == before
+
+
 def _rehash_from(rows, start, change):
     """The chain rewritten from entry `start` on, every hash recomputed: what a rewrite of the file can do."""
     out, prev = [], (rows[start - 2]["hash"] if start > 1 else "0" * 64)
@@ -625,16 +651,41 @@ def test_the_differences_in_words():
     assert diff(rows, [line(1), line(2), line(3), {"type": "owner_entry", "venue": VENUE, "id": "x"}], venue=VENUE)
 
 
-def test_a_journal_with_a_line_that_is_not_whole_cannot_be_compared_and_is_refused(tmp_path, capsys):
+def test_a_line_of_the_journal_that_is_not_whole_is_skipped_as_a_run_skips_it(tmp_path, capsys):
+    """Addendum 5, R18: a torn line no longer refuses by itself; the comparison says what is missing."""
     _entries_via_command(tmp_path, ("1000",))
     day_file = next((tmp_path / "journal").glob("????-??-??.jsonl"))
     with day_file.open("ab") as fh:
-        fh.write(b'{"type": "owner_entry", "venue": "' + VENUE.encode() + b'", "id": 2, "ha')   # a torn line
+        fh.write(b'{"type": "order_step", "venue": "' + VENUE.encode() + b'", "event": "summ')   # a torn line
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n") == 0
+    assert [ln["id"] for ln in journaled(tmp_path)] == [1, 2]
+
+
+def test_a_torn_line_that_was_an_owners_entry_is_found_missing_and_refused(tmp_path, capsys):
+    _entries_via_command(tmp_path, ("1000", "20"))
+    day_file = next((tmp_path / "journal").glob("????-??-??.jsonl"))
+    data = day_file.read_bytes().rstrip(b"\n")
+    day_file.write_bytes(data[:-30])                                     # entry 2's line cut short by a kill
     before = _listing(tmp_path)
     capsys.readouterr()
     assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n") == 2
     err = capsys.readouterr().err
-    assert err.startswith("refused:") and "journal" in err and "line 2" in err and "nothing was written" in err
+    assert err.startswith("refused:") and "entry 2 is in the state file and not in the journal" in err
+    assert _listing(tmp_path) == before
+
+
+@pytest.mark.parametrize("behind", [0.0, 1.0, 86_400.0])
+def test_an_entry_not_later_than_the_last_one_is_refused_before_anything_is_written(tmp_path, capsys, monkeypatch,
+                                                                                     behind):
+    """Addendum 5, R18: the clock is behind the record; it would be filed in an earlier day's journal."""
+    monkeypatch.setattr(osx, "wall_clock", lambda: 1_763_478_000.0)
+    _entries_via_command(tmp_path, ("1000",))
+    monkeypatch.setattr(osx, "wall_clock", lambda: 1_763_478_000.0 - behind)
+    before = _listing(tmp_path)
+    capsys.readouterr()
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n") == 2
+    err = capsys.readouterr().err
+    assert err.startswith("refused:") and "behind" in err and "nothing was written" in err
     assert _listing(tmp_path) == before
 
 
@@ -688,11 +739,29 @@ def _hold_lock(root, stack):
     stack.callback(lock.release)
 
 
+def _with_entries(root):
+    return state_of(root).exists() and dump(state_of(root))["version"] == 2
+
+
 def _break_chain(root, stack):
-    if state_of(root).exists() and dump(state_of(root))["version"] == 2:
-        _bypass(state_of(root), "UPDATE owner_entries SET amount = '7' WHERE id = 1")
-    else:
-        pytest.skip("a layout-1 file has no entries to change")
+    if not _with_entries(root):
+        pytest.skip("no entries to change in this layout")
+    _bypass(state_of(root), "UPDATE owner_entries SET amount = '7' WHERE id = 1")
+
+
+def _clock_behind(root, stack):
+    if not _with_entries(root):
+        pytest.skip("no entry for the clock to be behind")
+    last = OrderStepState(state_of(root))
+    t = last.owner_entries()[-1]["time"]
+    last.close()
+    mp = stack.enter_context(pytest.MonkeyPatch.context())
+    mp.setattr(osx, "wall_clock", lambda: t - 86_400.0)
+
+
+def _needs_a_holding(root, stack):
+    if not osx.ledger_path_for(root / "memory", VENUE).exists():
+        pytest.skip("no ledger, so the book holds nothing to mark")
 
 
 def _journal_only(root, stack):
@@ -714,6 +783,8 @@ def _no_day(root, stack):
 
 
 def _other_layout(root, stack):
+    if not state_of(root).exists():
+        pytest.skip("no state file in this layout")
     if state_of(root).exists():
         con = sqlite3.connect(state_of(root))
         con.execute("PRAGMA user_version = 7")
@@ -735,7 +806,17 @@ REFUSALS = {
                                     "--note", "n", "--mark", "SPY=100"], None),
     "units_out without its mark": (["--owner-entry", "units_out", "--symbol", "QQQ", "--units", "1", "--who", "o",
                                     "--note", "n", "--mark", "SPY=100"], None),
-    "a held symbol without its mark": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n"], None),
+    "a held symbol without its mark": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n"],
+                                       _needs_a_holding),
+    "who over 200 characters": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o" * 201, "--note", "n",
+                                 "--mark", "SPY=100"], None),
+    "a note over 1000 characters": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n" * 1001,
+                                     "--mark", "SPY=100"], None),
+    "who holding a newline": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o\nx", "--note", "n",
+                               "--mark", "SPY=100"], None),
+    "a note holding a tab": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n\tx",
+                              "--mark", "SPY=100"], None),
+    "a clock behind the last entry": (_ok(), _clock_behind),
     "more than the book's cash": (["--owner-entry", "cash_out", "--amount", "999999999", "--who", "o", "--note", "n",
                                    "--mark", "SPY=100"], None),
     "more than the book holds": (["--owner-entry", "units_out", "--symbol", "SPY", "--units", "1000", "--who", "o",
@@ -750,25 +831,30 @@ REFUSALS = {
 }
 
 
-@pytest.mark.parametrize("layout", [1, 2])
+@pytest.mark.parametrize("layout", ["layout 1", "layout 2", "no state file", "no folder"])
 @pytest.mark.parametrize("refusal", list(REFUSALS))
 def test_prop_every_refusal_leaves_the_folder_and_every_file_as_they_were(tmp_path, capsys, base, layout, refusal):
-    """Addendum 4, R13: over every refusal the command has and both layouts, the listing of the root and every file's
-    bytes are the same before and after (the lock file, the state file's upgrade, the folder, the journal)."""
+    """Addendum 4, R13, and addendum 5, R15: over every refusal the command has, on a layout-1 file, a layout-2 file,
+    a folder with no state file and no folder at all, the listing of the root's parent and every file's bytes are the
+    same before and after (the lock file, the state file's upgrade, the folders, the journal), and no lock file exists
+    after a refusal where there was none."""
     import contextlib
     root = tmp_path / "root"
-    led, _ = _ledger_with(osx.ledger_path_for(root / "memory", VENUE), [10.0])
-    led.close()
-    if layout == 1:
+    if layout != "no folder":
+        led, _ = _ledger_with(osx.ledger_path_for(root / "memory", VENUE), [10.0])
+        led.close()
+    if layout == "layout 1":
         layout1_state(base, state_of(root))
-    else:
+    elif layout == "layout 2":
         assert owner(root, "--owner-entry", "cash_in", "--amount", "5000", "--mark", "SPY=100", "--who", "owner",
                      "--note", "opening") == 0
     args, prep = REFUSALS[refusal]
+    lock = Path(str(state_of(root)) + ".lock")
     with contextlib.ExitStack() as stack:
         if prep is not None:
             prep(root, stack)
-        before = _listing(root)
+        had_lock = lock.exists()
+        before = _listing(tmp_path)
         capsys.readouterr()
         if args is None:
             code = cli.main(["--root", str(root), "order-step", *_ok()])
@@ -776,7 +862,8 @@ def test_prop_every_refusal_leaves_the_folder_and_every_file_as_they_were(tmp_pa
             code = owner(root, *args)
         err = capsys.readouterr().err
         assert code == 2 and err.startswith("refused:"), (code, err)
-        assert _listing(root) == before
+        assert _listing(tmp_path) == before
+        assert had_lock or not lock.exists()
 
 
 def test_the_order_step_without_the_owner_flag_is_called_as_before(tmp_path, monkeypatch):
