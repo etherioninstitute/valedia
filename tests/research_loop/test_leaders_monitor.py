@@ -759,3 +759,243 @@ def test_a_memory_error_or_an_interrupt_is_not_caught(store, monkeypatch, error)
     with pytest.raises(error):
         run(["pass"], world, wall, store)
     assert lm.consistency(db(store)) == []
+
+
+# ------------------------------------------------------------------ addendum 2, item 2: a malformed row is not an EXIT
+def held_now(store, w):
+    return {r["token_id"]: (r["size"], r["carried"], r["seen_read_id"]) for r in db(store).execute(
+        "SELECT token_id, size, carried, seen_read_id FROM holdings_current WHERE wallet_key=?", (w,))}
+
+
+def last_read(store, w):
+    return db(store).execute("SELECT * FROM wallet_reads WHERE wallet_key=? ORDER BY read_id DESC", (w,)).fetchone()
+
+
+def test_a_held_token_whose_row_is_rejected_or_missing_in_a_read_with_a_reject_is_carried_not_an_exit(store):
+    world, wall = fixed(store)
+    w = wallet(1)
+    world.held[w] = [pos(w, 1, 10.0), pos(w, 2, 10.0), pos(w, 3, 10.0)]
+    run(["pass"], world, wall, store)
+    base = last_read(store, w)
+    wall.t += 300
+    world.held[w] = [pos(w, 1, 10.0), pos(w, 2, current_size="x")]          # t2 unreadable, t3 not served
+    run(["pass"], world, wall, store)
+    assert changes(store) == []                                              # no EXIT invented
+    r2 = last_read(store, w)
+    assert (r2["good"], r2["rows"], r2["carried"]) == (1, 1, 2)
+    assert held_now(store, w) == {token(1): (10.0, 0, r2["read_id"]), token(2): (10.0, 1, base["read_id"]),
+                                  token(3): (10.0, 1, base["read_id"])}
+    assert lm.consistency(db(store)) == []
+    wall.t += 300
+    world.held[w] = [pos(w, 1, 10.0), pos(w, 2, 10.0)]                       # a clean read: t3 truly left
+    run(["pass"], world, wall, store)
+    got = [(r["kind"], r["token_id"], r["size_before"], r["prev_read_ts"], r["last_seen_ts"]) for r in changes(store)]
+    assert got == [("EXIT", token(3), 10.0, base["read_ts"] + 300, base["read_ts"])]    # and no NEW for t2
+    r3 = last_read(store, w)
+    assert r3["carried"] == 0 and set(held_now(store, w)) == {token(1), token(2)}
+    assert all(c == 0 for _, c, _ in held_now(store, w).values())
+    assert lm.consistency(db(store)) == []
+
+
+def test_a_held_token_in_conflict_is_carried_and_a_later_size_is_compared_with_the_carried_one(store):
+    world, wall = fixed(store)
+    w = wallet(2)
+    world.held[w] = [pos(w, 1, 10.0), pos(w, 2, 10.0)]
+    run(["pass"], world, wall, store)
+    wall.t += 300
+    world.held[w] = [pos(w, 1, 10.0), pos(w, 2, 4.0), pos(w, 2, 5.0)]       # t2 in conflict
+    run(["pass"], world, wall, store)
+    assert changes(store) == [] and held_now(store, w)[token(2)][:2] == (10.0, 1)
+    wall.t += 300
+    world.held[w] = [pos(w, 1, 10.0), pos(w, 2, 6.0)]
+    run(["pass"], world, wall, store)
+    assert [(r["kind"], r["token_id"], r["size_before"], r["size_after"]) for r in changes(store)] == \
+        [("DECREASE", token(2), 10.0, 6.0)]
+
+
+def test_new_increase_and_decrease_from_the_good_rows_of_a_read_with_a_reject_are_recorded(store):
+    world, wall = fixed(store)
+    w = wallet(3)
+    world.held[w] = [pos(w, 1, 10.0), pos(w, 2, 10.0), pos(w, 3, 10.0)]
+    run(["pass"], world, wall, store)
+    wall.t += 300
+    world.held[w] = [pos(w, 1, 12.0), pos(w, 2, 8.0), pos(w, 4, 1.0, opp=token(3)), {"not": "a position"}]
+    run(["pass"], world, wall, store)
+    got = {(r["kind"], r["token_id"]): (r["size_before"], r["size_after"], r["flip"]) for r in changes(store)}
+    assert got == {("INCREASE", token(1)): (10.0, 12.0, 0), ("DECREASE", token(2)): (10.0, 8.0, 0),
+                   ("NEW", token(4)): (0.0, 1.0, 1)}
+    assert held_now(store, w)[token(3)][:2] == (10.0, 1)
+
+
+def test_a_true_repeat_alone_does_not_stop_an_exit(store):
+    world, wall = fixed(store)
+    w = wallet(4)
+    world.held[w] = [pos(w, 1), pos(w, 2)]
+    run(["pass"], world, wall, store)
+    wall.t += 300
+    world.held[w] = [pos(w, 1), pos(w, 1)]                                   # every token readable: t2 left
+    run(["pass"], world, wall, store)
+    assert [(r["kind"], r["token_id"]) for r in changes(store)] == [("EXIT", token(2))]
+
+
+def test_report_prints_the_carried_holdings_and_the_share_of_good_reads_that_carried_any(store):
+    world, wall = fixed(store)
+    w = wallet(0)
+    world.held[w] = [pos(w, 1), pos(w, 2), pos(w, 3)]
+    run(["pass"], world, wall, store)
+    for k in range(3):
+        wall.t += 300
+        world.held[w] = [pos(w, 1)] + ([pos(w, 2, avg_price="?")] if k < 2 else [pos(w, 2), pos(w, 3)])
+        run(["pass"], world, wall, store)
+    wall.t += 300
+    world.held[w] = [pos(w, 1), pos(w, 2, avg_price="?")]
+    run(["pass"], world, wall, store)
+    code, out = run(["report"], world, wall, store)
+    line0 = [l for l in out.splitlines() if l.startswith(wallet(0)[:10])][0]
+    assert "carried=2" in line0 and "reads carrying=60.0%" in line0           # 3 of 5 good reads carried any
+    line1 = [l for l in out.splitlines() if l.startswith(wallet(1)[:10])][0]
+    assert "carried=0" in line1 and "reads carrying=0.0%" in line1
+
+
+import random as _random
+
+
+def sizes_held(store, w):
+    return dict(db(store).execute("SELECT token_id, size FROM holdings_current WHERE wallet_key=?", (w,)).fetchall())
+
+
+def _render(w, truth, fresh, rng, junk):
+    """The service's answer for `truth` {n: size}: a freshly bought token's row is always good; any other row
+    may be rejected, in conflict or repeated; junk rows (another wallet's, not an object) may be added."""
+    rows, unreadable = [], set()
+    for n, size in sorted(truth.items()):
+        x = rng.random()
+        if n in fresh or x < 0.65:
+            rows.append(pos(w, n, size))
+        elif x < 0.8:
+            rows.append(pos(w, n, size, current_size=rng.choice(["x", None, True, [1]])))
+            unreadable.add(n)
+        elif x < 0.92:
+            rows += [pos(w, n, size), pos(w, n, size + 1.0)]
+            unreadable.add(n)
+        else:
+            rows += [pos(w, n, size), pos(w, n, size)]
+    if junk and rng.random() < 0.15:
+        rows.append(rng.choice([pos(wallet(99), 5000), "a row", pos(w, 6000, token_id=None)]))
+    rng.shuffle(rows)
+    return rows, unreadable
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_property_no_exit_or_new_for_a_merely_unreadable_row_and_a_true_exit_at_the_first_clean_read(tmp_path,
+                                                                                                     seed):
+    rng = _random.Random(seed)
+    store = tmp_path / ("s%d" % seed) / "leaders.sqlite"
+    world, wall = fixed(store)
+    ws = [wallet(i) for i in range(3)]
+    truth = {w: {100 * i + k: float(rng.randint(1, 9)) for k in range(rng.randint(0, 4))} for i, w in enumerate(ws)}
+    nxt = {w: 100 * i + 50 for i, w in enumerate(ws)}
+    fresh = {w: set(truth[w]) for w in ws}
+    prev_truth = {w: {} for w in ws}
+    for p in range(10):
+        for w in ws:
+            world.held[w], _ = _render(w, truth[w], fresh[w], rng, junk=p > 0)
+            world.fail[w] = "http500" if p and rng.random() < 0.1 else None
+        n_before = len(changes(store))
+        held_before = {w: sizes_held(store, w) for w in ws}
+        run(["pass"], world, wall, store)
+        for r in changes(store)[n_before:]:
+            w, n = r["wallet_key"], int(r["token_id"][1:])
+            if r["kind"] == "EXIT":
+                assert n not in truth[w], (seed, p, "an EXIT for a token still held")
+            if r["kind"] == "NEW":
+                assert r["token_id"] not in held_before[w], (seed, p, "a NEW for a token already in the record")
+                assert n in fresh[w] or n not in prev_truth[w], (seed, p, "a NEW for a merely unreadable row")
+        for w in ws:
+            last = last_read(store, w)
+            mine = {int(t[1:]): s for t, s in sizes_held(store, w).items()}
+            clean = last["good"] and last["read_id"] == db(store).execute(
+                "SELECT max(read_id) FROM wallet_reads WHERE wallet_key=?", (w,)).fetchone()[0] and \
+                not {k for k in json.loads(last["rejects"] or "{}") if k != "repeated_row"}
+            if clean and last["pass_id"] == db(store).execute("SELECT max(pass_id) FROM passes").fetchone()[0]:
+                assert mine == truth[w], (seed, p, "after a clean read the record is the truth")
+            assert set(mine) >= {n for n in truth[w] if n in fresh[w]} or not last["good"]
+        assert lm.consistency(db(store)) == []
+        wall.t += 300
+        for w in ws:                                         # the world moves on
+            prev_truth[w] = dict(truth[w])
+            if last_read(store, w)["good"]:                  # a bought token is fresh until a good read saw it
+                fresh[w] = set()
+            for n in list(truth[w]):
+                x = rng.random()
+                if x < 0.15:
+                    del truth[w][n]
+                elif x < 0.3:
+                    truth[w][n] = float(rng.randint(1, 9))
+            if rng.random() < 0.4:
+                truth[w][nxt[w]] = float(rng.randint(1, 9))
+                fresh[w].add(nxt[w])
+                nxt[w] += 1
+
+
+def held_state(s):
+    c = db(s)
+    try:
+        rows = c.execute("SELECT wallet_key, token_id, size, carried FROM holdings_current").fetchall()
+    except sqlite3.OperationalError:
+        rows = [(*r, 0) for r in c.execute("SELECT wallet_key, token_id, size FROM holdings_current")]
+    c.close()
+    out = {}
+    for w, t, size, carried in rows:
+        out.setdefault(w, {})[t] = (size, carried)
+    return out
+
+
+def test_one_write_per_wallet_survives_a_real_kill_at_every_statement_with_carried_holdings(tmp_path):
+    base = tmp_path / "base" / "leaders.sqlite"
+    world = World(sports=[board_row(i + 1, wallet(i)) for i in range(5)],
+                  crypto=[board_row(i + 1, wallet(i)) for i in range(5)])
+    wall = Wall()
+    run(["fix-leaders"], world, wall, base)
+    old = {wallet(i): [pos(wallet(i), 10 * i + n) for n in range(3)] for i in range(5)}
+    world.held = old
+    run(["pass"], world, wall, base)
+    old_s = held_state(base)
+    new = {}
+    for k, (w, rows) in enumerate(old.items()):
+        if k < 3:      # a rejected row and a missing row: both carried, the good new token is NEW
+            new[w] = [dict(rows[1], current_size="x"), rows[2], pos(w, 999 + k, size=4.0)]
+        else:          # a clean read: one EXIT, one NEW
+            new[w] = rows[1:] + [pos(w, 999 + k, size=4.0)]
+    probe = tmp_path / "probe" / "leaders.sqlite"
+    probe.parent.mkdir()
+    shutil.copy(base, probe)
+    p = child(tmp_path, {"kill_at": 10 ** 9, "held": new, "t": T0 + 300, "cmd": "pass", "store": str(probe)})
+    out, err = p.communicate(timeout=120)
+    assert p.returncode == 0, err[-2000:]
+    total = int(out.split()[1])
+    new_s = held_state(probe)
+    c = db(probe)
+    want_changes = {w: c.execute("SELECT count(*) FROM changes WHERE wallet_key=?", (w,)).fetchone()[0] for w in new}
+    c.close()
+    ws = list(new)
+    assert [want_changes[w] for w in ws] == [1, 1, 1, 2, 2]                   # no EXIT for the carried ones
+    assert all(sum(cr for _, cr in new_s[w].values()) == 2 and len(new_s[w]) == 4 for w in ws[:3])
+    assert all(sum(cr for _, cr in new_s[w].values()) == 0 and len(new_s[w]) == 3 for w in ws[3:])
+    killed = 0
+    for n in range(1, total + 1):
+        s = tmp_path / ("c%d" % n) / "leaders.sqlite"
+        s.parent.mkdir()
+        shutil.copy(base, s)
+        p = child(tmp_path, {"kill_at": n, "held": new, "t": T0 + 300, "cmd": "pass", "store": str(s)})
+        p.communicate(timeout=120)
+        killed += p.returncode == -signal.SIGKILL
+        c = db(s)
+        assert lm.consistency(c) == [], n
+        st = held_state(s)
+        for w in ws:
+            n_changes = c.execute("SELECT count(*) FROM changes WHERE wallet_key=?", (w,)).fetchone()[0]
+            assert (st.get(w), n_changes) in ((old_s.get(w), 0), (new_s.get(w), want_changes[w])), (n, w)
+        c.close()
+        shutil.rmtree(s.parent)
+    assert killed == total
