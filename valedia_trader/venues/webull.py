@@ -1386,26 +1386,32 @@ def _side_sign(side: Any) -> float | None:
     return 1.0 if side == "BUY" else -1.0 if side in ("SELL", "SHORT") else None
 
 
-def _fee(item: dict) -> float | None:
-    """commission.actual_commission plus every fees[].actual_value; None if none is given or one is unreadable."""
+def _fee_and_unread(item: dict) -> tuple[float | None, bool]:
+    """(fee, fee_unreadable) of a stock, fund or crypto order row: the fee is commission.actual_commission plus every
+    fees[].actual_value. T51c R33a: fee_unreadable is True when a fee is
+    PRESENT and cannot be read: a commission that is not an object; fees that are not a list of objects; an
+    actual_commission given (even as None) or a fees entry whose actual_value is absent, None or not a finite number
+    (_number); a total that is not finite. The fee is then None, never the sum of the parts that could be read. It is
+    False when no fee is given (commission absent, None or an object without actual_commission; fees absent, None or
+    an empty list: the observed shape of a purchase is commission {} and fees []) and when the fee is read."""
     values = []
     commission, fees = item.get("commission"), item.get("fees")
     if commission is not None:
         if not isinstance(commission, dict):
-            return None
+            return None, True
         if "actual_commission" in commission:
             values.append(commission["actual_commission"])
     if fees is not None:
         if not isinstance(fees, list) or not all(isinstance(f, dict) for f in fees):
-            return None
+            return None, True
         values += [f.get("actual_value") for f in fees]
     if not values:
-        return None
+        return None, False
     numbers = [_number(v) for v in values]
     if any(n is None for n in numbers):
-        return None
+        return None, True
     total = sum(numbers)
-    return total if math.isfinite(total) else None
+    return (total, False) if math.isfinite(total) else (None, True)
 
 
 def _state(raw: Any) -> str:
@@ -2660,7 +2666,10 @@ class WebullVenue:
         `state` comes from ORDER_STATES; `filled_units` is unsigned; a number that is absent or unreadable is None,
         never 0 (filled_units is 0.0 only when Webull says 0); avg_price is None when Webull gives 0 (nothing filled);
         `fee` is the actual commission plus the actual fees; venue_order_id is a plain id or None; raw_status is
-        Webull's status in the code shape, else WITHHELD.
+        Webull's status in the code shape, else WITHHELD. Outside an Events venue the answer also carries
+        `fee_unreadable` (T51c R33a, see _fee_and_unread): True when a commission or a fee entry is present and cannot be
+        read (`fee` is then None, never a partial sum), False when no fee is given and when the fee is read. An Events
+        venue's answer carries no such key (its fee is _event_fee's, unchanged).
 
         A combo that carries a client_order_id other than ours raises WebullError, whatever it holds. A single
         item is read as ours without its own client_order_id only when that key is absent or None (not "") and its
@@ -2709,10 +2718,12 @@ class WebullVenue:
             raise WebullError(f"Webull's order detail holds {len(items)} orders and {len(mine)} carry this client order id")
         item = mine[0]
         price = _number(item.get("filled_price"))
+        fee, unread = _fee_and_unread(item)
         out = {"state": _state(item.get("status")), "filled_units": _filled_units(item), "avg_price": price if price and price > 0 else None,
-               "fee": _fee(item), "venue_order_id": _plain_id(item.get("order_id"), secrets, self._final) if item.get("order_id") else None,
+               "fee": fee, "venue_order_id": _plain_id(item.get("order_id"), secrets, self._final) if item.get("order_id") else None,
                "raw_status": _status_word(item.get("status"), secrets, self._final)}
         if not self._events:
+            out["fee_unreadable"] = unread                                # R33a: a plain bool, no venue text; never on an event answer
             return self._row_read(cid, item, out, sent)
         kind = item.get("instrument_type")
         if not (type(kind) is str and kind == EVENT_INSTRUMENT):

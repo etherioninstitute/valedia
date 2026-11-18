@@ -44,6 +44,14 @@ zero) and, when the last report with an average left nothing unpriced, the price
 total, until the venue restates one of them (below). A fee total recorded below zero is kept as the order's total
 and opens one notice per order (an attention item of a kind in NOTICE_KINDS, which does not block).
 
+T51c R33a: a status whose `fee_unreadable` is exactly True (the venue gave a fee that could not be read; `fee` is then
+None) opens the notice fee_unreadable on the order's tag, unless one is open already, in the same write as the
+report's other effects; only a report the ledger uses (past the anomalies that change nothing) does so. It changes no
+units, price, fee or state, never blocks (NOTICE_KINDS), never makes a reconcile unclean and is not listed among the
+reconcile's `notices`. The ledger closes it (LEDGER_CLOSER) when a later used report of the order gives a fee total
+that is read (a finite number, with fee_unreadable not True); a report with no fee at all leaves it open. A status
+without the key (or one whose key cannot be read) is used exactly as before. `attention()` lists the open ones.
+
 Every entry a reconcile lists carries a `kind` from a closed set (ANOMALY_KINDS, UNRESOLVED_KINDS, RECHECK_KINDS;
 `positions_error_kind` from POSITIONS_ERROR_KINDS beside `positions_error`). T34b-3: three things honest brokers do
 after the fact are NOTICES (`notices`, kinds in RECONCILE_NOTICE_KINDS): they neither make the reconcile unclean nor
@@ -123,7 +131,8 @@ MAX_TEXT = 200
 BUSY_SECONDS = 30.0                                       # how long a connection waits for another's write to end
 # T34b-3: what a broker restates after the fact within bounds an honest broker keeps: told, followed, never blocking
 RECONCILE_NOTICE_KINDS = frozenset({"avg_restated", "late_amount", "fee_fell", "piece_unpriced"})
-NOTICE_KINDS = frozenset({"negative_fee"}) | RECONCILE_NOTICE_KINDS   # attention kinds that tell a person, never block
+FEE_UNREADABLE = "fee_unreadable"                         # T51c R33a: a fee the venue gave that could not be read
+NOTICE_KINDS = frozenset({"negative_fee", FEE_UNREADABLE}) | RECONCILE_NOTICE_KINDS   # attention kinds that tell a person, never block
 # T34b-3: the kind every entry of a reconcile carries beside its tag and reason (closed sets)
 ANOMALY_KINDS = frozenset({"reconcile_failed", "not_storable", "status_not_dict", "units_not_finite", "turned_up",
                            "missing_at_venue", "value_not_finite", "units_negative", "units_fell", "overfill",
@@ -562,7 +571,8 @@ class OrderLedger:
 
     def attention(self, open_only: bool = True) -> list[dict]:
         """Items a person must look at (an order found at the venue after it was declared never arrived, a submit
-        outcome that came back after that, a fee total below zero), oldest first; only the open ones unless
+        outcome that came back after that, a fee total below zero, a fee that could not be read (kind fee_unreadable:
+        the tags with such an open item are the orders whose fee is not known, R33a)), oldest first; only the open ones unless
         `open_only` is False. Every open item blocks further orders, except a notice (its kind is in NOTICE_KINDS),
         which only tells a person."""
         sql = "SELECT * FROM attention" + (" WHERE closed_time IS NULL" if open_only else "") + " ORDER BY id"
@@ -1038,12 +1048,17 @@ class OrderLedger:
                 {"tag": tag, "kind": "status_not_dict", "reason": f"the venue's status is not a dict: {_safe_repr(status)}"})
             return
         if status is not None:
+            raw = status
             try:                                          # a plain copy: an odd mapping cannot raise later
                 status = {k: status.get(k) for k in STATUS_KEYS}
             except Exception as exc:
                 out["unresolved"].append({"tag": tag, "kind": "status_unreadable",
                                           "reason": f"the venue's status could not be read: {_describe(exc)}"})
                 return
+            try:                                          # R33a: exactly True, else (absent, odd, unreadable) as before
+                status[FEE_UNREADABLE] = raw.get(FEE_UNREADABLE) is True
+            except Exception:
+                status[FEE_UNREADABLE] = False
             if status["filled_units"] is not None and not _finite(status["filled_units"]):
                 out["anomalies"].append({"tag": tag, "kind": "units_not_finite",
                                          "reason": "the venue's filled_units is not a finite number: "
@@ -1100,6 +1115,16 @@ class OrderLedger:
             return
         self._flag(tag, "negative_fee", f"the venue reports a fee total of {fee!r} for order {tag}, below zero; it is "
                    "kept as reported: check whether it is a rebate")
+
+    def _fee_unreadable_notice(self, tag: str, to_open: bool, close_id: int | None) -> None:
+        """Inside the caller's write (T51c R33a): open the notice fee_unreadable on `tag` (the caller found none open),
+        or close the open one `close_id` because a report gave a fee that was read. It carries no venue text."""
+        if close_id is not None:
+            self._db.execute("UPDATE attention SET closed_by = ?, closed_note = ?, closed_time = ? WHERE id = ?",
+                             (LEDGER_CLOSER, "a later report of the order gave a fee that was read", self.clock(), close_id))
+        if to_open:
+            self._flag(tag, FEE_UNREADABLE, f"the venue gives a fee for order {tag} that could not be read; the order's "
+                       "fee is left as it was, and this notice closes when a report of the order gives a fee that is read")
 
     def _record_notice(self, tag: str, kind: str, words: str, old, new, after_fill, row) -> int:
         """Inside the caller's write (T34b-3): record one notice of RECONCILE_NOTICE_KINDS as an attention item whose
@@ -1256,7 +1281,17 @@ class OrderLedger:
                 else:
                     anomaly("avg_restated_beyond", f"the venue's average changed from {p_avg} to {avg} with no new "
                             "units to price, by more than a cent; the stored average is kept")
+        unread = status.get(FEE_UNREADABLE) is True       # R33a: decided from this used report alone
+        read_fee = not unread and status.get("fee") is not None    # non-finite fees were set to None by _apply
+        open_id = None
+        if unread or read_fee:
+            got = self._db.execute("SELECT id FROM attention WHERE tag = ? AND kind = ? AND closed_time IS NULL",
+                                   (tag, FEE_UNREADABLE)).fetchone()
+            open_id = None if got is None else int(got[0])
+        to_open, to_close = unread and open_id is None, read_fee and open_id is not None
         if new == state and not wanted and all(rec[k] == v for k, v in fields.items()):
+            if to_open or to_close:                       # only the notice is new: the order's row is not touched
+                self._fee_unreadable_notice(tag, to_open, open_id if to_close else None)
             return                                        # nothing new: the record is left exactly as it was
         why = f"venue says {vstate}" + ("; it had been declared never arrived" if mode == "turned_up" else "")
         if not self._cas(tag, state, new, why, **fields):
@@ -1275,6 +1310,8 @@ class OrderLedger:
                 out["notices"].append({"tag": tag, "kind": kind, "old": was, "new": now_is, "id": nid})
         if fields.get("fee") is not None and fields["fee"] < 0:
             self._notice_negative_fee(tag, fields["fee"])
+        if to_open or to_close:
+            self._fee_unreadable_notice(tag, to_open, open_id if to_close else None)
         if new != state or wanted:
             out["updated"].append({"tag": tag, "from": state, "to": new})
 

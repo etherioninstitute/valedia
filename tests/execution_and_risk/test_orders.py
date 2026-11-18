@@ -3682,8 +3682,9 @@ def test_r33a_the_one_call_that_lists_the_tags_with_an_open_notice_is_attention(
     led, venue, clock = _accepted()
     intend(led, tag="other", units=5.0)
     venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee_unreadable=True)
+    venue.held = {"XLE": 10.0}
     clock.t += 5
-    led.reconcile(venue, {})
+    assert led.reconcile(venue, {})["clean"]
     led.mark_applied([f["id"] for f in led.unapplied_fills()])
     led.submit_once(venue, "other")
     venue.set("other", state="filled", filled_units=5.0, avg_price=90.0, fee=0.0, fee_unreadable=False)
@@ -3724,13 +3725,14 @@ def test_r33a_a_later_read_fee_closes_the_notice_and_a_later_unread_one_opens_a_
     led.reconcile(venue, {})
     (item,) = _unread_items(led)
     assert (item["closed_time"], item["closed_by"]) == (closed_at, orders.LEDGER_CLOSER) and "read" in item["closed_note"]
-    assert led.order(TAG)["fee"] == fee
+    stored = fee if fee > 0 else None                                   # a fee of 0 or below first given at a recheck is
+    assert led.order(TAG)["fee"] == stored                              # not stored (the rule as it was); it is still read
     venue.set(TAG, fee=None, fee_unreadable=True)
     clock.t += 60
     led.reconcile(venue, {})
     first, second = _unread_items(led)
     assert first["id"] == item["id"] and second["closed_time"] is None and second["time"] == clock.t
-    assert led.order(TAG)["fee"] == fee                                 # the stored figure is kept
+    assert led.order(TAG)["fee"] == stored                              # the stored figure is kept
 
 
 def test_r33a_a_read_fee_equal_to_the_stored_one_still_closes_the_notice_and_touches_no_order_row():
@@ -3955,15 +3957,26 @@ def test_r33a_old_against_new_without_the_key_every_table_row_for_row(tmp_path, 
         assert new == old, seed
 
 
+def _r33a_renumbered(row, renumber):
+    """A reconciles row whose summary's notice ids are mapped to the ids the same notices have without the new rows."""
+    summary = json.loads(row[3])
+    for n in summary.get("notices", []):
+        n["id"] = renumber[n["id"]]
+    return (*row[:3], json.dumps(summary), *row[4:])
+
+
 def test_r33a_old_against_new_with_the_key_the_same_tables_plus_exactly_the_rule_s_notices(tmp_path, base_r33a_orders):
     opened = closed = 0
     for seed in range(1000, 1070):
         scripts, sizes = _r33a_sequence(random.Random(seed), keyed=True)
         old = _r33a_run(base_r33a_orders, tmp_path / f"old-{seed}.db", scripts, sizes)
         new = _r33a_run(orders, tmp_path / f"new-{seed}.db", scripts, sizes)
-        for t in ("orders", "events", "fills", "reconciles", "served"):
+        for t in ("orders", "events", "fills", "served"):
             assert new[t] == old[t], (seed, t)
-        assert [r[1:] for r in new["attention"] if r[2] != UNREAD] == [r[1:] for r in old["attention"]], seed
+        others = [r for r in new["attention"] if r[2] != UNREAD]
+        assert [r[1:] for r in others] == [r[1:] for r in old["attention"]], seed
+        renumber = {r[0]: o[0] for r, o in zip(others, old["attention"])}   # the new rows shift later ids, nothing else
+        assert [_r33a_renumbered(r, renumber) for r in new["reconciles"]] == old["reconciles"], seed
         mine = sorted((r[1], r[3], r[7]) for r in new["attention"] if r[2] == UNREAD)
         assert new["served"] == old["served"] and mine == _r33a_oracle(new["served"]), seed
         assert all(r[5] == orders.LEDGER_CLOSER for r in new["attention"] if r[2] == UNREAD and r[7] is not None)
