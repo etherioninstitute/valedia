@@ -3194,13 +3194,13 @@ class OracleWorld(PagedWorld):
 
     VARIANTS = ("price69", "posed", "bad_time", "mixed", "neither")
 
-    def __init__(self, world, seed, share=1.0, odd=0.0, **kw):
+    def __init__(self, world, seed, share=1.0, odd=0.0, oracle=(), **kw):
         super().__init__(world, seed, **kw)
         rng = random.Random("oracle:%d" % seed)
         self.kind = {}
         for c in sorted(world.res):
             k = "reported"
-            if rng.random() < share:
+            if rng.random() < share or c in oracle:
                 k = rng.choice(self.VARIANTS) if rng.random() < odd else "oracle"
             self.kind[c] = k
 
@@ -3221,8 +3221,8 @@ class OracleWorld(PagedWorld):
             out.update(status="resolved", price="69")
         elif k == "posed":
             out.update(status="posed", price="69")
-        elif k == "bad_time":
-            out.update(status="resolved", last_update_timestamp=str(ts * 1000))
+        elif k == "bad_time":                                     # a time in milliseconds, all else readable
+            out.update(status="resolved", price=E18 if price == "69" else price, last_update_timestamp=str(ts * 1000))
         elif k == "mixed":
             out["payouts"] = r["payouts"]
         return out
@@ -3500,6 +3500,7 @@ def test_t47f_the_reread_makes_no_client_and_opens_no_socket(tmp_path, monkeypat
     monkeypatch.setattr(pd, "urllib_get", no)
     monkeypatch.setattr(urllib.request, "urlopen", no)
     monkeypatch.setattr(urllib.request, "build_opener", no)
+    monkeypatch.setattr(cl.time, "time", lambda: WALL)                               # the run's own start: in span
     assert cl.main(["reread-resolutions", "--store", str(store)]) == 0
     out = capsys.readouterr().out.splitlines()
     line = _final(out)
@@ -3517,13 +3518,18 @@ def test_t47f_a_store_the_code_before_made_is_read_again_planned_again_keeping_i
     monkeypatch.setattr(cl, "_now", lambda: FIXED)
     monkeypatch.setattr(ocl, "_now", lambda: FIXED)
     seen = Counter()
-    for seed in range(10):
-        w = _oracle_world(seed)
-        share = random.Random(seed).choice([0.2, 0.3, 0.5])
+    for seed in range(12):
+        if seed < 10:
+            w = _oracle_world(seed)
+            share, hidden = random.Random(seed).choice([0.2, 0.3, 0.5]), set()
+        else:                                     # more qualifiers than ten, half of them with their losses in the
+            w = World(seed, edge=0.0, move=0.0, pros=14, per_month=20, months=SMALL_MONTHS, market_makers=0)
+            share, hidden = 0.0, {r["condition_id"] for i in range(0, 14, 2) for r in w.trades["pro%02d" % i]
+                                  if w.res[r["condition_id"]]["payouts"][r["outcome_index"]] == 0}   # oracle's shape
         d = tmp_path / ("p%02d" % seed)
         d.mkdir()
         old, fresh = d / "old.sqlite", d / "fresh.sqlite"
-        mk = lambda: OracleWorld(w, seed, share=share, odd=0.1)
+        mk = lambda: OracleWorld(w, seed, share=share, odd=0.1, oracle=hidden)
         for phase in (1, 2):
             ocl.pull(old, _client_of(opd, mk()), phase=phase, say=lambda m: None)
             cl.pull(fresh, _client_of(pd, mk()), phase=phase, say=lambda m: None)
@@ -3689,3 +3695,47 @@ def test_t47f_with_no_row_of_the_oracles_shape_the_pull_and_the_outputs_equal_th
         assert raw_old == cl._dump(stripped), seed
     assert seen["PROCEED"] > 0 and seen["FAIL"] > 0 and seen["sealed"] > 0, seen
     print("T47f equal stores:", dict(sorted(seen.items())))
+
+
+class _FailingFor(OracleWorld):
+    """OracleWorld whose resolutions route answers 503 to any request holding an id of `fail` (a batch the code
+    before leaves unfinished)."""
+
+    def __init__(self, world, seed, fail, mod, **kw):
+        super().__init__(world, seed, **kw)
+        self.fail, self.mod = set(fail), mod
+
+    def __call__(self, url):
+        parts = urllib.parse.urlsplit(url)
+        if parts.path == "/v2/resolutions" and \
+                set(dict(urllib.parse.parse_qsl(parts.query))["condition"].split(",")) & self.fail:
+            raise self.mod.HttpError(503, url)
+        return super().__call__(url)
+
+
+def test_t47f_a_new_pull_that_finishes_a_store_holding_rows_stored_before_the_rule_makes_no_marker(tmp_path,
+                                                                                                 monkeypatch):
+    """The rows the new pull adds are read under the rule, the older ones are not: no marker, so develop still
+    refuses until the reread; after it, the counts are those of every row, old and new."""
+    opd, ocl = _code_before_t47f(tmp_path)
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    monkeypatch.setattr(ocl, "_now", lambda: FIXED)
+    w = _oracle_world(8)
+    conds = sorted(w.res)
+    store = tmp_path / "s.sqlite"
+    late = set(conds[len(conds) // 2:])
+    with pytest.raises(ocl.PullIncomplete):
+        ocl.pull(store, _client_of(opd, _FailingFor(w, 8, late, opd, share=0.6)), phase=1, say=lambda m: None)
+    assert _open_resolutions(store) and _marker(store) is None
+    cl.pull(store, _client_of(pd, OracleWorld(w, 8, share=0.6)), phase=1, say=lambda m: None)   # finishes it
+    assert _open_resolutions(store) == set() and _marker(store) is None
+    rows = _resolution_rows(store)
+    assert any(c in late and '"price"' in r[5] and r[2] != "null" for c, r in rows.items())   # new rows: read
+    assert any(c not in late and '"price"' in r[5] and r[2] == "null" and
+               OracleWorld(w, 8, share=0.6).expect(c) == "first" for c, r in rows.items())   # older: not
+    with pytest.raises(cl.Refused) as e:
+        cl.run_develop(store=store, out_dir=tmp_path / "o", say=lambda m: None)
+    assert UNREAD in str(e.value)
+    said = []
+    cl.reread_resolutions(store, say=said.append, wall=lambda: WALL)
+    assert _counts_in(_final(said)) == OracleWorld(w, 8, share=0.6).tally() == _marker(store)["counts"]
