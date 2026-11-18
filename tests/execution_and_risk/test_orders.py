@@ -2587,7 +2587,7 @@ def _settled(led, venue, book):
 
 def test_t34b3_the_kind_sets_are_closed_exported_and_the_four_notices_never_block():
     assert orders.RECONCILE_NOTICE_KINDS == {"avg_restated", "late_amount", "fee_fell", "piece_unpriced"}
-    assert orders.NOTICE_KINDS == {"negative_fee"} | orders.RECONCILE_NOTICE_KINDS
+    assert orders.NOTICE_KINDS == {"negative_fee", "fee_unreadable"} | orders.RECONCILE_NOTICE_KINDS   # R33a
     assert orders.ANOMALY_KINDS == {"reconcile_failed", "not_storable", "status_not_dict", "units_not_finite", "turned_up",
                                     "missing_at_venue", "value_not_finite", "units_negative", "units_fell", "overfill",
                                     "late_amount_other_state", "state_changed", "fee_fell_below_zero",
@@ -3642,3 +3642,331 @@ def test_the_order_paths_open_upgrades_a_layout3_file_and_opens_a_layout4_one_as
     raw = path.read_bytes()
     open_ledger(path, clock=Clock(1_000_300.0)).close()
     assert _look(path) == _as_layout4(before, _fresh_master(tmp_path)) and path.read_bytes() == raw
+
+
+# ---- T51c R33a: a fee the venue gives but the adapter could not read (`fee_unreadable` True on the status) is kept on
+# the order as an open notice of the kind fee_unreadable: once while open, in the report's own write, blocking nothing,
+# changing no figure; closed by the ledger when a later report of the order gives a fee that is read.
+
+UNREAD = "fee_unreadable"
+
+
+def _unread_items(led, open_only=False):
+    return [i for i in led.attention(open_only=open_only) if i["kind"] == UNREAD]
+
+
+def test_r33a_an_unread_fee_opens_one_notice_on_its_order_that_blocks_nothing():
+    led, venue, clock = _accepted()
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee=None, fee_unreadable=True)
+    venue.held = {"XLE": 10.0}
+    clock.t += 5
+    found = led.reconcile(venue, {})
+    assert found["clean"] and found["notices"] == [] and found["anomalies"] == []
+    assert [(f["units"], f["price"], f["fee"]) for f in found["fills"]] == [(10.0, 90.0, None)]
+    rec = led.order(TAG)
+    assert (rec["state"], rec["filled_units"], rec["fee"], rec["avg_price"]) == ("filled", 10.0, None, 90.0)
+    (item,) = led.attention()
+    assert (item["tag"], item["kind"], item["time"], item["closed_time"]) == (TAG, UNREAD, clock.t, None)
+    assert TAG in item["reason"] and "could not be read" in item["reason"]
+    led.mark_applied([f["id"] for f in found["fills"]])
+    assert led.blocked() == []
+    for _ in range(3):                                                   # repeated by every recheck: still one notice
+        clock.t += 60
+        assert led.reconcile(venue, {"XLE": 10.0})["clean"]
+    assert len(_unread_items(led)) == 1 and led.blocked() == []
+    intend(led, tag="next")
+    assert led.submit_once(venue, "next")["state"] == "accepted"
+
+
+def test_r33a_the_one_call_that_lists_the_tags_with_an_open_notice_is_attention():
+    led, venue, clock = _accepted()
+    intend(led, tag="other", units=5.0)
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee_unreadable=True)
+    clock.t += 5
+    led.reconcile(venue, {})
+    led.mark_applied([f["id"] for f in led.unapplied_fills()])
+    led.submit_once(venue, "other")
+    venue.set("other", state="filled", filled_units=5.0, avg_price=90.0, fee=0.0, fee_unreadable=False)
+    clock.t += 5
+    led.reconcile(venue, {})
+    assert {i["tag"] for i in led.attention() if i["kind"] == UNREAD} == {TAG}
+
+
+@pytest.mark.parametrize("report", [
+    {"fee": None},                                     # no fee entries at all: not a read fee, the notice stays
+    {"fee": None, "fee_unreadable": False},            # the adapter says nothing unread, but gives no fee either
+    {"fee": float("nan")},                             # not finite: value_not_finite, never read
+    {"fee": None, "fee_unreadable": True},             # the same unread fee again
+    {"fee": 0.03, "fee_unreadable": True},             # a figure with the flag still set: not a read fee
+])
+def test_r33a_a_report_without_a_read_fee_leaves_the_notice_open(report):
+    led, venue, clock = _accepted()
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee=None, fee_unreadable=True)
+    clock.t += 5
+    led.reconcile(venue, {})
+    venue.book[TAG].pop("fee_unreadable")
+    venue.set(TAG, **report)
+    clock.t += 60
+    led.reconcile(venue, {})
+    (item,) = _unread_items(led)
+    assert item["closed_time"] is None
+
+
+@pytest.mark.parametrize("fee", [0.03, 0.0, -0.01])
+def test_r33a_a_later_read_fee_closes_the_notice_and_a_later_unread_one_opens_a_new_one(fee):
+    led, venue, clock = _accepted()
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee=None, fee_unreadable=True)
+    clock.t += 5
+    led.reconcile(venue, {})
+    venue.set(TAG, fee=fee, fee_unreadable=False)
+    clock.t += 60
+    closed_at = clock.t
+    led.reconcile(venue, {})
+    (item,) = _unread_items(led)
+    assert (item["closed_time"], item["closed_by"]) == (closed_at, orders.LEDGER_CLOSER) and "read" in item["closed_note"]
+    assert led.order(TAG)["fee"] == fee
+    venue.set(TAG, fee=None, fee_unreadable=True)
+    clock.t += 60
+    led.reconcile(venue, {})
+    first, second = _unread_items(led)
+    assert first["id"] == item["id"] and second["closed_time"] is None and second["time"] == clock.t
+    assert led.order(TAG)["fee"] == fee                                 # the stored figure is kept
+
+
+def test_r33a_a_read_fee_equal_to_the_stored_one_still_closes_the_notice_and_touches_no_order_row():
+    led, venue, clock = _accepted()
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee=0.03)
+    clock.t += 5
+    led.reconcile(venue, {})
+    before = led.order(TAG)
+    venue.set(TAG, fee=None, fee_unreadable=True)                       # nothing else new: only the notice is written
+    clock.t += 60
+    led.reconcile(venue, {})
+    assert led.order(TAG) == before and len(_unread_items(led, open_only=True)) == 1
+    venue.set(TAG, fee=0.03, fee_unreadable=False)
+    clock.t += 60
+    led.reconcile(venue, {})
+    assert led.order(TAG) == before and _unread_items(led, open_only=True) == [] and len(_unread_items(led)) == 1
+    assert len(led.fills(TAG)) == 1
+
+
+def test_r33a_after_a_person_closes_it_a_repeated_unread_fee_opens_it_again():
+    led, venue, clock = _accepted()
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee_unreadable=True)
+    clock.t += 5
+    led.reconcile(venue, {})
+    (item,) = led.attention()
+    led.close_attention(item["id"], "Burton", "looked at the statement")
+    clock.t += 60
+    led.reconcile(venue, {})
+    assert [i["closed_time"] is None for i in _unread_items(led)] == [False, True]
+
+
+@pytest.mark.parametrize("value", [None, False, 1, "true", "yes", 0.0, [True]])
+def test_r33a_only_the_value_true_opens_the_notice(value):
+    led, venue, clock = _accepted()
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee_unreadable=value)
+    clock.t += 5
+    assert led.reconcile(venue, {})["anomalies"] == []
+    assert led.attention() == []
+
+
+def test_r33a_a_report_the_ledger_does_not_use_writes_no_notice():
+    led, venue, clock = _accepted()
+    venue.set(TAG, state="partly_filled", filled_units=4.0, avg_price=90.0)
+    clock.t += 5
+    led.reconcile(venue, {})
+    venue.set(TAG, filled_units=2.0, fee_unreadable=True)               # units fell: an anomaly that changes nothing
+    clock.t += 5
+    assert [a["kind"] for a in led.reconcile(venue, {})["anomalies"]] == ["units_fell"]
+    venue.set(TAG, state="mystery", filled_units=4.0)                   # a state not known: unresolved, nothing used
+    clock.t += 5
+    assert [u["kind"] for u in led.reconcile(venue, {})["unresolved"]] == ["state_unknown"]
+    assert led.attention() == []
+
+
+def test_r33a_a_status_whose_key_cannot_be_read_is_taken_as_without_it():
+    class Odd(dict):
+        def get(self, k, default=None):
+            if k == UNREAD:
+                raise RuntimeError("no")
+            return super().get(k, default)
+
+    led, venue, clock = _accepted()
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee=None)
+    venue.held = {"XLE": 10.0}
+    venue.order_status = lambda tag: Odd(venue.book[tag])
+    clock.t += 5
+    found = led.reconcile(venue, {})
+    assert found["clean"] and led.order(TAG)["state"] == "filled" and led.attention() == []
+
+
+def test_r33a_the_kind_is_a_notice_and_not_a_reconcile_notice():
+    assert UNREAD in orders.NOTICE_KINDS and UNREAD not in orders.RECONCILE_NOTICE_KINDS
+    assert UNREAD not in orders.ANOMALY_KINDS | orders.UNRESOLVED_KINDS | orders.RECHECK_KINDS
+    led, venue, clock = _accepted()
+    venue.set(TAG, state="filled", filled_units=10.0, avg_price=90.0, fee_unreadable=True)
+    clock.t += 5
+    led.reconcile(venue, {})
+    assert led.reconcile_notices() == [] and led.average_writes(TAG) is not None
+
+
+def test_r33a_the_readers_of_notice_kinds_take_the_new_kind_from_this_module():
+    """order_step (faults, the stop words, the pause test) and event_practice filter attention by orders.NOTICE_KINDS
+    itself, so the new kind is a notice to them: never a fault, never a stop."""
+    from valedia_trader.execution_and_risk import event_practice, order_step
+    assert order_step.NOTICE_KINDS is orders.NOTICE_KINDS and event_practice.NOTICE_KINDS is orders.NOTICE_KINDS
+    assert order_step.RECONCILE_NOTICE_KINDS is orders.RECONCILE_NOTICE_KINDS
+
+
+def test_r33a_the_same_reports_with_and_without_the_flag_give_the_same_figures_and_verdicts():
+    results = []
+    for flag in (None, True):
+        led, venue, clock = _accepted()
+        steps = [dict(state="partly_filled", filled_units=4.0, avg_price=90.0, fee=None),
+                 dict(state="partly_filled", filled_units=4.0, avg_price=90.0, fee=-0.2),
+                 dict(state="filled", filled_units=10.0, avg_price=90.5, fee=None),
+                 dict(state="filled", filled_units=10.0, avg_price=90.5, fee=float("nan"))]
+        out = []
+        for s in steps:
+            venue.set(TAG, **s, **({} if flag is None else {"fee_unreadable": flag}))
+            clock.t += 30
+            r = led.reconcile(venue, {})
+            out.append({k: r[k] for k in ("clean", "fills", "updated", "unresolved", "anomalies", "notices")})
+        results.append((out, led.order(TAG), led.fills(), led.events(),
+                        [(i["tag"], i["kind"], i["reason"]) for i in led.attention(open_only=False) if i["kind"] != UNREAD]))
+    assert results[0] == results[1]
+
+
+R33A_BASE = "e2a7153"                                     # main before R33a
+R33A_TABLES = ("orders", "events", "fills", "reconciles", "attention")
+
+
+@pytest.fixture(scope="module")
+def base_r33a_orders(tmp_path_factory):
+    where = tmp_path_factory.mktemp("at-e2a7153")
+    rel = "valedia_trader/execution_and_risk/orders.py"
+    got = subprocess.run(["git", "-C", str(REPO), "archive", "--format=tar", R33A_BASE, rel], capture_output=True, timeout=60)
+    assert got.returncode == 0, got.stderr.decode(errors="replace")[:300]
+    with tarfile.open(fileobj=io.BytesIO(got.stdout)) as tar:
+        tar.extractall(where, filter="data")
+    spec = importlib.util.spec_from_file_location("orders_at_e2a7153", where / rel)
+    old = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(old)
+    assert "fee_unreadable" not in old.NOTICE_KINDS and old.__file__ != orders.__file__
+    return old
+
+
+class _Scripted(FakeVenue):
+    """A venue whose status for each tag is the next one of a script (the last repeats)."""
+
+    def __init__(self, scripts, clock):
+        super().__init__()
+        self.scripts, self.clock, self.served = scripts, clock, []
+
+    def order_status(self, tag):
+        script = self.scripts.get(tag)
+        if not script:
+            return super().order_status(tag)
+        got = script.pop(0) if len(script) > 1 else script[0]
+        self.served.append((tag, self.clock.t, got))
+        return None if got is None else dict(got)
+
+
+def _r33a_sequence(rng, keyed):
+    """Reports for two orders over 3 to 8 reconciles. Without the key anything goes (backwards states, falling units,
+    unknown states, None, non-finite figures); with it, only reports the ledger uses (forward, rising, within size),
+    so the rule's oracle is simple. Returns {tag: [report, ...]} and the size of each order."""
+    sizes = {"r-A": 10.0, "r-B": -3.5}
+    out = {}
+    fees = [None, None, 0.0, 0.03, 0.05, 0.05, -0.01, 0.2, float("nan")]
+    for tag, size in sizes.items():
+        n, state, filled, reps = rng.randint(3, 8), "open", 0.0, []
+        for _ in range(n):
+            if keyed:
+                if state in ("open", "partly_filled"):
+                    state = rng.choice(["open", "partly_filled", "partly_filled", "filled", "cancelled"]) if state == "open" \
+                        else rng.choice(["partly_filled", "filled", "cancelled"])
+                if state == "partly_filled":
+                    filled = min(abs(size), filled + rng.choice([0.0, 0.5, 1.0]))
+                elif state == "filled":
+                    filled = abs(size)
+                rep = {"state": state, "filled_units": filled, "avg_price": 90.0 if filled else None,
+                       "fee": rng.choice(fees), "venue_order_id": "V-" + tag, "raw_status": state.upper()}
+                if rng.random() < 0.8:
+                    rep["fee_unreadable"] = rng.random() < 0.5
+                reps.append(rep)
+            else:
+                if rng.random() < 0.08:
+                    reps.append(None)
+                    continue
+                state = rng.choice(["open", "partly_filled", "filled", "cancelled", "expired", "rejected", "unknown_status"])
+                said = rng.choice([filled, filled, min(abs(size), filled + 1.0), abs(size), max(0.0, filled - 1.0),
+                                   abs(size) + 1, None, float("inf")])
+                filled = said if said is not None and math.isfinite(said) else filled
+                reps.append({"state": state, "filled_units": said, "avg_price": rng.choice([None, 90.0, 90.004, 91.0, -1.0, float("nan")]),
+                             "fee": rng.choice(fees), "venue_order_id": "V-" + tag, "raw_status": "X"})
+        out[tag] = reps
+    return out, sizes
+
+
+def _r33a_run(mod, path, scripts, sizes):
+    clock = Clock()
+    led = mod.OrderLedger(path, not_sent=(LocalRefusal,), clock=clock)
+    venue = _Scripted({t: [r if r is None else dict(r) for r in reps] for t, reps in scripts.items()}, clock)
+    assert led.reconcile(venue, {})["clean"]
+    for tag, size in sizes.items():
+        led.intend(tag, "XLE" if size > 0 else "QQQ", size, 90.0)
+        led.submit_once(venue, tag)
+    steps = max(len(r) for r in scripts.values())
+    for _ in range(steps):
+        clock.t += 60
+        led.reconcile(venue, {})
+    led.close()
+    db = sqlite3.connect(path)
+    try:
+        tables = {t: db.execute(f"SELECT * FROM {t} ORDER BY rowid").fetchall() for t in R33A_TABLES}
+        tables["served"] = venue.served
+        return tables
+    finally:
+        db.close()
+
+
+def _r33a_oracle(served):
+    """fee_unreadable rows the rule gives for the reports a keyed run served (every one is used): (tag, opened, closed)."""
+    rows, open_row = [], {}
+    for tag, t, rep in served:
+        if rep is None:
+            continue
+        if rep.get("fee_unreadable") is True:
+            if tag not in open_row:
+                open_row[tag] = [tag, t, None]
+                rows.append(open_row[tag])
+        elif rep["fee"] is not None and math.isfinite(rep["fee"]) and tag in open_row:
+            open_row.pop(tag)[2] = t
+    return sorted(tuple(r) for r in rows)
+
+
+def test_r33a_old_against_new_without_the_key_every_table_row_for_row(tmp_path, base_r33a_orders):
+    for seed in range(70):
+        scripts, sizes = _r33a_sequence(random.Random(seed), keyed=False)
+        old = _r33a_run(base_r33a_orders, tmp_path / f"old-{seed}.db", scripts, sizes)
+        new = _r33a_run(orders, tmp_path / f"new-{seed}.db", scripts, sizes)
+        assert new == old, seed
+
+
+def test_r33a_old_against_new_with_the_key_the_same_tables_plus_exactly_the_rule_s_notices(tmp_path, base_r33a_orders):
+    opened = closed = 0
+    for seed in range(1000, 1070):
+        scripts, sizes = _r33a_sequence(random.Random(seed), keyed=True)
+        old = _r33a_run(base_r33a_orders, tmp_path / f"old-{seed}.db", scripts, sizes)
+        new = _r33a_run(orders, tmp_path / f"new-{seed}.db", scripts, sizes)
+        for t in ("orders", "events", "fills", "reconciles", "served"):
+            assert new[t] == old[t], (seed, t)
+        assert [r[1:] for r in new["attention"] if r[2] != UNREAD] == [r[1:] for r in old["attention"]], seed
+        mine = sorted((r[1], r[3], r[7]) for r in new["attention"] if r[2] == UNREAD)
+        assert new["served"] == old["served"] and mine == _r33a_oracle(new["served"]), seed
+        assert all(r[5] == orders.LEDGER_CLOSER for r in new["attention"] if r[2] == UNREAD and r[7] is not None)
+        opened += len(mine)
+        closed += sum(1 for m in mine if m[2] is not None)
+    assert opened > 30 and closed > 10, (opened, closed)

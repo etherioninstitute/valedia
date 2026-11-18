@@ -376,7 +376,7 @@ def test_partial_fill_numbers_fees_and_the_plain_and_list_shapes(tmp_path):
                  commission={"actual_commission": "0.5", "receivable_commission": "0.5"},
                  fees=[{"type": "SEC_FEE", "actual_value": "0.01"}, {"type": "FINRA_TAF", "actual_value": "0.02"}])
     expected = {"state": "partly_filled", "filled_units": 0.4, "avg_price": 101.5, "fee": pytest.approx(0.53),
-                "venue_order_id": "WB-1", "raw_status": "PARTIAL_FILLED"}
+                "venue_order_id": "WB-1", "raw_status": "PARTIAL_FILLED", "fee_unreadable": False}
     other = order("FILLED", cid="someone-else", order_id="WB-2")
     for shape in (detail(other, item), item, [detail(other, item)]):                       # combo, plain, list of combos
         assert status_venue(tmp_path, shape)[0].order_status("t") == expected
@@ -4010,3 +4010,167 @@ def test_t50_a3_a_fresh_import_with_planted_variables_fixes_the_same_hosts_and_w
         seen.append(json.loads(out.stdout))
     assert seen[0] == seen[1] and Path(seen[0][0]).resolve() == Path(wb.__file__).resolve()
     assert seen[0][1:4] == [wb.SANDBOX_HOST, wb.PRODUCTION_HOST, wb.HOSTS]
+
+
+# ---- T51c R33a: a fee the adapter could not read is said to be so (`fee_unreadable`), never left looking like none.
+# Every branch of _fee, one case each. NONE: no fee is given (fee None, fee_unreadable False). UNREAD: a commission or a
+# fees entry is present and cannot be read (fee None, never a partial sum; fee_unreadable True). READ: the fee is read.
+
+R33A_NONE = {
+    "no commission and no fees key": {},
+    "commission and fees None": {"commission": None, "fees": None},
+    "the observed shape before a fill: commission {} and fees []": {"commission": {}, "fees": []},
+    "an empty list of fees": {"fees": []},
+    "a commission object without actual_commission": {"commission": {"receivable_commission": "0.5"}},
+}
+R33A_UNREAD = {
+    "a commission that is a string": {"commission": "0.5"},
+    "a commission that is a list": {"commission": [{"actual_commission": "0.5"}]},
+    "fees that are an object, not a list": {"fees": {"actual_value": "0.1"}},
+    "fees that are a string": {"fees": "0.1"},
+    "a fees entry that is not an object": {"fees": [{"actual_value": "0.1"}, "0.2"]},
+    "a fees entry without actual_value": {"fees": [{"type": "SEC_FEE"}]},
+    "an actual_value of None": {"fees": [{"actual_value": None}]},
+    "an actual_commission of None": {"commission": {"actual_commission": None}},
+    "a value that is not a number": {"commission": {"actual_commission": "abc"}},
+    "an empty string": {"fees": [{"actual_value": ""}]},
+    "a value that is a bool": {"fees": [{"actual_value": True}]},
+    "a value that is a list": {"fees": [{"actual_value": ["0.1"]}]},
+    "a value that is nan": {"fees": [{"actual_value": "nan"}]},
+    "a value that is infinite": {"commission": {"actual_commission": float("inf")}},
+    "a value beyond the float range": {"fees": [{"actual_value": HUGE}]},
+    "a total that overflows to infinity": {"fees": [{"actual_value": 1e308}, {"actual_value": 1e308}]},
+    "a read commission beside an unread fee": {"commission": {"actual_commission": "0.5"}, "fees": [{"actual_value": "x"}]},
+    "a read fee beside an unread commission": {"commission": "0.5", "fees": [{"actual_value": "0.1"}]},
+    "a read fee beside a fees entry without a value": {"fees": [{"actual_value": "0.1"}, {"type": "FINRA_TAF"}]},
+}
+R33A_READ = {
+    "a commission": ({"commission": {"actual_commission": "0.5"}}, 0.5),
+    "a string of a number": ({"fees": [{"actual_value": "0.03"}]}, 0.03),
+    "a plain number": ({"fees": [{"actual_value": 0.03}]}, 0.03),
+    "a zero": ({"commission": {"actual_commission": "0"}, "fees": []}, 0.0),
+    "a negative value (the ledger's negative_fee notice)": ({"fees": [{"actual_value": "-0.01"}]}, -0.01),
+    "commission and fees": ({"commission": {"actual_commission": "0.5"},
+                             "fees": [{"actual_value": "0.01"}, {"actual_value": "0.02"}]}, 0.53),
+    "fees beside a commission object without actual_commission": ({"commission": {}, "fees": [{"actual_value": "0.03"}]}, 0.03),
+}
+
+
+def _r33a_status(tmp_path, fields):
+    item = order("FILLED", filled_quantity="1", filled_price="100", **fields)
+    return status_venue(tmp_path, detail(item))[0].order_status("t")
+
+
+@pytest.mark.parametrize("name", sorted(R33A_NONE))
+def test_r33a_no_fee_given_is_none_and_not_unreadable(tmp_path, name):
+    out = _r33a_status(tmp_path, R33A_NONE[name])
+    assert (out["fee"], out["fee_unreadable"]) == (None, False)
+
+
+@pytest.mark.parametrize("name", sorted(R33A_UNREAD))
+def test_r33a_a_present_fee_that_cannot_be_read_is_said_unreadable_and_never_summed(tmp_path, name):
+    out = _r33a_status(tmp_path, R33A_UNREAD[name])
+    assert out["fee"] is None and out["fee_unreadable"] is True
+
+
+@pytest.mark.parametrize("name", sorted(R33A_READ))
+def test_r33a_a_read_fee_is_the_fee_and_not_unreadable(tmp_path, name):
+    fields, fee = R33A_READ[name]
+    out = _r33a_status(tmp_path, fields)
+    assert out["fee"] == pytest.approx(fee) and out["fee_unreadable"] is False
+
+
+def test_r33a_the_key_is_a_plain_bool_and_carries_no_venue_text(tmp_path):
+    plant = SECRET + "-in-a-fee"
+    for fields in ({"commission": plant}, {"fees": [{"type": plant, "actual_value": plant}]}, {"commission": {"actual_commission": plant}}):
+        out = _r33a_status(tmp_path, fields)
+        assert type(out["fee_unreadable"]) is bool and out["fee_unreadable"] is True
+        assert SECRET not in json.dumps(out, default=str)
+    assert set(_r33a_status(tmp_path, {})) == {"state", "filled_units", "avg_price", "fee", "venue_order_id", "raw_status",
+                                               "fee_unreadable"}
+
+
+@pytest.mark.parametrize("name", sorted(R33A_NONE) + sorted(R33A_UNREAD) + sorted(R33A_READ))
+def test_r33a_the_event_answer_is_left_as_it_was_and_carries_no_such_key(tmp_path, name, base_r33a_webull):
+    """The EVENT path (_event_fee) is not changed: the answer has no fee_unreadable, and every key equals the code before."""
+    fields = R33A_READ[name][0] if name in R33A_READ else {**R33A_NONE, **R33A_UNREAD}[name]
+    cid = wb.client_order_id("e")
+    answers = []
+    for mod in (wb, base_r33a_webull):
+        row = _event_detail(cid, status="FILLED", filled_quantity="1", filled_price="0.5", **fields)
+        client = FakeClient(account_class="EVENTS_CASH", details={cid: row})
+        v = mod.WebullVenue(KEY, SECRET, client=client, account_class="EVENTS_CASH", confirmation_file=tmp_path / f"{mod.__name__}.json")
+        answers.append(v.order_status("e", expected="KXTEST:yes", expected_side="BUY"))
+    assert "fee_unreadable" not in answers[0] and answers[0] == answers[1]
+
+
+R33A_BASE = "e2a7153"                                                       # main before R33a
+
+
+@pytest.fixture(scope="module")
+def base_r33a_webull(tmp_path_factory):
+    import importlib.util
+    import subprocess
+    root = Path(__file__).resolve().parents[2]
+    src = subprocess.run(["git", "-C", str(root), "show", f"{R33A_BASE}:valedia_trader/venues/webull.py"],
+                         capture_output=True, check=True).stdout
+    path = tmp_path_factory.mktemp("base_r33a") / "webull_r33a_base.py"
+    path.write_bytes(src)
+    spec = importlib.util.spec_from_file_location("webull_r33a_base", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["webull_r33a_base"] = mod
+    spec.loader.exec_module(mod)
+    assert not hasattr(mod, "_fee_and_unread")
+    return mod
+
+
+def _r33a_random_fee_fields(rng):
+    """A random commission and fees shape: absent, None, odd types, objects with and without their value, values that
+    read and values that do not."""
+    values = ["0.03", "0", "-0.01", 0.5, 1, "", "x", None, True, "nan", "inf", 1e308, HUGE, [], {}]
+    out = {}
+    pick = rng.random()
+    if pick < 0.7:
+        c = rng.choice(["absent", "none", "obj", "obj_empty", "obj_other", "odd"])
+        if c == "none":
+            out["commission"] = None
+        elif c == "obj":
+            out["commission"] = {"actual_commission": rng.choice(values)}
+        elif c == "obj_empty":
+            out["commission"] = {}
+        elif c == "obj_other":
+            out["commission"] = {"receivable_commission": rng.choice(values)}
+        elif c == "odd":
+            out["commission"] = rng.choice(["0.5", 0, [], ["x"], True])
+    f = rng.choice(["absent", "none", "empty", "list", "list", "list", "odd", "mixed"])
+    if f == "none":
+        out["fees"] = None
+    elif f == "empty":
+        out["fees"] = []
+    elif f == "list":
+        out["fees"] = [({"actual_value": rng.choice(values)} if rng.random() < 0.85 else {"type": "CAT"})
+                       for _ in range(rng.randint(1, 3))]
+    elif f == "odd":
+        out["fees"] = rng.choice([{"actual_value": "0.1"}, "0.1", 0, True])
+    elif f == "mixed":
+        out["fees"] = [{"actual_value": "0.1"}, rng.choice(["0.2", None, 3, []])]
+    return out
+
+
+def test_r33a_old_against_new_the_answer_is_the_old_one_plus_the_key(tmp_path, base_r33a_webull):
+    """400 seeded fee shapes on a stock order: the answer equals the code before apart from fee_unreadable; where the key is
+    True the old fee was None too (so no fee the old code gave is lost)."""
+    rng = _random.Random(3301)
+    seen = {True: 0, False: 0}
+    for i in range(400):
+        fields = _r33a_random_fee_fields(rng)
+        item = order(rng.choice(["FILLED", "PARTIAL_FILLED", "SUBMITTED"]), filled_quantity="1", filled_price="100", **fields)
+        new = status_venue(tmp_path, detail(item))[0].order_status("t")
+        client = FakeClient(details={wb.client_order_id("t"): detail(item)})
+        old = base_r33a_webull.WebullVenue(KEY, SECRET, environment="sandbox", client=client, confirmation_file=CONF(tmp_path)).order_status("t")
+        unread = new.pop("fee_unreadable")
+        assert new == old, (i, fields)
+        seen[unread] += 1
+        if unread:
+            assert old["fee"] is None, (i, fields)
+    assert seen[True] > 50 and seen[False] > 50, seen
