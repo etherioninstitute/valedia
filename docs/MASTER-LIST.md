@@ -50,10 +50,13 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   `f40bc41`), written before any trade was analysed (none has been): measured, those rows are the ORACLE'S OWN
   record (a price, a status, a last update time; present from 2022 to 2026, not only old ones), checked on 14
   known markets (the 2024 election and the 2025 Super Bowl among them): status `resolved` with a price of 1, 0
-  or one half is a known resolution at its last update time; anything else is not. **NOW** T47f (builder at
-  work since 13:36): the reader reads both shapes, the stored rows are read again with no new request, the
-  plan is made again; then the lead runs phase 2 for the new price windows and the first stage ONCE more,
-  stated beside the first run. The sealed months stay unopened unless that passes. The same reading feeds the
+  or one half is a known resolution at its last update time; anything else is not. **NOW** T47f BUILT
+  (14:16 PST, candidate `e79f61a`: the reader reads both shapes; `reread-resolutions` reads the stored rows
+  again with no request; phase 2 makes the plan again and keeps the price windows already read; the first
+  and the sealed stage refuse a store not yet read again) and WITH ITS BLIND CHECKER, whose main task is to
+  show the analysis gives the same answer whichever shape a market's result came in. After it: merge, the
+  re-reading of the real store, phase 2 for the new price windows (a long pull, under the guard) and the
+  first stage ONCE more, stated beside the first run. The sealed months stay unopened unless that passes. The same reading feeds the
   consistency screen of the owner's method below. Roadmap 1.26. **QUEUED** T47d items 8 to 12 (among
   them: a reader of the store must not end the pull; the pull's start must not read the store at full speed
   beside the collector).
@@ -71,8 +74,11 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   day 05:20 local, one pass of about 20 seconds, `com.valedia.leaders.daily`, log
   `~/Library/Logs/valedia-leaders-daily.log`; skipped unless the six project files a pass loads equal the
   revision in `valedia-deploy/accepted-leaders-commit`. Pass 2 (the job's script by hand, 13:55): in 17
-  hours 56 new positions, 53 grown, 33 shrunk, 52 gone. **WATCH** the first scheduled run on 19 Nov; after
-  T47f merges (it changes two of the six files) the lead re-tests and moves that gate, or the job skips.
+  hours 56 new positions, 53 grown, 33 shrunk, 52 gone. T52c (the record can be fixed from a FILE of
+  wallets into a store of its own, with no request: the door for the forward test's screened set) MERGED
+  2026-11-18 15:30 PST (main `0cac9ab`, one blind check, 147 tests on main; the job's gate moved to it).
+  **WATCH** the first scheduled run on 19 Nov; after T47f merges (it changes two of the six files) the lead
+  re-tests and moves that gate, or the job skips.
 - **NEXT** THE OWNER'S COPY-TRADING METHOD (his video, 2026-11-18; analysis in `~/Downloads/Copytrade_analysis.md`):
   from Polymarket's board pick CONSISTENT, low-volatility leaders (not the top by profit), check their closed
   positions for wins, copy what they hold NOW, place it on Webull, repeat daily. What exists: the boards, 189
@@ -94,13 +100,25 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   more than one of them have leaders on opposite sides. Kalshi's ask was at or below the leader's own entry
   for 37 of 91. Three of the ten fixed leaders are the multi-million-trade machines. Cost on Webull: 0.02 a
   contract a trade, so a copy held to the result needs a chance above its ask plus 0.02. One day's prices:
-  not evidence of profit or loss. **NEXT**, in this order: (1) the lead's locked forward document (the
-  screen's parameters fixed before it runs; the copy, the price, the close, the bar); (2) Webull's listing
-  of the 27 unverified series by the project's own probe; (3) a reader for Polymarket's rule texts and the
-  lead's rule map, family by family; (4) the screen over the 189 wallets' histories once T47 is closed;
-  (5) the record pointed at the wallets it picks; (6) the paper copier with a slow Kalshi reader.
+  not evidence of profit or loss. **DONE 2026-11-18 14:06 PST** THE FORWARD TEST IS LOCKED
+  (`docs/research/2026-11-18-forward-copy-on-webull-prediction.md`, main `58754c7`, written before any
+  wallet's results were read): up to 20 wallets picked ONCE by a fixed screen over the 189 histories
+  (consistent months, machines out, wins above the prices paid); a copy only where the position has a
+  SAME-rule Kalshi market in a series Webull lists as tradable and the picked wallets do not sit on both
+  sides; one contract on paper at Kalshi's ask; closed at settlement or when the wallet leaves; 0.02 a
+  contract a trade; ONE read at 200 closed copies from 100 events, no result computed before; ended as "not
+  testable at this scale" after 120 days. **DONE** the rule map's first four series (both venues' rule
+  texts read: `forward-copy-rule-map.md`): NBA game winner, NBA spread, Premier League champion, 2028
+  Democratic nomination. **DONE 15:26 PST** Webull's listing probed (`forward-copy-listing-table.md`, main
+  `e312446`): NBA spreads 396 of 396 tradable, Premier League 20 of 20, also the NBA champion, the Super
+  Bowl and two yearly crypto series; the nomination series is listed but NOT tradable (no copy); so three
+  series can be copied today: NBA winners, NBA spreads, the Premier League champion. **DONE** the record's
+  door for a chosen list of wallets (T52c). **NOW** T54a the paper copier (the matcher and its book, a slow
+  Kalshi reader; builder at work since 14:14). **NEXT** the screen's program (after T47f merges), then the
+  screen ONCE (when T47 is closed, else from 24 Nov on data to June), the record pointed at its set, the
+  copier beside each pass, more series read into the rule map (the other sports first).
   **OWNER** whether the leaders' pass runs more often than once a day (game positions resolve within the
-  day; a change to his job's schedule is his to allow).
+  day; a change to his job's schedule is his to allow; asked 2026-11-18 14:15 PST).
 - **WATCH** the order-book collector (roadmap 1.16). 2026-11-18, the last development day: 33 decisions lost,
   3 at 03:14 (the pull's start read its 70 GB store on the collector's SSD) and 30 from 07:20 to 07:33 (the
   LEAD's own copy of that store off the SSD at 100 MB/s made the collector overrun whole minutes). What is
@@ -171,10 +189,16 @@ trading (his word, 2026-11-17).
    (main `599ae5b`; two blind checks; sixteen test files, 3,934 tests, pass on main; the order-path gate
    moved to it at 13:54): a purchase's fee the venue leaves empty is bounded by Webull's published rate
    while the order can still be rechecked and taken as none after, so the book can be valued after its
-   first purchase. **NOW** S4b (builder at work since 13:43): the owner's command takes its marks from the
-   quote path (never typed), shows a preview with a code and writes only on a confirm, and can repair an
-   entry whose journal line failed. **NEXT** S4c practice shared mode (first: the adapter must say when a
-   fee could not be read), S4d live, S4e alerts and the owner's page. What the record
+   first purchase. **NOW** S4b BUILT (the owner's command takes its marks from the quote path, never typed,
+   shows a preview with a code and writes only on a confirm, and can repair an entry whose journal line
+   failed) and FAILED ITS BLIND CHECK ON ONE POINT (15:22 PST): a fill arriving between the confirm's read
+   and its lock was left out of the valuation; everything else passed; the repair (judged again under the
+   lock) is with the builder. **NOW** R33a BUILT (the adapter says when a fee could not be read; the ledger
+   keeps it as a notice that blocks nothing) and FAILED ITS CHECK ON ONE POINT: an older test in a file the
+   lead had fenced off needs to learn the new field; with the builder. Both merge together, then ONE run
+   of the sixteen files on main and the gate, before the 06:55 practice run. **NEXT** S4c practice shared
+   mode (first: read a real practice run for the new notice: an ordinary purchase must not open one), S4d
+   live, S4e alerts and the owner's page. What the record
    catches is written in `docs/WEBULL.md`: a change to the state file OR to the journal is found; both
    rewritten to match are not. FOR S4, found on the way: Webull reports no fee on a purchase (the book then
    calls the fee unknown: a rule is needed); the marks of an entry must come from the order step's quote
@@ -477,6 +501,9 @@ run beside MiroFish and Elephant-1):
 - Not measured by the trial: a 27B loaded and IDLE beside the collector (no decision fell in those 43
   seconds); the two decisions made while it was loading were normal.
 
+- **OWNER** 2026-11-18 about 15:26 PST: this Mac's Tailscale name stopped resolving (Tailscale off, or its
+  name service down). Seen through git (it took the commit author from that name; commits now pass the same
+  author by hand, no setting changed). Hermes' Honcho and the phone's access to Hermes use Tailscale.
 - **WATCH** Telegram is on and has dropped its connection before; Signal is parked (possible relink about
   11 Dec; its job is not installed).
 - **QUEUED** the Live page (its session's summary of 2026-11-17, the owner calling that work done): a model
@@ -555,6 +582,10 @@ run beside MiroFish and Elephant-1):
 - 2026-11-18 T51c S4a the fee rule: merged (main `599ae5b`); the order-path gate moved.
 - 2026-11-18 T52b the leaders' record repaired: merged (main `ad07778`); the daily job installed (05:20).
 - 2026-11-18 the copying-leaders test's fifth amendment (the oracle's own resolution rows): main `f40bc41`.
+- 2026-11-18 T53 the owner's copy method on Webull, studied for one day: as shown it carries little over.
+- 2026-11-18 the forward paper test of that method: locked (main `58754c7`); rule map and listing table begun.
+- 2026-11-18 T52c the leaders' record from a list of wallets: merged (main `0cac9ab`).
+- 2026-11-18 the test gate passes a test's error output through (it had been dropping it).
 - 2026-11-17 TMF6 the MiroFish operator: merged (never run for real); TMF7 the acknowledged-revisions list
   (the owner's "Yes, accept them" for 22 files).
 - 2026-11-17 T45-1 event settlement by two witnesses: merged.
