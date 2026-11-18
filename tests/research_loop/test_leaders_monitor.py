@@ -166,7 +166,7 @@ def test_pass_and_report_refuse_in_words_before_fix_leaders(store):
         code, out = run(cmd, world, wall, store)
         assert code == lm.REFUSED and "fix-leaders" in out
     assert world.urls == []
-    assert db(store).execute("SELECT count(*) FROM wallet_reads").fetchone()[0] == 0
+    assert not store.parent.exists()                         # T52b addendum 3: nothing is made where no store is
 
 
 def test_fix_leaders_stores_both_all_time_pnl_boards_once(store):
@@ -1543,3 +1543,87 @@ def test_a_pass_whose_only_not_good_reads_are_page_limits_is_done_and_counts_the
     reads = db(store).execute("SELECT good, reason FROM wallet_reads WHERE wallet_key=? ORDER BY read_id",
                               (wallet(4),)).fetchall()
     assert [tuple(r) for r in reads] == [(0, "page_limit")] * 3      # what a pass records for it is unchanged
+
+
+
+# ------------------------------------------------------------------ T52b addendum 3 (after V208)
+def _listing(root):
+    return sorted((str(p.relative_to(root)), p.is_dir(), p.stat().st_size if p.is_file() else 0)
+                  for p in root.rglob("*"))
+
+
+def test_a_store_whose_user_version_is_not_this_versions_is_refused_in_words(store):
+    world, wall = fixed(store)
+    run(["pass"], world, wall, store)
+    c = sqlite3.connect(str(store))
+    assert c.execute("PRAGMA user_version").fetchone()[0] == lm.USER_VERSION == 0
+    c.execute("PRAGMA user_version = 3")
+    c.commit()
+    c.close()
+    before, files, n = store.read_bytes(), sorted(os.listdir(store.parent)), len(world.urls)
+    for cmd in (["pass"], ["report"], ["fix-leaders"]):
+        code, out = run(cmd, world, wall, store)
+        assert code == lm.OTHER_SHAPE and "another version of the record" in out and "user_version" in out, (cmd, out)
+        assert len(out.strip().splitlines()) == 1 and len(world.urls) == n
+        assert store.read_bytes() == before and sorted(os.listdir(store.parent)) == files
+
+
+def test_a_new_store_gets_this_versions_user_version_when_it_is_made(store, monkeypatch):
+    monkeypatch.setattr(lm, "USER_VERSION", 7)               # as a later version that raised it would
+    world, wall = fixed(store)
+    assert sqlite3.connect(str(store)).execute("PRAGMA user_version").fetchone()[0] == 7
+    assert run(["pass"], world, wall, store)[0] == lm.OK     # and its own stores are accepted
+
+
+def test_a_pass_waits_busy_seconds_for_a_write_lock_held_in_the_same_process_then_ends_busy(store, monkeypatch):
+    world, wall = fixed(store)
+    run(["pass"], world, wall, store)
+    wall.t += 300
+    monkeypatch.setattr(lm, "BUSY_SECONDS", 1.5)
+    monkeypatch.setattr(lm, "WAIT_SECONDS", 0.3)
+    n = len(world.urls)
+    w = sqlite3.connect(str(store), isolation_level=None)    # a second connection in this same process
+    try:
+        w.execute("BEGIN IMMEDIATE")                         # SQLite's write lock; the lock file is free
+        t = time.monotonic()
+        code, out = run(["pass"], world, wall, store)
+        took = time.monotonic() - t
+    finally:
+        w.execute("ROLLBACK")
+        w.close()
+    assert code == lm.BUSY and out.startswith("BUSY ") and "a pass is writing; try again" in out, out
+    assert "another version" not in out and "not readable" not in out and len(out.strip().splitlines()) == 1
+    assert 1.4 < took < 6.0, took                             # its own wait, BUSY_SECONDS, not WAIT_SECONDS
+    assert len(world.urls) == n
+    busy = [l for l in lm.__doc__.splitlines() if l.strip().startswith("BUSY ")][0]
+    assert "BUSY_SECONDS" in busy and "WAIT_SECONDS" in busy, busy     # the doc says what a pass waits for
+
+
+@pytest.mark.parametrize("where", ["no folder", "an empty folder", "an empty file", "a database with no objects"])
+def test_pass_and_report_create_nothing_where_no_store_is(tmp_path, where):
+    root = tmp_path / "root"
+    root.mkdir()
+    s = root / "lm" / "leaders.sqlite"
+    if where != "no folder":
+        s.parent.mkdir()
+    if where == "an empty file":
+        s.write_bytes(b"")
+    if where == "a database with no objects":
+        c = sqlite3.connect(str(s))
+        c.execute("CREATE TABLE x (a)")
+        c.execute("DROP TABLE x")
+        c.commit()
+        c.close()
+    before = _listing(root)
+    world = World()
+    for cmd in (["pass"], ["report"]):
+        code, out = run(cmd, world, Wall(), s)
+        assert code == lm.REFUSED and "no leaders are fixed here: run fix-leaders first" in out, (cmd, out)
+        assert len(out.strip().splitlines()) == 1 and world.urls == []
+        assert _listing(root) == before, (cmd, where)
+    assert run(["fix-leaders"], World(), Wall(), s)[0] == lm.OK                    # only fix-leaders makes a store
+
+
+def test_the_doc_text_says_report_answers_the_lock_code_while_a_pass_holds_the_lock():
+    locked = [l for l in lm.__doc__.splitlines() if l.strip().startswith("LOCKED ")][0]
+    assert "report" in locked and "a pass is writing; try again" in locked, locked
