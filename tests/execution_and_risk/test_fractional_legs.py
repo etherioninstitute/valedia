@@ -26,6 +26,13 @@ FUNDS = ("SPY", "QQQ", "IWM", "TLT")
 NEW_FIELDS = ("order_type", "leg", "collar_price", "residuals")
 
 
+@pytest.fixture(autouse=True)
+def _t51_no_real_second_source(monkeypatch):
+    """T51 ruling C: no test here loads the real second price source; a run that would fails its test."""
+    monkeypatch.setattr(osx, "_load_second_source", lambda: pytest.fail("the real second price source would be loaded"),
+                        raising=False)
+
+
 class LegVenue(Booked):
     """Booked, keeping every submit's own arguments; with an rng it accepts, refuses or rejects at random."""
 
@@ -215,9 +222,10 @@ def test_two_legs_of_one_fund_carry_two_tags_and_the_journal_keys_order_and_fill
     assert (fills[f"{b}-SPY"]["order_type"], fills[f"{b}-SPY"]["leg"]) == ("LIMIT", "whole")
     assert (fills[f"{b}-SPY.r"]["order_type"], fills[f"{b}-SPY.r"]["leg"]) == ("MARKET", "remainder")
     assert list(fills[f"{b}-SPY.r"])[-1] == "verdict"                 # the verdict stays the line's last field
-    # A2's seam (A3 judges a MARKET fill against its collar): today's rules leave an order with no limit unjudged
-    assert fills[f"{b}-SPY.r"]["verdict"] == "unjudged" and fills[f"{b}-SPY"]["verdict"] == "ok"
-    assert out["cap_unjudged"] == ["SPY"] and "faults" not in out
+    # T51 A3 (R6, addendum 4 point c): a MARKET fill is judged against its collar price, 505.00: at 500.00 it is ok
+    assert (fills[f"{b}-SPY.r"]["verdict"], fills[f"{b}-SPY.r"]["judged_avg"]) == ("ok", 500.0)
+    assert fills[f"{b}-SPY"]["verdict"] == "ok"
+    assert "cap_unjudged" not in out and "faults" not in out
     assert w.book() == {"SPY": 2.5}
 
 

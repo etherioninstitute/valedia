@@ -18,6 +18,15 @@ from valedia_trader.research_loop.paper import Journal
 from valedia_trader.venues.webull import NotTransmitted, OrderRejected
 
 CAL = exchange_calendars.get_calendar("XNYS")
+
+
+@pytest.fixture(autouse=True)
+def _t51_no_real_second_source(monkeypatch):
+    """T51 ruling C: no test here loads the real second price source; a run that would fails its test."""
+    monkeypatch.setattr(osx, "_load_second_source", lambda: pytest.fail("the real second price source would be loaded"),
+                        raising=False)
+
+
 GENEROUS = {"max_daily_loss_pct": 99.0, "max_drawdown_pct": 99.0, "max_position_pct": 1.0, "max_open_positions": 50}
 
 
@@ -166,6 +175,7 @@ class World:
         self.latch = tmp / "kill_switch.json"
         self.halt = None
         self.paper = paper({})
+        self.second = Second()                       # T51 ruling C: the second source a fractional run asks (agrees)
 
     def quotes(self, symbols):
         self.quote_calls.append(list(symbols))
@@ -185,6 +195,8 @@ class World:
         if isinstance(book, osx.PaperTargets) and getattr(book, "day", None) == AUTO:
             prev = CAL.sessions[CAL.sessions.searchsorted(ny_day(self.clock.t)) - 1] if math.isfinite(self.clock.t) else None
             book = dataclasses.replace(book, day=None if prev is None else str(prev.date()))
+        if kw.get("fractional") and kw.get("live") is None:   # T51 ruling C: never the real second source in a test
+            kw.setdefault("second_opinion", self.second)
         try:
             return osx.run_order_step(ledger=led, venue=self.venue, paper=book, quotes=self.quotes, journal=self.journal,
                                       limits_file=self.limits, state=self.state_path, clock=self.clock, calendar=CAL,
