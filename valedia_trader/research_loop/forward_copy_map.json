@@ -1,0 +1,160 @@
+{
+ "about": "The forward copy test's rule map and listing table as data (T54a). Mirrors docs/research/forward-copy-rule-map.md and docs/research/forward-copy-listing-table.md, which are the rule: a test fails when this file and those two disagree on a series, its class or its listing. Templates are the texts read 2026-11-18 (the saved public answers), whitespace collapsed, with slots {name:kind} for names, numbers and dates; a slot written {name} again must hold the same words. A name not in a table here is never guessed.",
+ "map_dated": "2026-11-18",
+ "series": {
+  "KXNBAGAME": {
+   "class": "SAME",
+   "polymarket_market": "an NBA game's winner (\"Jazz vs. Clippers\", outcomes the two teams)",
+   "recognise": {
+    "event_slug": "^nba-(?P<a>[a-z]+)-(?P<b>[a-z]+)-(?P<date>\\d{4}-\\d{2}-\\d{2})$",
+    "title": "^(?P<a>[^:]+) vs\\. (?P<b>[^:]+)$",
+    "outcome": "one of the title's two teams"
+   },
+   "names": "nba",
+   "kalshi": {
+    "event": "KXNBAGAME-{yymmmdd}{code_a}{code_b} (either order of the two codes)",
+    "market": "{event}-{code_held}, yes_sub_title the held team's Kalshi words",
+    "side": "yes"
+   },
+   "templates": {
+    "polymarket": "In the upcoming NBA game between {t1:name} and {t2:name}, originally scheduled for {wday:wday}, {month:month} {day:day}, {year:year} at {time:time} ET (as of creation of the first market related to the event): If the {w1:name} win, the market will resolve to \"{w1}\". If the {w2:name} win, the market will resolve to \"{w2}\". If this market's outcome was definitively determined under its rules by the listed resolution sources before abandonment, that outcome will stand. Otherwise, the following no-result provisions apply. If the game is canceled, does not start by {wday2:wday}, {month2:month} {day2:day}, {year2:year}, 11:59 PM ET, or is abandoned with no official result by that time, this market will resolve 50-50. The result will be determined based on the final score including any overtime periods.",
+    "kalshi_primary": "If {team:words} wins the {k1:words} vs {k2:words} Pro Basketball game originally scheduled for {kmon:mon} {kday:day}, {kyear:year}, then the market resolves to Yes.",
+    "kalshi_secondary": "If the game is postponed but begins within 48 hours of its originally scheduled start time, the market will remain open and resolve based on the official final result. If the game is cancelled or not started within 48 hours of its originally scheduled start, all markets will resolve to a fair price. Kalshi is not affiliated, associated, authorized, endorsed by, or in any way officially connected with the Governing League. All trademarks, logos, and brand names are the property of their respective owners."
+   },
+   "map_words": ["The result will be determined based on the final score including any overtime periods", "If the game is postponed but begins within 48 hours of its originally scheduled start time, the market will remain open and resolve based on the official final result. If the game is cancelled or not started within 48 hours of its originally scheduled start, all markets will resolve to a fair price."]
+  },
+  "KXNBASPREAD": {
+   "class": "SAME",
+   "half_point_lines_only": true,
+   "polymarket_market": "an NBA game's spread (\"Spread: Lakers (-7.5)\", outcomes the two teams)",
+   "recognise": {
+    "event_slug": "^nba-(?P<a>[a-z]+)-(?P<b>[a-z]+)-(?P<date>\\d{4}-\\d{2}-\\d{2})$",
+    "title": "^Spread: (?P<fav>[^:()]+) \\(-(?P<line>\\d+(?:\\.\\d+)?)\\)$",
+    "outcome": "the favourite named in the title, or the other team of the slug"
+   },
+   "names": "nba",
+   "kalshi": {
+    "event": "KXNBASPREAD-{yymmmdd}{code_a}{code_b} (either order of the two codes)",
+    "market": "{event}-{code_fav}{line rounded up}, floor_strike the line, yes_sub_title \"{favourite's Kalshi words} wins by over {line} points\"",
+    "side": "yes for the favourite's outcome, no for the other"
+   },
+   "templates": {
+    "polymarket": "In the upcoming NBA game between {t1:name} and {t2:name}, originally scheduled for {wday:wday}, {month:month} {day:day}, {year:year} at {time:time} ET (as of creation of the first market related to the event): This market will resolve to \"{fav:name}\" if the {fav} win the game by {points:int} or more points. Otherwise, this market will resolve to \"{dog:name}\". If the game ends in a tie, this market will resolve to \"{dog}\". If this market's outcome was definitively determined under its rules by the listed resolution sources before abandonment, that outcome will stand. Otherwise, the following no-result provisions apply. If the game is canceled, does not start by {wday2:wday}, {month2:month} {day2:day}, {year2:year}, 11:59 PM ET, or is abandoned with no official result by that time, this market will resolve 50-50.",
+    "kalshi_primary": "If {team:words} wins by more than {kline:line} points in the {k1:words} vs {k2:words} Pro Basketball game originally scheduled for {kmon:mon} {kday:day}, {kyear:year}, then the market resolves to Yes.",
+    "kalshi_secondary": "If the game is postponed but begins within 48 hours of its originally scheduled start time, the market will remain open and resolve based on the official final result. If the game is cancelled or not started within 48 hours of its originally scheduled start, all markets will resolve to a fair price. Kalshi is not affiliated, associated, authorized, endorsed by, or in any way officially connected with the Governing League. All trademarks, logos, and brand names are the property of their respective owners."
+   },
+   "map_words": ["For a line ending in one half the two are the same event. A whole-number line is NOT in this entry."]
+  },
+  "KXPREMIERLEAGUE": {
+   "class": "SAME",
+   "polymarket_market": "\"Will X win the 2026-27 English Premier League Championship?\"",
+   "recognise": {
+    "event_slug": "^epl-2027-champion-\\d+$",
+    "title": "^Will (?P<club>.+) win the 2026-27 English Premier League \\(EPL\\) Championship\\?$",
+    "outcome": "Yes or No"
+   },
+   "names": "epl",
+   "kalshi": {
+    "event": "KXPREMIERLEAGUE-27",
+    "market": "{event}-{code_club}, yes_sub_title the club's Kalshi words",
+    "side": "Yes = yes, No = no"
+   },
+   "templates": {
+    "polymarket": "This market will resolve according to the team that wins the 2026-27 English Premier League (EPL) Championship. If at any point it becomes impossible for a listed team to win the 2026-27 English Premier League (EPL) Championship per the rules of English Premier League (EPL) (e.g., they are eliminated in the playoffs), the corresponding market will resolve to \"No\". If the 2026-27 English Premier League (EPL) season is cancelled, postponed after June 14, 2027, 11:59 PM ET or there is otherwise no winner declared within that timeframe, this market will resolve to \"Other\". The primary resolution source will be official information from English Premier League (EPL); however, a consensus of credible reporting may also be used.",
+    "kalshi_primary": "If {team:words} is the 2026-27 English Premier League champion, then the market resolves to Yes.",
+    "kalshi_secondary": "Kalshi is not affiliated, associated, authorized, endorsed by, or in any way officially connected with the Governing League. All trademarks, logos, and brand names are the property of their respective owners."
+   },
+   "map_words": ["is the 2026-27 English Premier League champion, then the market resolves to Yes"]
+  },
+  "KXPRESNOMD": {
+   "class": "SAME",
+   "polymarket_market": "\"Will X win the 2028 Democratic presidential nomination?\"",
+   "recognise": {
+    "event_slug": "^democratic-presidential-nominee-2028$",
+    "title": "^Will (?P<person>.+) win the 2028 Democratic presidential nomination\\?$",
+    "outcome": "Yes or No"
+   },
+   "names": "dem_nominee_2028",
+   "kalshi": {
+    "event": "KXPRESNOMD-28",
+    "market": "{event}-{code_person}, yes_sub_title the person's Kalshi words",
+    "side": "Yes = yes, No = no"
+   },
+   "templates": {
+    "polymarket": "This market will resolve to “Yes” if the named individual wins and accepts the 2028 nomination of the Democratic Party for U.S. president. Otherwise, this market will resolve to “No”. The resolution source for this market will be a consensus of official Democratic Party sources. Any replacement of the democratic nominee before election day will not change the resolution of the market.",
+    "kalshi_primary": "If {team:words} wins and accepts the nomination for the Presidency for the Democratic party in 2028, then the market resolves to Yes.",
+    "kalshi_secondary": ""
+   },
+   "map_words": ["wins and accepts the nomination"]
+  }
+ },
+ "listing_table": [
+  {"series": "KXNBAGAME", "seen": "2026-11-13", "how": "probe, test environment"},
+  {"series": "KXNFLGAME", "seen": "2026-11-13", "how": "probe, test environment"},
+  {"series": "KXNHLGAME", "seen": "2026-11-13", "how": "probe, test environment"},
+  {"series": "KXNCAAFGAME", "seen": "2026-11-13", "how": "probe, test environment"},
+  {"series": "KXNCAAMBGAME", "seen": "2026-11-13", "how": "probe, test environment"}
+ ],
+ "near_families": [
+  {"family": "crypto price level by a date", "map_words": "Crypto price levels \"by a date\"",
+   "title": "^Will (?:Bitcoin|Ethereum|Solana|XRP|Dogecoin|Hyperliquid|BNB) (?:reach|dip to|hit) \\$[0-9][0-9,.]*k? (?:by|in|before) .+\\?$|^Will (?:Bitcoin|Ethereum|Solana|XRP|Dogecoin|Hyperliquid|BNB) (?:reach|dip to|hit) \\$[0-9][0-9,.]*k? (?:January|February|March|April|May|June|July|August|September|October|November|December) \\d{1,2}-\\d{1,2}\\?$"},
+  {"family": "crypto price on a date", "map_words": "Crypto price \"on a date\"",
+   "title": "^Will the price of (?:Bitcoin|Ethereum|Solana|XRP|Dogecoin|Hyperliquid|BNB) be above \\$[0-9][0-9,.]* on .+\\?$"}
+ ],
+ "names": {
+  "nba": [
+   {"polymarket": "76ers", "slug": "phi", "kalshi_code": "PHI", "kalshi_words": "Philadelphia"},
+   {"polymarket": "Bucks", "slug": "mil", "kalshi_code": "MIL", "kalshi_words": "Milwaukee"},
+   {"polymarket": "Bulls", "slug": "chi", "kalshi_code": "CHI", "kalshi_words": "Chicago"},
+   {"polymarket": "Cavaliers", "slug": "cle", "kalshi_code": "CLE", "kalshi_words": "Cleveland"},
+   {"polymarket": "Celtics", "slug": "bos", "kalshi_code": "BOS", "kalshi_words": "Boston"},
+   {"polymarket": "Clippers", "slug": "lac", "kalshi_code": "LAC", "kalshi_words": "Los Angeles C"},
+   {"polymarket": "Grizzlies", "slug": "mem", "kalshi_code": "MEM", "kalshi_words": "Memphis"},
+   {"polymarket": "Hawks", "slug": "atl", "kalshi_code": "ATL", "kalshi_words": "Atlanta"},
+   {"polymarket": "Heat", "slug": "mia", "kalshi_code": "MIA", "kalshi_words": "Miami"},
+   {"polymarket": "Hornets", "slug": "cha", "kalshi_code": "CHA", "kalshi_words": "Charlotte"},
+   {"polymarket": "Jazz", "slug": "uta", "kalshi_code": "UTA", "kalshi_words": "Utah"},
+   {"polymarket": "Kings", "slug": "sac", "kalshi_code": "SAC", "kalshi_words": "Sacramento"},
+   {"polymarket": "Knicks", "slug": "nyk", "kalshi_code": "NYK", "kalshi_words": "New York"},
+   {"polymarket": "Lakers", "slug": "lal", "kalshi_code": "LAL", "kalshi_words": "Los Angeles L"},
+   {"polymarket": "Magic", "slug": "orl", "kalshi_code": "ORL", "kalshi_words": "Orlando"},
+   {"polymarket": "Mavericks", "slug": "dal", "kalshi_code": "DAL", "kalshi_words": "Dallas"},
+   {"polymarket": "Nets", "slug": "bkn", "kalshi_code": "BKN", "kalshi_words": "Brooklyn"},
+   {"polymarket": "Nuggets", "slug": "den", "kalshi_code": "DEN", "kalshi_words": "Denver"},
+   {"polymarket": "Pacers", "slug": "ind", "kalshi_code": "IND", "kalshi_words": "Indiana"},
+   {"polymarket": "Pelicans", "slug": "nop", "kalshi_code": "NOP", "kalshi_words": "New Orleans"},
+   {"polymarket": "Pistons", "slug": "det", "kalshi_code": "DET", "kalshi_words": "Detroit"},
+   {"polymarket": "Raptors", "slug": "tor", "kalshi_code": "TOR", "kalshi_words": "Toronto"},
+   {"polymarket": "Rockets", "slug": "hou", "kalshi_code": "HOU", "kalshi_words": "Houston"},
+   {"polymarket": "Spurs", "slug": "sas", "kalshi_code": "SAS", "kalshi_words": "San Antonio"},
+   {"polymarket": "Suns", "slug": "phx", "kalshi_code": "PHX", "kalshi_words": "Phoenix"},
+   {"polymarket": "Thunder", "slug": "okc", "kalshi_code": "OKC", "kalshi_words": "Oklahoma City"},
+   {"polymarket": "Timberwolves", "slug": "min", "kalshi_code": "MIN", "kalshi_words": "Minnesota"},
+   {"polymarket": "Trail Blazers", "slug": "por", "kalshi_code": "POR", "kalshi_words": "Portland"},
+   {"polymarket": "Warriors", "slug": "gsw", "kalshi_code": "GSW", "kalshi_words": "Golden State"},
+   {"polymarket": "Wizards", "slug": "was", "kalshi_code": "WAS", "kalshi_words": "Washington"}
+  ],
+  "epl": [
+   {"polymarket": "Arsenal", "kalshi_code": "ARS", "kalshi_words": "Arsenal"},
+   {"polymarket": "Aston Villa", "kalshi_code": "AVL", "kalshi_words": "Aston Villa"},
+   {"polymarket": "Brentford", "kalshi_code": "BRE", "kalshi_words": "Brentford"},
+   {"polymarket": "Brighton", "kalshi_code": "BRI", "kalshi_words": "Brighton"},
+   {"polymarket": "Chelsea", "kalshi_code": "CFC", "kalshi_words": "Chelsea"},
+   {"polymarket": "Coventry City", "kalshi_code": "COV", "kalshi_words": "Coventry City"},
+   {"polymarket": "Everton", "kalshi_code": "EVE", "kalshi_words": "Everton"},
+   {"polymarket": "Fulham", "kalshi_code": "FUL", "kalshi_words": "Fulham"},
+   {"polymarket": "Ipswich Town", "kalshi_code": "IPS", "kalshi_words": "Ipswich Town"},
+   {"polymarket": "Liverpool", "kalshi_code": "LFC", "kalshi_words": "Liverpool"},
+   {"polymarket": "Manchester City", "kalshi_code": "MCI", "kalshi_words": "Manchester City"},
+   {"polymarket": "Manchester United", "kalshi_code": "MUN", "kalshi_words": "Manchester United"},
+   {"polymarket": "Newcastle United", "kalshi_code": "NEW", "kalshi_words": "Newcastle United"},
+   {"polymarket": "Nottingham Forest", "kalshi_code": "NFO", "kalshi_words": "Nottingham Forest"},
+   {"polymarket": "Sunderland", "kalshi_code": "SUN", "kalshi_words": "Sunderland"},
+   {"polymarket": "Tottenham", "kalshi_code": "TOT", "kalshi_words": "Tottenham"}
+  ],
+  "dem_nominee_2028": [
+   {"polymarket": "Jon Ossoff", "kalshi_code": "JOSS", "kalshi_words": "Jon Ossoff"}
+  ]
+ },
+ "names_note": "Each row joins words seen on both venues on 2026-11-18: the Polymarket name in a holding's title (and for the NBA its slug code, seen with that name in the leaders' record), the Kalshi code and words in Kalshi's open events. The Kings are seen in the record only as the outcome of spreads whose slug's other code is the favourite's (nba-orl-sac, nba-sac-lac), which joins the name to the code sac. Kalshi's other clubs (Crystal Palace, Hull City, Leeds United, Bournemouth) and every other 2028 candidate were not seen in a Polymarket title, so they are not here: such a holding is skipped and counted, never guessed."
+}

@@ -631,11 +631,14 @@ def test_close_a_settlement_and_the_venues_part(env):
     gw.markets[g3.cid] = g3.gamma(closed=False)                             # still trading at Kalshi's settlement
     wall.t = settled + H
     run_step(rec, book, kw, gw, wall)
-    got = rows(book, "SELECT kalshi_market, status, close_kind, close_price, close_ts FROM copies ORDER BY copy_id")
-    assert [r[1:] for r in got] == [("closed", "settled", 0.0, settled), ("closed", "settled", 0.0, settled),
-                                    ("closed", "settled", 1.0, settled)]
-    flags = rows(book, "SELECT copy_id, kind FROM copy_flags ORDER BY copy_id")
-    assert flags == [(2, "parted_settled_differently"), (3, "parted_pm_trading_at_settlement")]
+    got = {r[0]: r[1:] for r in rows(book, "SELECT kalshi_market, status, close_kind, close_price, close_ts "
+                                           "FROM copies")}           # copies are made in token order, so by ticker
+    t1, t2, t3 = g1.markets["Clippers"]["ticker"], g2.markets["Hornets"]["ticker"], g3.markets["Celtics"]["ticker"]
+    assert got == {t1: ("closed", "settled", 0.0, settled), t2: ("closed", "settled", 0.0, settled),
+                   t3: ("closed", "settled", 1.0, settled)}
+    flags = rows(book, "SELECT c.kalshi_market, f.kind FROM copy_flags f JOIN copies c USING (copy_id) "
+                       "ORDER BY c.kalshi_market")
+    assert sorted(flags) == sorted([(t2, "parted_settled_differently"), (t3, "parted_pm_trading_at_settlement")])
 
 
 def test_close_on_the_opening_wallets_exit_at_the_bid(env):
@@ -719,8 +722,10 @@ def test_only_step_makes_a_book_and_its_shape_is_checked(env, tmp_path):
 def test_a_copy_changes_only_to_close_and_never_after(env):
     rec, book, kw, gw, wall = env
     g = Game("Jazz", "Clippers").install(kw, gw)
-    rec.pass_({wallet(0): [g.holding(wallet(0), "Clippers")]})
+    g2 = Game("Hornets", "Lakers").install(kw, gw)
+    rec.pass_({wallet(0): [g.holding(wallet(0), "Clippers"), g2.holding(wallet(0), "Lakers", value=10.0)]})
     run_step(rec, book, kw, gw, wall)
+    assert len(rows(book, "SELECT * FROM copies")) == 1 and len(rows(book, "SELECT * FROM skips")) == 1
     con = sqlite3.connect(str(book), isolation_level=None)
     for sql in ("UPDATE copies SET ask=0.5", "UPDATE copies SET status='closed'", "DELETE FROM copies",
                 "UPDATE skips SET reason='late'", "DELETE FROM considered", "UPDATE considered SET outcome='skip'"):
@@ -961,6 +966,41 @@ def _check(book, rec, kw, gw, truth, truth_k):
     assert {(w, r, t) for w, r, t, o in considered if o == "copy"} == copy_keys
     assert {(w, r, t) for w, r, t, o in considered if o == "skip"} == skip_keys
     assert all(x in fc.SKIP_REASONS for *_k, x in skip_rows)
+    when = {(w, r, t): ts for w, r, t, ts in rows(book, "SELECT wallet_key, read_id, token_id, considered_ts FROM "
+                                                        "considered")}
+    for w, read_id, tok, reason in skip_rows:                               # every skip's one reason is true
+        _w, pass_id, read_ts = reads[read_id]
+        p = pass_id - 1
+        h = truth[p][w][tok]
+        big = h["current_value"] >= 1000
+        if reason == "value_under_1000":
+            assert not big
+            continue
+        assert big
+        if reason == "price_outside":
+            assert not 0.10 <= h["current_price"] <= 0.90
+            continue
+        assert 0.10 <= h["current_price"] <= 0.90
+        g = truth_k.get(h["condition_id"])
+        if g is None or h["title"].startswith("Spread"):
+            listed_series = h["title"].startswith(("Spread", "Will Arsenal"))
+            assert reason == ("not_listed" if listed_series else "no_same"), (reason, h["title"])
+            continue
+        team = h["outcome"]
+        m = g.markets[team]
+        other = g.tok[g.b if team == g.a else g.a]
+        n_events = sum(1 for e in kw.events.get("KXNBAGAME", []) if e["event_ticker"] == g.event_ticker)
+        no = (sorted(float(x[0]) for x in kw.books[m["ticker"]]["no_dollars"])[-1]
+              if m["ticker"] in kw.books else None)
+        truths = {
+            "leaders_disagree": any(other in truth[q][v] for q in range(p, len(truth)) for v in truth[q] if v != w),
+            "late": when[(w, read_id, tok)] - read_ts > 6 * H,
+            "no_unique_market": n_events != 1,
+            "market_not_open": m["status"] != "active",
+            "text_departs": gw.markets[g.cid]["description"] != g.pm_text,
+            "already_open": any(c[4] == m["ticker"] for c in copies),
+            "ask_outside": no is not None and not 0.05 <= round(1 - no, 6) <= 0.95}
+        assert truths.get(reason), (reason, h["title"], team)
     assert rows(book, "SELECT max(n) FROM (SELECT count(*) AS n FROM copies WHERE status='open' GROUP BY "
                       "kalshi_market, side)")[0][0] in (None, 1)
     return {(reads[r][0], reads[r][1] - 1, t) for w, r, t in keys}
