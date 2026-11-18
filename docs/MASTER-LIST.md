@@ -220,6 +220,17 @@ Items:
   NOT USED YET: no real filing has been made. The daily review (L-1) is its first intended caller.
 - **OWNER** a three-seat coding pipeline (planner, implementer, blind reviewer) built from Paperclip's own
   review and approval stages: a design in that session, with the lead's four changes; not built until he says.
+- **OWNER** FreeLLMAPI as free hosted capacity for coding workhorses (his request of 2026-11-18 00:00 PST; a
+  nested session on Opus 5.5 read the whole repository; nothing installed). Its picks, waiting for his
+  answers there: a native run inside a file-access sandbox on 127.0.0.1, NOT Docker for now (the Mac is about
+  11 GB into swap; a container VM would hold about 2 GB; Docker reconsidered after the scored test); the
+  vendor's catalog feed OFF by default (when on it sends the address, the catalog version and the licence
+  every 12 hours; never prompts or provider keys); a short list of providers whose free tiers do not keep
+  prompts; a separate Hermes root for one chat-only coding profile with no memory, tools or fallback; a
+  fail-closed filter in front of it; started by hand, no kept-alive job. He creates the accounts and enters
+  the keys himself. Build window offered: 2026-11-18 09:45 to 11:00 PST, on the lead's word at the time.
+  Whether Ollama's hosted service may be one of the providers is his to say (his "no Ollama" rule was made
+  about local models).
 - **QUEUED** L-2 lessons by idea family, and a stop on a family after N failures (roadmap 2.3).
 - **QUEUED** L-3 a check on the critic itself (roadmap 2.5).
 - **QUEUED** L-4 scores earn weight (roadmap 1.5).
