@@ -1060,15 +1060,16 @@ def test_property_every_walk_but_positions_answers_as_the_reader_at_f747911(tmp_
 
         def walks(m):
             c = m.PolymarketData(FakeTransport(handler), sleep=lambda s: None, clock=lambda: 0.0,
-                                 wall=lambda: 1_790_000_000.0)
+                                 wall=lambda: 1_790_000_000.0, now=lambda: "2026-11-17T12:00:00+00:00")
             out = []
             for call in (lambda: c.trades("0xabc"), lambda: c.prices_history("111", 1, 2),
                          lambda: c.leaderboard("all", rows=50),
                          lambda: list(c.resolution_batches(["0xc%d" % i for i in range(45)]))):
                 try:
-                    w = call()
-                    out.append(("ok", json.dumps(w if isinstance(w, list) else
-                                                 [w.rows, w.raw, sorted(w.rejects.items()), w.pages],
+                    got = call()                 # the fields a walk had at f747911 (its repr gained `unread`)
+                    ws = [(x[1], x[0], x[2]) for x in got] if isinstance(got, list) else [(got, None, None)]
+                    out.append(("ok", json.dumps([[w.rows, w.raw, sorted(w.rejects.items()), w.pages, w.read_at,
+                                                   batch, answers] for w, batch, answers in ws],
                                                  sort_keys=True, default=repr)))
                 except Exception as e:
                     out.append(("raise", type(e).__name__))
