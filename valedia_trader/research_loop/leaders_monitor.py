@@ -18,20 +18,26 @@ nothing here repeats itself: `pass` reads once and ends; whether and how often i
   LOCKED), each leader's open positions are read one wallet at a time (at most POSITION_PAGE_CAP pages). A good
   read is compared with that wallet's last good read: a token not held then is NEW (`flip` when its opposite token
   was held), a size moved by more than SIZE_EPS is an INCREASE or a DECREASE, a token no longer held is an EXIT;
-  each change carries the read time, the previous good read's time and the gap. A wallet's first good read is a
-  baseline and creates no change. A failed read (an error after the reader's retries: `read_error`; the page cap:
-  `page_limit`; a page short of the first while more were promised: `rows_shrank`) records only the failure and
-  infers nothing. An error of any other kind while one wallet is read or written (not a memory error, not an
-  interrupt) is that wallet's failed read `internal_error`, with the error's class name only; the pass goes on and
-  ends with code INTERNAL_ERROR, its summary line counting such wallets. ONE WRITE PER WALLET: the read, its holdings, its changes, its snapshot and its rejects are one
+  each change carries the read time, the previous good read's time and the gap. A read with a rejected or
+  conflicting row (a true repeat does not count) cannot say a held token is gone: a held token missing from its
+  good rows is CARRIED (the holding as it was, marked, with the read that last saw it; the read counts them), and
+  an EXIT is written only by a clean read, with the time of the read that last saw the token (`last_seen_ts`).
+  A wallet's first good read is a baseline and creates no change. A failed read (an error after the reader's
+  retries: `read_error`; the page cap: `page_limit`; a page short of the first while more were promised:
+  `rows_shrank`) records only the failure and infers nothing. An error of any other kind while one wallet is read
+  or written (not a memory error, not an interrupt) is that wallet's failed read `internal_error`, with the
+  error's class name only; the pass goes on and ends with code INTERNAL_ERROR, its summary line counting such
+  wallets. ONE WRITE PER WALLET: the read, its holdings, its changes, its snapshot and its rejects are one
   transaction, so a kill leaves the old holding or the new one with its changes, never one without the other.
-  A full snapshot is kept at the baseline and once per UTC day. Memory is read at each wallet; above
-  --max-memory-mb the pass stops between wallets (code STOPPED_MEMORY). At the end, rows of changes, snapshots,
-  rejects, wallet_reads and passes dated more than RETENTION_DAYS before the pass are removed, DELETE_BATCH rows a
+  A full snapshot is kept at the baseline and once per UTC day, also when the wallet holds nothing (the read that
+  took it is marked with `snapshot_day`). A pass first marks every earlier pass still `running` as `died`.
+  Memory is read at each wallet; above --max-memory-mb the pass stops between wallets (code STOPPED_MEMORY). At
+  the end, rows of changes, snapshots, rejects, wallet_reads and passes dated more than RETENTION_DAYS before the pass are removed, DELETE_BATCH rows a
   statement, at most DELETE_STATEMENTS statements a pass; holdings_current, leaders and each wallet's last good
   read are never aged out.
-* `report`: counts per leader and per kind over a window, the largest and median gap between good reads, the
-  share of failed reads, and whether the store is consistent.
+* `report`: counts per leader and per kind over a window, each leader's carried holdings and the share of its good
+  reads that carried any, the largest and median gap between good reads, the share of failed reads, the passes by
+  status, and whether the store is consistent.
 
 No line printed here names a title, an outcome, a token, a market or a price, nor a wallet beyond its first ten
 characters: what a leader holds is read from the store by whoever needs it.
@@ -87,7 +93,8 @@ CREATE INDEX IF NOT EXISTS passes_ts ON passes (started_ts);
 CREATE TABLE IF NOT EXISTS wallet_reads (read_id INTEGER PRIMARY KEY AUTOINCREMENT, pass_id INTEGER,
     wallet_key TEXT NOT NULL, good INTEGER NOT NULL, reason TEXT, detail TEXT, rows INTEGER, pages INTEGER,
     rejects TEXT, unread TEXT, baseline INTEGER, prev_read_id INTEGER, prev_read_ts REAL, gap REAL,
-    n_new INTEGER, n_increase INTEGER, n_decrease INTEGER, n_exit INTEGER, carried INTEGER, snapshot_day TEXT, read_ts REAL NOT NULL);
+    n_new INTEGER, n_increase INTEGER, n_decrease INTEGER, n_exit INTEGER, carried INTEGER, snapshot_day TEXT,
+    read_ts REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS wallet_reads_snapshot ON wallet_reads (wallet_key, snapshot_day);
 CREATE INDEX IF NOT EXISTS wallet_reads_wallet ON wallet_reads (wallet_key, good, read_id);
 CREATE INDEX IF NOT EXISTS wallet_reads_ts ON wallet_reads (read_ts);
