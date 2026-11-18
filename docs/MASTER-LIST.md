@@ -113,8 +113,9 @@ trading (his word, 2026-11-17).
    rewritten to match are not. FOR S4, found on the way: Webull reports no fee on a purchase (the book then
    calls the fee unknown: a rule is needed); the marks of an entry must come from the order step's quote
    path, not be typed; where the live book's entries go; no repair path yet when a journal line fails.
-   **OWNER** S4 waits for his answer:
-   does her position limit count only her own book, or his own holdings of the same fund too. Known gaps of
+   **DECIDED by the owner 2026-11-18 ("Yes, hers only"):** her position limit and her count of positions are
+   judged on her own book alone; his holdings of the same fund never refuse or allow an order of hers; a
+   line on the owner's page shows the combined holding per fund as information (S4e). Known gaps of
    the first build: fund distributions on her shares; the venue's order history read (before unattended mode
    or any step up of the stake); a per-fund hold instead of a whole-book stop. PRECONDITION of the first
    real order. Until S4 runs on practice, a hand order in the PRACTICE account would stop the practice runs.
