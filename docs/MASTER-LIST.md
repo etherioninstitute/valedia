@@ -200,6 +200,20 @@ Items:
   supervised task end to end on something that is not the trader, then add only what that run shows missing.
   Trader coding stays on builder plus blind checker. Its `neural-trader` and `market-data` parts: a
   reading-only look for ideas, nothing run or copied.
+- **NEXT** L-0 (lead, 2026-11-18): read which model the Sunday 18:00 research cycle's idea-proposing agents
+  call. If it is the local 27B, the first Sunday of the scored period (22 Nov) would load a model beside the
+  collector: then the job is held or pointed elsewhere for those weeks, on the owner's word.
+- **QUEUED** L-11 a register of known coming events and expiries, read by the alerts check so that it warns
+  days ahead (the end of the scored period, the fund book's 21-session resets, half-days, the real-money
+  confirmation's 31-day expiry, fixed test dates, credit, credential and licence dates). No model. The first
+  piece of "lookahead" (the lead's suggestion to the owner, 2026-11-17).
+- **QUEUED** L-12 a pre-mortem with a prediction on every CHANGE: each ticket states what should be seen
+  afterwards and when; the daily review checks it.
+- **OWNER** the division of work he asked about (2026-11-17): the master list is the one backlog; one board
+  holds approved work in flight, each card naming its master-list item (the lead suggests Hermes's Kanban as
+  that board and Paperclip as its display, not two sets of cards); bots file proposals into a create-only
+  inbox and never start a worker or patch code; RuFlo for coding outside the trader only, a fresh blind
+  checker as its acceptance; thinking roles on a hosted Claude model while the collector is scored.
 - **QUEUED** L-2 lessons by idea family, and a stop on a family after N failures (roadmap 2.3).
 - **QUEUED** L-3 a check on the critic itself (roadmap 2.5).
 - **QUEUED** L-4 scores earn weight (roadmap 1.5).
