@@ -714,7 +714,8 @@ def test_an_error_inside_one_wallets_read_is_that_wallets_failed_read_and_the_pa
     assert changes(store) == []                              # its holding stays; nothing inferred
     assert c.execute("SELECT count(*) FROM holdings_current WHERE wallet_key=?", (wallet(2),)).fetchone()[0] == 1
     lines = out.strip().splitlines()
-    assert len(lines) == 11 and "internal_error" in lines[2] and "internal_error=1" in lines[-1]
+    mine = [l for l in lines if l.startswith("wallet " + wallet(2)[:10])]
+    assert len(lines) == 11 and len(mine) == 1 and "failed internal_error" in mine[0] and "internal_error=1" in lines[-1]
     assert "1 failed" in lines[-1] and "SECRET" not in out
     assert lm.consistency(c) == []
 
