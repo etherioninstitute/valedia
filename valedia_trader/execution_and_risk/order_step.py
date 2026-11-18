@@ -657,6 +657,238 @@ def broker_book(fills) -> dict[str, float]:
     return {sym: math.fsum(us) for sym, us in by.items()}
 
 
+# ---- T51c S2: the fund book's own figures in an account the owner also trades (pure; called by nothing yet)
+
+ENTRY_KINDS = ("cash_in", "cash_out", "units_out", "split")   # R5: the owner's entries
+_BOOK_PREC = 60                                   # decimal digits: every sum and product of ledger figures is exact
+
+
+class BookError(OrderStepError):
+    """The ledger's rows, the owner's entries or the marks cannot make a book: said in words, nothing assumed."""
+
+
+@dataclass(frozen=True)
+class BookFigures:
+    """The book's own figures (R4). `cash` is the cautious figure, `cash_low`; `cash_low` and `cash_high` bound the
+    cash (None: no bound on that side), equal when every price and fee is known (`cash_bounded` False). `usable_cash`
+    (R8a) is `cash_low` less the proceeds (at that bound) of the book's sales with a fill on the given New York day
+    or later, which are unsettled until the next session. `value` is `cash_low` plus every unit at its mark (None
+    when the cash has no lower bound or a symbol held has no mark: `unmarked`); `value_high` is the same at
+    `cash_high`. `units_outstanding` are the book's units issued and redeemed by the owner's entries;
+    `value_per_unit` is `value` over them (None with none outstanding)."""
+    units: dict
+    cash: Decimal | None
+    cash_low: Decimal | None
+    cash_high: Decimal | None
+    cash_bounded: bool
+    bounded_by: tuple
+    usable_cash: Decimal | None
+    value: Decimal | None
+    value_high: Decimal | None
+    units_outstanding: Decimal
+    value_per_unit: Decimal | None
+    unmarked: tuple
+
+
+def _dec(x, what: str) -> Decimal:
+    """A ledger figure as an exact decimal: a float is the shortest decimal that reads back as it (repr), text and
+    Decimal as written. Not finite, a bool or anything else: BookError."""
+    if isinstance(x, bool) or x is None:
+        raise BookError(f"{what} is {x!r}, not a number")
+    try:
+        d = Decimal(repr(float(x))) if isinstance(x, (int, float)) else Decimal(str(x)) if isinstance(x, (str, Decimal)) else None
+    except Exception:
+        d = None
+    if d is None or not d.is_finite():
+        raise BookError(f"{what} is {_cut(repr(x))}, not a finite number")
+    return d
+
+
+def _cut(text: str, n: int = 60) -> str:
+    text = str(text).replace("\n", " ")
+    return text if len(text) <= n else text[: n - 1] + "..."
+
+
+def _opt_dec(x, what: str) -> Decimal | None:
+    return None if x is None or x == "" else _dec(x, what)
+
+
+def book_figures(fills, orders, entries, marks, day: str) -> BookFigures:
+    """T51c S2 (R4, R5, R8a): the book's figures from this ledger's own `fills` and `orders` rows (as
+    OrderLedger.fills() and .orders() give them), the owner's `entries` (as the state file holds them, each with the
+    figures next_entry gave it) and `marks` {symbol: price}; `day` is today's New York day (YYYY-MM-DD), for the
+    unsettled proceeds of R8a. Pure: it reads no file, clock, venue or global, and the order in which rows are given
+    changes nothing (fills and entries are taken by time, a fill before an entry of the same time, then by id).
+
+    Units per symbol: the signed sum of the fill rows (applied or not), times the ratio of each later `split` of that
+    symbol, less each later `units_out`. Cash: the `cash_in` entries less the `cash_out` ones, less the cost of every
+    purchase, plus the proceeds of every sale, less the fees, in exact decimals; the account's average cost is never
+    read. A fill row's price covers `price_covers_units` units; what an order filled beyond the units its rows price
+    is valued at the order's limit (a MARKET leg: its collar price), the most a purchase can have cost and the least a
+    sale can have brought; it bounds the cash: a purchase's upper bound counts it at nothing, a sale's has no upper
+    bound. An order with fills whose fee total is not known (the order's `fee` None) leaves the lower bound open (no
+    fee bound is assumed) and its known row fees in the upper one. Units outstanding are the last entry's
+    `units_after`; every entry must start where the one before it ended, or BookError names it."""
+    with localcontext() as ctx:
+        ctx.prec = _BOOK_PREC
+        by_tag = {}
+        for o in orders:
+            by_tag[o["tag"]] = o
+        rows: dict[str, list] = {}
+        for f in fills:
+            if f["tag"] not in by_tag:
+                raise BookError(f"fill row {f.get('id')} is of order {_cut(f['tag'])}, which the ledger's orders do not hold")
+            rows.setdefault(f["tag"], []).append(f)
+        low: Decimal | None = Decimal(0)
+        high: Decimal | None = Decimal(0)
+        today_low = Decimal(0)
+        bounded: list[str] = []
+        for tag in sorted(rows):
+            o, rs = by_tag[tag], rows[tag]
+            total = sum((_dec(r["units"], f"the units of fill row {r.get('id')}") for r in rs), Decimal(0))
+            priced = covered = Decimal(0)
+            for r in rs:
+                if r.get("price") is not None and r.get("price_covers_units") is not None:
+                    p = _dec(r["price"], f"the price of fill row {r.get('id')}")
+                    c = _dec(r["price_covers_units"], f"the units priced by fill row {r.get('id')}")
+                    priced += p * c
+                    covered += c
+            open_units = abs(total) - covered
+            if open_units <= Decimal(repr(REL_TOL)) * max(Decimal(1), abs(total)):
+                open_units = Decimal(0)
+            buy = _dec(o["units"], f"the units of order {_cut(tag)}") > 0
+            limit = o.get("collar_price") if o.get("order_type") == "MARKET" else o.get("limit_price")
+            bound = _opt_dec(limit, f"the limit of order {_cut(tag)}")
+            if open_units > 0:
+                bounded.append(f"order {_cut(tag)}: {open_units} units without a price, "
+                               + (f"bounded by its {'collar' if o.get('order_type') == 'MARKET' else 'limit'} {bound}"
+                                  if bound is not None else "with no limit to bound them"))
+            if buy:
+                worst = None if open_units > 0 and bound is None else priced + open_units * (bound or 0)
+                low = None if low is None or worst is None else low - worst
+                high = None if high is None else high - priced
+            else:
+                least = priced + open_units * (bound or 0)
+                low = None if low is None else low + least
+                high = None if high is None or open_units > 0 else high + priced
+                if any(_ny_day(r.get("time")) is None or _ny_day(r.get("time")) >= day for r in rs):
+                    today_low += least
+            fees = sum((_dec(r["fee"], f"the fee of fill row {r.get('id')}") for r in rs if r.get("fee") is not None),
+                       Decimal(0))
+            if o.get("fee") is None and total != 0:
+                bounded.append(f"order {_cut(tag)}: its fee is not known")
+                low = None
+            elif low is not None:
+                low -= fees
+            if high is not None:
+                high -= fees
+        units: dict[str, Decimal] = {}
+        steps = [((_dec(f["time"], "a fill's time"), 0, int(f.get("id") or 0)), "fill", f) for f in fills]
+        steps += [((_dec(e["time"], "an entry's time"), 1, int(e["id"])), "entry", e) for e in entries]
+        flows = Decimal(0)
+        outstanding = Decimal(0)
+        chain = sorted(entries, key=lambda e: int(e["id"]))
+        for i, e in enumerate(chain):
+            before = _dec(e["units_before"], f"entry {e['id']}'s units before")
+            if before != outstanding:
+                raise BookError(f"entry {e['id']} starts from {before} units outstanding, but the entry before it left "
+                                f"{outstanding}: the owner's entries do not chain")
+            outstanding = _dec(e["units_after"], f"entry {e['id']}'s units after")
+        for _, what, x in sorted(steps, key=lambda s: s[0]):
+            if what == "fill":
+                units[x["symbol"]] = units.get(x["symbol"], Decimal(0)) + _dec(x["units"], f"the units of fill row {x.get('id')}")
+                continue
+            kind = x["kind"]
+            if kind == "cash_in":
+                flows += _dec(x["amount"], f"entry {x['id']}'s amount")
+            elif kind == "cash_out":
+                flows -= _dec(x["amount"], f"entry {x['id']}'s amount")
+            elif kind == "units_out":
+                units[x["symbol"]] = units.get(x["symbol"], Decimal(0)) - _dec(x["units"], f"entry {x['id']}'s units")
+            elif kind == "split":
+                units[x["symbol"]] = units.get(x["symbol"], Decimal(0)) * _dec(x["ratio"], f"entry {x['id']}'s ratio")
+            else:
+                raise BookError(f"entry {x['id']} is of kind {_cut(repr(kind))}, which is none of {', '.join(ENTRY_KINDS)}")
+        low = None if low is None else low + flows
+        high = None if high is None else high + flows
+        usable = None if low is None else low - today_low
+        unmarked = tuple(sorted(s for s, u in units.items() if u != 0 and marks.get(s) is None))
+        held = sum((u * _dec(marks[s], f"the mark of {_cut(s)}") for s, u in units.items() if u != 0 and s not in unmarked),
+                   Decimal(0))
+        value = None if low is None or unmarked else low + held
+        value_high = None if high is None or unmarked else high + held
+        per_unit = None if value is None or outstanding <= 0 else value / outstanding
+        return BookFigures(units=units, cash=low, cash_low=low, cash_high=high, cash_bounded=bool(bounded),
+                           bounded_by=tuple(sorted(bounded)), usable_cash=usable, value=value, value_high=value_high,
+                           units_outstanding=outstanding, value_per_unit=per_unit, unmarked=unmarked)
+
+
+def _positive(x, what: str) -> Decimal:
+    if not isinstance(x, Decimal) or not x.is_finite() or x <= 0:
+        raise BookError(f"{what} must be a positive decimal figure, not {_cut(repr(x))}; no figure is assumed")
+    return x
+
+
+def next_entry(figures: BookFigures, kind: str, *, amount: Decimal | None = None, symbol: str | None = None,
+               units: Decimal | None = None, ratio: Decimal | None = None, mark: Decimal | None = None) -> dict:
+    """T51c S2 (R5): the figures an owner's entry of `kind` is recorded with, worked out from the book's figures at
+    its moment (`figures`, from book_figures with the marks the owner gave): its own figure as text, and the units
+    outstanding and the value per unit before and after. Pure. Every figure is the owner's, a positive Decimal; none is
+    defaulted. A stake change issues or redeems units at the value per unit (R4), so it is never profit or loss: a
+    `cash_in` issues amount / value per unit (the first, with none outstanding, issues one unit per unit of the book's
+    value after it, a value per unit of 1); a `cash_out` (at most the book's cash, lower bound) and a `units_out` (at
+    most the book's units of that symbol, valued at `mark`) redeem at it; a `split` changes no unit outstanding.
+    Refused (BookError) in words: another kind, a figure that is not a positive decimal, more than the book holds, or
+    a book whose value is not known."""
+    if kind not in ENTRY_KINDS:
+        raise BookError(f"an owner's entry is of kind {', '.join(ENTRY_KINDS)}, not {_cut(repr(kind))}")
+    with localcontext() as ctx:
+        ctx.prec = _BOOK_PREC
+        out = {"kind": kind, "symbol": None, "amount": None, "units": None, "ratio": None, "mark": None}
+        if kind in ("cash_in", "cash_out"):
+            out["amount"] = str(_positive(amount, "the amount"))
+        else:
+            if not _plain(_SYMBOL, symbol):
+                raise BookError(f"a {kind} entry names a plain symbol, not {_cut(repr(symbol))}")
+            out["symbol"] = symbol
+            if kind == "units_out":
+                out["units"], out["mark"] = str(_positive(units, "the units")), str(_positive(mark, "the mark"))
+            else:
+                out["ratio"] = str(_positive(ratio, "the ratio"))
+        value, before, per_unit = figures.value, figures.units_outstanding, figures.value_per_unit
+        if value is None:
+            why = "; ".join(figures.bounded_by) or f"no mark for {', '.join(figures.unmarked)}"
+            raise BookError(f"the book's value is not known ({_cut(why, 300)}), so no entry can be valued now")
+        if kind == "cash_in" and before == 0:
+            after = value + amount
+            if after <= 0:
+                raise BookError(f"the book's value after this entry would be {after}, not above nothing")
+            per_after = Decimal(1)
+        else:
+            if per_unit is None or per_unit <= 0:
+                raise BookError(f"the book has no value per unit ({before} units outstanding, value {value}); only a "
+                                "cash_in can open it")
+            if kind == "cash_in":
+                after = before + amount / per_unit
+                value_after = value + amount
+            elif kind == "cash_out":
+                if figures.cash_low is None or amount > figures.cash_low:
+                    raise BookError(f"the cash_out of {amount} is more than the book's cash ({figures.cash_low})")
+                after, value_after = before - amount / per_unit, value - amount
+            elif kind == "units_out":
+                held = figures.units.get(symbol, Decimal(0))
+                if units > held:
+                    raise BookError(f"the units_out of {units} {symbol} is more than the book's {held} {symbol}")
+                after, value_after = before - units * mark / per_unit, value - units * mark
+            else:
+                after, value_after = before, value
+            per_after = None if after <= 0 else value_after / after
+        out.update(units_before=str(before), units_after=str(after),
+                   value_per_unit_before=None if before == 0 else str(per_unit),
+                   value_per_unit_after=None if per_after is None else str(per_after))
+        return out
+
+
 UNATTRIBUTED = "(unattributed)"
 
 

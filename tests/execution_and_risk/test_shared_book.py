@@ -216,6 +216,10 @@ def test_units_out_and_split_move_the_units_the_book_counts():
     more = book_figures(f + later, o + [order("b2-SPY", "SPY", 1.0, limit=51.0, fee=0.0)], [e1, e2, e3],
                         {"SPY": 50.25}, DAY)
     assert more.units == {"SPY": D("15.0")}
+    same = [fill(2, "b2-SPY", "SPY", 1.0, 100.0, fee=0.0, t=T0 + 20)]   # a fill at the split's own time: before it
+    tie = book_figures(f + same, o + [order("b2-SPY", "SPY", 1.0, limit=101.0, fee=0.0)], [e1, e2, e3],
+                       {"SPY": 50.25}, DAY)
+    assert tie.units == {"SPY": D("16.0")}
 
 
 def test_next_entry_refuses_what_the_book_cannot_give():
@@ -286,14 +290,13 @@ def test_prop_cash_entries_change_neither_value_per_unit_nor_any_other_figure(se
     rng = random.Random(9000 + seed)
     o, f, _ = history(rng)
     marks = marks_for(f, rng)
-    e = [opening(str(rng.choice((5000, 10000, 25000))))]
+    e = [opening(str(rng.choice((50000, 100000, 250000))))]       # enough that the value is above nothing
     base = book_figures(f, o, e, marks, DAY)
-    if base.value is None or base.value <= 0:
-        return
+    assert base.value is not None and base.value > 0
     kind = rng.choice(("cash_in", "cash_out"))
     amount = D(str(round(rng.uniform(1, float(min(base.cash, D(2000))) if kind == "cash_out" else 5000), 2)))
     if kind == "cash_out" and (base.cash <= 1 or amount > base.cash):
-        kind = "cash_in"
+        kind, amount = "cash_in", D(str(round(rng.uniform(1, 5000), 2)))
     moved = book_figures(f, o, e + [entry(2, T0 + 10_000, base, kind, amount=amount)], marks, DAY)
     sign = 1 if kind == "cash_in" else -1
     assert abs(moved.value_per_unit - base.value_per_unit) <= TINY * base.value_per_unit
