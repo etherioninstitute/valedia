@@ -220,7 +220,7 @@ service's resolution route made to learn why it refused (one ordinary id, three 
 three padded: their status and the number of rows they returned, not what a row says). No trade, price or resolution has been set beside an outcome. Prices have not been
 pulled at all.
 
-## Fifth amendment of 2026-11-18, 21:40 UTC (after a first development run that produced NO trade; no copied trade has been analysed)
+## Fifth amendment of 2026-11-18, 21:34 UTC (after a first development run that produced NO trade; no copied trade has been analysed)
 
 **What happened.** The pull's second phase ended at 19:59 UTC (11,228 price windows, nothing unfinished). The
 first-stage run ended at 21:13 UTC and, by this document's letter, FAILED: 0 trades from 0 events. Every one of
