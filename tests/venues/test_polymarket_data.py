@@ -1099,8 +1099,8 @@ IDS = ["0x%02d" % i for i in range(20)]
 
 
 def refusing(bad=(), no_row=(), fail=None):
-    """A stand-in /v2/resolutions: HTTP 400 for any request holding an id of `bad` (the service's words for it are
-    not kept by the transport); `fail(conds)` may answer another failure first; else one row an id but `no_row`."""
+    """A stand-in /v2/resolutions: HTTP 400 with the service's refusal of the first id of `bad` a request holds;
+    `fail(conds)` may answer another failure first; else one row an id but `no_row`."""
     def h(p, q):
         assert p == "/v2/resolutions"
         conds = q["condition"].split(",")
@@ -1108,10 +1108,16 @@ def refusing(bad=(), no_row=(), fail=None):
             ans = fail(conds)
             if ans is not None:
                 return ans
-        if set(conds) & set(bad):
-            return pd.HttpError(400, "invalid resolution condition id")
+        hit = [cd for cd in conds if cd in set(bad)]
+        if hit:
+            return pd.HttpError(400, "u", body=refusal(hit[0]))
         return {"data": [resolution(cd) for cd in conds if cd not in no_row]}
     return h
+
+
+def refusal(cond):
+    """The service's own refusal of an id, as the lead measured it (2026-11-18): a JSON object, code and words."""
+    return json.dumps({"code": "invalid_request", "error": "invalid resolution condition id: %s" % cond}).encode()
 
 
 def _asked(t):
@@ -1241,3 +1247,112 @@ def test_with_no_refused_id_the_reader_asks_and_answers_exactly_as_before(tmp_pa
             got.append((t.urls, json.dumps([[b, w.rows, w.raw, sorted(w.rejects.items()), w.pages, w.read_at, a]
                                             for b, w, a in c.resolution_batches(ids)], sort_keys=True, default=repr)))
         assert got[0] == got[1], seed
+
+
+
+# ------------------------------------------------------------------ T47e: `refused` only when the service says so
+OTHER_400 = {                                        # a 400 of another shape for the single id `c`: never a refusal
+    "bare": lambda c: None, "empty": lambda c: b"",
+    "other_code": lambda c: json.dumps({"code": "bad_request", "error": "invalid resolution condition id: %s" % c}),
+    "no_code": lambda c: json.dumps({"error": "invalid resolution condition id: %s" % c}),
+    "other_id": lambda c: json.dumps({"code": "invalid_request", "error": "invalid resolution condition id: 0xother"}),
+    "longer_id": lambda c: json.dumps({"code": "invalid_request", "error": "invalid resolution condition id: %s00" % c}),
+    "no_id": lambda c: json.dumps({"code": "invalid_request", "error": "invalid resolution condition id"}),
+    "error_not_text": lambda c: json.dumps({"code": "invalid_request", "error": [c]}),
+    "a_list": lambda c: json.dumps([{"code": "invalid_request", "error": "invalid resolution condition id: %s" % c}]),
+    "not_json": lambda c: "invalid resolution condition id: %s" % c,
+    "html": lambda c: "<html><body>400 Bad Request %s</body></html>" % c,
+    "cut_short": lambda c: json.dumps({"code": "invalid_request", "error": "invalid resolution condition id: %s" % c}
+                                      )[:-2]}
+
+
+def _as_bytes(b):
+    return b.encode() if isinstance(b, str) else b
+
+
+@pytest.mark.parametrize("shape", sorted(OTHER_400))
+def test_a_400_of_any_other_shape_to_a_single_id_is_not_a_refusal_and_the_id_stays_unanswered(shape):
+    def h(p, q):
+        conds = q["condition"].split(",")
+        if "0x03" in conds:
+            body = OTHER_400[shape]("0x03") if conds == ["0x03"] else refusal("0x03")
+            return pd.HttpError(400, "u", body=_as_bytes(body))
+        return {"data": [resolution(cd) for cd in conds]}
+    told, out = [], []
+    c, t, clock = client(h)
+    with pytest.raises(pd.HttpError) as e:
+        for x in c.resolution_batches(IDS + ["0xnext"], narrowed=told.append):
+            out.append(x)
+    answers = {k: v for _, _, a in out for k, v in a.items()}
+    assert pd.REFUSED not in answers.values() and "0x03" not in answers and sorted(answers) == ["0x00", "0x01", "0x02"]
+    assert e.value.status == 400 and "invalid resolution" not in str(e.value)     # the body is never in its words
+    assert told == [{"asked": 20, "answered": 3, "refused": 0, "requests": 7, "finished": False}]
+    c, t, clock = client(h)                                                    # a request of that id alone
+    with pytest.raises(pd.HttpError):
+        list(c.resolution_batches(["0x03"]))
+    assert len(t.urls) == 1
+
+
+def test_the_refusal_is_the_400_whose_json_code_is_invalid_request_and_whose_words_name_the_id_asked():
+    e = pd.HttpError(400, "u", body=refusal("0xab"))
+    assert pd.refuses_id(e, "0xab") is True
+    assert pd.refuses_id(pd.HttpError(400, "u", body=refusal("0xab") + b" "), "0xab") is True
+    assert not pd.refuses_id(e, "0xa") and not pd.refuses_id(e, "0xabc") and not pd.refuses_id(e, "ab")
+    for status in (401, 404, 409, 422, 429, 500):
+        assert not pd.refuses_id(pd.HttpError(status, "u", body=refusal("0xab")), "0xab")
+    for shape, make in OTHER_400.items():
+        assert not pd.refuses_id(pd.HttpError(400, "u", body=_as_bytes(make("0xab"))), "0xab"), shape
+
+
+def test_the_transport_keeps_the_first_2000_bytes_of_an_error_answers_body_and_never_prints_them(monkeypatch):
+    fake_network(monkeypatch, status=400, body=refusal("0x1"))
+    with pytest.raises(pd.HttpError) as e:
+        pd.urllib_get(pd.BASE_URL + "/v2/resolutions?condition=0x1")
+    assert e.value.status == 400 and e.value.body == refusal("0x1") and pd.refuses_id(e.value, "0x1")
+    assert "invalid" not in str(e.value) and "invalid" not in repr(e.value.args)
+    fake_network(monkeypatch, status=400, body=b"x" * 5000)
+    with pytest.raises(pd.HttpError) as e:
+        pd.urllib_get(pd.BASE_URL + "/v2/resolutions?condition=0x1")
+    assert e.value.body == b"x" * pd.ERROR_BODY_MAX and pd.ERROR_BODY_MAX == 2000
+    fake_network(monkeypatch, status=503, body=b"")
+    with pytest.raises(pd.HttpError) as e:
+        pd.urllib_get(pd.BASE_URL + "/v2/resolutions?condition=0x1")
+    assert e.value.status == 503 and e.value.body == b""
+
+
+def test_an_id_is_refused_if_and_only_if_its_single_request_got_the_exact_refusal_on_seeded_services():
+    import random
+    shapes = sorted(OTHER_400)
+    seen = {"refused": 0, "other": 0, "stopped": 0}
+    for seed in range(400):
+        rng = random.Random(seed)
+        ids = ["0x%02x" % i for i in rng.sample(range(256), rng.randint(1, 20))]
+        bad = {x: rng.choice(["refusal"] * 3 + shapes) for x in ids if rng.random() < rng.choice([0.05, 0.2, 0.6])}
+        alone = {}                                                         # what each single request was answered
+
+        def h(p, q):
+            conds = q["condition"].split(",")
+            hit = [x for x in conds if x in bad]
+            if not hit:
+                if len(conds) == 1:
+                    alone[conds[0]] = "row"
+                return {"data": [resolution(x) for x in conds]}
+            if len(conds) > 1:                       # a request of several: some 400, any shape
+                return pd.HttpError(400, "u", body=_as_bytes(rng.choice([refusal(hit[0]), None, b"<html>"])))
+            alone[conds[0]] = bad[conds[0]]
+            body = refusal(conds[0]) if bad[conds[0]] == "refusal" else _as_bytes(OTHER_400[bad[conds[0]]](conds[0]))
+            return pd.HttpError(400, "u", body=body)
+        c, t, clock = client(h)
+        out = []
+        try:
+            for x in c.resolution_batches(ids):
+                out.append(x)
+        except pd.HttpError:
+            seen["stopped"] += 1
+        answers = {k: v for _, _, a in out for k, v in a.items()}
+        refused = {k for k, v in answers.items() if v == pd.REFUSED}
+        assert refused == {k for k, v in alone.items() if v == "refusal"}, seed       # if and only if
+        assert all(answers.get(k) != pd.REFUSED for k, v in alone.items() if v != "refusal")
+        seen["refused"] += len(refused)
+        seen["other"] += sum(1 for v in alone.values() if v not in ("row", "refusal"))
+    assert all(v > 20 for v in seen.values()), seen

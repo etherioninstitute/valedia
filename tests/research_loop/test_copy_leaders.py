@@ -2845,9 +2845,10 @@ class RefusingWorld(PagedWorld):
     request holding an id of `refused`, as the real service does; once it has refused a request, a request holding
     an id of `broken` gets a 503 (a failure of another kind met while narrowing)."""
 
-    def __init__(self, world, seed, refused, mod=pd, broken=(), **kw):
+    def __init__(self, world, seed, refused, mod=pd, broken=(), shape=None, **kw):
         super().__init__(world, seed, **kw)
         self.refused, self.mod, self.broken, self.has_refused = set(refused), mod, set(broken), False
+        self.shape = shape                       # the body of a single refused id's 400 (default: the refusal)
 
     def __call__(self, url):
         parts = urllib.parse.urlsplit(url)
@@ -2859,8 +2860,16 @@ class RefusingWorld(PagedWorld):
             if conds & self.refused:
                 self.urls.append(url)
                 self.has_refused = True
-                raise self.mod.HttpError(400, url)
+                hit = sorted(conds & self.refused)[0]
+                e = self.mod.HttpError(400, url)
+                e.body = REFUSAL(hit) if len(conds) > 1 or self.shape is None else self.shape(hit)
+                raise e
         return super().__call__(url)
+
+
+def REFUSAL(cond):
+    """The service's refusal of an id (the lead's measurement, 2026-11-18)."""
+    return json.dumps({"code": "invalid_request", "error": "invalid resolution condition id: %s" % cond}).encode()
 
 
 def _client_of(mod, svc):
@@ -3097,3 +3106,30 @@ def test_t47e_with_no_refused_id_the_pull_and_the_outputs_equal_the_code_before_
         assert counts == (0, 0) and raw_old == cl._dump(stripped), seed
     assert seen["PROCEED"] > 0 and seen["FAIL"] > 0 and seen["sealed"] > 0, seen
     print("T47e equal stores:", dict(sorted(seen.items())))
+
+
+
+OTHER_400 = {"bare": lambda c: None, "other_code": lambda c: json.dumps(
+    {"code": "bad_request", "error": "invalid resolution condition id: %s" % c}).encode(),
+             "other_id": lambda c: REFUSAL(c + "00"), "not_json": lambda c: b"<html>400 Bad Request</html>"}
+
+
+@pytest.mark.parametrize("shape", sorted(OTHER_400))
+def test_t47e_a_400_that_does_not_say_the_id_is_invalid_is_never_stored_as_refused_and_the_pull_is_incomplete(
+        tmp_path, monkeypatch, shape):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    w = _small_world(5)
+    conds = sorted(w.res)
+    said = []
+    store = tmp_path / "s.sqlite"
+    with pytest.raises(cl.PullIncomplete):
+        cl.pull(store, _client_of(pd, RefusingWorld(w, 5, {conds[3]}, shape=OTHER_400[shape])), phase=1,
+                say=said.append)
+    assert _open_resolutions(store) == set(conds[3:20])                        # that id and the rest of its twenty
+    with cl.Store(store) as s:
+        answers = s.resolution_answers()
+        assert pd.REFUSED not in answers.values() and conds[3] not in answers
+        assert cl.phase1_problems(s)
+    line, = [x for x in said if "the service refused a request of" in x]
+    assert "3 ids answered, 0 ids refused" in line and "17 ids stay unfinished" in line
+    assert not ID_IN_LINE.search(line) and "invalid resolution" not in line and "html" not in " ".join(said)
