@@ -396,6 +396,25 @@ def test_the_cash_bounds_hold_the_rows_fees_and_the_orders_total(order_fee, row_
         assert fig.cash_bounded is False and fig.cash_low == fig.cash_high   # no fall: exact, as before
 
 
+@pytest.mark.parametrize("rows", [(None,), (None, None), (None, None, None)])
+@pytest.mark.parametrize("total", [0.35, 1.0, 0.0, 1.0 / 3.0])
+def test_a_fee_total_with_no_fee_row_is_the_fee_for_both_bounds(rows, total):
+    """Addendum 6, R20: the rows are silent, not zero: the total is the fee, exact, nothing flagged."""
+    o = [order("a-SPY", "SPY", float(len(rows)), limit=101.0, fee=total)]
+    f = [fill(i + 1, "a-SPY", "SPY", 1.0, 100.0, fee=x, t=T0 + i) for i, x in enumerate(rows)]
+    fig = book_figures(f, o, [opening()], {"SPY": 100.0}, DAY)
+    truth = D("10000") - D("100.0") * len(rows) - D(repr(total))
+    assert fig.cash_low == fig.cash_high == truth and fig.cash_bounded is False and fig.bounded_by == ()
+
+
+def test_with_one_fee_row_the_pair_rule_stands_and_silent_rows_count_nothing():
+    o = [order("a-SPY", "SPY", 2.0, limit=101.0, fee=1.0)]
+    f = [fill(1, "a-SPY", "SPY", 1.0, 100.0, fee=0.25, t=T0), fill(2, "a-SPY", "SPY", 1.0, 100.0, fee=None, t=T0 + 1)]
+    fig = book_figures(f, o, [opening()], {"SPY": 100.0}, DAY)
+    assert fig.cash_low == D("10000") - D("200.0") - D("1.0") and fig.cash_high == D("10000") - D("200.0") - D("0.25")
+    assert fig.cash_bounded is True
+
+
 @pytest.mark.parametrize("seed", range(80))
 def test_prop_the_bounds_hold_the_cash_at_either_fee_figure_whatever_the_floats_do(seed):
     """Addendum 5, R17: fee rows as the ledger keeps them (floats, each what the total rose by) against the order's

@@ -538,7 +538,7 @@ def test_each_entry_is_journaled_through_the_journals_own_writer(tmp_path, capsy
 
 
 COMPARED = ("id", "kind", "symbol", "amount", "units", "ratio", "mark", "units_before", "units_after",
-            "value_per_unit_before", "value_per_unit_after", "prev_hash", "hash")
+            "value_per_unit_before", "value_per_unit_after", "prev_hash", "hash", "time")   # addendum 6, R19: time
 
 
 @pytest.mark.parametrize("field", [f for f in COMPARED if f != "id"] + ["who", "note"])
@@ -817,6 +817,8 @@ REFUSALS = {
     "a note holding a tab": (["--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n\tx",
                               "--mark", "SPY=100"], None),
     "a clock behind the last entry": (_ok(), _clock_behind),
+    "a split of a symbol the book does not hold": (["--owner-entry", "split", "--symbol", "QQQ", "--ratio", "2",
+                                                    "--who", "o", "--note", "n", "--mark", "SPY=100"], None),   # R21
     "more than the book's cash": (["--owner-entry", "cash_out", "--amount", "999999999", "--who", "o", "--note", "n",
                                    "--mark", "SPY=100"], None),
     "more than the book holds": (["--owner-entry", "units_out", "--symbol", "SPY", "--units", "1000", "--who", "o",
