@@ -30,9 +30,13 @@ matched by keyword only, not read one by one. Item H-1 closes that.
 - **DONE 2026-11-17 20:30 PST** T51 fractional orders, build A (practice path only; live fractions stay
   refused): four slices, one blind check, merged (main `5d944d4`), 2,601 tests pass on main, the order-step
   job gate moved. **NEXT** the practice proof in market hours, then build B (section 2).
-- **NOW** T47 copying Polymarket's leaders (historical test): phase 1 of the data pull is running; two wallets
-  with more than five million trades each are left out by name, as the locked rule says. Then phase 2
-  (prices), then the first-stage test. Lead's locked expectation: it fails. Roadmap 1.26.
+- **NOW** T47 copying Polymarket's leaders (historical test): phase 1 read 189 of 192 wallets (35.3 million
+  trade rows, a 69.7 GB store) and ended INCOMPLETE on 2026-11-18 01:15 PST: 4,705 market ids in the trades
+  are one byte short and the service refuses any request holding one. Fourth amendment (a refused id is a
+  market without a known resolution, counted) and T47e (the pull narrows a refused request and goes on)
+  merged 2026-11-18 03:05 PST (main `cdd5371`); the pull RESUMED 03:12 for the 8,540 unfinished ids. Three
+  wallets with more than five million trades each are left out by name, as the locked rule says. Then
+  phase 2 (prices), then the first-stage test. Lead's locked expectation: it fails. Roadmap 1.26.
 - **NOW** T47c (the analysis in bounded memory): passed its blind check and is on main (`0172b3f`,
   2026-11-17 15:21 PST).
 - **DONE 2026-11-17 20:38 PST** T52 the leaders' record: merged (main `bc4e8eb`) after three blind checks; the
@@ -431,6 +435,10 @@ run beside MiroFish and Elephant-1):
 - 2026-11-17 Webull approved the owner's app for live API trading (his word).
 - 2026-11-17 T50 the live key pair kept apart from the practice jobs: merged (main `c2aeeb6`).
 - 2026-11-17 T47 the copying-leaders program and its bounded-memory pull: merged (main `33ace6f`).
+- 2026-11-18 T47e a refused market id no longer stops the pull: merged (main `cdd5371`), blind check passed
+  with notes (three follow-ups in T47d).
+- 2026-11-18 L-0 the Sunday research cycle's model read: Claude Sonnet through Hermes, nothing local.
+- 2026-11-18 T51c step 0 (the shared account): study done, rulings written; the build has started.
 - 2026-11-17 TMF6 the MiroFish operator: merged (never run for real); TMF7 the acknowledged-revisions list
   (the owner's "Yes, accept them" for 22 files).
 - 2026-11-17 T45-1 event settlement by two witnesses: merged.
