@@ -670,7 +670,8 @@ class BookError(OrderStepError):
 @dataclass(frozen=True)
 class BookFigures:
     """The book's own figures (R4). `cash` is the cautious figure, `cash_low`; `cash_low` and `cash_high` bound the
-    cash (None: no bound on that side), equal when every price and fee is known (`cash_bounded` False). `usable_cash`
+    cash (None: no bound on that side), equal when every price and fee is known and an order's fee total and its rows'
+    fees agree within REL_TOL (`cash_bounded` False; otherwise the bounds hold both fee figures). `usable_cash`
     (R8a) is `cash_low` less the proceeds (at that bound) of the book's sales with a fill on the given New York day
     or later, which are unsettled until the next session. `value` is `cash_low` plus every unit at its mark (None
     when the cash has no lower bound or a symbol held has no mark: `unmarked`); `value_high` is the same at
@@ -727,9 +728,11 @@ def book_figures(fills, orders, entries, marks, day: str) -> BookFigures:
     is valued at the order's limit (a MARKET leg: its collar price), the most a purchase can have cost and the least a
     sale can have brought; it bounds the cash: a purchase's upper bound counts it at nothing, a sale's has no upper
     bound. An order with fills whose fee total is not known (the order's `fee` None) leaves the lower bound open (no
-    fee bound is assumed) and its known row fees in the upper one. An order whose fee total fell under its rows' sum
-    (the ledger keeps the rows and the order's total follows the venue's) counts the rows' sum in the lower bound and
-    the total in the upper one, and marks the cash bounded. Units outstanding are the last entry's
+    fee bound is assumed) and its known row fees in the upper one. An order whose fee total is known and none of whose
+    rows carries a fee has that total as its fee in both bounds. An order with a known total and at least one row
+    fee (rows without one counting 0) takes the two figures as a pair: the larger in the lower bound, the smaller in
+    the upper, and the cash marked bounded only when they differ by more than REL_TOL (a total that fell under the
+    rows, which the ledger keeps). Units outstanding are the last entry's
     `units_after`; every entry must start where the one before it ended, or BookError names it."""
     with localcontext() as ctx:
         ctx.prec = _BOOK_PREC
@@ -780,7 +783,10 @@ def book_figures(fills, orders, entries, marks, day: str) -> BookFigures:
             fees_least = fees_most = fees                # addendum 5 (R17): the order's total and its rows' sum as a
             if o.get("fee") is not None and total != 0:  # pair; the truth is one of the two (a total that fell, or
                 told = _dec(o["fee"], f"the fee of order {_cut(tag)}")   # floats a hair apart), so the bounds hold both
-                fees_least, fees_most = min(told, fees), max(told, fees)
+                if not any(r.get("fee") is not None for r in rs):   # addendum 6 (R20): rows silent, not zero:
+                    fees_least = fees_most = told                   # the total is the fee for both bounds
+                else:
+                    fees_least, fees_most = min(told, fees), max(told, fees)
                 if fees_most - fees_least > Decimal(repr(REL_TOL)) * max(Decimal(1), fees_most):
                     bounded.append(f"order {_cut(tag)}: its fee total {told} and its rows' {fees} differ")
             if o.get("fee") is None and total != 0:
@@ -863,6 +869,9 @@ def next_entry(figures: BookFigures, kind: str, *, amount: Decimal | None = None
                 out["units"], out["mark"] = str(_positive(units, "the units")), str(_positive(mark, "the mark"))
             else:
                 out["ratio"] = str(_positive(ratio, "the ratio"))
+                if figures.units.get(symbol, Decimal(0)) == 0:   # addendum 6 (R21): a mistyped symbol records nothing
+                    raise BookError(f"the book holds no {symbol}, so a split of it changes nothing and is not recorded; "
+                                    "nothing was written")
         value, before, per_unit = figures.value, figures.units_outstanding, figures.value_per_unit
         if value is None:
             why = "; ".join(figures.bounded_by) or f"no mark for {', '.join(figures.unmarked)}"
@@ -1587,6 +1596,9 @@ def owner_entry_differences(entries, journal, *, venue: str) -> list[str]:
             out.append(f"the journal holds owner entry {n}, which is not in the state file")
         else:                                             # addendum 5 (R16): every journaled field but who and note
             other = [k for k in _COMPARED_FIELDS if seen[n].get(k) != state[n].get(k)]
+            held_time = state[n].get("time")              # addendum 6 (R19): the journal's text of it against the same
+            if seen[n].get("time") != (None if held_time is None else repr(float(held_time))):   # text of the state's
+                other.append("time")
             if other:
                 out.append(f"owner entry {n} differs between the journal and the state file in "
                            f"{', '.join(other)}" + (" (it has another hash)" if "hash" in other else ""))

@@ -490,7 +490,7 @@ not wired yet:
   added by hand in the state file, its hashes recomputed or not, or the state file put back from an older copy; or
   a journal line changed, removed or added) makes them differ, and the owner's command finds that before it writes
   and refuses in words. Compared for each entry: its id, kind, symbol, amount, units, ratio, mark, units and value
-  per unit before and after, previous hash and hash; NOT `who` and `note` (the journal's writer may redact them), so
+  per unit before and after, time, previous hash and hash; NOT `who` and `note` (the journal's writer may redact them), so
   a change to those two in the journal alone is not found. A journal line that is not whole is skipped as a run
   skips it; if it was an owner's entry, that entry is then missing from the journal and the command refuses. An
   entry whose time is not later than the last entry's (a clock behind the record) is refused. Someone who rewrites BOTH to match, or puts both back from one older copy, is not caught by
