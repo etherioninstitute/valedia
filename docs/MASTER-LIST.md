@@ -27,18 +27,21 @@ matched by keyword only, not read one by one. Item H-1 closes that.
 
 ## 1. In flight today (2026-11-17)
 
-- **NOW** T51 fractional orders for the fund book, build A in four slices (A1 the split and the order ledger's
-  new layout; A2 two orders per fund and the approval ticket; A3 the price collar, verdicts and the
-  never-sell-what-is-not-hers fence; A4 properties, old-against-new proof, docs). Then one blind check.
-  Practice path only; live fractions stay refused. Tickets `T51-*`.
+- **DONE 2026-11-17 20:30 PST** T51 fractional orders, build A (practice path only; live fractions stay
+  refused): four slices, one blind check, merged (main `5d944d4`), 2,601 tests pass on main, the order-step
+  job gate moved. **NEXT** the practice proof in market hours, then build B (section 2).
 - **NOW** T47 copying Polymarket's leaders (historical test): phase 1 of the data pull is running; two wallets
   with more than five million trades each are left out by name, as the locked rule says. Then phase 2
   (prices), then the first-stage test. Lead's locked expectation: it fails. Roadmap 1.26.
 - **NOW** T47c (the analysis in bounded memory): passed its blind check and is on main (`0172b3f`,
   2026-11-17 15:21 PST).
-- **NOW** T52 live record of ten leaders' positions (all-time top five of Sports and of Crypto): the record
-  only (reader additions, store, fixed leaders, one `pass` command). Build dispatched 2026-11-17 15:27 PST on
-  `cand/t52`; a blind check follows.
+- **DONE 2026-11-17 20:38 PST** T52 the leaders' record: merged (main `bc4e8eb`) after three blind checks; the
+  ten leaders FIXED (five Sports, five Crypto, none on both) and the first pass taken as the baseline in
+  `artifacts/leaders_monitor/leaders.sqlite`: 9 wallets read, 1,942 open positions; two of the Sports leaders
+  hold nothing open; Sports #2 holds more than 20,000 open positions and is past the page limit (it stays in
+  the list as unread; a wallet of that size is a market maker). Passes are run BY HAND until the owner allows a
+  job; each later pass records what is new, grown, shrunk or gone. **QUEUED** T52b (three follow-ups) before
+  any job; the forward document before any paper trade.
 - **WATCH** the order-book collector (roadmap 1.16): clean since 05:48 today. From 2026-11-19 00:00 UTC its
   scored period runs: at most ONE test-running agent beside it.
 
@@ -48,7 +51,9 @@ The owner said yes on 2026-11-17 to preparing the fund-holding book (fifteen fun
 reset every 21 sessions) at a stake smaller than whole shares. Webull has approved his app for live API
 trading (his word, 2026-11-17).
 
-1. **NOW** T51 build A (above), blind check, merge, move the order-path job gate.
+1. **DONE 2026-11-17** T51 build A: blind check passed with notes, merged, the order-path job gate moved. The
+   first scheduled practice run on it (06:55 PST) upgrades the practice ledger's layout; both real ledgers are
+   backed up in the deploy folder.
 2. **NEXT** The practice proof, run by the lead in market hours: a fractional market purchase accepted; the
    decimals Webull reports for a fill and a position; a fractional sale; a closing sale under 5 dollars.
 3. **NEXT** T51 build B: the proof reading (only fills of this code path count; one purchase and one sale in
@@ -212,6 +217,11 @@ Lessons so far (each is also a "do not repeat"):
 - Process: more than two test-running agents beside the collector cost 24 late decisions; a finished test was
   nearly repeated because the research folder was not read first; a pull was started without a trial run and
   reached 6.9 GB.
+- Process (2026-11-17 evening): the KIND of test matters. Inside a two-agent limit the collector still lost
+  eleven decisions in an hour, each where a kill-and-race suite was running (processes killed at every
+  database write, several processes racing); hours of ordinary test files beside it cost none. While the
+  scored test runs: no kill tests, race tests or many-process suites on this Mac.
+- A 27B coding worker cannot share this GPU with the collector (section 11).
 
 ## 8. Autonomy
 
@@ -348,6 +358,8 @@ run beside MiroFish and Elephant-1):
 
 ## 14. Closed log (newest first)
 
+- 2026-11-17 T52 the leaders' record: merged (main `bc4e8eb`); leaders fixed and the baseline pass taken.
+- 2026-11-17 T51 build A, fractional orders on the practice path: merged (main `5d944d4`); live still refused.
 - 2026-11-17 local coding models beside the collector: tried once (the 27B, aborted after 43 seconds, two
   late decisions), then decided by the owner: off while the scored test runs.
 - 2026-11-17 the master list as a hosted page: not now. Owner: "the file is enough right now".
