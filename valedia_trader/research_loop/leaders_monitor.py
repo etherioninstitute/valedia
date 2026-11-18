@@ -360,6 +360,8 @@ def run_pass(conn, client, wall, say, memory: Callable[[], float], max_mb: float
         say("pass refused: no leaders are fixed yet; run fix-leaders first")
         return REFUSED
     started, t0 = wall(), time.monotonic()
+    # this pass holds the exclusive lock, so no other can be running: one still marked so died
+    conn.execute("UPDATE passes SET status='died' WHERE status='running'")
     pass_id = conn.execute("INSERT INTO passes (started_ts, status) VALUES (?, 'running')", (started,)).lastrowid
     totals: Counter = Counter()
     good = failed = internal = 0
@@ -477,6 +479,9 @@ def report(conn, wall, say, days: int) -> int:
                            "ORDER BY reason", (since,)).fetchall()
     say("failed reads %d of %d (%.1f%%)%s" % (nf, total, 100.0 * nf / total if total else 0.0,
                                                "; " + ", ".join("%s=%d" % r for r in reasons) if reasons else ""))
+    st = dict(conn.execute("SELECT status, count(*) FROM passes WHERE started_ts>=? GROUP BY status", (since,)))
+    say("passes %d in the window: done=%d died=%d stopped_memory=%d"
+        % (sum(st.values()), st.get("done", 0), st.get("died", 0), st.get("stopped_memory", 0)))
     return OK
 
 
