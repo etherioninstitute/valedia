@@ -6177,7 +6177,7 @@ def test_t32_rev2_following_every_strategy_is_the_whole_book_over_generated_book
     apart from the follow field."""
     counts = {"submit": 0, "smallest": 0}
     for k in range(50):
-        seed = 640_000 + n * 1_000 + k
+        seed = 660_000 + n * 1_000 + k     # T51 A3 (e): a block whose n=2 books reach the send path (submits only)
         whole = _every_scenario(tmp_path / f"whole{k}", seed, monkeypatch, n, follow=False)
         every = _every_scenario(tmp_path / f"every{k}", seed, monkeypatch, n, follow=True)
         assert len(whole) == len(every)
@@ -6187,7 +6187,6 @@ def test_t32_rev2_following_every_strategy_is_the_whole_book_over_generated_book
                 if key != "followed":
                     assert a[key] == b[key], (seed, i, key)
         counts["submit"] += sum(1 for r in every for c in r["calls"] if c[0] == "submit")
-        counts["submit"] += sum(len(r["summary"].get("residuals", [])) for r in every)   # T51 A2: or held back (R1)
         counts["smallest"] += sum(1 for r in every for s in r["summary"]["skipped"] if "smallest trade" in s["reason"])
         _shutil.rmtree(tmp_path / f"whole{k}")
         _shutil.rmtree(tmp_path / f"every{k}")
