@@ -2987,6 +2987,8 @@ def _refused_counts(store, wallets):
 def _without_counts(doc, **same):
     prov = dict(doc["provenance"])
     counts = tuple(prov.pop(k) for k in cl.REFUSED_COUNTS)
+    reading = prov.pop("resolution_reading", None)        # T47f's block: zeros on a store with no oracle row
+    assert reading in (None, ZERO_READING), reading
     prov.update(same)
     return counts, dict(doc, provenance=prov)
 
@@ -3133,3 +3135,557 @@ def test_t47e_a_400_that_does_not_say_the_id_is_invalid_is_never_stored_as_refus
     line, = [x for x in said if "the service refused a request of" in x]
     assert "3 ids answered, 0 ids refused" in line and "17 ids stay unfinished" in line
     assert not ID_IN_LINE.search(line) and "invalid resolution" not in line and "html" not in " ".join(said)
+
+
+# ------------------------------------------------------------------ T47f: the oracle's own resolution rows (fifth amendment)
+BEFORE_T47F = "832977f"                                # the reader and the program before T47f: the reference
+E18, HALF18 = "1000000000000000000", "500000000000000000"
+READ_WORDS = ("first", "second", "half", "not_resolved_status", "not_resolved_price", "bad_time", "mixed_shape")
+ZERO_READING = {"rule": "fifth amendment (f40bc41)", "rows_read_again": False,
+                "counts": {w: 0 for w in READ_WORDS}, "plan_made_after_reading": None}
+STALE = "the store's plan is older than its resolution reading"
+UNREAD = "not yet read under the fifth amendment"
+
+
+def _code_before_t47f(tmp_path):
+    """(the reader, the program) at BEFORE_T47F, each loaded as its own module from its own file; the old program
+    reads with the old reader. What is loaded is checked: the code before the fifth amendment's reading, and this
+    run's own modules are the candidate's. A missing history is a failure that says so, never a skip."""
+    import types
+    root = Path(cl.__file__).resolve().parents[2]
+    mods = []
+    for rel, name in (("valedia_trader/venues/polymarket_data.py", "pd_before_t47f"),
+                      ("valedia_trader/research_loop/copy_leaders.py", "cl_before_t47f")):
+        got = subprocess.run(["git", "-C", str(root), "show", "%s:%s" % (BEFORE_T47F, rel)], capture_output=True,
+                             text=True)
+        if got.returncode != 0:
+            pytest.fail("%s at %s cannot be read from this checkout's history (git show: %s)"
+                        % (rel, BEFORE_T47F, got.stderr.strip()[:200]), pytrace=False)
+        path = tmp_path / (name + ".py")
+        path.write_text(got.stdout)
+        mod = types.ModuleType(name)
+        mod.__file__ = str(path)
+        sys.modules[name] = mod
+        exec(compile(got.stdout, str(path), "exec"), mod.__dict__)
+        mods.append(mod)
+    opd, ocl = mods
+    ocl.pd = opd
+    assert hasattr(opd, "REFUSED") and not hasattr(opd, "oracle_reading") and not hasattr(ocl, "reread_resolutions")
+    assert ocl.pd is opd and Path(ocl.pd.__file__).parent == tmp_path
+    assert cl.pd is pd and hasattr(cl, "reread_resolutions") and hasattr(pd, "oracle_reading")
+    return opd, ocl
+
+
+def _halves(world, seed, share=0.1):
+    """Some resolved markets of `world` paid half each (both doors, both shapes, the same fact)."""
+    rng = random.Random("half:%d" % seed)
+    for c, r in sorted(world.res.items()):
+        if r["status"] == "resolved" and rng.random() < share:
+            r["payouts"] = [500_000, 500_000]
+    return world
+
+
+class OracleWorld(PagedWorld):
+    """PagedWorld whose resolutions route serves a share of the markets in the oracle's own shape (the real rows'
+    keys, as the lead read them): status, a price of 10**18, 0 or 5 * 10**17 as text by the market's payouts, and its
+    resolution time as text in `last_update_timestamp`. `odd`: a share of those served instead as a variant: price
+    69 with status resolved, status posed, a time in milliseconds, a row that also carries payouts, or a row of
+    neither shape. `expect(c)`: the reading each market's row must get (None for a row without a price)."""
+
+    VARIANTS = ("price69", "posed", "bad_time", "mixed", "neither")
+
+    def __init__(self, world, seed, share=1.0, odd=0.0, **kw):
+        super().__init__(world, seed, **kw)
+        rng = random.Random("oracle:%d" % seed)
+        self.kind = {}
+        for c in sorted(world.res):
+            k = "reported"
+            if rng.random() < share:
+                k = rng.choice(self.VARIANTS) if rng.random() < odd else "oracle"
+            self.kind[c] = k
+
+    def row(self, c):
+        r, k = self.w.res[c], self.kind[c]
+        if k == "reported":
+            return {"condition_id": c, "status": r["status"], "payouts": r["payouts"],
+                    "resolved_at": _iso(r["resolved_ts"]) if r["resolved_ts"] else None}
+        if k == "neither":
+            return {"condition_id": c, "status": "resolved", "question_id": "0xq" + c}
+        price = {(1_000_000, 0): E18, (0, 1_000_000): "0", (500_000, 500_000): HALF18}.get(tuple(r["payouts"] or ()),
+                                                                                           "69")
+        ts = r["resolved_ts"] or MS(2026, 6)
+        out = {"condition_id": c, "extended_review": False, "last_update_timestamp": str(ts), "log_index": "23",
+               "new_version_q": True, "price": price, "proposed_price": price, "question_id": "0xq" + c,
+               "reproposed_price": "69", "status": r["status"], "transaction_hash": "0xt" + c, "was_disputed": False}
+        if k == "price69":
+            out.update(status="resolved", price="69")
+        elif k == "posed":
+            out.update(status="posed", price="69")
+        elif k == "bad_time":
+            out.update(status="resolved", last_update_timestamp=str(ts * 1000))
+        elif k == "mixed":
+            out["payouts"] = r["payouts"]
+        return out
+
+    def expect(self, c):
+        k, r = self.kind[c], self.w.res[c]
+        if k in ("reported", "neither"):
+            return None
+        if k == "oracle":
+            if r["status"] != "resolved":
+                return "not_resolved_status"
+            return {(1_000_000, 0): "first", (0, 1_000_000): "second", (500_000, 500_000): "half"}[tuple(r["payouts"])]
+        return {"price69": "not_resolved_price", "posed": "not_resolved_status", "bad_time": "bad_time",
+                "mixed": "mixed_shape"}[k]
+
+    def tally(self, conds=None):
+        got = Counter(self.expect(c) for c in (self.w.res if conds is None else conds))
+        return {w: got[w] for w in READ_WORDS}
+
+    def __call__(self, url):
+        parts = urllib.parse.urlsplit(url)
+        if parts.path == "/v2/resolutions":
+            self.urls.append(url)
+            conds = dict(urllib.parse.parse_qsl(parts.query))["condition"].split(",")
+            return json.dumps({"data": [self.row(c) for c in conds]}).encode()
+        return super().__call__(url)
+
+
+def _oracle_world(seed, **extra):
+    return _halves(World(seed, **dict(_variety(seed), **extra)), seed)
+
+
+def _marker(store):
+    db = sqlite3.connect(str(store))
+    try:
+        row = db.execute("SELECT value FROM meta WHERE key = 'resolution_reading'").fetchone()
+        return json.loads(row[0]) if row else None
+    finally:
+        db.close()
+
+
+def _set_marker(store, value):
+    db = sqlite3.connect(str(store))
+    if value is None:
+        db.execute("DELETE FROM meta WHERE key = 'resolution_reading'")
+    else:
+        db.execute("INSERT OR REPLACE INTO meta VALUES ('resolution_reading', ?)", (json.dumps(value),))
+    db.commit()
+    db.close()
+
+
+def _but_marker(t):
+    return dict(t, meta=[r for r in t["meta"] if r[0] != "resolution_reading"])
+
+
+def _resolution_rows(store):
+    db = sqlite3.connect(str(store))
+    try:
+        return {r[0]: r for r in db.execute("SELECT condition_id, status, payouts, resolved_at, resolved_ts, raw, "
+                                            "read_at FROM resolutions")}
+    finally:
+        db.close()
+
+
+def _final(said):
+    line, = [x for x in said if x.startswith("reread-resolutions ended:")]
+    return line
+
+
+def _counts_in(line):
+    m = re.search(r"first (\d+), second (\d+), half (\d+), not resolved by status (\d+), not resolved by price (\d+), "
+                  r"bad time (\d+), mixing the two shapes (\d+)", line)
+    return dict(zip(READ_WORDS, map(int, m.groups())))
+
+
+def _sha_file(p):
+    import hashlib
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def test_t47f_an_oracle_row_read_under_the_rule_is_the_same_resolution_as_the_reported_row_of_the_same_fact(
+        tmp_path, monkeypatch):
+    """One fact, two shapes: a world served all reported and the same world served all in the oracle's shape give
+    the same stored result and time per market, the same plan and the same development result."""
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    seen = Counter()
+    for seed in range(6):
+        w = _oracle_world(seed)
+        d = tmp_path / ("f%02d" % seed)
+        d.mkdir()
+        rep, orc = d / "rep.sqlite", d / "orc.sqlite"
+        svc = OracleWorld(w, seed, share=1.0)
+        for phase in (1, 2):
+            cl.pull(rep, _client_of(pd, PagedWorld(w, seed)), phase=phase, say=lambda m: None)
+            cl.pull(orc, _client_of(pd, OracleWorld(w, seed, share=1.0)), phase=phase, say=lambda m: None)
+        a, b = _resolution_rows(rep), _resolution_rows(orc)
+        assert sorted(a) == sorted(b)
+        for c in a:
+            assert (a[c][1], a[c][2], a[c][4]) == (b[c][1], b[c][2], b[c][4]), (seed, c)   # status, payouts, time
+            assert b[c][3] is None and json.loads(b[c][5])["price"] in (E18, "0", HALF18, "69")
+        ta, tb = _tables(rep), _tables(orc)
+        for name in ("plan", "plan_windows", "resolution_answers", "trades", "price_points"):
+            assert ta[name] == tb[name], (seed, name)
+        ra = cl.run_develop(store=rep, out_dir=d / "oa", say=lambda m: None)
+        rb = cl.run_develop(store=orc, out_dir=d / "ob", say=lambda m: None)
+        assert ra["result"] == rb["result"], seed
+        assert ra["provenance"]["resolution_reading"] == ZERO_READING
+        got = rb["provenance"]["resolution_reading"]
+        assert got["counts"] == svc.tally() and got["plan_made_after_reading"] is True, seed
+        assert got["rows_read_again"] is False and got["rule"] == ZERO_READING["rule"]
+        assert _marker(orc)["by"] == "pull" and _marker(rep) is None
+        text = cl.format_table(rb)
+        assert ("first %(first)d, second %(second)d, half %(half)d, not resolved by status %(not_resolved_status)d"
+                % got["counts"]) in text and "plan made after the reading: yes" in text
+        seen["half"] += got["counts"]["half"]
+        seen["first"] += got["counts"]["first"]
+        seen["planned"] += len(tb["plan"])
+        seen[rb["result"]["step_1"]["verdict"]] += 1
+    assert seen["half"] > 0 and seen["first"] > 0 and seen["planned"] > 0 and seen["PROCEED"] > 0, seen
+
+
+def test_t47f_two_doors_a_new_pull_stores_what_rereading_the_rows_the_code_before_stored_stores(tmp_path, monkeypatch):
+    opd, ocl = _code_before_t47f(tmp_path)
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    monkeypatch.setattr(ocl, "_now", lambda: FIXED)
+    seen = Counter()
+    for seed in range(8):
+        w = _oracle_world(seed)
+        rng = random.Random(seed)
+        share, odd = rng.choice([0.3, 0.5, 0.9]), rng.choice([0.1, 0.3])
+        d = tmp_path / ("d%02d" % seed)
+        d.mkdir()
+        new, old = d / "new.sqlite", d / "old.sqlite"
+        svc = OracleWorld(w, seed, share=share, odd=odd)
+        cl.pull(new, _client_of(pd, OracleWorld(w, seed, share=share, odd=odd)), phase=1, say=lambda m: None)
+        ocl.pull(old, _client_of(opd, OracleWorld(w, seed, share=share, odd=odd)), phase=1, say=lambda m: None)
+        before = _tables(old)
+        rows_before = _resolution_rows(old)
+        assert not any(r[2] != "null" for r in rows_before.values()                       # the fault: no result
+                       if '"price"' in r[5] and '"payouts"' not in r[5])
+        said = []
+        got = cl.reread_resolutions(old, say=said.append, wall=lambda: WALL)
+        assert _but_marker(_tables(new)) == _but_marker(_tables(old)), seed             # one rule, two doors
+        mn, mo = _marker(new), _marker(old)
+        assert mn["counts"] == mo["counts"] == svc.tally() == _counts_in(_final(said)), seed
+        assert (mn["by"], mo["by"], mn["complete"], mo["complete"]) == ("pull", "reread", True, True)
+        after = _tables(old)
+        for name in after:
+            if name not in ("resolutions", "meta"):
+                assert after[name] == before[name], (seed, name)                         # no other table
+        rows_after = _resolution_rows(old)
+        changed = set()
+        for c, r in rows_before.items():
+            assert (rows_after[c][0], rows_after[c][5], rows_after[c][6]) == (r[0], r[5], r[6])   # raw kept
+            if '"price"' not in r[5]:
+                assert rows_after[c] == r, (seed, c)                                       # a reported row, as is
+            elif rows_after[c] != r:
+                changed.add(c)
+        known = {c for c in rows_before if svc.expect(c) in ("first", "second", "half")
+                 or (svc.expect(c) == "mixed_shape" and w.res[c]["payouts"])}             # read as known before
+        assert changed == known and got["changed"] == len(known), seed
+        line = _final(said)
+        assert "no request" in line and "changed this run: %d" % len(known) in line and not _ANY_ID.search(line)
+        sha = _sha_file(old)
+        said2 = []
+        cl.reread_resolutions(old, say=said2.append, wall=lambda: WALL)                   # a second complete run
+        assert "nothing changed" in _final(said2) and _sha_file(old) == sha, seed
+        assert _counts_in(_final(said2)) == svc.tally()
+        for k, v in svc.tally().items():
+            seen[k] += v
+        seen["reported"] += sum(1 for c in w.res if svc.expect(c) is None)
+    assert all(seen[k] > 0 for k in READ_WORDS + ("reported",)), seen
+
+
+def test_t47f_the_reread_works_in_bounded_transactions_can_be_stopped_and_run_again(tmp_path, monkeypatch):
+    opd, ocl = _code_before_t47f(tmp_path)
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    monkeypatch.setattr(ocl, "_now", lambda: FIXED)
+    monkeypatch.setattr(cl, "REREAD_CHUNK", 7)
+    monkeypatch.setattr(cl, "REREAD_EVERY", 21)
+    w = _oracle_world(2)
+    store, whole = tmp_path / "s.sqlite", tmp_path / "whole.sqlite"
+    svc = OracleWorld(w, 2, share=0.6, odd=0.2)
+    ocl.pull(store, _client_of(opd, OracleWorld(w, 2, share=0.6, odd=0.2)), phase=1, say=lambda m: None)
+    ocl.pull(store, _client_of(opd, OracleWorld(w, 2, share=0.6, odd=0.2)), phase=2, say=lambda m: None)
+    shutil.copy(store, whole)
+    said = []
+    cl.reread_resolutions(whole, say=said.append, wall=lambda: WALL)
+    n = len(_resolution_rows(whole))
+    running = [x for x in said if x.startswith("reread-resolutions: ") and " rows read again" in x]
+    assert len(running) == n // 21 and n > 63 and not any(_ANY_ID.search(x) for x in said)
+
+    class Stop(Exception):
+        pass
+    lines = []
+
+    def stop_at_second(m):
+        lines.append(m)
+        if len([x for x in lines if " rows read again" in x and not x.startswith("reread-resolutions ended")]) == 2:
+            raise Stop()
+    before = _resolution_rows(store)
+    with pytest.raises(Stop):
+        cl.reread_resolutions(store, say=stop_at_second, wall=lambda: WALL)
+    db = sqlite3.connect(str(store))
+    order = [c for (c,) in db.execute("SELECT condition_id FROM resolutions ORDER BY rowid")]
+    db.close()
+    mid = _resolution_rows(store)
+    done = set(order[:42])                                                             # six chunks committed
+    for c in order:
+        want = _resolution_rows(whole)[c] if c in done else before[c]
+        assert mid[c] == want, c
+    assert any(mid[c] != before[c] for c in done)
+    m = _marker(store)
+    assert m["complete"] is False and m["plan_after_reading"] is False
+    for run in (lambda: cl.run_develop(store=store, out_dir=tmp_path / "o", say=lambda x: None),
+                lambda: cl.pull(store, _client_of(pd, svc), phase=2, say=lambda x: None)):
+        with pytest.raises(cl.Refused) as e:
+            run()
+        assert UNREAD in str(e.value) and "reread-resolutions" in str(e.value)
+    assert svc.urls == []                                                              # phase 2 asked nothing
+    cl.reread_resolutions(store, say=lambda x: None, wall=lambda: WALL)               # run again: finishes
+    assert _tables(store) == _tables(whole) and _marker(store) == _marker(whole)
+
+
+def test_t47f_the_reread_refuses_while_a_pull_holds_the_lock_and_on_a_store_it_must_not_change(tmp_path, monkeypatch,
+                                                                                            capsys):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    w = _oracle_world(4)
+    store = tmp_path / "s.sqlite"
+    cl.pull(store, _client_of(pd, OracleWorld(w, 4, share=0.5)), phase=1, say=lambda m: None)
+    _set_marker(store, None)
+    sha = _sha_file(store)
+    with cl._store_lock(store, exclusive=True):                                       # as a running pull holds it
+        with pytest.raises(cl.Refused) as e:
+            cl.reread_resolutions(store, say=lambda m: None)
+        assert "a pull is running on this store" in str(e.value)
+        assert cl.main(["reread-resolutions", "--store", str(store)]) == 2
+        assert "REFUSED: a pull is running on this store" in capsys.readouterr().err
+    with cl._store_lock(store, exclusive=False):                                      # as develop or sealed hold it
+        with pytest.raises(cl.Refused):
+            cl.reread_resolutions(store, say=lambda m: None)
+    assert _sha_file(store) == sha
+    with pytest.raises(cl.Refused) as e:
+        cl.reread_resolutions(tmp_path / "none.sqlite", say=lambda m: None)
+    assert "missing" in str(e.value) and not (tmp_path / "none.sqlite").exists()
+    spent = tmp_path / "spent.sqlite"
+    shutil.copy(store, spent)
+    _set_meta_raw(spent, "sealed_marker", '{"time": "t"}')
+    sha = _sha_file(spent)
+    with pytest.raises(cl.Refused) as e:
+        cl.reread_resolutions(spent, say=lambda m: None)
+    assert "sealed period" in str(e.value) and _sha_file(spent) == sha
+    odd = tmp_path / "odd.sqlite"
+    shutil.copy(store, odd)
+    db = sqlite3.connect(str(odd))
+    db.execute("CREATE TABLE extra (x)")
+    db.commit()
+    db.close()
+    sha = _sha_file(odd)
+    with pytest.raises(cl.Refused) as e:
+        cl.reread_resolutions(odd, say=lambda m: None)
+    assert "own shape" in str(e.value) and _sha_file(odd) == sha
+
+
+def test_t47f_the_reread_makes_no_client_and_opens_no_socket(tmp_path, monkeypatch, capsys):
+    opd, ocl = _code_before_t47f(tmp_path)
+    monkeypatch.setattr(ocl, "_now", lambda: FIXED)
+    w = _oracle_world(5)
+    store = tmp_path / "s.sqlite"
+    ocl.pull(store, _client_of(opd, OracleWorld(w, 5, share=0.7)), phase=1, say=lambda m: None)
+
+    def no(*a, **k):
+        raise AssertionError("the reread tried to make a request")
+    monkeypatch.setattr(pd, "PolymarketData", no)
+    monkeypatch.setattr(pd, "urllib_get", no)
+    monkeypatch.setattr(urllib.request, "urlopen", no)
+    monkeypatch.setattr(urllib.request, "build_opener", no)
+    assert cl.main(["reread-resolutions", "--store", str(store)]) == 0
+    out = capsys.readouterr().out.splitlines()
+    line = _final(out)
+    assert _counts_in(line) == OracleWorld(w, 5, share=0.7).tally() and "no request" in line
+    assert _marker(store)["complete"] is True and _marker(store)["by"] == "reread"
+
+
+def test_t47f_a_store_the_code_before_made_is_read_again_planned_again_keeping_its_windows_and_then_developed(
+        tmp_path, monkeypatch):
+    """Outcome 3 on stores made by the code before (both shapes, a finished phase 2, price windows): after the
+    reread, develop and sealed refuse the stale plan in words; pull --phase 2 makes the plan again, asks for no
+    window it holds, says how many it kept and leaves unused; the plan and the development result are then those
+    of a store pulled whole by the new code."""
+    opd, ocl = _code_before_t47f(tmp_path)
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    monkeypatch.setattr(ocl, "_now", lambda: FIXED)
+    seen = Counter()
+    for seed in range(10):
+        w = _oracle_world(seed)
+        share = random.Random(seed).choice([0.2, 0.3, 0.5])
+        d = tmp_path / ("p%02d" % seed)
+        d.mkdir()
+        old, fresh = d / "old.sqlite", d / "fresh.sqlite"
+        mk = lambda: OracleWorld(w, seed, share=share, odd=0.1)
+        for phase in (1, 2):
+            ocl.pull(old, _client_of(opd, mk()), phase=phase, say=lambda m: None)
+            cl.pull(fresh, _client_of(pd, mk()), phase=phase, say=lambda m: None)
+        with cl.Store(old) as s:
+            before = s.finished_keys("prices")
+            old_plan = set(s.plan_windows())
+        assert before == old_plan, seed                                                  # a finished phase 2
+        with pytest.raises(cl.Refused) as e:                                               # never read again yet
+            cl.run_develop(store=old, out_dir=d / "o0", say=lambda m: None)
+        assert UNREAD in str(e.value)
+        cl.reread_resolutions(old, say=lambda m: None, wall=lambda: WALL)
+        for run in (lambda: cl.run_develop(store=old, out_dir=d / "o1", say=lambda m: None),
+                    lambda: cl.run_sealed(store=old, out_dir=d / "o1", flag=True, say=lambda m: None)):
+            with pytest.raises(cl.Refused) as e:
+                run()
+            assert STALE in str(e.value) and "pull --phase 2" in str(e.value), seed
+        assert not (d / "o1").exists() and cl.store_sealed_marker(old) is None
+        svc, said = mk(), []
+        cl.pull(old, _client_of(pd, svc), phase=2, say=said.append)
+        asked = {(dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(u).query))["token_id"],
+                  int(dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(u).query))["start"]))
+                 for u in svc.urls if "/v2/prices-history" in u}
+        assert not {cl.price_key(t, s) for t, s in asked} & before, seed                # never asked again
+        assert all("/v2/prices-history" in u for u in svc.urls)                          # nothing else asked
+        with cl.Store(old) as s:
+            plan = set(s.plan_windows())
+        kept, unused = len(plan & before), len(before - plan)
+        line, = [x for x in said if "kept, not asked again" in x]
+        assert ("%d were read before this run (kept, not asked again)" % kept) in line, (seed, line)
+        assert ("%d windows read before are left unused" % unused) in line, (seed, line)
+        assert {cl.price_key(t, s) for t, s in asked} == plan - before, seed
+        ta, tf = _tables(old), _tables(fresh)
+        assert ta["plan"] == tf["plan"] and ta["plan_windows"] == tf["plan_windows"], seed
+        ra = cl.run_develop(store=old, out_dir=d / "oa", say=lambda m: None)
+        rf = cl.run_develop(store=fresh, out_dir=d / "of", say=lambda m: None)
+        assert ra["result"] == rf["result"], seed
+        prov = ra["provenance"]["resolution_reading"]
+        assert prov["rows_read_again"] is True and prov["plan_made_after_reading"] is True
+        assert prov["counts"] == rf["provenance"]["resolution_reading"]["counts"] == mk().tally()
+        qa = _outcome(lambda: cl.run_sealed(store=old, out_dir=d / "oa", flag=True, say=lambda m: None))
+        qf = _outcome(lambda: cl.run_sealed(store=fresh, out_dir=d / "of", flag=True, say=lambda m: None))
+        assert qa[0] == qf[0], (seed, qa, qf)
+        if qa[0] == "ok":
+            ka, kf = dict(qa[1]["result"]), dict(qf[1]["result"])
+            ka.pop("store_counts"), kf.pop("store_counts")                              # the unused windows' rows
+            assert ka == kf, seed
+            seen["sealed"] += 1
+        seen["kept"] += kept
+        seen["unused"] += unused
+        seen["new"] += len(plan - before)
+    assert seen["kept"] > 0 and seen["unused"] > 0 and seen["new"] > 0 and seen["sealed"] > 0, seen
+    print("T47f replanned stores:", dict(sorted(seen.items())))
+
+
+def test_t47f_rows_stored_before_the_rule_and_not_read_again_stop_phase_2_develop_and_sealed(tmp_path, monkeypatch):
+    opd, ocl = _code_before_t47f(tmp_path)
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    monkeypatch.setattr(ocl, "_now", lambda: FIXED)
+    w = _oracle_world(6)
+    store = tmp_path / "s.sqlite"
+    ocl.pull(store, _client_of(opd, OracleWorld(w, 6, share=0.5)), phase=1, say=lambda m: None)
+    n = sum(1 for r in _resolution_rows(store).values() if '"price"' in r[5])
+    svc = OracleWorld(w, 6, share=0.5)
+    cl.pull(store, _client_of(pd, svc), phase=1, say=lambda m: None)                     # a resume: nothing to ask
+    assert svc.urls == [] and _marker(store) is None                                     # and no marker made
+    for run in (lambda: cl.pull(store, _client_of(pd, svc), phase=2, say=lambda m: None),
+                lambda: cl.run_develop(store=store, out_dir=tmp_path / "o", say=lambda m: None),
+                lambda: cl.run_sealed(store=store, out_dir=tmp_path / "o", flag=True, say=lambda m: None)):
+        with pytest.raises(cl.Refused) as e:
+            run()
+        assert ("%d resolution rows of the oracle's shape" % n) in str(e.value) and UNREAD in str(e.value)
+        assert "reread-resolutions" in str(e.value)
+    assert svc.urls == [] and not (tmp_path / "o").exists()
+
+
+def test_t47f_a_reading_marker_that_does_not_count_the_stores_rows_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    w = _oracle_world(7)
+    store = tmp_path / "s.sqlite"
+    for phase in (1, 2):
+        cl.pull(store, _client_of(pd, OracleWorld(w, 7, share=0.8, odd=0.2)), phase=phase, say=lambda m: None)
+    good = _marker(store)
+    assert good["by"] == "pull" and good["complete"] and good["plan_after_reading"] is True
+    assert sum(good["counts"].values()) == sum(1 for r in _resolution_rows(store).values() if '"price"' in r[5])
+    cl.run_develop(store=store, out_dir=tmp_path / "ok", say=lambda m: None)
+    bad = dict(good, counts=dict(good["counts"], first=good["counts"]["first"] - 1))
+    _set_marker(store, bad)
+    with pytest.raises(cl.Refused) as e:
+        cl.run_develop(store=store, out_dir=tmp_path / "o", say=lambda m: None)
+    assert "but its reading counted" in str(e.value)
+    _set_marker(store, dict(good, plan_after_reading=False))
+    with pytest.raises(cl.Refused) as e:
+        cl.run_develop(store=store, out_dir=tmp_path / "o", say=lambda m: None)
+    assert STALE in str(e.value)
+    _set_marker(store, None)
+    with pytest.raises(cl.Refused) as e:
+        cl.run_develop(store=store, out_dir=tmp_path / "o", say=lambda m: None)
+    assert UNREAD in str(e.value)
+    said = []
+    cl.reread_resolutions(store, say=said.append, wall=lambda: WALL)                      # the rows were read: no change
+    assert "nothing changed" in _final(said) and _marker(store)["counts"] == good["counts"]
+    doc = cl.run_develop(store=store, out_dir=tmp_path / "o", say=lambda m: None)         # so the plan stands
+    assert doc["provenance"]["resolution_reading"]["rows_read_again"] is True
+    assert doc["provenance"]["resolution_reading"]["plan_made_after_reading"] is True
+
+
+def test_t47f_with_no_row_of_the_oracles_shape_the_pull_and_the_outputs_equal_the_code_before_on_30_seeded_worlds(
+        tmp_path, monkeypatch):
+    opd, ocl = _code_before_t47f(tmp_path)
+    monkeypatch.setattr(cl, "_now", lambda: FIXED)
+    monkeypatch.setattr(ocl, "_now", lambda: FIXED)
+    seen = Counter()
+    for seed in range(30):
+        w = World(seed, **_variety(seed))
+        leave = ["pro01"] if seed % 5 == 3 else []
+        d = tmp_path / ("q%02d" % seed)
+        d.mkdir()
+        old, new = d / "old.sqlite", d / "new.sqlite"
+        for phase in (1, 2):
+            ocl.pull(old, _client_of(opd, PagedWorld(w, seed)), phase=phase, leave_out=leave, say=lambda m: None)
+            cl.pull(new, _client_of(pd, PagedWorld(w, seed)), phase=phase, leave_out=leave, say=lambda m: None)
+        assert _tables(old) == _tables(new), seed                               # the same tables, meta included
+        c_old, c_new, o_old, o_new = d / "c_old.sqlite", d / "c_new.sqlite", d / "o_old", d / "o_new"
+        shutil.copy(new, c_old)
+        shutil.copy(new, c_new)
+        r_old = _outcome(lambda: ocl.run_develop(store=c_old, out_dir=o_old, leave_out=leave, say=lambda m: None))
+        r_new = _outcome(lambda: cl.run_develop(store=c_new, out_dir=o_new, leave_out=leave, say=lambda m: None))
+        assert r_old[0] == r_new[0] and (r_old[0] == "ok" or r_old[1].replace(str(c_old), str(c_new)) == r_new[1]), \
+            (seed, r_old, r_new)
+        if r_old[0] != "ok":
+            seen["develop_refused"] += 1
+            continue
+        sha_old, sha_new = r_old[1]["provenance"]["code_sha256"], r_new[1]["provenance"]["code_sha256"]
+        assert sha_old != sha_new
+        doc = json.loads((o_new / "develop.json").read_bytes())
+        assert doc["provenance"]["resolution_reading"] == ZERO_READING, seed           # the new provenance: zeros
+        counts, stripped = _without_counts(doc)
+        assert counts == (0, 0) and "resolution_reading" not in stripped["provenance"]
+        raw_old = (o_old / "develop.json").read_bytes().replace(sha_old.encode(), sha_new.encode())
+        raw_old = raw_old.replace(str(c_old.resolve()).encode(), str(c_new.resolve()).encode())
+        stripped["provenance"].update(dict(zip(cl.REFUSED_COUNTS, counts)))
+        assert raw_old == cl._dump(stripped), seed                              # byte for byte but the new block
+        seen[r_new[1]["result"]["step_1"]["verdict"]] += 1
+        q_old = _outcome(lambda: ocl.run_sealed(store=c_old, out_dir=o_old, flag=True, leave_out=leave,
+                                                say=lambda m: None))
+        q_new = _outcome(lambda: cl.run_sealed(store=c_new, out_dir=o_new, flag=True, leave_out=leave,
+                                               say=lambda m: None))
+        assert q_old[0] == q_new[0], (seed, q_old, q_new)
+        if q_old[0] != "ok":
+            assert q_old[1].replace(str(c_old), str(c_new)).replace(str(o_old), str(o_new)) == q_new[1], seed
+            continue
+        seen["sealed"] += 1
+        swap = [(sha_old, sha_new), (str(c_old.resolve()), str(c_new.resolve())),
+                (str(o_old / "develop.json"), str(o_new / "develop.json"))] + [
+            tuple((o / "develop.json.sha256").read_text().strip() for o in (o_old, o_new))]
+        raw_old = (o_old / "sealed.json").read_bytes()
+        for x, y in swap:
+            raw_old = raw_old.replace(x.encode(), y.encode())
+        doc = json.loads((o_new / "sealed.json").read_bytes())
+        assert doc["provenance"]["resolution_reading"] == ZERO_READING, seed
+        counts, stripped = _without_counts(doc)
+        stripped["provenance"].update(dict(zip(cl.REFUSED_COUNTS, counts)))
+        assert raw_old == cl._dump(stripped), seed
+    assert seen["PROCEED"] > 0 and seen["FAIL"] > 0 and seen["sealed"] > 0, seen
+    print("T47f equal stores:", dict(sorted(seen.items())))
