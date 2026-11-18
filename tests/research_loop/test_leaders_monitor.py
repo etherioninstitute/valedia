@@ -1204,3 +1204,69 @@ def test_a_mixed_case_wallet_address_is_well_formed(store):
     world.boards["sports"][0]["user_id"] = "0x" + "AbCdEf0123" * 4
     fixed(store, world)
     assert db(store).execute("SELECT count(*) FROM leaders").fetchone()[0] == 10
+
+
+def test_a_refused_pass_marks_no_earlier_pass_died(store):
+    world, wall = fixed(store)
+    run(["pass"], world, wall, store)
+    c = db(store)
+    c.execute("INSERT INTO passes (started_ts, status) VALUES (?, 'running')", (T0 + 1,))
+    c.commit()
+    fd = os.open(str(store) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)            # a pass is running
+        code, out = run(["pass"], world, wall, store)
+        assert code == lm.LOCKED
+    finally:
+        os.close(fd)
+    assert [r[0] for r in db(store).execute("SELECT status FROM passes ORDER BY pass_id")] == ["done", "running"]
+
+
+def _record_at(commit, tmp_path):
+    """The record's module as it was at `commit`, from this repository's history, under a name of its own."""
+    import importlib.util
+    got = subprocess.run(["git", "-C", WORKTREE, "show",
+                          "%s:valedia_trader/research_loop/leaders_monitor.py" % commit], capture_output=True, text=True)
+    if got.returncode != 0:
+        pytest.skip("commit %s is not in this checkout's history" % commit)
+    f = tmp_path / ("record_%s.py" % commit)
+    f.write_text(got.stdout)
+    name = "record_at_%s" % commit
+    spec = importlib.util.spec_from_file_location(name, f)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[name] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+@pytest.mark.parametrize("made_by", ["fix-leaders", "fix-leaders and a pass"])
+def test_a_store_made_by_another_version_is_refused_in_words_with_nothing_written(tmp_path, made_by):
+    old = _record_at("c106abe", tmp_path)
+    s = tmp_path / "old" / "leaders.sqlite"
+    world, wall = World(), Wall()
+    world.held[wallet(0)] = [pos(wallet(0), 1)]
+    for cmd in (["fix-leaders"], ["pass"])[:1 if made_by == "fix-leaders" else 2]:
+        assert old.main(cmd + ["--store", str(s)], client=make_client(world, wall), wall=wall, out=io.StringIO(),
+                        memory=lambda: 50.0) == 0
+    before, files = s.read_bytes(), sorted(os.listdir(s.parent))
+    for cmd in (["pass"], ["report"], ["fix-leaders"]):
+        n = len(world.urls)
+        code, out = run(cmd, world, wall, s)
+        assert code == lm.REFUSED and "another version of the record" in out and "nothing done" in out, (cmd, out)
+        assert len(out.strip().splitlines()) == 1 and len(world.urls) == n
+        assert s.read_bytes() == before and sorted(os.listdir(s.parent)) == files
+    assert run(["fix-leaders"], World(), Wall(), tmp_path / "fresh" / "leaders.sqlite")[0] == 0   # a new store: made
+
+
+def test_report_prints_every_pass_status_present_running_included(store):
+    world, wall = fixed(store)
+    run(["pass"], world, wall, store)
+    c = db(store)
+    c.executemany("INSERT INTO passes (started_ts, status) VALUES (?, ?)",
+                  [(T0 + 1, "running"), (T0 + 2, "running"), (T0 + 3, "an_unknown_status")])
+    c.commit()
+    code, out = run(["report"], world, wall, store)
+    line = [l for l in out.splitlines() if l.startswith("passes ")][0]
+    assert line.startswith("passes 4 in the window:")
+    for word in ("done=1", "running=2", "an_unknown_status=1", "died=0", "stopped_memory=0"):
+        assert word in line, (word, line)
