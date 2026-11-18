@@ -66,9 +66,11 @@ for each job.
   - Each change stores the size before and after, this read's time, the previous good read's time and the gap
     between them, and (INCREASE, DECREASE, EXIT) `last_seen_ts`, the time of the read that last saw the token: for
     a carried token's EXIT the exit lies between `last_seen_ts` and this read. A missed pass shows as a longer gap.
-  - Not covered: a token whose row was unreadable at the first read that served it (its wallet's baseline, or the
-    read after it was bought) is not in the record, so the first read that reads it well records it as NEW (at a
-    baseline: a NEW for a token already held then; otherwise a NEW bounded one read too late).
+  - VOUCHED. Every change row carries `vouched` (1 or 0). A NEW says "at the previous good read this wallet did
+    not hold the token", and only a CLEAN previous good read can say that: a NEW is vouched only when that wallet's
+    previous good read was clean, else unvouched (the token may have been held and its row unreadable, as at a
+    baseline with a rejected row). INCREASE, DECREASE and EXIT are always vouched. ONLY A VOUCHED NEW IS A POSITION
+    SEEN TO OPEN; an unvouched NEW is a holding first read well, opened at some unknown time.
 - **Failed reads.** A failed read records only the failure and infers nothing. Holdings stay as they were and no
   exit is recorded. The reasons:
   - `read_error`: an error after the reader's retries.
@@ -91,7 +93,7 @@ for each job.
 - `pass` prints one line per wallet: its first ten characters, good or failed, rows, rejects, the count of each
   kind of change, carried holdings, seconds and memory. It ends with one summary line (with `internal_error=N`).
 - `report` prints, over a stated window:
-  - counts per leader and per kind of change, and per leader its carried holdings and the share of its good reads
+  - counts per leader and per kind of change (NEWs as vouched and unvouched), and per leader its carried holdings and the share of its good reads
     that carried any;
   - the largest and the median gap between good reads;
   - the share of failed reads, by reason;
@@ -109,7 +111,7 @@ for each job.
 | `wallet_reads` | One row per wallet read: good or failed with its reason, rows, pages, rejects and unread fields as JSON counts, baseline, the previous good read and the gap, the count of each kind of change, the carried holdings, and `snapshot_day` when it took the day's snapshot. |
 | `holdings_current` | Each wallet's holdings as of its last good read (`read_id`): its good rows, and its carried holdings (`carried` 1) with the read that last saw each (`seen_read_id`, `seen_read_ts`). |
 | `snapshots` | Full copies of a wallet's holdings: the baseline, and one a UTC day (carried ones marked). |
-| `changes` | NEW, INCREASE, DECREASE and EXIT rows, with `last_seen_ts`. |
+| `changes` | NEW, INCREASE, DECREASE and EXIT rows, with `last_seen_ts` and `vouched`. |
 | `rejects` | The rows the reader refused, truncated to 2,000 characters, with their reasons. |
 
 ## What it does not do

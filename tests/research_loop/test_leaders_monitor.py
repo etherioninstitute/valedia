@@ -372,10 +372,11 @@ def test_retention_removes_rows_older_than_365_days_in_bounded_statements(store,
     c = db(store)
     old = T0 - 366 * DAY
     c.executemany("INSERT INTO changes (read_id, wallet_key, token_id, kind, flip, size_before, size_after, read_ts,"
-                  " prev_read_ts, gap) VALUES (0, ?, 'x', 'NEW', 0, 0, 1, ?, ?, 1)",
+                  " prev_read_ts, gap, vouched) VALUES (0, ?, 'x', 'NEW', 0, 0, 1, ?, ?, 1, 1)",
                   [(w, old, old)] * 100_500)
     c.executemany("INSERT INTO changes (read_id, wallet_key, token_id, kind, flip, size_before, size_after, read_ts,"
-                  " prev_read_ts, gap) VALUES (0, ?, 'y', 'NEW', 0, 0, 1, ?, ?, 1)", [(w, T0 - 364 * DAY, old)] * 7)
+                  " prev_read_ts, gap, vouched) VALUES (0, ?, 'y', 'NEW', 0, 0, 1, ?, ?, 1, 1)",
+                  [(w, T0 - 364 * DAY, old)] * 7)
     c.execute("INSERT INTO rejects (read_id, wallet_key, reason, raw, read_ts) VALUES (0, ?, 'r', '{}', ?)", (w, old))
     c.commit()
     statements = []

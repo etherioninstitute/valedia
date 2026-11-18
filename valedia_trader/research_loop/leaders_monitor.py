@@ -22,6 +22,9 @@ nothing here repeats itself: `pass` reads once and ends; whether and how often i
   conflicting row (a true repeat does not count) cannot say a held token is gone: a held token missing from its
   good rows is CARRIED (the holding as it was, marked, with the read that last saw it; the read counts them), and
   an EXIT is written only by a clean read, with the time of the read that last saw the token (`last_seen_ts`).
+  Every change carries `vouched`: a NEW is vouched only when the wallet's previous good read was clean (else the
+  token may have been held and unreadable); INCREASE, DECREASE and EXIT are always vouched. Only a vouched NEW is
+  a position seen to open.
   A wallet's first good read is a baseline and creates no change. A failed read (an error after the reader's
   retries: `read_error`; the page cap: `page_limit`; a page short of the first while more were promised:
   `rows_shrank`) records only the failure and infers nothing. An error of any other kind while one wallet is read
@@ -109,7 +112,7 @@ CREATE INDEX IF NOT EXISTS snapshots_ts ON snapshots (read_ts);
 CREATE TABLE IF NOT EXISTS changes (change_id INTEGER PRIMARY KEY AUTOINCREMENT, read_id INTEGER NOT NULL,
     wallet_key TEXT NOT NULL, token_id TEXT NOT NULL, kind TEXT NOT NULL, flip INTEGER NOT NULL,
     size_before REAL NOT NULL, size_after REAL NOT NULL, first_entry_at INTEGER, read_ts REAL NOT NULL,
-    prev_read_ts REAL, gap REAL, last_seen_ts REAL);
+    prev_read_ts REAL, gap REAL, last_seen_ts REAL, vouched INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS changes_ts ON changes (read_ts);
 CREATE INDEX IF NOT EXISTS changes_read ON changes (read_id);
 CREATE TABLE IF NOT EXISTS rejects (read_id INTEGER, wallet_key TEXT, reason TEXT, raw TEXT, read_ts REAL NOT NULL);
@@ -284,7 +287,7 @@ def write_wallet(conn, pass_id: int, key: str, res: dict, read_ts: float) -> dic
                                                           read_ts))
             conn.execute("COMMIT")
             return {"baseline": False}
-        last = conn.execute("SELECT read_id, read_ts FROM wallet_reads WHERE wallet_key=? AND good=1 "
+        last = conn.execute("SELECT read_id, read_ts, rejects FROM wallet_reads WHERE wallet_key=? AND good=1 "
                             "ORDER BY read_id DESC LIMIT 1", (key,)).fetchone()
         cols = ", ".join(HOLDING_COLS)
         marks = ", ".join("?" * len(HOLDING_COLS))
@@ -297,7 +300,10 @@ def write_wallet(conn, pass_id: int, key: str, res: dict, read_ts: float) -> dic
         clean = not any(v for why, v in res["rejects"].items() if why != "repeated_row")
         carry = {} if baseline or clean else {tok: p for tok, p in prev.items() if tok not in new}
         found = [] if baseline else _diff({tok: p[size_at] for tok, p in prev.items()}, new, exits=clean)
-        prev_id, prev_ts = (None, None) if baseline else last
+        prev_id, prev_ts = (None, None) if baseline else last[:2]
+        # only a clean previous good read can say the wallet did not hold a token: a NEW after any other is unvouched
+        prev_clean = not baseline and not any(v for why, v in json.loads(last[2] or "{}").items()
+                                              if why != "repeated_row")
         gap = None if baseline else read_ts - prev_ts
         n = Counter(c[1] for c in found)
         day = _utc_day(read_ts)
@@ -319,11 +325,11 @@ def write_wallet(conn, pass_id: int, key: str, res: dict, read_ts: float) -> dic
                          "seen_read_ts, %s) VALUES (?, ?, ?, ?, ?, ?, %s)" % (cols, marks),
                          [(key, read_id, *h) for h in held])
         conn.executemany("INSERT INTO changes (read_id, wallet_key, token_id, kind, flip, size_before, size_after,"
-                         " first_entry_at, read_ts, prev_read_ts, gap, last_seen_ts) "
-                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         " first_entry_at, read_ts, prev_read_ts, gap, last_seen_ts, vouched) "
+                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                          [(read_id, key, tok, kind, flip, before, after,
                            _int(r.get("first_entry_at")) if r else None, read_ts, prev_ts, gap,
-                           prev[tok][1] if tok in prev else None)
+                           prev[tok][1] if tok in prev else None, int(kind != "NEW" or prev_clean))
                           for tok, kind, flip, before, after, r in found])
         if take:
             conn.executemany("INSERT INTO snapshots (read_id, wallet_key, kind, utc_day, read_ts, token_id, carried, "
@@ -464,11 +470,13 @@ def report(conn, wall, say, days: int) -> int:
                                (key,)).fetchone()[0]
         carrying = conn.execute("SELECT count(*) FROM wallet_reads WHERE wallet_key=? AND good=1 AND carried>0 AND "
                                 "read_ts>=?", (key, since)).fetchone()[0]
-        say("%s sports#%s crypto#%s good=%d failed=%d new=%d increase=%d decrease=%d exit=%d carried=%d reads "
-            "carrying=%.1f%% last good read %s"
-            % (wallet[:10], srank or "-", crank or "-", g, f, kinds.get("NEW", 0), kinds.get("INCREASE", 0),
-               kinds.get("DECREASE", 0), kinds.get("EXIT", 0), carried, 100.0 * carrying / g if g else 0.0,
-               "never" if last is None else "%.0fs ago" % (now - last)))
+        vouched = conn.execute("SELECT coalesce(sum(vouched), 0) FROM changes WHERE wallet_key=? AND kind='NEW' AND "
+                               "read_ts>=?", (key, since)).fetchone()[0]
+        say("%s sports#%s crypto#%s good=%d failed=%d new=%d (new vouched=%d unvouched=%d) increase=%d decrease=%d "
+            "exit=%d carried=%d reads carrying=%.1f%% last good read %s"
+            % (wallet[:10], srank or "-", crank or "-", g, f, kinds.get("NEW", 0), vouched,
+               kinds.get("NEW", 0) - vouched, kinds.get("INCREASE", 0), kinds.get("DECREASE", 0), kinds.get("EXIT", 0),
+               carried, 100.0 * carrying / g if g else 0.0, "never" if last is None else "%.0fs ago" % (now - last)))
     flips = conn.execute("SELECT count(*) FROM changes WHERE flip=1 AND read_ts>=?", (since,)).fetchone()[0]
     say("changes in the window: new=%d increase=%d decrease=%d exit=%d (flip=%d)"
         % (totals["NEW"], totals["INCREASE"], totals["DECREASE"], totals["EXIT"], flips))
