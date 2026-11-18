@@ -299,7 +299,8 @@ usual):
   source live mode loads (read-only quotes, the keys of lock 3) the first time a MARKET leg needs it; if it cannot be
   loaded, or it says anything but "agree", the leg is held back;
 - `value`: its collar price c, the price a LIMIT leg of that size would carry (a purchase: the quote plus 1% rounded
-  down to the cent; a sale: the quote less 2% rounded up), is stored with the order in the ledger (`collar_price`), and
+  down to the cent; a sale: the quote less 1%, or less 2% when the sale reduces risk, rounded up), is stored with the
+  order in the ledger (`collar_price`), and
   the leg's units times c are charged against the purchase budget like a LIMIT order's.
 
 **The verdict on a MARKET fill.** Its average is judged against c with the rules a LIMIT fill is judged by against its
