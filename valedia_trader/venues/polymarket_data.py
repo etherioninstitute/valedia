@@ -27,8 +27,10 @@ Routes (field names from the service's published specification, /v2/openapi.json
   A bool, None, NaN, infinity or a string where a number belongs is wrong. A time must be whole epoch seconds from
   2020-01-01 to one day after the client was made (a time in milliseconds is out of that span). No validator
   raises, whatever value of whatever size or type sits in whatever field: a whole number beyond a float's range
-  takes the too-large reason where that rule applies, else its field's own reason; a string that cannot be stored
-  or printed (it holds a NUL, or a lone surrogate that UTF-8 cannot encode) is malformed (T52 addendum 2).
+  takes the too-large reason where that rule applies, else its field's own reason. In a POSITION row only, a
+  string that cannot be stored or printed (it holds a NUL, or a lone surrogate that UTF-8 cannot encode) is
+  malformed; trades, price points, resolutions and board rows answer such strings exactly as before (T52
+  addenda 2 and 4).
 * one identity per row within a walk. A true repeat (the whole row equal) is dropped and counted ("repeated_row");
   rows alike in identity and different elsewhere are a conflict ("conflicting_row"): a trade keeps the first and
   counts the rest; a price point in conflict is never kept (all its rows are counted as conflicts), so it can never
@@ -251,7 +253,7 @@ def validate_board_row(row) -> tuple[dict | None, str | None]:
         return None, "not_an_object"
     if not _is_int(row.get("rank")):
         return None, "bad_rank"
-    if not _is_text(row.get("user_id")):
+    if not _is_str(row.get("user_id")):
         return None, "bad_user_id"
     for k in ("pnl", "volume"):
         if not is_number(row.get(k)):
@@ -271,14 +273,14 @@ def validate_trade(row, user: str | None = None, ts_max: int | None = None) -> t
     (case folded)."""
     if not isinstance(row, dict):
         return None, "not_an_object"
-    if not _is_text(row.get("proxy_wallet")):
+    if not _is_str(row.get("proxy_wallet")):
         return None, "bad_proxy_wallet"
     if user is not None and row["proxy_wallet"].lower() != user.lower():
         return None, "other_wallet"
     if row.get("side") not in ("BUY", "SELL"):
         return None, "bad_side"
     for k in TRADE_STR:
-        if not _is_text(row.get(k)):
+        if not _is_str(row.get(k)):
             return None, "bad_" + k
     size, price, ts, oi = row.get("size"), row.get("price"), row.get("timestamp"), row.get("outcome_index")
     if not is_number(size) or size <= 0:
@@ -291,12 +293,12 @@ def validate_trade(row, user: str | None = None, ts_max: int | None = None) -> t
     if not _is_int(oi) or oi not in (0, 1):
         return None, "bad_outcome_index"
     for k in ("event_slug", "transaction_hash"):
-        if not _is_text(row.get(k), nonempty=False):
+        if not _is_str(row.get(k), nonempty=False):
             return None, "bad_" + k
     out = {k: row[k] for k in ("proxy_wallet", "side", "token_id", "condition_id", "size", "price", "timestamp",
                                "event_slug", "outcome_index", "transaction_hash")}
     for k in ("slug", "title", "outcome"):
-        out[k] = _text_or_none(row.get(k))
+        out[k] = row.get(k) if isinstance(row.get(k), str) else None
     if not _fits_store(out.values()):
         return None, TOO_LARGE
     return out, None
@@ -374,9 +376,9 @@ def validate_resolution(row, ts_max: int | None = None) -> tuple[dict | None, st
     also given as `resolved_ts`."""
     if not isinstance(row, dict):
         return None, "not_an_object"
-    if not _is_text(row.get("condition_id")):
+    if not _is_str(row.get("condition_id")):
         return None, "bad_condition_id"
-    if not _is_text(row.get("status")):
+    if not _is_str(row.get("status")):
         return None, "bad_status"
     pay = row.get("payouts")
     if pay is not None and not (isinstance(pay, list) and len(pay) == 2 and all(_is_int(x) and x >= 0 for x in pay)):
@@ -384,7 +386,7 @@ def validate_resolution(row, ts_max: int | None = None) -> tuple[dict | None, st
     ra = row.get("resolved_at")
     ts = None
     if ra is not None:
-        ts = rfc3339_to_ts(ra) if _is_text(ra) else None
+        ts = rfc3339_to_ts(ra)
         if ts is None:
             return None, "bad_resolved_at"
         if _ts_why(ts, ts_max):

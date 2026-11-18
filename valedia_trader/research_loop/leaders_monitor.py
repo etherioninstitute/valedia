@@ -12,7 +12,8 @@ nothing here repeats itself: `pass` reads once and ends; whether and how often i
   that answers fewer good rows (or fewer distinct wallets) than asked is a refusal with nothing stored (an unknown
   category answers an empty board, not an error). The claim is an INSERT of the meta key `leaders_fixed_at` inside
   BEGIN IMMEDIATE, with the leaders in the same transaction: of two runs at once exactly one fixes, and every later
-  run refuses before any request. A wallet on both boards is one leader with both ranks; the list is not filled.
+  run refuses before any request. A board row counts as good only when its wallet id is a well-formed address
+  (WALLET_RE: 0x and forty ASCII hex digits, either case). A wallet on both boards is one leader with both ranks; the list is not filled.
   Nothing ever re-ranks, replaces or drops a leader.
 * `pass`: under an exclusive lock on STORE.lock taken without waiting (a second pass exits at once, one line, code
   LOCKED), each leader's open positions are read one wallet at a time (at most POSITION_PAGE_CAP pages). A good
@@ -51,6 +52,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import sqlite3
 import statistics
 import sys
@@ -76,6 +78,7 @@ RAW_MAX = 2000                              # characters of a rejected row kept 
 BUSY_SECONDS = 30.0
 DAY = 86_400
 CLAIM_KEY = "leaders_fixed_at"
+WALLET_RE = re.compile(r"0x[0-9a-fA-F]{40}")   # a wallet address the record can store and print: 0x + 40 ASCII hex
 KINDS = ("NEW", "INCREASE", "DECREASE", "EXIT")
 OK, LOCKED, REFUSED, STOPPED_MEMORY, INTERNAL_ERROR = 0, 2, 3, 5, 6
 
@@ -184,11 +187,14 @@ def fix_leaders(conn, client, wall: Callable[[], float], say) -> int:
             say("fix-leaders refused: the %s board could not be read (%s); nothing stored" % (cat, type(e).__name__))
             return REFUSED
         read_ts = wall()
-        rows = w.rows[:BOARD_ROWS]
+        # a row is good only with a well-formed wallet address (the reader keeps any string a board sends)
+        rows = [r for r in w.rows[:BOARD_ROWS] if WALLET_RE.fullmatch(r["user_id"])]
+        malformed = len(w.rows[:BOARD_ROWS]) - len(rows)
         distinct = len({r["user_id"].lower() for r in rows})
         if len(rows) < BOARD_ROWS or distinct < BOARD_ROWS:
-            say("fix-leaders refused: the %s board answered %d good rows (%d distinct wallets, %d rejects) of %d asked;"
-                " nothing stored" % (cat, len(rows), distinct, sum(w.rejects.values()), BOARD_ROWS))
+            say("fix-leaders refused: the %s board answered %d good rows (%d distinct wallets, %d rejects, %d malformed"
+                " wallet ids) of %d asked; nothing stored" % (cat, len(rows), distinct, sum(w.rejects.values()),
+                                                               malformed, BOARD_ROWS))
             return REFUSED
         boards[cat] = (rows, read_ts)
     fixed_ts = wall()
