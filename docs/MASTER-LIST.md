@@ -34,9 +34,16 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   trade rows, a 69.7 GB store) and ended INCOMPLETE on 2026-11-18 01:15 PST: 4,705 market ids in the trades
   are one byte short and the service refuses any request holding one. Fourth amendment (a refused id is a
   market without a known resolution, counted) and T47e (the pull narrows a refused request and goes on)
-  merged 2026-11-18 03:05 PST (main `cdd5371`); the pull RESUMED 03:12 for the 8,540 unfinished ids. Three
-  wallets with more than five million trades each are left out by name, as the locked rule says. Then
-  phase 2 (prices), then the first-stage test. Lead's locked expectation: it fails. Roadmap 1.26.
+  merged 2026-11-18 03:05 PST (main `cdd5371`); the pull resumed 03:12, answered 119 of the 427 refused
+  requests (every refused id so far is a short one) and was stopped at 03:41 by the nightly backup's lock on
+  its store. THE STORE NOW LIVES ON THE INTERNAL DISK, `~/valedia-data/polymarket/copy_leaders.sqlite` (a
+  proven copy; the phase-1 original is a cold spare at `/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-data/`):
+  off the collector's SSD and out of the folders the nightly backup takes. Resumed again 07:38 under the
+  lead's wrapper and a guard that stops it if the collector shows strain. Three wallets with more than five
+  million trades each are left out by name, as the locked rule says. Then phase 2 (prices), then the
+  first-stage test. Lead's locked expectation: it fails. Roadmap 1.26. **QUEUED** T47d items 8 to 12 (among
+  them: a reader of the store must not end the pull; the pull's start must not read the store at full speed
+  beside the collector).
 - **NOW** T47c (the analysis in bounded memory): passed its blind check and is on main (`0172b3f`,
   2026-11-17 15:21 PST).
 - **DONE 2026-11-17 20:38 PST** T52 the leaders' record: merged (main `bc4e8eb`) after three blind checks; the
@@ -46,8 +53,18 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   the list as unread; a wallet of that size is a market maker). Passes are run BY HAND until the owner allows a
   job; each later pass records what is new, grown, shrunk or gone. **QUEUED** T52b (three follow-ups) before
   any job; the forward document before any paper trade.
-- **WATCH** the order-book collector (roadmap 1.16): clean since 05:48 today. From 2026-11-19 00:00 UTC its
-  scored period runs: at most ONE test-running agent beside it.
+- **WATCH** the order-book collector (roadmap 1.16). 2026-11-18, the last development day: 33 decisions lost,
+  3 at 03:14 (the pull's start read its 70 GB store on the collector's SSD) and 30 from 07:20 to 07:33 (the
+  LEAD's own copy of that store off the SSD at 100 MB/s made the collector overrun whole minutes). What is
+  now known: sustained disk load on that SSD stalls the collector's cycle; a long test file alone or beside a
+  slow backup read does not. RULES for the scored period (from 2026-11-19 00:00 UTC): ONE test activity at a
+  time; no kill or race suites; no large file work on NIMROD_SSD without the lead's guard
+  (`claude-tmp/valedia-trader1/lead-pull/guard.py`, which stops the load at the first late decision); big
+  research data off that SSD. **NEXT** the controlled comparison the owner approved, before 14:00 PST today,
+  with the disk arm first.
+- **NEXT** the nightly backup (03:40) must not take very large research stores: with the 70 GB store in
+  `artifacts/` its copy held a read lock for 21 minutes and its integrity check of the copy ran for hours.
+  The store has left those folders; the lead checks that today's backup ends and tomorrow's is ordinary.
 
 ## 2. Path to the first real order of the fund book (in order)
 
@@ -58,8 +75,15 @@ trading (his word, 2026-11-17).
 1. **DONE 2026-11-17** T51 build A: blind check passed with notes, merged, the order-path job gate moved. The
    first scheduled practice run on it (06:55 PST) upgrades the practice ledger's layout; both real ledgers are
    backed up in the deploy folder.
-2. **NEXT** The practice proof, run by the lead in market hours: a fractional market purchase accepted; the
-   decimals Webull reports for a fill and a position; a fractional sale; a closing sale under 5 dollars.
+2. **DONE 2026-11-18 (three of four seen)** The practice proof on the paper account, through the guarded
+   order step: two fractional MARKET purchases accepted and filled inside their collars (QQQ 0.68938 at
+   661.11, SPY 0.43859 at 732.64); fills and holdings come back with the five decimals sent; a fractional
+   MARKET sale accepted (SPY 0.31095; its fill is read at the next reconcile); a whole-share sale filled
+   (XLK). Not seen, by design: a closing sale under 5 dollars (the step holds it back). Also seen: no fee
+   is reported on a purchase and 0.02 on each sale; the venue's holding changes before the order's status
+   says filled, and the next reconcile settles it. **NEXT, before build B's rules:** MEASURE the age of the
+   quote for each of the fifteen funds over a session (the remainder leg of the XLK sale was held back
+   because its quote was over 120 s old; with most funds like that, fractional legs would rarely go).
 3. **NEXT** T51 build B: the proof reading (only fills of this code path count; one purchase and one sale in
    clean batches), the owner's consent field for live fractions, the live opening, and the FIRST-CONTACT RULE
    (in production one fractional order per run until one has filled and reconciled cleanly: practice is looser
