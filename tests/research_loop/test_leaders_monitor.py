@@ -305,7 +305,7 @@ def test_a_failed_read_records_only_the_failure_and_the_next_good_read_compares_
     wall.t += 300
     world.fail[w] = mode
     code, out = run(["pass"], world, wall, store)
-    assert code == lm.FAILED_READS and reason in out
+    assert code == (lm.OK if mode == "page_limit" else lm.FAILED_READS) and reason in out     # page_limit: a known state
     c = db(store)
     last = c.execute("SELECT * FROM wallet_reads WHERE wallet_key=? ORDER BY read_id DESC", (w,)).fetchone()
     assert (last["good"], last["reason"]) == (0, reason)
@@ -1525,3 +1525,21 @@ def test_every_way_a_pass_ends_prints_one_final_line_with_a_fixed_word_and_its_o
     assert len(set(WORDS.values())) == len(WORDS)
     for word, code in WORDS.items():                         # the module's doc text lists every word and code
         assert re.search(r"^\s*%s\s+%d\s" % (word, code), lm.__doc__, re.M), word
+
+
+def test_a_pass_whose_only_not_good_reads_are_page_limits_is_done_and_counts_them_in_words(store):
+    world, wall = fixed(store)
+    world.fail[wallet(4)] = "page_limit"                     # a wallet past the page limit for good
+    for k in range(2):
+        code, out = run(["pass"], world, wall, store)
+        last = out.strip().splitlines()[-1]
+        assert code == lm.OK and last.startswith("DONE pass ") and "9 good" in last, out
+        assert "1 past the page limit" in last, last
+        wall.t += 300
+    world.fail[wallet(6)] = "http500"                        # and one read that failed: FAILED
+    code, out = run(["pass"], world, wall, store)
+    last = out.strip().splitlines()[-1]
+    assert code == lm.FAILED_READS and last.startswith("FAILED pass ") and "1 past the page limit" in last, out
+    reads = db(store).execute("SELECT good, reason FROM wallet_reads WHERE wallet_key=? ORDER BY read_id",
+                              (wallet(4),)).fetchall()
+    assert [tuple(r) for r in reads] == [(0, "page_limit")] * 3      # what a pass records for it is unchanged
