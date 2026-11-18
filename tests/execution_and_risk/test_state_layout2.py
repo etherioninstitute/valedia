@@ -625,6 +625,29 @@ def test_the_differences_in_words():
     assert diff(rows, [line(1), line(2), line(3), {"type": "owner_entry", "venue": VENUE, "id": "x"}], venue=VENUE)
 
 
+def test_a_journal_with_a_line_that_is_not_whole_cannot_be_compared_and_is_refused(tmp_path, capsys):
+    _entries_via_command(tmp_path, ("1000",))
+    day_file = next((tmp_path / "journal").glob("????-??-??.jsonl"))
+    with day_file.open("ab") as fh:
+        fh.write(b'{"type": "owner_entry", "venue": "' + VENUE.encode() + b'", "id": 2, "ha')   # a torn line
+    before = _listing(tmp_path)
+    capsys.readouterr()
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n") == 2
+    err = capsys.readouterr().err
+    assert err.startswith("refused:") and "journal" in err and "line 2" in err and "nothing was written" in err
+    assert _listing(tmp_path) == before
+
+
+def test_a_layout_1_file_is_read_as_no_entries_and_upgraded_only_by_an_entry_written(tmp_path, capsys, base):
+    led, _ = _ledger_with(osx.ledger_path_for(tmp_path / "memory", VENUE), [10.0])
+    led.close()
+    layout1_state(base, state_of(tmp_path))
+    assert osx._owner_entries_read_only(state_of(tmp_path)) == [] and dump(state_of(tmp_path))["version"] == 1
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--mark", "SPY=100", "--who", "o",
+                 "--note", "n") == 0
+    assert dump(state_of(tmp_path))["version"] == 2 and [ln["id"] for ln in journaled(tmp_path)] == [1]
+
+
 def test_only_the_command_calls_the_comparison_in_this_build():
     src = Path(osx.__file__).read_text()
     assert src.count("owner_entry_differences(") == 2                   # its definition and the command's own check
