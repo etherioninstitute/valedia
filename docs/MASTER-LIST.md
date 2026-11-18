@@ -98,7 +98,15 @@ trading (his word, 2026-11-17).
    always on for live; her book is her own fills; her capital is the owner's stake entries plus her results;
    every limit on her book; positions checked one way (his surplus is his; an account holding LESS than her
    book stops her until he says he took the shares); she never spends the day's own sale proceeds or more
-   than the account's settled cash. Slices S1 to S3 can be built now; **OWNER** S4 waits for his answer:
+   than the account's settled cash. SLICES S1 TO S3 BUILT 2026-11-18 (the one-way position check as an
+   option, her book's own figures, the record of the owner's entries with his command; nothing wired): four
+   blind checks (two failed on the record of entries and on refusals that wrote to disk, then two passed
+   with notes); the merge, the lead's tests on main and the gate move follow at 11:00 PST. What the record
+   catches is written in `docs/WEBULL.md`: a change to the state file OR to the journal is found; both
+   rewritten to match are not. FOR S4, found on the way: Webull reports no fee on a purchase (the book then
+   calls the fee unknown: a rule is needed); the marks of an entry must come from the order step's quote
+   path, not be typed; where the live book's entries go; no repair path yet when a journal line fails.
+   **OWNER** S4 waits for his answer:
    does her position limit count only her own book, or his own holdings of the same fund too. Known gaps of
    the first build: fund distributions on her shares; the venue's order history read (before unattended mode
    or any step up of the stake); a per-fund hold instead of a whole-book stop. PRECONDITION of the first
