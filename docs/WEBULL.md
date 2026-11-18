@@ -489,7 +489,11 @@ not wired yet:
   also written as one `owner_entry` line in the journal. A change to ONE of the two (an entry changed, removed or
   added by hand in the state file, its hashes recomputed or not, or the state file put back from an older copy; or
   a journal line changed, removed or added) makes them differ, and the owner's command finds that before it writes
-  and refuses in words. Someone who rewrites BOTH to match, or puts both back from one older copy, is not caught by
+  and refuses in words. Compared for each entry: its id, kind, symbol, amount, units, ratio, mark, units and value
+  per unit before and after, previous hash and hash; NOT `who` and `note` (the journal's writer may redact them), so
+  a change to those two in the journal alone is not found. A journal line that is not whole is skipped as a run
+  skips it; if it was an owner's entry, that entry is then missing from the journal and the command refuses. An
+  entry whose time is not later than the last entry's (a clock behind the record) is refused. Someone who rewrites BOTH to match, or puts both back from one older copy, is not caught by
   this build; the nightly copies and the venue's own record are what would show it. A second new table, `book_nav`, will hold the book's own value
   per unit, its bounds, the marks it was valued at and the latest entry it includes, run by run, for the day's
   loss and the drawdown of S4; nothing writes or reads it yet. The old `equity` table is kept as it was.

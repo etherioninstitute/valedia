@@ -777,17 +777,17 @@ def book_figures(fills, orders, entries, marks, day: str) -> BookFigures:
                     today_low += least
             fees = sum((_dec(r["fee"], f"the fee of fill row {r.get('id')}") for r in rs if r.get("fee") is not None),
                        Decimal(0))
-            fees_least = fees                            # addendum 4 (R14): a venue fee total that fell under the rows'
-            if o.get("fee") is not None and total != 0:  # sum (the ledger keeps the rows, the order's total follows):
-                told = _dec(o["fee"], f"the fee of order {_cut(tag)}")   # the truth is one of the two, so the bounds
-                if told < fees - Decimal(repr(REL_TOL)) * max(Decimal(1), abs(fees)):   # hold both
-                    fees_least = told
-                    bounded.append(f"order {_cut(tag)}: its fee total fell to {told} under its rows' {fees}")
+            fees_least = fees_most = fees                # addendum 5 (R17): the order's total and its rows' sum as a
+            if o.get("fee") is not None and total != 0:  # pair; the truth is one of the two (a total that fell, or
+                told = _dec(o["fee"], f"the fee of order {_cut(tag)}")   # floats a hair apart), so the bounds hold both
+                fees_least, fees_most = min(told, fees), max(told, fees)
+                if fees_most - fees_least > Decimal(repr(REL_TOL)) * max(Decimal(1), fees_most):
+                    bounded.append(f"order {_cut(tag)}: its fee total {told} and its rows' {fees} differ")
             if o.get("fee") is None and total != 0:
                 bounded.append(f"order {_cut(tag)}: its fee is not known")
                 low = None
             elif low is not None:
-                low -= fees
+                low -= fees_most
             if high is not None:
                 high -= fees_least
         units: dict[str, Decimal] = {}
@@ -974,10 +974,10 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None) -
     if not isinstance(venue, str) or not venue or _safe_name(venue) != venue or venue.strip(".") == "":
         return refuse("the owner's entry needs --venue, the plain name of the venue whose book it is (the name in its "
                       "state file's name); nothing was written")
-    for what in ("who", "note"):
-        text = getattr(args, what, None)
-        if not isinstance(text, str) or not text.strip():
-            return refuse(f"the owner's entry needs --{what}; nothing was written")
+    for what in ("who", "note"):                          # addendum 5 (R15): judged in full, before anything is read
+        problem = _owner_text_problem(what, getattr(args, what, None))
+        if problem is not None:
+            return refuse(f"the owner's entry needs --{problem}")
     if kind not in _OWNER_USES:
         return refuse(f"an owner's entry is of kind {', '.join(ENTRY_KINDS)}; nothing was written")
     for name in ("amount", "units", "ratio", "symbol"):
@@ -1023,14 +1023,13 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None) -
             finally:
                 ro.close()
         entries = _owner_entries_read_only(Path(state_path))
+        if entries and not now > float(entries[-1]["time"]):   # addendum 5 (R18): the clock is behind the record
+            return refuse(f"the clock gives {now!r}, not later than owner entry {entries[-1]['id']}'s time "
+                          f"{float(entries[-1]['time'])!r}: the clock is behind the record (the entry would be filed "
+                          "in an earlier day's journal); nothing was written")
         lines: list[dict] = []
         if journal_dir.is_dir():                          # (the Journal makes its folder; only one that is there is read)
-            reader = Journal(journal_dir)
-            lines = reader.read()
-            if reader.skipped_lines:
-                return refuse(f"the journal has lines that are not a complete entry "
-                              f"({', '.join(str(s.get('file')) + ' line ' + str(s.get('line')) for s in reader.skipped_lines[:5])}), so "
-                              "the owner's entries cannot be compared with it; a person must look; nothing was written")
+            lines = Journal(journal_dir).read()           # R18: a line that is not whole is skipped, as a run skips it;
         differences = owner_entry_differences(entries, lines, venue=venue)
         if differences:
             return refuse(f"the state file and the journal differ on the owner's entries: {_cut('; '.join(differences), 600)};"
@@ -1482,6 +1481,17 @@ MAX_WHO, MAX_NOTE = 200, 1000
 JOURNAL_NOT_WRITTEN = 3                           # addendum 4 (R12): the owner's entry is written, its journal line not
 
 
+def _owner_text_problem(what: str, text) -> str | None:
+    """Addendum 5 (R15): the one judgement of an owner's entry's `who` or `note`, which the command makes among its
+    first refusals and the writing method makes again: plain printable text (no newline or tab), not blank, of at most
+    MAX_WHO or MAX_NOTE characters. None when it is fine, else what is wrong, in words."""
+    most = MAX_WHO if what == "who" else MAX_NOTE
+    if not isinstance(text, str) or not text.strip() or len(text) > most or not text.isprintable():
+        return (f"{what}: plain text on one line (no newline or tab) of at most {most} characters, not "
+                f"{_cut(repr(text))}; nothing was written")
+    return None
+
+
 def _entry_hash(row: dict) -> str:
     """The sha256 of an owner entry's every field but its own hash, the previous entry's hash among them."""
     fields = [repr(float(row["time"])) if k == "time" else row[k] for k in _ENTRY_FIELDS]
@@ -1542,13 +1552,16 @@ def _owner_entries_read_only(path: Path) -> list[dict]:
 
 _JOURNALED_ENTRY = ("id", "kind", "symbol", "amount", "units", "ratio", "mark", "units_before", "units_after",
                     "value_per_unit_before", "value_per_unit_after", "who", "note", "prev_hash", "hash")
+_COMPARED_FIELDS = tuple(k for k in _JOURNALED_ENTRY if k not in ("id", "who", "note"))   # R16: the writer may redact these two
 
 
 def owner_entry_differences(entries, journal, *, venue: str) -> list[str]:
     """Addendum 4 (R12): every difference, in words, between the owner's entries a state file holds (`entries`, as
     owner_entries gives them) and the journal's `owner_entry` lines of `venue` (`journal`: the journal's entries, any
     type, in the order read): an entry in the state file and not in the journal, a journal line whose entry the state
-    file does not hold, the same id with another hash (or previous hash), an id journaled twice or not a whole number,
+    file does not hold, the same id differing in any of _COMPARED_FIELDS (kind, symbol, amount, units, ratio, mark,
+    units and value per unit before and after, previous hash, hash: every journaled field but who and note, which the
+    journal's writer may redact), an id journaled twice or not a whole number,
     and lines in another order than their ids. Pure. Called only by the owner's command in this build (S4 wires it into
     every run). It finds a change to ONE of the two records; two changed to match, or both put back from one older
     copy, agree and are not found here."""
@@ -1572,9 +1585,11 @@ def owner_entry_differences(entries, journal, *, venue: str) -> list[str]:
             out.append(f"owner entry {n} is in the state file and not in the journal")
         elif n not in state:
             out.append(f"the journal holds owner entry {n}, which is not in the state file")
-        elif (seen[n].get("hash"), seen[n].get("prev_hash")) != (state[n]["hash"], state[n]["prev_hash"]):
-            out.append(f"owner entry {n} has another hash in the journal ({_cut(str(seen[n].get('hash')), 16)}) than in "
-                       f"the state file ({state[n]['hash'][:16]})")
+        else:                                             # addendum 5 (R16): every journaled field but who and note
+            other = [k for k in _COMPARED_FIELDS if seen[n].get(k) != state[n].get(k)]
+            if other:
+                out.append(f"owner entry {n} differs between the journal and the state file in "
+                           f"{', '.join(other)}" + (" (it has another hash)" if "hash" in other else ""))
     if order != sorted(order):
         out.append(f"the journal holds the owner's entries in the order {', '.join(map(str, order))}, not their ids' order")
     return out
@@ -1645,10 +1660,10 @@ class OrderStepState:
         hash chained to the entry before it, all in one write transaction after the chain is checked. With `after`
         (the hash of the last entry its caller valued the book with, or the genesis hash for none), refused when the
         entries are no longer those. Returns the entry as written. No figure is defaulted here."""
-        for what, text, most in (("who", who, MAX_WHO), ("note", note, MAX_NOTE)):
-            if not isinstance(text, str) or not text.strip() or len(text) > most or not text.isprintable():
-                raise OrderStepError(f"an owner's entry needs {what}: plain text of at most {most} characters, not "
-                                     f"{_cut(repr(text))}; nothing was written")
+        for what, text in (("who", who), ("note", note)):
+            problem = _owner_text_problem(what, text)     # the same judgement as the command's (R15)
+            if problem is not None:
+                raise OrderStepError(f"an owner's entry needs {problem}")
         if figures.get("kind") not in ENTRY_KINDS:
             raise OrderStepError(f"an owner's entry is of kind {', '.join(ENTRY_KINDS)}; nothing was written")
         reading = self.clock() if now is None else now
