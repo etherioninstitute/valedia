@@ -614,6 +614,23 @@ def _is_b3(s, head_step, cand_step, reserved):
             and Decimal(h[4]) == without)
 
 
+def _is_r33a(head_step, cand_step):
+    """T51c R33a (ruling R37), the third difference made on purpose: at `order_status`, with the same SDK calls, the
+    candidate's answer is the older adapter's answer plus the one key `fee_unreadable`, a bool, True only where the older
+    answer's fee is None; with that key removed the two answers are equal. An event answer (it carries fee_type and
+    symbol) never carries the key."""
+    (name, h_out, h_calls), (_, c_out, c_calls) = head_step, cand_step
+    if name != "order_status" or h_calls != c_calls or h_out[0] != "ok" or c_out[0] != "ok":
+        return False
+    old, new = h_out[1], c_out[1]
+    if not (isinstance(old, dict) and isinstance(new, dict)) or "fee_unreadable" in old or "fee_unreadable" not in new:
+        return False
+    if "fee_type" in new or "symbol" in new:
+        return False
+    flag, rest = new["fee_unreadable"], {k: v for k, v in new.items() if k != "fee_unreadable"}
+    return type(flag) is bool and rest == old and (not flag or old.get("fee") is None)
+
+
 def _record(module, s, tmp_path):
     """Every step of one sequence on a fresh venue: (step name, outcome, the SDK calls that step made)."""
     client = SpecClient(s)
@@ -639,14 +656,15 @@ def test_generated_stock_and_crypto_inputs_behave_as_before_except_b1_and_b3(tmp
     """600 seeded accounts and requests on venues that are not Events venues, each run on a fresh venue of the adapter
     before T19 and of this one: at every step every public method gives the same value or raises the same kind of
     error with the same text, and the SDK sees the same calls with the same payloads, except a step that is one of
-    the two differences T22d-2 made on purpose (see _is_b1, _is_b3), recognised by what it is wherever it falls.
+    the two differences T22d-2 made on purpose (see _is_b1, _is_b3), or the key T51c R33a added to a stock or
+    crypto order_status answer (see _is_r33a), recognised by what it is wherever it falls.
 
     After such a difference the comparison goes on: the only state it leaves behind is the candidate's reservation of
     an unsettled sale, which no read, cancel or check uses, so every later step must still be equal, except the last
     one, a second sale of the same symbol, which is judged by _is_b3 with this test's own count of that reservation."""
     rng = random.Random(4242)
     compared = placed = accepted = accepted_before = identical = 0
-    kinds = {"B1": 0, "B3": 0, "B1_first": 0}
+    kinds = {"B1": 0, "B3": 0, "B1_first": 0, "R33a": 0}
     for _ in range(600):
         s = _spec(rng)
         h, c = _record(head, s, tmp_path), _record(wb, s, tmp_path)
@@ -662,18 +680,21 @@ def test_generated_stock_and_crypto_inputs_behave_as_before_except_b1_and_b3(tmp
                 kinds["B1_first"] += hs[0] == "submit"
             elif hs[0] == "second submit" and _is_b3(s, hs, cs, reserved):
                 kinds["B3"] += 1
+            elif _is_r33a(hs, cs):                                # T51c R33a (R37): the key fee_unreadable, and only it
+                kinds["R33a"] += 1
             else:
-                pytest.fail(f"a difference that is neither B1 nor B3 at step {hs[0]!r}: before {hs[1:]!r}, now {cs[1:]!r}; spec {s!r}")
+                pytest.fail(f"a difference that is neither B1, B3 nor R33a at step {hs[0]!r}: before {hs[1:]!r}, now {cs[1:]!r}; spec {s!r}")
         identical += not differed
         compared += 1
         placed += any(c_[0] == "place" for c_ in c[2][2])
         accepted += c[2][1][0] == "ok"
         accepted_before += h[2][1][0] == "ok"                    # the generator still reaches acceptance
     print(f"T22d-2 comparison: {compared} sequences, {identical} identical, {kinds['B1']} B1 differences, "
-          f"{kinds['B3']} B3 differences; first submit accepted {accepted_before} times before, {accepted} now")
+          f"{kinds['B3']} B3 differences, {kinds['R33a']} R33a differences; first submit accepted {accepted_before} times before, {accepted} now")
     assert compared == 600 and placed > 150 and accepted_before > 100 and accepted == accepted_before - kinds["B1_first"]
+    assert kinds["R33a"] > 50                                    # the generator reaches the new key (R37)
     assert kinds["B1"] > 0, f"no B1 difference was ever seen, so the test never reached the case it exists for: {kinds}"
-    assert identical + kinds["B1"] + kinds["B3"] >= compared
+    assert identical + kinds["B1"] + kinds["B3"] + kinds["R33a"] >= compared
 
 
 def test_the_b3_recogniser_checks_the_in_open_sells_figure_where_the_older_adapter_sent_the_sale():
