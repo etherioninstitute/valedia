@@ -64,6 +64,9 @@ class StandIn:
 
     def submit(self, symbol, units, tag, price=None, limit_price=None, session="CORE"):
         self.calls.append(("submit", tag))
+        if limit_price is None:                      # T51 A2: a MARKET order (no limit) fills at its reference price,
+            self.__dict__.setdefault("no_limit", set()).add(tag)   # kept as the stand-in's fill price for it
+            limit_price = price
         mode = self.submit_mode.pop(0) if isinstance(self.submit_mode, list) and self.submit_mode else (
             "accept" if isinstance(self.submit_mode, list) else self.submit_mode)
         if mode == "accept":
@@ -617,8 +620,8 @@ def test_differences_are_rounded_toward_zero_and_a_sale_never_exceeds_the_broker
 
 def test_the_fractional_option_rounds_toward_zero_to_five_decimals(world):
     world.paper = paper({"a": {"SPY": 1.23456789}})
-    world.run(fractional=True)
-    assert units_sent(world) == {"SPY": 1.23456}
+    world.run(fractional=True)                                            # T51 A2: 1.23456 as a whole leg and a remainder
+    assert [(o["units"], o["order_type"]) for o in world.orders()] == [(1.0, "LIMIT"), (0.23456, "MARKET")]
     w2 = World(world.tmp / "whole")
     w2.paper = world.paper
     w2.run()
@@ -3152,8 +3155,10 @@ def test_fractional_units_must_match_to_within_a_billionth(tw):
     _, number = _proposed(tw, {"a": {"SPY": 1.23456, "QQQ": 2.5}}, fractional=True)
     tw.paper = paper({"a": {"SPY": 1.23456, "QQQ": 2.50001}})
     out = approve(tw, number, fractional=True)
-    by = {o["fund"]: o["outcome"] for o in out["ticket"]["orders"]}
-    assert by == {"SPY": "sent", "QQQ": "dropped"} and [o["units"] for o in tw.orders()] == [1.23456]
+    by = {(o["fund"], o["leg"]): o["outcome"] for o in out["ticket"]["orders"]}    # T51 A2: lines by (fund, leg)
+    assert by == {("SPY", "whole"): "sent", ("SPY", "remainder"): "sent", ("QQQ", "whole"): "sent",
+                  ("QQQ", "remainder"): "dropped"}
+    assert [o["units"] for o in tw.orders()] == [2.0, 1.0, 0.23456]
 
 
 @pytest.mark.parametrize("move, sent", [(0.0, True), (0.004, True), (0.005, True), (-0.005, True), (0.0051, False),
@@ -3358,15 +3363,16 @@ def test_an_approve_run_sends_at_most_what_its_ticket_allows_over_generated_scen
         out2 = approve(w, number if right else wrong_other_number(number), fractional=fractional, capital=capital)
         sent = [o for o in w.orders() if o["batch"] == out2["batch"] and o["state"] not in ("intended",)]
         assert len(w.venue.submits()) - submits_before == len(sent)
-        units = {ln["fund"]: ln["units"] for ln in lines}
+        units = {(ln["fund"], ln.get("leg", "whole")): ln["units"] for ln in lines}   # T51 A2: by (fund, leg)
+        leg = {o["tag"]: "remainder" if o["tag"].endswith(".r") else "whole" for o in sent}
         for o in sent:
             assert o["symbol"] in allowed, (seed_block, k, o["symbol"], allowed, moves, changed, minutes, out2["ticket"])
-            assert o["units"] == units[o["symbol"]]                              # the ticket's units, never more
-        assert len({o["symbol"] for o in sent}) == len(sent)
+            assert o["units"] == units[(o["symbol"], leg[o["tag"]])]               # the ticket's units, never more
+        assert len({(o["symbol"], leg[o["tag"]]) for o in sent}) == len(sent)
         if allowed:
             assert {o["symbol"] for o in sent} == allowed                     # nothing else stood in the way here
             full += 1
-        partial += len(allowed) < len(lines)
+        partial += len(allowed) < len({ln["fund"] for ln in lines})
         if right:
             again = approve(w, number, fractional=fractional, capital=capital)    # never twice
             assert again["status"] == "stopped" and again["orders_sent"] == 0
@@ -3724,9 +3730,37 @@ def _run_with(mod, w, **kw):
 _STAMP = re.compile(rb'"timestamp": "[^"]*"')
 
 
-def _scenario(mod, tmp, seed, monkeypatch):
+_T51_DREW_FRACTIONAL: set = set()   # T51 A2: the seeds whose scenario drew `fractional` (see _t51_fractional_shape)
+
+
+def _t51_fractional_shape(records) -> int:
+    """T51 A2: a fractional run now splits each fund into a whole-share LIMIT leg and a MARKET remainder (R4), which
+    no base before T51 sends; a seed that drew `fractional` is compared with its base with the flag dropped (both
+    sides whole shares), and run once more here with it, where every order line must have the new shape. Returns
+    the order lines checked."""
+    n = 0
+    for raw in records[-1]["journal"].values():
+        for text in raw.decode("utf-8", "replace").splitlines():
+            try:
+                e = json.loads(text)
+            except ValueError:
+                continue
+            if not (isinstance(e, dict) and e.get("type") == "order_step" and e.get("event") == "order"):
+                continue
+            u, tag = e["units"], e["tag"]
+            if e["order_type"] == "MARKET":
+                assert e["leg"] == "remainder" and tag.endswith(".r") and 0 < abs(u) < 1, e
+                assert e["limit_price"] is None and e["collar_price"] > 0, e
+            else:
+                assert e["order_type"] == "LIMIT" and e["leg"] == "whole" and not tag.endswith(".r"), e
+                assert abs(u) >= 1 and u == math.trunc(u) and e["limit_price"] > 0, e
+            n += 1
+    return n
+
+
+def _scenario(mod, tmp, seed, monkeypatch, whole_only=False):
     """One generated scenario driven through `mod`: what the venue, the quote source, the journal, the ledger and
-    the state file saw, run by run."""
+    the state file saw, run by run. `whole_only` (T51 A2): a drawn `fractional` is dropped (the draw is still made)."""
     rng = random.Random(seed)
     urandom = random.Random(seed + 1)
     monkeypatch.setattr("os.urandom", lambda n: bytes(urandom.getrandbits(8) for _ in range(n)))
@@ -3737,6 +3771,9 @@ def _scenario(mod, tmp, seed, monkeypatch):
     kw = {}
     if rng.random() < 0.3:
         kw["fractional"] = True
+        _T51_DREW_FRACTIONAL.add(seed)
+        if whole_only:
+            del kw["fractional"]
     if rng.random() < 0.3:
         kw["capital"] = rng.choice([50_000.0, 250_000.0])
     seen = []
@@ -3778,8 +3815,10 @@ def test_a_run_without_the_new_flags_is_the_base_byte_for_byte_over_generated_sc
     sends = crashes = 0
     for k in range(50):
         seed = 150_000 + seed_block * 50 + k
-        base = _scenario(base_osx, tmp_path / f"base{k}", seed, monkeypatch)
-        mine = _scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch)
+        base = _scenario(base_osx, tmp_path / f"base{k}", seed, monkeypatch, whole_only=True)
+        mine = _scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch, whole_only=True)
+        if seed in _T51_DREW_FRACTIONAL:                                # T51 A2: the fractional run, in its new shape
+            _t51_fractional_shape(_scenario(osx, tmp_path / f"frac{k}", seed, monkeypatch))
         assert len(base) == len(mine)
         for i, (b, m) in enumerate(zip(base, mine)):                    # T34b-2: equal but for `faults` (F1, F2)
             added = _t34_same_but(b, m, T34B2_PRACTICE_KEYS, (seed, i))
@@ -5549,9 +5588,10 @@ def t22b_base(tmp_path_factory):
     return mod
 
 
-def _flow_scenario(mod, tmp, seed, monkeypatch):
+def _flow_scenario(mod, tmp, seed, monkeypatch, whole_only=False):
     """One generated scenario of the scheduled run and the paper ticket flow driven through `mod`: what the venue, the
-    quote source, the journal, the ledger, the state file and the ticket file saw, run by run."""
+    quote source, the journal, the ledger, the state file and the ticket file saw, run by run. `whole_only` (T51 A2): a
+    drawn `fractional` is dropped (the draw is still made)."""
     rng = random.Random(seed)
     urandom, numbers = random.Random(seed + 1), random.Random(seed + 2)
     monkeypatch.setattr("os.urandom", lambda n: bytes(urandom.getrandbits(8) for _ in range(n)))
@@ -5563,6 +5603,9 @@ def _flow_scenario(mod, tmp, seed, monkeypatch):
     kw = {}
     if rng.random() < 0.3:
         kw["fractional"] = True
+        _T51_DREW_FRACTIONAL.add(seed)
+        if whole_only:
+            del kw["fractional"]
     if rng.random() < 0.4:
         kw["capital"] = rng.choice([50_000.0, 250_000.0])
     seen, last_number = [], None
@@ -5615,8 +5658,10 @@ def test_without_live_the_scheduled_run_and_the_paper_ticket_flow_are_t22bs_base
     counts = {"submit": 0, "tickets": 0, "approved": 0, "crashed": 0}
     for k in range(50):
         seed = 440_000 + seed_block * 50 + k
-        base = _flow_scenario(t22b_base, tmp_path / f"base{k}", seed, monkeypatch)
-        mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch)
+        base = _flow_scenario(t22b_base, tmp_path / f"base{k}", seed, monkeypatch, whole_only=True)
+        mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch, whole_only=True)
+        if seed in _T51_DREW_FRACTIONAL:                                # T51 A2: the fractional run, in its new shape
+            _t51_fractional_shape(_flow_scenario(osx, tmp_path / f"frac{k}", seed, monkeypatch))
         assert len(base) == len(mine)
         for i, (b, m) in enumerate(zip(base, mine)):                    # T34b-2: equal but for `faults` (F1, F2)
             added = _t34_same_but(b, m, T34B2_PRACTICE_KEYS, (seed, i))
@@ -6010,8 +6055,10 @@ def test_t32_without_a_follow_list_the_step_is_its_bases_byte_for_byte(tmp_path,
     sends = 0
     for k in range(50):
         seed = 532_000 + seed_block * 50 + k
-        base = _flow_scenario(t32_base, tmp_path / f"base{k}", seed, monkeypatch)
-        mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch)
+        base = _flow_scenario(t32_base, tmp_path / f"base{k}", seed, monkeypatch, whole_only=True)
+        mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch, whole_only=True)
+        if seed in _T51_DREW_FRACTIONAL:                                # T51 A2: the fractional run, in its new shape
+            _t51_fractional_shape(_flow_scenario(osx, tmp_path / f"frac{k}", seed, monkeypatch))
         assert len(base) == len(mine)
         for i, (b, m) in enumerate(zip(base, mine)):                    # T34b-2: equal but for `faults` (F1, F2)
             added = _t34_same_but(b, m, T34B2_PRACTICE_KEYS, (seed, i))
@@ -6128,6 +6175,7 @@ def test_t32_rev2_following_every_strategy_is_the_whole_book_over_generated_book
                 if key != "followed":
                     assert a[key] == b[key], (seed, i, key)
         counts["submit"] += sum(1 for r in every for c in r["calls"] if c[0] == "submit")
+        counts["submit"] += sum(len(r["summary"].get("residuals", [])) for r in every)   # T51 A2: or held back (R1)
         counts["smallest"] += sum(1 for r in every for s in r["summary"]["skipped"] if "smallest trade" in s["reason"])
         _shutil.rmtree(tmp_path / f"whole{k}")
         _shutil.rmtree(tmp_path / f"every{k}")
@@ -6527,8 +6575,10 @@ def test_t22d1_practice_runs_are_the_bases_byte_for_byte(tmp_path, monkeypatch, 
     runs = sends = 0
     for k in range(25):
         seed = 770_000 + seed_block * 25 + k
-        base = _flow_scenario(t22d1_base, tmp_path / f"base{k}", seed, monkeypatch)
-        mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch)
+        base = _flow_scenario(t22d1_base, tmp_path / f"base{k}", seed, monkeypatch, whole_only=True)
+        mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch, whole_only=True)
+        if seed in _T51_DREW_FRACTIONAL:                                # T51 A2: the fractional run, in its new shape
+            _t51_fractional_shape(_flow_scenario(osx, tmp_path / f"frac{k}", seed, monkeypatch))
         assert len(base) == len(mine)
         for i, (b, m) in enumerate(zip(base, mine)):                    # T34b-2: equal but for `faults` (F1, F2)
             added = _t34_same_but(b, m, T34B2_PRACTICE_KEYS, (seed, i))
@@ -8036,8 +8086,10 @@ def test_t34b2_practice_runs_are_the_bases_but_for_faults_where_a_fault_marks_th
     runs = marked = pending = sends = 0
     for k in range(50):
         seed = 990_000 + seed_block * 50 + k
-        base = _flow_scenario(t34b2_base, tmp_path / f"base{k}", seed, monkeypatch)
-        mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch)
+        base = _flow_scenario(t34b2_base, tmp_path / f"base{k}", seed, monkeypatch, whole_only=True)
+        mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch, whole_only=True)
+        if seed in _T51_DREW_FRACTIONAL:                                # T51 A2: the fractional run, in its new shape
+            _t51_fractional_shape(_flow_scenario(osx, tmp_path / f"frac{k}", seed, monkeypatch))
         assert len(base) == len(mine)
         for i, (b, m) in enumerate(zip(base, mine)):
             added = _t34_same_but(b, m, T34B2_PRACTICE_KEYS, (seed, i))
@@ -8843,8 +8895,10 @@ def test_t34b3_practice_runs_equal_the_bases_but_for_the_allowed_differences(tmp
     counts, runs = {}, 0
     for k in range(50):
         seed = 3_400_000 + seed_block * 50 + k
-        base = _flow_scenario(t34b3_base, tmp_path / f"base{k}", seed, monkeypatch)
-        mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch)
+        base = _flow_scenario(t34b3_base, tmp_path / f"base{k}", seed, monkeypatch, whole_only=True)
+        mine = _flow_scenario(osx, tmp_path / f"mine{k}", seed, monkeypatch, whole_only=True)
+        if seed in _T51_DREW_FRACTIONAL:                                # T51 A2: the fractional run, in its new shape
+            _t51_fractional_shape(_flow_scenario(osx, tmp_path / f"frac{k}", seed, monkeypatch))
         assert len(base) == len(mine)
         for i, (b, m) in enumerate(zip(base, mine)):
             last, seen = i == len(mine) - 1, {}             # lines and ledger rows counted once, at the scenario's end
