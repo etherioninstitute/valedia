@@ -214,6 +214,12 @@ Items:
   approval desk; bots file proposals into a create-only inbox (one command, being built that night in the
   design session's repository: at most 5 proposals a bot and 20 in all a day, nothing it files can start a
   worker). Still his to decide: RuFlo's first supervised task; which bot and model do the daily review.
+- The inbox command is built and blind-checked twice by that session (2026-11-17 23:30 PST, its report):
+  `~/valedia-orchestration/bin/propose`, one JSON object with the keys bot, title, item, day, class, evidence,
+  seen, proposed, prediction; `--dry-run` sends nothing; it files into Paperclip's backlog with no assignee.
+  NOT USED YET: no real filing has been made. The daily review (L-1) is its first intended caller.
+- **OWNER** a three-seat coding pipeline (planner, implementer, blind reviewer) built from Paperclip's own
+  review and approval stages: a design in that session, with the lead's four changes; not built until he says.
 - **QUEUED** L-2 lessons by idea family, and a stop on a family after N failures (roadmap 2.3).
 - **QUEUED** L-3 a check on the critic itself (roadmap 2.5).
 - **QUEUED** L-4 scores earn weight (roadmap 1.5).
