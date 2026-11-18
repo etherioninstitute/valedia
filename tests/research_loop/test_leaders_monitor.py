@@ -1029,3 +1029,35 @@ def test_one_snapshot_a_wallet_a_utc_day_also_when_it_holds_nothing(store):
     assert sorted(tuple(r) for r in taken) == sorted([(w, d1, 1), (w, d2, 1), (e, d1, 1), (e, d2, 1)])
     assert all(r[0] == lm._utc_day(r[1]) for r in c.execute(
         "SELECT snapshot_day, read_ts FROM wallet_reads WHERE snapshot_day IS NOT NULL"))
+
+
+# ------------------------------------------------------------------ addendum 2, item 4: a pass that died
+def test_a_pass_marks_an_earlier_pass_still_running_as_died_and_report_counts_them(store):
+    world, wall = fixed(store)
+    run(["pass"], world, wall, store)
+    c = db(store)
+    c.executemany("INSERT INTO passes (started_ts, status) VALUES (?, 'running')", [(T0 + 10,), (T0 + 20,)])
+    c.execute("INSERT INTO passes (started_ts, status) VALUES (?, 'running')", (T0 - 40 * DAY,))  # outside the window
+    c.commit()
+    wall.t += 300
+    code, out = run(["pass"], world, wall, store)
+    assert code == 0
+    st = [r[0] for r in db(store).execute("SELECT status FROM passes ORDER BY pass_id")]
+    assert st == ["done", "died", "died", "died", "done"]
+    code, out = run(["report", "--days", "30"], world, wall, store)
+    assert "passes 4 in the window: done=2 died=2 stopped_memory=0" in out
+
+
+def test_a_pass_killed_for_real_is_said_to_have_died(tmp_path):
+    s = tmp_path / "died" / "leaders.sqlite"
+    world, wall = fixed(s)
+    p = child(tmp_path, {"kill_at": 4, "held": {wallet(0): [pos(wallet(0), 1)]}, "t": T0 + 300, "cmd": "pass",
+                         "store": str(s)})
+    p.communicate(timeout=120)
+    assert p.returncode == -signal.SIGKILL
+    assert [r[0] for r in db(s).execute("SELECT status FROM passes")] == ["running"]
+    wall.t += 600
+    assert run(["pass"], world, wall, s)[0] == 0
+    assert [r[0] for r in db(s).execute("SELECT status FROM passes ORDER BY pass_id")] == ["died", "done"]
+    code, out = run(["report"], world, wall, s)
+    assert "died=1" in out
