@@ -955,3 +955,8 @@ def test_a_resolution_row_whose_condition_is_not_a_string_is_an_answer_not_an_er
     c, t, clock = client(lambda p, q: {"data": rows})
     (batch, w, answers), = list(c.resolution_batches(["0x1", "0x2"]))
     assert answers == {"0x1": "row", "0x2": "no_row"} and dict(w.rejects) == {"bad_condition_id": 2}
+
+
+def test_the_store_check_looks_inside_lists_at_any_depth_without_recursion():
+    assert pd._fits_store([[0, [2 ** 63]]]) is False and pd._fits_store([1, [2, [-2 ** 63 - 1]]]) is False
+    assert pd._fits_store([[0, [2 ** 63 - 1]], _deep(50_000)]) is True

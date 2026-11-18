@@ -1061,3 +1061,24 @@ def test_a_pass_killed_for_real_is_said_to_have_died(tmp_path):
     assert [r[0] for r in db(s).execute("SELECT status FROM passes ORDER BY pass_id")] == ["died", "done"]
     code, out = run(["report"], world, wall, s)
     assert "died=1" in out
+
+
+def test_consistency_names_a_carried_holding_that_is_not_marked_as_its_read_says(store):
+    world, wall = fixed(store)
+    w = wallet(1)
+    world.held[w] = [pos(w, 1), pos(w, 2)]
+    run(["pass"], world, wall, store)
+    wall.t += 300
+    world.held[w] = [pos(w, 1), pos(w, 2, current_size="x")]
+    run(["pass"], world, wall, store)
+    assert lm.consistency(db(store)) == []
+    for corrupt in ("UPDATE holdings_current SET carried=0 WHERE carried=1",
+                    "UPDATE holdings_current SET seen_read_id=read_id WHERE carried=1"):
+        s = store.parent / "copy.sqlite"
+        shutil.copy(store, s)
+        c = db(s)
+        c.execute(corrupt)
+        c.commit()
+        assert lm.consistency(c) != [], corrupt
+        c.close()
+        s.unlink()
