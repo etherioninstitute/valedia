@@ -535,15 +535,15 @@ KILL_SCRIPT = textwrap.dedent(r'''
     kill_at = spec["kill_at"]
     count = [0]
     class Kill(sqlite3.Connection):
-        def _tick(self):
+        def _tick(self, sql=""):
             count[0] += 1
-            if count[0] == kill_at:
+            if count[0] == kill_at or (spec.get("kill_on") and str(sql).startswith(spec["kill_on"])):
                 os.kill(os.getpid(), signal.SIGKILL)
         def execute(self, *a, **k):
-            self._tick()
+            self._tick(a[0] if a else "")
             return super().execute(*a, **k)
         def executemany(self, *a, **k):
-            self._tick()
+            self._tick(a[0] if a else "")
             return super().executemany(*a, **k)
     real = sqlite3.connect
     lm.sqlite3.connect = lambda *a, **k: real(*a, factory=Kill, **k)
@@ -1052,8 +1052,8 @@ def test_a_pass_marks_an_earlier_pass_still_running_as_died_and_report_counts_th
 def test_a_pass_killed_for_real_is_said_to_have_died(tmp_path):
     s = tmp_path / "died" / "leaders.sqlite"
     world, wall = fixed(s)
-    p = child(tmp_path, {"kill_at": 4, "held": {wallet(0): [pos(wallet(0), 1)]}, "t": T0 + 300, "cmd": "pass",
-                         "store": str(s)})
+    p = child(tmp_path, {"kill_at": 10 ** 9, "kill_on": "BEGIN IMMEDIATE", "held": {wallet(0): [pos(wallet(0), 1)]},
+                         "t": T0 + 300, "cmd": "pass", "store": str(s)})     # killed at its first wallet's write
     p.communicate(timeout=120)
     assert p.returncode == -signal.SIGKILL
     assert [r[0] for r in db(s).execute("SELECT status FROM passes")] == ["running"]
