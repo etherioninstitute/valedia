@@ -312,8 +312,11 @@ run beside MiroFish and Elephant-1):
 
 - **WATCH** Telegram is on and has dropped its connection before; Signal is parked (possible relink about
   11 Dec; its job is not installed).
-- **QUEUED** the Live page: not yet verified for a question to a person, a delegation, a model error, a
-  failed turn; next round of page notes.
+- **QUEUED** the Live page (its session's summary of 2026-11-17, the owner calling that work done): a model
+  error is now shown (a turn whose process died reads as not signalled; reader 1.4.0, live since his restart
+  at 21:19 PST). Still not seen in real use: a question to a person, a delegation, a failed or interrupted
+  turn's end, and the new sentences on the page itself. Two sessions write to `~/valedia-live`: check its log
+  and status first, one writer at a time. No review by another model family there either.
 - **QUEUED** the skill system: skills not yet rewritten to the standard; per-skill checks, scorecard and run
   log not built.
 - **QUEUED** Hermes: the `valedia-cto` profile has no config; panel bots still carry built-in tools pending
