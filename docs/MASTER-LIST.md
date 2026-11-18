@@ -191,7 +191,15 @@ What loops today, found in code on 2026-11-17:
 
 Items:
 - **QUEUED** L-1 daily self-review (roadmap 2.2): each day's closed trades, settled forecasts, faults and
-  held-back orders become lessons. The owner approved the daily job by name on 2026-11-14; not built.
+  held-back orders become lessons. The owner approved the daily job by name on 2026-11-14; not built. This is
+  the "review and improvement agent" he asked about on 2026-11-17: a reviewer that PROPOSES (lessons and
+  findings that become tickets), never one that patches guarded trading code by itself; code changes keep
+  going through a builder, a blind check and the job gates.
+- **IDEA** RuFlo (asked by the owner 2026-11-17 through the design session): not proven for coding here; its
+  agents are Sonnet subagents and its prompts fetch a package at run time (to be blocked first). One
+  supervised task end to end on something that is not the trader, then add only what that run shows missing.
+  Trader coding stays on builder plus blind checker. Its `neural-trader` and `market-data` parts: a
+  reading-only look for ideas, nothing run or copied.
 - **QUEUED** L-2 lessons by idea family, and a stop on a family after N failures (roadmap 2.3).
 - **QUEUED** L-3 a check on the critic itself (roadmap 2.5).
 - **QUEUED** L-4 scores earn weight (roadmap 1.5).
