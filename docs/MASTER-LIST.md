@@ -46,10 +46,15 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   leader, because 467,532 of 958,230 resolution rows are in an OLDER SHAPE of the service with no resolution
   time and no payouts (everything resolved before about mid-2025), which the reader stores but does not
   interpret. The sealed months are NOT opened. This is NOT evidence about copy-trading either way; the lead
-  did not measure that field before writing the rule. **NEXT** T47f: measure what the older rows hold (a last
-  update time and a price), write a FIFTH amendment before any trade is analysed (none has been), read the
-  stored rows again without a new pull of resolutions, price the development months' positions, run the
-  first stage again. The same reading feeds the consistency screen of the owner's method below. Roadmap 1.26. **QUEUED** T47d items 8 to 12 (among
+  did not measure that field before writing the rule. **DONE 2026-11-18 13:34 PST** the FIFTH amendment (main
+  `f40bc41`), written before any trade was analysed (none has been): measured, those rows are the ORACLE'S OWN
+  record (a price, a status, a last update time; present from 2022 to 2026, not only old ones), checked on 14
+  known markets (the 2024 election and the 2025 Super Bowl among them): status `resolved` with a price of 1, 0
+  or one half is a known resolution at its last update time; anything else is not. **NOW** T47f (builder at
+  work since 13:36): the reader reads both shapes, the stored rows are read again with no new request, the
+  plan is made again; then the lead runs phase 2 for the new price windows and the first stage ONCE more,
+  stated beside the first run. The sealed months stay unopened unless that passes. The same reading feeds the
+  consistency screen of the owner's method below. Roadmap 1.26. **QUEUED** T47d items 8 to 12 (among
   them: a reader of the store must not end the pull; the pull's start must not read the store at full speed
   beside the collector).
 - **NOW** T47c (the analysis in bounded memory): passed its blind check and is on main (`0172b3f`,
@@ -59,9 +64,15 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   `artifacts/leaders_monitor/leaders.sqlite`: 9 wallets read, 1,942 open positions; two of the Sports leaders
   hold nothing open; Sports #2 holds more than 20,000 open positions and is past the page limit (it stays in
   the list as unread; a wallet of that size is a market maker). Each later pass records what is new, grown,
-  shrunk or gone. THE OWNER ALLOWED A DAILY JOB for the pass on 2026-11-18 ("Yes, daily job"), to be added
-  once T52b's three follow-ups are built and blind-checked; its schedule is told to him before it is
-  installed. **NEXT** T52b, then the job. The forward document before any paper trade.
+  shrunk or gone. T52b (a pass takes its lock before it checks the store; the store's whole shape is checked;
+  a wallet past the page limit no longer reads as a failed day; nothing is created where no record is)
+  MERGED 2026-11-18 13:54 PST (main `ad07778`, two blind checks, 129 tests on main). THE DAILY JOB the owner
+  allowed on 2026-11-18 ("Yes, daily job") IS INSTALLED (13:58 PST, its schedule told to him first): every
+  day 05:20 local, one pass of about 20 seconds, `com.valedia.leaders.daily`, log
+  `~/Library/Logs/valedia-leaders-daily.log`; skipped unless the six project files a pass loads equal the
+  revision in `valedia-deploy/accepted-leaders-commit`. Pass 2 (the job's script by hand, 13:55): in 17
+  hours 56 new positions, 53 grown, 33 shrunk, 52 gone. **WATCH** the first scheduled run on 19 Nov; after
+  T47f merges (it changes two of the six files) the lead re-tests and moves that gate, or the job skips.
 - **NEXT** THE OWNER'S COPY-TRADING METHOD (his video, 2026-11-18; analysis in `~/Downloads/Copytrade_analysis.md`):
   from Polymarket's board pick CONSISTENT, low-volatility leaders (not the top by profit), check their closed
   positions for wins, copy what they hold NOW, place it on Webull, repeat daily. What exists: the boards, 189
@@ -71,6 +82,12 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   the wallets it picks; (3) each open position matched to a Webull contract with the same resolution rule;
   (4) paper copies under a rule locked BEFORE the first copy; (5) its result against a bar stated in that
   locked document. Real orders only after it passes, the event order step (T45-2) and his event limits.
+  **NOW** T53 step 0 (a study, at work since 13:45): what the leaders hold, which positions have a Kalshi
+  market with the SAME resolution rule (Webull lists Kalshi's tickers), one day's prices and fees, the
+  consistency screen designed WITHOUT reading T47's sealed months, the forward test sketched. The lead's
+  first look at the baseline pass: 281 of the 1,942 open positions are priced between 3 and 97 cents (about
+  3.0 million dollars); 175 of those are crypto and commodity price-level questions. Then the lead writes the
+  locked forward document.
 - **WATCH** the order-book collector (roadmap 1.16). 2026-11-18, the last development day: 33 decisions lost,
   3 at 03:14 (the pull's start read its 70 GB store on the collector's SSD) and 30 from 07:20 to 07:33 (the
   LEAD's own copy of that store off the SSD at 100 MB/s made the collector overrun whole minutes). What is
@@ -82,9 +99,17 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   test activities overlapping with their scratch on NIMROD_SSD cost 3 of 9 decisions inside three and a half
   minutes; the same overlap with scratch on the internal disk, four arms and 16 minutes with the kill suite
   among them, cost 0 of 39. THE RULE NOW: all test scratch on the internal disk, and every test run of every
-  session through the machine-wide lock `~/valedia-data/bin/test-slot` (one holder, 20-minute cap, a shared
+  session through the machine-wide gate `~/valedia-data/bin/test-slot` (TWO activities at once since 13:25
+  PST, after the owner asked for parallel work instead of time slots; one run a name, 20-minute cap, a shared
   log at `~/valedia-data/locks/test-activity.log`). Today's losses: 36 decisions (3 the pull's start, 30 the
-  lead's copy, 3 the comparison's SSD arm), all in the development period.
+  lead's copy, 3 the comparison's SSD arm) and one `model_unavailable` at 13:03 (cause not known), all in the
+  development period. NEW 13:49 PST: the collector reads Kalshi's public data host, and a study worker's 86
+  requests to that host in one minute (the project's own reader at its 3 a second) sat one cycle before the
+  collector's cycle slipped 11 seconds; no decision lost, but the loop keeps the later phase for hours and a
+  cycle that starts with under 12 seconds left loses its decision. One event, suspected. RULE: every
+  ticket's network hosts are checked against the collector's; until the scored period ends a second Kalshi
+  reader on this machine runs far below that pace, set by measurement under the guard (this binds the
+  forward copy test's daily matching).
 - **NEXT** the nightly backup (03:40) must not take very large research stores: with the 70 GB store in
   `artifacts/` its copy held a read lock for 21 minutes and its integrity check of the copy ran for hours.
   The store has left those folders; the lead checks that today's backup ends and tomorrow's is ordinary.
@@ -128,10 +153,15 @@ trading (his word, 2026-11-17).
    files pass on main (3,626 tests); the order-path gate moved to it; the real practice state files are
    backed up in the deploy folder (the first run on the new gate, 19 Nov 06:55, upgrades the state file's
    layout; code before this build then refuses it). The owner's command refuses a live venue's name until
-   live entries open with `--live`. **NEXT** S4 in slices (rulings in
-   `.foreman/tickets/T51c-addendum-7-S4-rulings.md`): S4a the fee rule, S4b the owner's command wired (marks
-   from the quote path, a preview and a confirm code), S4c practice shared mode, S4d live, S4e alerts and
-   the owner's page. What the record
+   live entries open with `--live`. S4 in slices (rulings in
+   `.foreman/tickets/T51c-addendum-7-S4-rulings.md`). S4a THE FEE RULE MERGED 2026-11-18 about 13:30 PST
+   (main `599ae5b`; two blind checks; sixteen test files, 3,934 tests, pass on main; the order-path gate
+   moved to it at 13:54): a purchase's fee the venue leaves empty is bounded by Webull's published rate
+   while the order can still be rechecked and taken as none after, so the book can be valued after its
+   first purchase. **NOW** S4b (builder at work since 13:43): the owner's command takes its marks from the
+   quote path (never typed), shows a preview with a code and writes only on a confirm, and can repair an
+   entry whose journal line failed. **NEXT** S4c practice shared mode (first: the adapter must say when a
+   fee could not be read), S4d live, S4e alerts and the owner's page. What the record
    catches is written in `docs/WEBULL.md`: a change to the state file OR to the journal is found; both
    rewritten to match are not. FOR S4, found on the way: Webull reports no fee on a purchase (the book then
    calls the fee unknown: a rule is needed); the marks of an entry must come from the order step's quote
@@ -229,7 +259,7 @@ Ideas not committed to:
 - **NEXT** T52 the leaders record (above). Later slices: rule match to Kalshi's public markets (Webull lists
   Kalshi's contracts: verified for five sports series only, never for crypto), the entry price at first
   sight, the forward document locked by the lead BEFORE any paper trade.
-- **OWNER** a repeating job for the leaders record (asked, unanswered). Until then passes are run by hand.
+- **DONE 2026-11-18** the repeating job for the leaders' record: allowed by the owner, installed (section 1).
 - **QUEUED** Elephant-1 as the judge of "the same question": not while the collector's test runs (it serves
   the collector with one slot). Rule survivors are stored and judged later in one batch.
 - **QUEUED** the Odds API: 16,730 credits left; every use goes through the credit ledger. The sportsbook
@@ -504,6 +534,14 @@ run beside MiroFish and Elephant-1):
   with notes (three follow-ups in T47d).
 - 2026-11-18 L-0 the Sunday research cycle's model read: Claude Sonnet through Hermes, nothing local.
 - 2026-11-18 T51c step 0 (the shared account): study done, rulings written; the build has started.
+- 2026-11-18 T51c S1 to S3 (the shared account's parts, nothing wired): merged (main `46b398d`).
+- 2026-11-18 the position limit's basis in the shared account: her own book alone (owner: "Yes, hers only").
+- 2026-11-18 fractional orders proven on the practice account (market orders filled inside their collars).
+- 2026-11-18 test activities beside the collector, compared: scratch on the internal disk costs no decision;
+  the one-at-a-time rule replaced by a two-slot gate (owner: no time slots).
+- 2026-11-18 T51c S4a the fee rule: merged (main `599ae5b`); the order-path gate moved.
+- 2026-11-18 T52b the leaders' record repaired: merged (main `ad07778`); the daily job installed (05:20).
+- 2026-11-18 the copying-leaders test's fifth amendment (the oracle's own resolution rows): main `f40bc41`.
 - 2026-11-17 TMF6 the MiroFish operator: merged (never run for real); TMF7 the acknowledged-revisions list
   (the owner's "Yes, accept them" for 22 files).
 - 2026-11-17 T45-1 event settlement by two witnesses: merged.
