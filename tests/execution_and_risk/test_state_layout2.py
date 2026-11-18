@@ -469,6 +469,25 @@ def test_the_command_needs_a_plain_venue_name(tmp_path, capsys, name):
     assert "venue" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("name", ["webull-production", "webull-production-events", "WEBULL-PRODUCTION",
+                                  "Webull-Production-Events", "webull-production.", "webull-production.."])
+def test_a_production_venues_name_is_refused_in_words_until_live_entries_open(tmp_path, capsys, name):
+    """Addendum 7, R23: the name alone picks the live venue's state file; refused among the first refusals."""
+    from valedia_trader.execution_and_risk import go_live
+    assert go_live.LIVE_VENUE == "webull-production"                   # the name the code already has
+    assert cli.main(["--root", str(tmp_path), "order-step", *_ok("--venue", name)]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("refused:") and "production" in err and "--live" in err and "nothing was written" in err
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("name", ["webull-sandbox", "webull-sandbox-events", "webull-test-cash", "production",
+                                  "webull-productio"])
+def test_a_practice_venues_entry_works_as_before(tmp_path, capsys, name):
+    assert cli.main(["--root", str(tmp_path), "order-step", "--venue", name, "--owner-entry", "cash_in", "--amount",
+                     "5", "--who", "o", "--note", "n"]) == 0
+
+
 def test_the_command_is_refused_while_a_run_holds_the_lock(tmp_path, capsys):
     path = osx.state_path_for(osx.ledger_path_for(tmp_path / "memory", VENUE), VENUE)
     lock = osx._RunLock(str(path))
@@ -819,6 +838,9 @@ REFUSALS = {
     "a clock behind the last entry": (_ok(), _clock_behind),
     "a split of a symbol the book does not hold": (["--owner-entry", "split", "--symbol", "QQQ", "--ratio", "2",
                                                     "--who", "o", "--note", "n", "--mark", "SPY=100"], None),   # R21
+    **{f"a production venue's name {name!r}": (_ok("--venue", name), None)                         # addendum 7, R23
+       for name in ("webull-production", "webull-production-events", "WEBULL-Production", "webull-production.",
+                    "webull-production ")},
     "more than the book's cash": (["--owner-entry", "cash_out", "--amount", "999999999", "--who", "o", "--note", "n",
                                    "--mark", "SPY=100"], None),
     "more than the book holds": (["--owner-entry", "units_out", "--symbol", "SPY", "--units", "1000", "--who", "o",
