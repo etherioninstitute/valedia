@@ -1097,7 +1097,10 @@ def test_r22_the_code_before_this_slice_refuses_the_same_book_value_not_known(tm
     _opening_then(tmp_path, monkeypatch, [(10.0, 100.0, None)])
     capsys.readouterr()
     _at(monkeypatch, T0 + 3_600)
-    monkeypatch.setattr(osx, "book_figures", lambda *a, now=None, **k: old.book_figures(*a, **k))
+    import dataclasses                        # the old figures, carried into this build's type (this build's two new fields at nothing)
+    monkeypatch.setattr(osx, "book_figures", lambda *a, now=None, **k: osx.BookFigures(
+        **{x.name: getattr(old.book_figures(*a, **k), x.name) for x in dataclasses.fields(old.BookFigures)},
+        fees_taken_as_none=0, open_by=()))
     assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "100", "--mark", "SPY=150", "--who", "owner",
                  "--note", "a second deposit") == 2
     assert "value is not known" in capsys.readouterr().err

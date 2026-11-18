@@ -677,7 +677,9 @@ class BookFigures:
     when the cash has no lower bound or a symbol held has no mark: `unmarked`); `value_high` is the same at
     `cash_high`. `units_outstanding` are the book's units issued and redeemed by the owner's entries;
     `value_per_unit` is `value` over them (None with none outstanding). `fees_taken_as_none` counts the purchases
-    whose fee the venue left empty and whose recheck window has closed (addendum 7, R22 (b))."""
+    whose fee the venue left empty and whose recheck window has closed (addendum 7, R22 (b)). `open_by` holds the
+    lines of `bounded_by` whose order leaves a bound open (a fee not known, or units without a price that no limit
+    bounds or that a sale brought), the reasons a refusal gives (S4a addendum 1, R32)."""
     units: dict
     cash: Decimal | None
     cash_low: Decimal | None
@@ -691,6 +693,7 @@ class BookFigures:
     value_per_unit: Decimal | None
     unmarked: tuple
     fees_taken_as_none: int                       # addendum 7 (R22): purchases whose empty fee was taken as none
+    open_by: tuple                                # S4a addendum 1 (R32): the lines of `bounded_by` that leave a bound open
 
 
 @dataclass(frozen=True)
@@ -799,6 +802,7 @@ def book_figures(fills, orders, entries, marks, day: str, *, now: float) -> Book
         today_low = Decimal(0)
         none_taken = 0
         bounded: list[str] = []
+        opened: list[str] = []                    # R32: the lines of orders that leave a bound OPEN (not merely bounded)
         for tag in sorted(rows):
             o, rs = by_tag[tag], rows[tag]
             total = sum((_dec(r["units"], f"the units of fill row {r.get('id')}") for r in rs), Decimal(0))
@@ -819,6 +823,8 @@ def book_figures(fills, orders, entries, marks, day: str, *, now: float) -> Book
                 bounded.append(f"order {_cut(tag)}: {open_units} units without a price, "
                                + (f"bounded by its {'collar' if o.get('order_type') == 'MARKET' else 'limit'} {bound}"
                                   if bound is not None else "with no limit to bound them"))
+                if bound is None or not buy:              # a purchase's lower bound, or a sale's upper one, is open
+                    opened.append(bounded[-1])
             if buy:
                 worst = None if open_units > 0 and bound is None else priced + open_units * (bound or 0)
                 low = None if low is None or worst is None else low - worst
@@ -856,6 +862,7 @@ def book_figures(fills, orders, entries, marks, day: str, *, now: float) -> Book
                         low -= most
                 else:                                     # (d) as built, in its words: a sale, a purchase with fee rows
                     bounded.append(f"order {_cut(tag)}: its fee is not known")   # but no total, or no limit or collar
+                    opened.append(bounded[-1])
                     low = None
             elif low is not None:
                 low -= fees_most
@@ -900,7 +907,23 @@ def book_figures(fills, orders, entries, marks, day: str, *, now: float) -> Book
         return BookFigures(units=units, cash=low, cash_low=low, cash_high=high, cash_bounded=bool(bounded),
                            bounded_by=tuple(sorted(bounded)), usable_cash=usable, value=value, value_high=value_high,
                            units_outstanding=outstanding, value_per_unit=per_unit, unmarked=unmarked,
-                           fees_taken_as_none=none_taken)
+                           fees_taken_as_none=none_taken, open_by=tuple(sorted(opened)))
+
+
+def _value_unknown_why(figures: BookFigures) -> str:
+    """S4a addendum 1 (R32): why the value is not known, for a refusal: the orders that leave a bound open and the
+    symbols without a mark, first and in full up to the cut, then how many other orders are only bounded (never given
+    as the reason)."""
+    reasons = list(figures.open_by) + ([f"no mark for {', '.join(figures.unmarked)}"] if figures.unmarked else [])
+    if not reasons:                                       # nothing open is known: every line, as before
+        return _cut("; ".join(figures.bounded_by), 300)
+    named = {b.split(": ", 1)[0] for b in figures.open_by}          # each line starts "order TAG: "
+    others = len({b.split(": ", 1)[0] for b in figures.bounded_by} - named)
+    why = _cut("; ".join(reasons), 300)
+    if others:
+        why += (f"; {others} other order{' is' if others == 1 else 's are'} only bounded, which is not why the value "
+                "is not known")
+    return why
 
 
 def _positive(x, what: str) -> Decimal:
@@ -940,8 +963,7 @@ def next_entry(figures: BookFigures, kind: str, *, amount: Decimal | None = None
                                     "nothing was written")
         value, before, per_unit = figures.value, figures.units_outstanding, figures.value_per_unit
         if value is None:
-            why = "; ".join(figures.bounded_by) or f"no mark for {', '.join(figures.unmarked)}"
-            raise BookError(f"the book's value is not known ({_cut(why, 300)}), so no entry can be valued now")
+            raise BookError(f"the book's value is not known ({_value_unknown_why(figures)}), so no entry can be valued now")
         if kind == "cash_in" and before == 0:
             after = value + amount
             if after <= 0:
