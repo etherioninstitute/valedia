@@ -20,7 +20,8 @@ Rules the code holds:
 * The pull has two phases. Phase 1: the two profit boards ONCE (the candidate set, stored with its read time; a later
   pull never reads the boards into the same store), every candidate's full trade history, and the resolution of
   every traded condition (twenty ids a request, one answer word per id; a request the service refuses with HTTP 400
-  is asked again in halves down to single ids, a single id it refuses is answered "refused", its walk finishes, and
+  is asked again in halves down to single ids, a single id whose 400 says that id is invalid (pd.refuses_id) is answered "refused", its walk finishes (a single
+  id's 400 of any other shape is a failure: it stays unfinished), and
   the pull prints one line a refused request with the counts of ids asked, answered and refused, never an id: the
   fourth amendment, b55bc88). Phase 2 refuses while phase 1 is
   unfinished; it computes from phase 1 the leaders of every month (standing uses only what precedes the month) and

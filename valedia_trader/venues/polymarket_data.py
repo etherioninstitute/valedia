@@ -20,8 +20,10 @@ Routes (field names from the service's published specification, /v2/openapi.json
   any number of ids twenty at a time and records an answer per id: a short answer (fewer rows than ids) is the
   per-id answer "no_row" (unresolved or unknown), never an error for the batch. The service refuses with HTTP 400 a
   whole request that holds one id it takes as invalid (fourth amendment, b55bc88): such a request is asked again in
-  halves, down to single ids; a single id refused with HTTP 400 is the per-id answer "refused" (REFUSED) and its walk
-  ends. A refused request of n ids costs at most 2n - 2 more requests (38 for twenty), each paced and checked like
+  halves, down to single ids; a single id whose 400 says, as a JSON object of code "invalid_request" whose error
+  text names that id, that the id is invalid is the per-id answer "refused" (REFUSED) and its walk ends; a single
+  id's 400 of any other shape is another failure. An error answer's first 2,000 bytes are kept on the HttpError,
+  never printed. A refused request of n ids costs at most 2n - 2 more requests (38 for twenty), each paced and checked like
   any other and retried like any other. Any other failure, the first or one met while narrowing, raises as before
   for the ids not yet answered. No id is ever altered.
 * /v2/prices-history?token_id=<outcome token>&start=<s>&end=<e> answers one token's price points in [s, e) (start
@@ -62,7 +64,7 @@ from typing import Any, Callable
 __all__ = ["BASE_URL", "USER_AGENT", "HttpError", "PolymarketDataError", "PageCapHit", "Pacer", "urllib_get", "Walk",
            "PolymarketData", "is_number", "validate_board_row", "validate_trade", "validate_position",
            "validate_resolution", "validate_price_point", "trade_identity", "position_identity", "TS_MIN",
-           "BOARD_CATEGORIES", "REFUSED"]
+           "BOARD_CATEGORIES", "REFUSED", "refuses_id"]
 
 BASE_URL = "https://data-api.polymarket.com"
 USER_AGENT = "market-data-reader/1.0"
@@ -71,17 +73,20 @@ BOARD_WINDOWS = ("day", "week", "month", "all")
 BOARD_CATEGORIES = ("sports", "crypto")    # T52: a board per category; None is the overall board
 POSITION_STATUSES = (None, "CLOSED")
 MAX_CONDITIONS = 20
-REFUSED = "refused"                # the answer to a single condition id the service refuses (HTTP 400) as invalid
+REFUSED = "refused"                # the answer to a single condition id the service says is invalid (refuses_id)
+REFUSAL_CODE = "invalid_request"   # the `code` of the service's refusal of an id (measured by the lead, 2026-11-18)
+ERROR_BODY_MAX = 2000              # the bytes of an error answer's body kept on its HttpError (never printed)
 TS_MIN = 1_577_836_800             # 2020-01-01T00:00:00Z: no time of this service is earlier
 TS_AFTER_START = 86_400            # a time may be at most one day after the client was made
 
 
 class HttpError(Exception):
-    """A non-200 answer. Transports raise this so the retry rules see the status code."""
-    def __init__(self, status: int, url: str, retry_after: float | None = None):
+    """A non-200 answer. Transports raise this so the retry rules see the status code. `body`: the first
+    ERROR_BODY_MAX bytes of the answer's body when the transport read them (None when not); never in the words."""
+    def __init__(self, status: int, url: str, retry_after: float | None = None, body: bytes | None = None):
         super().__init__("HTTP %s for %s%s" % (status, url, " (a redirect: never followed)" if 300 <= status < 400
                                                else ""))
-        self.status, self.url, self.retry_after = status, url, retry_after
+        self.status, self.url, self.retry_after, self.body = status, url, retry_after, body
 
 
 class PolymarketDataError(RuntimeError):
@@ -154,7 +159,11 @@ def urllib_get(url: str, timeout: float = 60.0) -> tuple[bytes, str | None]:
             retry_after = float(retry) if retry is not None else None
         except ValueError:
             retry_after = None
-        raise HttpError(e.code, url, retry_after) from None
+        try:
+            body = e.read(ERROR_BODY_MAX)
+        except Exception:                          # no body to read, or a broken one: kept as none
+            body = None
+        raise HttpError(e.code, url, retry_after, body if isinstance(body, bytes) else None) from None
 
 
 # ---------------------------------------------------------------- shapes
@@ -711,53 +720,58 @@ class PolymarketData:
         holds one word per id asked: "row" (exactly one valid row), "no_row" (none: unresolved or unknown),
         "rejected" (only rows of the wrong shape), "row_and_reject" or "duplicate" (not trusted), or REFUSED.
 
-        A request answered with HTTP 400 is asked again in halves (the first half first), each half refused with
-        HTTP 400 again in halves, down to single ids; a single id refused with HTTP 400 is yielded alone, with an empty
-        walk of one page, as REFUSED. So a refused request of n ids costs at most 2n - 2 more requests. Every other
-        failure (and one met while narrowing) raises, as it always did, and the ids not yet yielded have no answer.
+        A request answered with HTTP 400 (any 400) is asked again in halves (the first half first), each half answered
+        with HTTP 400 again in halves, down to single ids. A single id whose 400 says that id is invalid (refuses_id)
+        is yielded alone, with an empty walk of one page, as REFUSED; a single id's 400 of any other shape is raised
+        as another failure. So a refused request of n ids costs at most 2n - 2 more requests. Every other failure (and
+        one met while narrowing) raises, as it always did, and the ids not yet yielded have no answer.
         `narrowed`, when given, is called once per refused request with the counts only (no id): {"asked",
         "answered", "refused", "requests" (the more requests made), "finished" (False when another failure stopped
         the narrowing; it is called before that failure is raised)}."""
         conds = list(dict.fromkeys(conditions))
         for i in range(0, len(conds), MAX_CONDITIONS):
             batch = conds[i:i + MAX_CONDITIONS]
+            first = None
             try:
                 w = self.resolutions(batch)
             except HttpError as e:
                 if e.status != 400:
                     raise
-                w = None
-            if w is None:
-                yield from self._narrow(batch, narrowed)
+                first = e
+            if first is not None:
+                yield from self._narrow(batch, first, narrowed)
             else:
                 yield batch, w, self._answers(batch, w)
 
-    def _narrow(self, batch: list, narrowed):
-        """The ids of a request the service refused with HTTP 400, asked again in halves (see resolution_batches)."""
+    def _narrow(self, batch: list, first: HttpError, narrowed):
+        """The ids of a request the service answered with HTTP 400 (`first`), asked again in halves (see
+        resolution_batches)."""
         tally = {"asked": len(batch), "answered": 0, "refused": 0, "requests": 0, "finished": False}
-        stack = [(batch, True)]                    # (ids, already refused); popped last first
+        stack = [(batch, first)]                   # (ids, the 400 they got or None when not yet asked); last first
         try:
             while stack:
-                part, refused = stack.pop()
-                if not refused:
+                part, err = stack.pop()
+                if err is None:
                     tally["requests"] += 1
                     try:
                         w = self.resolutions(part)
                     except HttpError as e:
                         if e.status != 400:
                             raise
-                        refused = True
+                        err = e
                     else:
                         tally["answered"] += len(part)
                         yield part, w, self._answers(part, w)
                         continue
                 if len(part) == 1:
+                    if not refuses_id(err, part[0]):
+                        raise err                  # a 400 that does not say this id is invalid: another failure
                     tally["refused"] += 1
                     read_at = self.now()
                     yield part, Walk(pages=1, read_at=[read_at]), {part[0]: REFUSED}
                     continue
                 half = len(part) // 2
-                stack += [(part[half:], False), (part[:half], False)]
+                stack += [(part[half:], None), (part[:half], None)]
         except Exception:
             if narrowed is not None:
                 narrowed(dict(tally))
@@ -803,6 +817,22 @@ class PolymarketData:
         return self.walk_pages("/v2/prices-history", params, lambda r: validate_price_point(r, self.ts_max),
                                page_cap=page_cap, identity=lambda p: price_identity(token_id, p), ids=ids,
                                conflicted=conflicted)
+
+
+def refuses_id(e: HttpError, cond: str) -> bool:
+    """The service's refusal of the id `cond`: HTTP 400 whose body is a JSON object with `code` REFUSAL_CODE and an
+    `error` text naming `cond` exactly as asked, as a whole token (no letter or digit next to it on either side, so a
+    longer id that starts with `cond` is not `cond`). Anything else is not a refusal."""
+    body = getattr(e, "body", None)
+    if not isinstance(e, HttpError) or e.status != 400 or not isinstance(body, bytes) or not _is_str(cond):
+        return False
+    try:
+        doc = json.loads(body)
+    except (ValueError, RecursionError):
+        return False
+    if not isinstance(doc, dict) or doc.get("code") != REFUSAL_CODE or not isinstance(doc.get("error"), str):
+        return False
+    return re.search(r"(?<![0-9A-Za-z])%s(?![0-9A-Za-z])" % re.escape(cond), doc["error"]) is not None
 
 
 def price_identity(token_id: str, p: dict) -> tuple:
