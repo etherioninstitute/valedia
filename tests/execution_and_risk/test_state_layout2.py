@@ -89,8 +89,25 @@ def test_a_new_state_file_is_layout_2_with_an_empty_entries_table(tmp_path):
     osx.OrderStepState(tmp_path / "s.sqlite").close()
     d = dump(tmp_path / "s.sqlite")
     assert osx.STATE_LAYOUT == 2 and d["version"] == 2
-    assert set(d["rows"]) == {"meta", "baseline", "equity", "sends", "owner_entries", "sqlite_sequence"}
-    assert d["rows"]["owner_entries"] == []
+    assert set(d["rows"]) == {"meta", "baseline", "equity", "sends", "owner_entries", "book_nav", "sqlite_sequence"}
+    assert d["rows"]["owner_entries"] == [] and d["rows"]["book_nav"] == []
+
+
+def test_book_nav_holds_what_s4_needs_as_text_and_nothing_writes_it(tmp_path):
+    """Repair item 3: the book's value history, keyed like the equity table (an id, the New York day, the time), with
+    exact decimals as text; written and read by nothing in this build."""
+    osx.OrderStepState(tmp_path / "s.sqlite").close()
+    con = sqlite3.connect(tmp_path / "s.sqlite")
+    cols = {r[1]: (r[2], r[3]) for r in con.execute("PRAGMA table_info(book_nav)")}
+    con.close()
+    assert cols == {"id": ("INTEGER", 0), "day": ("TEXT", 1), "time": ("REAL", 1), "batch": ("TEXT", 1),
+                    "units_outstanding": ("TEXT", 1), "value_per_unit": ("TEXT", 0), "value_low": ("TEXT", 0),
+                    "value_high": ("TEXT", 0), "cash_bounded": ("INTEGER", 1), "marks": ("TEXT", 1),
+                    "marks_hash": ("TEXT", 1), "entry_hash": ("TEXT", 1)}
+    src = Path(osx.__file__).read_text()
+    assert "CREATE TABLE book_nav " in src
+    for verb in ("FROM book_nav", "INTO book_nav", "UPDATE book_nav", "JOIN book_nav"):
+        assert verb not in src, verb                                    # nothing in this build writes or reads it
 
 
 def test_state_layout1_upgrade_keeps_rows_and_ignores_old_equity(tmp_path, base):
@@ -105,33 +122,41 @@ def test_state_layout1_upgrade_keeps_rows_and_ignores_old_equity(tmp_path, base)
     assert after["version"] == 2
     for table, rows in before["rows"].items():
         assert after["rows"][table] == rows, table                     # every row kept, the equity table untouched
-    assert set(after["rows"]) - set(before["rows"]) == {"owner_entries"} and after["rows"]["owner_entries"] == []
+    assert set(after["rows"]) - set(before["rows"]) == {"owner_entries", "book_nav"}
+    assert after["rows"]["owner_entries"] == [] and after["rows"]["book_nav"] == []
     assert set(before["schema"]) <= set(after["schema"])                # the old tables' schema text unchanged
     assert T._dump(path) == after
     OrderStepState(path).close()                                        # once: a second open changes nothing
     assert dump(path) == after
 
 
-def test_the_upgrade_happens_inside_one_transaction_or_not_at_all(tmp_path, base, monkeypatch):
+@pytest.mark.parametrize("at", ["after the entries table", "after both tables"])
+def test_the_upgrade_happens_inside_one_transaction_or_not_at_all(tmp_path, base, monkeypatch, at):
     path = tmp_path / "s.sqlite"
     before = layout1_state(base, path)
-    monkeypatch.setattr(osx, "_STATE_UPGRADE_1_TO_2", list(osx._STATE_UPGRADE_1_TO_2) + ["CREATE TABLE meta (x)"])
+    raw = path.read_bytes()
+    steps = list(osx._STATE_UPGRADE_1_TO_2)
+    assert any(s.startswith("CREATE TABLE owner_entries ") for s in steps)
+    assert any(s.startswith("CREATE TABLE book_nav ") for s in steps)
+    where = 1 if at == "after the entries table" else len(steps)
+    monkeypatch.setattr(osx, "_STATE_UPGRADE_1_TO_2", steps[:where] + ["CREATE TABLE meta (x)"] + steps[where:])
     with pytest.raises(sqlite3.Error):
         OrderStepState(path)
-    assert dump(path) == before                                         # nothing of the upgrade stayed
+    assert dump(path) == before and path.read_bytes() == raw            # nothing of the upgrade stayed, byte for byte
     monkeypatch.undo()
     OrderStepState(path).close()
-    assert dump(path)["version"] == 2
+    assert dump(path)["version"] == 2 and {"owner_entries", "book_nav"} <= set(dump(path)["rows"])
 
 
 def test_the_code_before_this_build_refuses_a_layout_2_file_in_words(tmp_path, base):
     path = tmp_path / "s.sqlite"
     layout1_state(base, path)
     OrderStepState(path).close()
-    seen = dump(path)
+    seen, raw = dump(path), path.read_bytes()
+    assert {"owner_entries", "book_nav"} <= set(seen["rows"])
     with pytest.raises(base.OrderStepError, match="is not an order-step state file of layout 1; it is not opened"):
         base.OrderStepState(path)
-    assert dump(path) == seen
+    assert dump(path) == seen and path.read_bytes() == raw
 
 
 @pytest.mark.parametrize("version, tables", [(2, ("meta", "baseline", "equity", "sends")), (3, None), (1, "extra")])
@@ -196,8 +221,9 @@ def _bypass(path, sql):
     con.execute("DROP TRIGGER owner_entries_no_update")
     con.execute("DROP TRIGGER owner_entries_no_delete")
     con.execute(sql)
-    for statement in osx._STATE_UPGRADE_1_TO_2[1:]:
-        con.execute(statement)
+    for statement in osx._STATE_UPGRADE_1_TO_2:
+        if statement.startswith("CREATE TRIGGER owner_entries_"):
+            con.execute(statement)
     con.commit()
     con.close()
 
@@ -432,6 +458,17 @@ def test_the_command_is_refused_while_a_run_holds_the_lock(tmp_path, capsys):
     assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n") == 0
 
 
+@pytest.mark.parametrize("reading", [float("nan"), float("inf"), None, "noon", -1e300])
+def test_the_command_is_refused_when_the_clock_gives_no_new_york_day(tmp_path, capsys, monkeypatch, reading):
+    """Repair item 2: refused in words, with the other refusals' exit code, and nothing written: no state file, no
+    lock file, no folder."""
+    monkeypatch.setattr(osx, "wall_clock", lambda: reading)
+    assert owner(tmp_path, "--owner-entry", "cash_in", "--amount", "5", "--who", "o", "--note", "n") == 2
+    err = capsys.readouterr().err
+    assert err.startswith("refused:") and "New York day" in err and "nothing was written" in err
+    assert not (tmp_path / "memory").exists()
+
+
 def test_the_order_step_without_the_owner_flag_is_called_as_before(tmp_path, monkeypatch):
     seen = []
     monkeypatch.setattr(cli, "_order_step_build", lambda: seen.append("built") or None)
@@ -492,16 +529,23 @@ def test_alerts_reads_nothing_of_the_state_file():
 # ---- outcome 4: nothing else changes
 
 
-def layout1_view(d):
-    """A layout-2 state dump seen as layout 1, after asserting it IS layout 2 with the entries table empty and the
-    schema exactly layout 1's plus the upgrade's statements."""
-    if d is None:
-        return None
-    assert d["version"] == 2 and d["rows"].get("owner_entries") == [], d["version"]
-    added = set(osx._STATE_UPGRADE_1_TO_2)
-    assert added <= set(d["schema"]), d["schema"]
-    rows = {k: v for k, v in d["rows"].items() if k != "owner_entries"}
-    return {**d, "version": 1, "schema": sorted(s for s in d["schema"] if s not in added), "rows": rows}
+layout1_view = T._t51c_layout1_view                                    # one mask, shared with the base comparisons
+
+
+def test_the_layout1_view_masks_only_the_layout_number_and_the_new_empty_tables(tmp_path, base):
+    path = tmp_path / "s.sqlite"
+    before = layout1_state(base, path)
+    OrderStepState(path).close()
+    assert layout1_view(dump(path)) == before
+    con = sqlite3.connect(path)
+    con.execute("INSERT INTO book_nav (day, time, batch, units_outstanding, cash_bounded, marks, marks_hash, entry_hash) "
+                "VALUES ('2025-11-18', 1.0, 'b', '1', 0, '{}', 'h', 'e')")
+    con.commit()
+    con.close()
+    with pytest.raises(AssertionError):
+        layout1_view(dump(path))                                        # a row in a new table is never masked
+    with pytest.raises(AssertionError):
+        layout1_view(before)                                            # a layout-1 dump is not layout 2
 
 
 def test_practice_runs_equal_cdd5371_but_for_the_state_layout(tmp_path, base, capsys):

@@ -25,9 +25,14 @@ What is masked, and why (nothing else is):
   layout 4 with every row's `order_type` LIMIT and `collar_price` NULL (ruling A) and only then seen through the
   layout-3 columns (`_t51_layout3_view`), which must equal 33ace6f's dump exactly. The ledger file's raw bytes are
   not compared (its page layout follows its schema).
+- M3 the order step's state file's layout (T51c S3): 33ace6f writes layout 1 and this revision layout 2. The state
+  file is compared as a dump (layout number, schema text, every row of every table): this revision's dump is first
+  checked to BE layout 2 with its two new tables (`owner_entries`, `book_nav`) present and EMPTY and every statement
+  of the upgrade in its schema, and only then seen as layout 1 (`_t51c_layout1_view`: those tables and statements
+  left out, the number 1), which must equal 33ace6f's dump exactly. Its raw bytes are not compared (as M2).
 - Random ids are NOT masked: the batch ids and the state file's account key (os.urandom) and the ticket numbers
   (secrets.randbelow) are drawn on both sides from the same seeded source, so they must be equal too.
-Every other file (state file, ticket file, the live owner's files, the limits file) is compared byte for byte.
+Every other file (ticket file, the live owner's files, the limits file) is compared byte for byte.
 
 A sanity pair shows the comparison can fail: two different worlds, and one world with a single input changed by a
 cent, are each reported as different.
@@ -54,8 +59,8 @@ from valedia_trader.data_and_fees import second_quote
 from valedia_trader.execution_and_risk import order_step as osx
 from valedia_trader.execution_and_risk import orders as _orders
 from valedia_trader.venues import webull as _wb
-from test_order_step import Booked, GENEROUS, LiveVenue, _dump, _run_with, _t51_layout3_view, live_world, paper, \
-    ticket_world
+from test_order_step import Booked, GENEROUS, LiveVenue, _dump, _run_with, _t51_layout3_view, _t51c_layout1_view, \
+    live_world, paper, ticket_world
 
 BASE = "33ace6f"
 MAY_DIFFER = ("valedia_trader/execution_and_risk/order_step.py", "valedia_trader/execution_and_risk/orders.py",
@@ -300,6 +305,8 @@ def _snapshot(w, out):
         rel = str(p.relative_to(w.tmp))
         if p == w.ledger_path:
             files[rel] = ("ledger", _dump(p))
+        elif p == Path(w.state_path):                                    # M3: compared as a dump
+            files[rel] = ("state", _dump(p))
         elif p.parent == w.tmp / "journal":
             files[rel] = ("journal", STAMP.sub(b'"timestamp": "T"', p.read_bytes()))
         else:
@@ -416,7 +423,7 @@ def _drive(mod, tmp, rng, kind):
 
 
 def differences(b_runs, m_runs):
-    """Every difference between 33ace6f's runs and this revision's, as (run, artefact) pairs, with M1 and M2."""
+    """Every difference between 33ace6f's runs and this revision's, as (run, artefact) pairs, with M1, M2 and M3."""
     diffs = []
     if len(b_runs) != len(m_runs):
         return [("runs", f"{len(b_runs)} against {len(m_runs)}")]
@@ -438,6 +445,12 @@ def differences(b_runs, m_runs):
                     mdata = _t51_layout3_view(mdata)                     # asserts every row LIMIT, collar NULL
                 except AssertionError as e:
                     diffs.append((i, (rel, f"ruling A: {e}"[:200])))
+                    continue
+            if how == "state" and mhow == "state" and data is not None and data["version"] == 1:
+                try:
+                    mdata = _t51c_layout1_view(mdata)                    # M3: asserts layout 2, its new tables empty
+                except AssertionError as e:
+                    diffs.append((i, (rel, f"M3: {e}"[:200])))
                     continue
             if (how, data) != (mhow, mdata):
                 diffs.append((i, rel))

@@ -3649,8 +3649,8 @@ def test_the_state_files_layout_is_unchanged_and_the_base_reads_and_continues_it
     _, number = _proposed(w, {"a": {"SPY": 10.0}})                        # ... continued by tickets
     approve(w, number)
     now = _dump(w.state_path)
-    assert now["version"] == 2 and now["rows"]["owner_entries"] == []
-    assert set(now["rows"]) <= {"meta", "baseline", "equity", "sends", "owner_entries", "sqlite_sequence"}
+    assert now["version"] == 2 and now["rows"]["owner_entries"] == [] and now["rows"]["book_nav"] == []
+    assert set(now["rows"]) <= {"meta", "baseline", "equity", "sends", "owner_entries", "book_nav", "sqlite_sequence"}
     for table, rows in written["rows"].items():
         if table != "sqlite_sequence":                                     # sqlite's own counter moves on
             assert now["rows"][table][:len(rows)] == rows, table
@@ -8066,16 +8066,19 @@ def _t34_same_but(b, m, keys, where, skip=(), counts=None):
 
 
 def _t51c_layout1_view(dump):
-    """T51c S3: a layout-2 state dump seen as layout 1, after asserting that it IS layout 2 with the owner's entries
-    table empty and every statement of the upgrade in its schema: that table's rows and those statements left out, the
-    layout number 1. Everything else as it is. None stays None."""
+    """T51c S3: a layout-2 state dump seen as layout 1, after asserting that it IS layout 2, that each table the
+    upgrade adds (the owner's entries, the book's value history) is there and empty, and that every statement of the
+    upgrade is in its schema: those tables' rows and those statements left out, the layout number 1. Everything else
+    as it is. None stays None."""
     if dump is None:
         return None
-    assert dump["version"] == 2 and dump["rows"].get("owner_entries") == [], (dump["version"], dump["rows"].get("owner_entries"))
+    new = ("owner_entries", "book_nav")
+    assert dump["version"] == 2 and all(dump["rows"].get(t) == [] for t in new), \
+        (dump["version"], {t: dump["rows"].get(t) for t in new})
     added = set(osx._STATE_UPGRADE_1_TO_2)
     assert added <= set(dump["schema"]), dump["schema"]
     return {**dump, "version": 1, "schema": sorted(s for s in dump["schema"] if s not in added),
-            "rows": {k: v for k, v in dump["rows"].items() if k != "owner_entries"}}
+            "rows": {k: v for k, v in dump["rows"].items() if k not in new}}
 
 
 def _t34_practice_marks(added, where):
