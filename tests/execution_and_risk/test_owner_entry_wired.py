@@ -591,6 +591,96 @@ def test_r36_a_preview_edited_by_hand_is_not_one_refused_spent_and_nothing_writt
     assert w.files() == before and not w.pending.exists()
 
 
+# ---- addendum 2 (R38): every field present; whatever reading the pending file raises; the ledger under the lock
+
+PREVIEW_FIELDS = ("what", "venue", "code", "created", "expires", "marks", "arguments", "head", "ledger", "held", "close")
+
+
+@pytest.mark.parametrize("key", PREVIEW_FIELDS)
+def test_r38_a_preview_missing_a_field_the_confirm_reads_is_not_one(w, key):
+    opened(w)                                                           # inside the session: `close` is null
+    number, _ = w.preview(*CASH_IN)
+    rec = json.loads(w.pending.read_text())
+    assert set(PREVIEW_FIELDS) <= set(rec)
+    del rec[key]
+    w.pending.write_text(json.dumps(rec))
+    before = w.files()
+    code, _, err = w.cmd(*CASH_IN, "--confirm", number)
+    assert code == 2 and "not an owner-entry preview" in err, err
+    assert w.files() == before and not w.pending.exists()
+
+
+UNREADABLE = {         # what reading the pending file can raise: reading and decoding (OSError, UnicodeDecodeError),
+    "nested too deeply": lambda p: p.write_text("[" * 100_000 + "]" * 100_000),     # parsing (RecursionError,
+    "not UTF-8": lambda p: p.write_bytes(b"\xff\xfe{\"what\": 1}"),                  # JSONDecodeError)
+    "not JSON": lambda p: p.write_text("{"),
+}
+
+
+@pytest.mark.parametrize("what", list(UNREADABLE))
+def test_r38_a_pending_file_that_cannot_be_read_is_refused_in_words_and_spent(w, what):
+    opened(w)
+    number, _ = w.preview(*CASH_IN)
+    UNREADABLE[what](w.pending)
+    before = w.files()
+    code, _, err = w.cmd(*CASH_IN, "--confirm", number)
+    assert code == 2 and "the pending preview cannot be read" in err and "Traceback" not in err, err
+    assert w.files() == before and not w.pending.exists()
+    for record in (None, {"code": number}):                             # the function that spends a preview
+        UNREADABLE[what](w.pending)
+        assert osx._spend_preview(w.pending, record).startswith("; the preview is spent")
+        assert not w.pending.exists()
+
+
+@pytest.mark.parametrize("how", ["gone", "not a ledger"])
+def test_r38_a_ledger_gone_or_unreadable_under_the_lock_is_said_so(w, monkeypatch, how):
+    opened(w)
+    number, _ = w.preview(*CASH_IN)
+    w.t += 1.0
+    after = {}
+    real = osx._RunLock.acquire
+
+    def acquire(self):
+        if how == "gone":
+            w.ledger.unlink()
+        else:
+            w.ledger.write_bytes(b"not an order ledger\n" * 64)
+        after.update(w.files())
+        return real(self)
+    monkeypatch.setattr(osx._RunLock, "acquire", acquire)
+    code, _, err = w.cmd(*CASH_IN, "--confirm", number)
+    words = {"gone": "the ledger is gone", "not a ledger": "the ledger could not be read again under the lock"}[how]
+    assert code == 2 and words in err and "arrived" not in err, err
+    assert after and w.files() == after and not w.pending.exists()
+
+
+def test_r38_a_writing_confirm_asks_no_quote_while_the_lock_is_held(w, monkeypatch):
+    opened(w)
+    number, _ = w.preview(*CASH_IN)
+    w.t += 1.0
+    held, under = [], []
+    acquire, release, quotes = osx._RunLock.acquire, osx._RunLock.release, w.quotes
+
+    def taken(self):
+        got = acquire(self)
+        held.append(got)
+        return got
+
+    def let_go(self):
+        held.append(False)
+        return release(self)
+
+    def asked(symbols):
+        under.append(bool(held and held[-1]))
+        return quotes(symbols)
+    monkeypatch.setattr(osx._RunLock, "acquire", taken)
+    monkeypatch.setattr(osx._RunLock, "release", let_go)
+    monkeypatch.setattr(osx, "minute_quotes", asked)
+    code, out, err = w.cmd(*CASH_IN, "--confirm", number)
+    assert code == 0 and out.startswith("written:"), err
+    assert held == [True, False] and under == [False]                  # the confirm's own quotes, before the lock
+
+
 def test_only_the_owners_command_knows_the_pending_preview():
     """R34 as built: the pending preview lives in its own file, which no other code names: not the runs, the
     reconcile, the ticket book, untracked_tags, owner_entry_differences, the alerts or the owner's page."""
