@@ -1151,6 +1151,20 @@ def test_a_cap_at_every_request_count_ends_cleanly_and_later_steps_finish_the_sa
         assert code == 0 and _state(book) == want, cap
 
 
+def test_a_cap_reached_in_the_settlement_checks_is_a_capped_step(env):
+    rec, book, kw, gw, wall = env
+    games = [Game(a, b).install(kw, gw) for a, b in (("Jazz", "Clippers"), ("Hornets", "Lakers"),
+                                                     ("Celtics", "Knicks"))]
+    rec.pass_({wallet(0): [g.holding(wallet(0), g.a) for g in games]})
+    assert run_step(rec, book, kw, gw, wall)[0] == 0
+    kw.events["KXNBAGAME"] = []                               # every copy out of the list: one market read each
+    code, out = run_step(rec, book, kw, gw, wall, cap=2)      # the list, one market read; the cap
+    assert code == fc.CAPPED and "in the settlement checks" in out and "2 settlement checks" in out, out
+    assert rows(book, "SELECT status FROM steps ORDER BY step_id DESC LIMIT 1") == [("capped",)]
+    code, out = run_step(rec, book, kw, gw, wall, cap=4)      # the list and the three market reads
+    assert code == 0, out
+
+
 # ------------------------------------------------------------------ 4. counts, and no result anywhere
 def test_counts_prints_counts_only(env):
     rec, book, kw, gw, wall = env
