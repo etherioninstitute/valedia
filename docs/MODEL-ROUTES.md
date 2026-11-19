@@ -15,7 +15,10 @@ profiles' own settings (model and provider lines only; no key was read), the tra
 | arex-2, bonsai-27b | the Mac mini, through LM Link | listed, not loaded | spare |
 | the 27B's local builds (`qwen/qwen3.8-27b`, `qwen3.8-27b`) | THIS Mac | NOT loaded | naming them makes LM Studio load 16 to 19 GB here, beside the collector |
 | FreeLLMAPI (Groq with zero retention, Cloudflare Workers AI) | outside, through a local filter | NOT running (nothing listens on its ports; its coding root is not installed; the owner enters the keys) | workhorse for self-contained tasks with no secret in them |
-| Claude Sonnet / Opus / Fable, xAI, OpenAI | paid | in use | judgment, final acceptance, anything on the path to real money that must be right and fast |
+| Claude Sonnet / Opus / Fable | paid (the weekly limit) | in use | judgment, final acceptance, anything on the path to real money that must be right and fast |
+| ChatGPT or Codex subscription, through Hermes | paid, NOT on the Claude limit | signed in (Hermes Desktop, Accounts, shown for the default profile on 2026-11-18) | a second frontier family: builders and blind checks that need frontier quality, sparing Claude; a check by another family is worth more than a second Claude one |
+| xAI Grok, through Hermes | paid, NOT on the Claude limit | signed in (the same screen) | the same; the off-family review route (`hermes proxy start --provider xai`) already exists |
+| Nous Portal, through Hermes | account connected | signed in (the same screen) | not yet looked at |
 
 ## 2. Valedia's own processes (what runs without a person)
 
