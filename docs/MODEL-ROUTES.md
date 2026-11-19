@@ -37,7 +37,7 @@ profiles' own settings (model and provider lines only; no key was read), the tra
 | Profile | Model today | Paid? | Proposed |
 | --- | --- | --- | --- |
 | `valedia` (her chat, Telegram, the desktop app) | Claude Sonnet 5 through the Anthropic API key | YES, by the token | the local 27B once one is loaded with a 64K window on etherion; Sonnet stays one command away for hard questions |
-| default (the owner's own Hermes, Telegram) | Claude Sonnet 5.5, 1M window, subscription | YES | his choice; a 1M window makes every turn costly: 200K unless he needs it |
+| default (the owner's own Hermes, Telegram) | ChatGPT/Codex `gpt-6.2-sol` (his switch at 6:21 PM on 2026-11-18, off Claude). Since 8:30 PM: `delegation.backend: model_map` with `local_worker` (`hs27b` on etherion) as the default route and `paid_frontier` (`gpt-6.2-sol`); auxiliary `title_generation` and `mcp` on `hs27b` | his ChatGPT plan, not the Claude limit | held, not done: a `free_pool` route (a free model with the default profile's tools could read his secrets until the OS wall exists), an `elephant-1` router service (a second 9B model on this Mac during the collector's scored test; a download), auxiliary `approval`, `compression` (a 1M-window context does not fit the 262K local window) and `review` on free models. Backup: `~/.hermes/backups/config.yaml.before-orchestrator-routes-20261118-202747` |
 | `valedia-cto` | Claude Sonnet 5.5, subscription | YES | the local 27B (64K window) |
 | `valedia-trading-decider` | Claude Sonnet 5.5, subscription | YES | see the weekly cycle above |
 | `valedia-trading-auditor` | Claude Sonnet 5.5, subscription | YES | stays paid |
