@@ -50,13 +50,15 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   `f40bc41`), written before any trade was analysed (none has been): measured, those rows are the ORACLE'S OWN
   record (a price, a status, a last update time; present from 2022 to 2026, not only old ones), checked on 14
   known markets (the 2024 election and the 2025 Super Bowl among them): status `resolved` with a price of 1, 0
-  or one half is a known resolution at its last update time; anything else is not. **NOW** T47f BUILT
-  (14:16 PST, candidate `e79f61a`: the reader reads both shapes; `reread-resolutions` reads the stored rows
-  again with no request; phase 2 makes the plan again and keeps the price windows already read; the first
-  and the sealed stage refuse a store not yet read again) and WITH ITS BLIND CHECKER, whose main task is to
-  show the analysis gives the same answer whichever shape a market's result came in. After it: merge, the
-  re-reading of the real store, phase 2 for the new price windows (a long pull, under the guard) and the
-  first stage ONCE more, stated beside the first run. The sealed months stay unopened unless that passes. The same reading feeds the
+  or one half is a known resolution at its last update time; anything else is not. T47f MERGED 2026-11-18
+  15:36 PST (main `174fb9f`; its blind check showed 22 worlds built in each shape, and half and half, give
+  the same leaders, trades, prices and result). THE REAL STORE READ AGAIN 15:41 (12 seconds, no request):
+  439,247 more markets have a known resolution (126,605 first outcome, 311,370 second, 1,272 half; 28,285
+  not resolved by their status), every count equal to the lead's profile. **NOW** phase 2 with the plan made
+  again: 7,670 positions (2,877 before), 15,546 price windows to read, about one a second, under a guard
+  that stops it at the first collector decision not ok (it did, at 16:53, and was restarted 16:54: it plans
+  again for half an hour, then reads on). **NEXT** the first stage ONCE more, stated beside the first run.
+  The sealed months stay unopened unless that passes. The same reading feeds the
   consistency screen of the owner's method below. Roadmap 1.26. **QUEUED** T47d items 8 to 12 (among
   them: a reader of the store must not end the pull; the pull's start must not read the store at full speed
   beside the collector).
@@ -114,7 +116,11 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   Bowl and two yearly crypto series; the nomination series is listed but NOT tradable (no copy); so three
   series can be copied today: NBA winners, NBA spreads, the Premier League champion. **DONE** the record's
   door for a chosen list of wallets (T52c). **NOW** T54a the paper copier (the matcher and its book, a slow
-  Kalshi reader; builder at work since 14:14). **NEXT** the screen's program (after T47f merges), then the
+  Kalshi reader): built; its blind check FAILED on three points (a copy priced at a second book read
+  instead of the first after the pass; its Kalshi requests followed a redirect; a crash at the request cap)
+  and found it asked Kalshi once an open copy a step; repaired 16:34 PST (one stored read a market and pass,
+  a fetch of its own that follows nothing, settlements before exits, about one request a series) and WITH A
+  FRESH CHECKER. **NEXT** the screen's program (T47f is merged: it can start), then the
   screen ONCE (when T47 is closed, else from 24 Nov on data to June), the record pointed at its set, the
   copier beside each pass, more series read into the rule map (the other sports first).
   **OWNER** whether the leaders' pass runs more often than once a day (game positions resolve within the
@@ -190,16 +196,18 @@ trading (his word, 2026-11-17).
    (main `599ae5b`; two blind checks; sixteen test files, 3,934 tests, pass on main; the order-path gate
    moved to it at 13:54): a purchase's fee the venue leaves empty is bounded by Webull's published rate
    while the order can still be rechecked and taken as none after, so the book can be valued after its
-   first purchase. **NOW** S4b BUILT (the owner's command takes its marks from the quote path, never typed,
-   shows a preview with a code and writes only on a confirm, and can repair an entry whose journal line
-   failed) and FAILED ITS BLIND CHECK ON ONE POINT (15:22 PST): a fill arriving between the confirm's read
-   and its lock was left out of the valuation; everything else passed; the repair (judged again under the
-   lock) is with the builder. **NOW** R33a BUILT (the adapter says when a fee could not be read; the ledger
-   keeps it as a notice that blocks nothing) and FAILED ITS CHECK ON ONE POINT: an older test in a file the
-   lead had fenced off needs to learn the new field; with the builder. Both merge together, then ONE run
-   of the sixteen files on main and the gate, before the 06:55 practice run. **NEXT** S4c practice shared
-   mode (first: read a real practice run for the new notice: an ordinary purchase must not open one), S4d
-   live, S4e alerts and the owner's page. What the record
+   first purchase. S4b THE OWNER'S COMMAND, WIRED, MERGED 2026-11-18 16:20 PST (main `c6e2007`; three blind
+   checks): it takes its marks from the quote path, never typed; it shows a preview with a code and writes
+   only on a confirm inside a band; it judges the entry again under the lock (the first check found a fill
+   arriving in between was left out of the valuation); it can repair an entry whose journal line failed.
+   R33a MERGED 16:28 PST (main `ff3e0bc`; one blind check, then two older tests taught the change): the
+   adapter says when a fee could not be read and the ledger keeps it as a notice that blocks nothing. THE
+   LEAD'S TWENTY FILES pass on main (5,421 tests) and THE ORDER-PATH GATE MOVED to `ff3e0bc` at 16:53.
+   **WATCH 19 Nov 06:55** the first practice run on it: the state file moves to its new layout (code before
+   T51c then refuses it; backups in the deploy folder), and the ledger is read for a `fee_unreadable` notice
+   on an ordinary purchase (it must not open one; code before R33a would treat such a notice as blocking).
+   **NEXT** S4c practice shared mode (the bound left open for an unread fee; the practice book's opening
+   entry by the lead through the new command), S4d live, S4e alerts and the owner's page. What the record
    catches is written in `docs/WEBULL.md`: a change to the state file OR to the journal is found; both
    rewritten to match are not. FOR S4, found on the way: Webull reports no fee on a purchase (the book then
    calls the fee unknown: a rule is needed); the marks of an entry must come from the order step's quote
@@ -511,6 +519,10 @@ run beside MiroFish and Elephant-1):
   author from that name; commits now pass the same author by hand, no setting changed). During the 14
   scored days a repeat costs scored decisions: his to look at (was it restarted, updated or re-signed in?),
   and best left alone until 3 December. Hermes' Honcho and the phone's access to Hermes use Tailscale.
+  IN THE SCORED PERIOD: at 16:52:45 the Tailscale app changed state again and at 16:53:12 two decisions
+  failed with `model_unavailable` (the first not ok since 16:00); the day's one other `model_unavailable`
+  (13:03:10) follows a burst of Tailscale status changes at 13:02:38 the same way. Two of two: each state
+  change of Tailscale is followed within half a minute by a failed call to the local model.
 - **WATCH** Telegram is on and has dropped its connection before; Signal is parked (possible relink about
   11 Dec; its job is not installed).
 - **QUEUED** the Live page (its session's summary of 2026-11-17, the owner calling that work done): a model
