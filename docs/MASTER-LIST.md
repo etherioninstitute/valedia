@@ -116,11 +116,14 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   Bowl and two yearly crypto series; the nomination series is listed but NOT tradable (no copy); so three
   series can be copied today: NBA winners, NBA spreads, the Premier League champion. **DONE** the record's
   door for a chosen list of wallets (T52c). **NOW** T54a the paper copier (the matcher and its book, a slow
-  Kalshi reader): built; its blind check FAILED on three points (a copy priced at a second book read
-  instead of the first after the pass; its Kalshi requests followed a redirect; a crash at the request cap)
-  and found it asked Kalshi once an open copy a step; repaired 16:34 PST (one stored read a market and pass,
-  a fetch of its own that follows nothing, settlements before exits, about one request a series) and WITH A
-  FRESH CHECKER. **NEXT** the screen's program (T47f is merged: it can start), then the
+  Kalshi reader): built; three blind checks (V217, V219, V220) failed on narrower and narrower points; the
+  third repair (895ca7e) was PARKED unchecked on the owner's token instruction. 2026-11-18 about 7 PM PST:
+  read by Grok 4.7 and ChatGPT/Codex through his own seats (scrubbed bundle, no Claude tokens; 43 findings);
+  the lead read each and confirmed six with gate tests (a finalized market with an unreadable payout sold at
+  the bid; a clock set back; a malformed nested list crashing the step; an infinite pause; no lock between
+  two steps; one case of an unclear read of another wallet). Repair round R61 to R68 (ticket
+  T54a-addendum-4) with a Sonnet builder, then both off-family readers read the new diff and the gate runs it.
+  It runs on nothing real until a check passes and the wallet screen exists. **NEXT** the screen's program (T47f is merged: it can start), then the
   screen ONCE (when T47 is closed, else from 24 Nov on data to June), the record pointed at its set, the
   copier beside each pass, more series read into the rule map (the other sports first).
   **OWNER** whether the leaders' pass runs more often than once a day (game positions resolve within the
@@ -375,6 +378,13 @@ Items:
   NOT USED YET: no real filing has been made. The daily review (L-1) is its first intended caller.
 - **OWNER** a three-seat coding pipeline (planner, implementer, blind reviewer) built from Paperclip's own
   review and approval stages: a design in that session, with the lead's four changes; not built until he says.
+- **UPDATE 2026-11-18 about 7:40 PM PST:** he said yes ("Yes, please route"; "i just want coding to happen ...
+  mostly by local models ... checked by a good frontier model ... if I run out of Anthropic credits, it will
+  just choose another") and set all four Paperclip agents to the Hermes harness himself. That session found
+  they would all run as his default Hermes home (one model, approvals skipped, no walls): NOTHING assigned;
+  it builds dedicated profiles, a launcher without `--yolo`, walls kept by the operating system, writer and
+  checker of different families, failover that stops rather than merging unchecked. Paperclip Runner: its
+  verdict so far is not to enable it (Hermes is not a Runner harness; its telemetry is unproven); report due.
 - **OWNER** FreeLLMAPI as free hosted capacity for coding workhorses (his request of 2026-11-18 00:00 PST; a
   nested session on Opus 5.5 read the whole repository; nothing installed). Its picks, waiting for his
   answers there: a native run inside a file-access sandbox on 127.0.0.1, NOT Docker for now (the Mac is about
@@ -392,6 +402,15 @@ Items:
   Cloudflare, and Ollama's hosted service by name, for FreeLLMAPI only. No build is needed any more. Left to
   do there (light, 09:45 to 11:00 PST): the guard code and its tests, the separate Hermes root for the one
   coding profile, one toy prompt. The app can read his files like any app he runs; that was his choice.
+- **UPDATE 2026-11-18 about 7:45 PM PST (the lead's decision, on his word "decide and respond ... so it isnt
+  waiting on my response"):** the simple wiring replaces the plan above. The existing `valedia-coder` profile
+  is repointed to the fixed `coding` chain (zero-retention providers only; OVH and its no-key access out until
+  its terms are read; no fallback either way); a key-leak hook only; trading code allowed on zero-retention
+  providers (never keys, accounts, positions, tests' data, config, journal, memory, state); order-path or
+  real-money code from a free model still gets one paid check; tool-enabled runs only through the
+  operating-system wall the Paperclip session builds. His alone: the single key paste, the gateway restart, any
+  download. Same evening he made etherion serve `hs27b` at 262144 context (2 parallel): a local Implementer seat
+  is possible; first agent request to be watched against the collector's cycle.
 - **QUEUED** L-2 lessons by idea family, and a stop on a family after N failures (roadmap 2.3).
 - **QUEUED** L-3 a check on the critic itself (roadmap 2.5).
 - **QUEUED** L-4 scores earn weight (roadmap 1.5).
