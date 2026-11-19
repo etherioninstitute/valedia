@@ -64,7 +64,10 @@ from test_order_step import Booked, GENEROUS, LiveVenue, _dump, _run_with, _t51_
 
 BASE = "33ace6f"
 MAY_DIFFER = ("valedia_trader/execution_and_risk/order_step.py", "valedia_trader/execution_and_risk/orders.py",
-              "valedia_trader/core/alerts.py")             # T51's own write set; alerts.py only matters if imported
+              "valedia_trader/core/alerts.py",             # T51's own write set; alerts.py only matters if imported
+              "valedia_trader/venues/webull.py")           # T51c R33a (R39): the adapter's status answer gained
+# fee_unreadable; this file's runs use stand-in venues and never build the Webull adapter (shown on this tree's side by a
+# probe that raised on construction; the old side's archived copy is the base's own and was not probed)
 TESTS = Path(__file__).resolve().parent
 KINDS = ("ordinary", "partial", "refusal", "cap", "breach", "stopped", "approved", "expired", "second_run",
          "baseline", "live")
@@ -250,11 +253,11 @@ def test_the_pin_fails_in_words_when_an_imported_module_changed_or_crossed_over(
                        for f in sides["old"]["modules"].values()}):
         (root / rel).parent.mkdir(parents=True, exist_ok=True)
         (root / rel).write_bytes((sides["old_root"] / rel).read_bytes())
-    (root / "valedia_trader/venues/webull.py").write_bytes(b"# changed after the base\n")
+    (root / "valedia_trader/venues/__init__.py").write_bytes(b"# changed after the base\n")
     fake["old_root"] = root
     fake["old"] = dict(sides["old"], modules={n: str(root / Path(f).resolve().relative_to(sides["old_root"].resolve()))
                                               for n, f in sides["old"]["modules"].items()})
-    with pytest.raises(pytest.fail.Exception, match=r"changed since 33ace6f .*valedia_trader/venues/webull.py"):
+    with pytest.raises(pytest.fail.Exception, match=r"changed since 33ace6f .*valedia_trader/venues/__init__.py"):
         check_pinned(fake)
 
 
