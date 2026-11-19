@@ -1,11 +1,14 @@
 """T54a: the forward copier's matcher and paper book. Every answer comes from a stand-in (Kalshi, Polymarket's
 description service, Polymarket's data service for the record); any socket connection fails at once. The record is
 built with the real leaders_monitor code. No test kills a process or races several."""
+import argparse
 import ast
 import email.message
+import fcntl
 import hashlib
 import io
 import json
+import os
 import random
 import re
 import socket
@@ -1356,7 +1359,10 @@ def test_a_wallet_that_opened_the_opposite_only_after_that_pass_is_no_disagreeme
     assert skips(book)[(b, g.tok["Jazz"])] == "leaders_disagree"            # at ITS pass, a held Clippers
 
 
-def test_where_the_record_cannot_say_a_wallet_holds_what_it_held_at_its_last_good_read(env):
+def test_where_the_record_cannot_say_what_another_wallet_holds_at_that_pass_nothing_is_copied(env):
+    """R54 said such a wallet "holds what it held at its last good read" (a disagreement skip). R66 reverses it: b's
+    read failed at a's pass, so nobody can say b does not hold the opposite there: a's holding is skipped with
+    other_wallet_read_unclear, ahead of the disagreement test."""
     rec, book, kw, gw, wall = env
     g = Game("Jazz", "Clippers").install(kw, gw)
     a, b = wallet(0), wallet(1)
@@ -1364,7 +1370,8 @@ def test_where_the_record_cannot_say_a_wallet_holds_what_it_held_at_its_last_goo
                         ({a: [g.holding(a, "Clippers")]}, (b,)),                 # b's read fails at a's pass
                         ({a: [g.holding(a, "Clippers")], b: []}, ())])
     run_step(rec, book, kw, gw, wall)
-    assert skips(book).get((a, g.tok["Clippers"])) == "leaders_disagree"
+    assert skips(book).get((a, g.tok["Clippers"])) == "other_wallet_read_unclear"
+    assert rows(book, "SELECT count(*) FROM copies WHERE token_id=?", (g.tok["Clippers"],))[0][0] == 0
 
 
 def test_a_kept_match_read_judges_a_later_holding_by_its_own_stamp(env):
@@ -1835,3 +1842,357 @@ def test_the_real_fixture_record_through_one_step(tmp_path):
         == {"KXPRESNOMD"}                                    # in the rule map, listed but not tradable
     assert reasons["no_unique_market"] == 9                  # spreads and the EPL reach their (stand-in, empty) lists
     assert rows(tmp_path / "real-book.sqlite", "SELECT count(*) FROM near_book")[0][0] >= 40
+
+
+# ------------------------------------------------------------------ addendum 4: after the off-family reading
+def _copy_one(env, yes_bid=0.52):
+    """Wallet 0's Clippers holding becomes one open copy (the yes side of the Clippers market)."""
+    rec, book, kw, gw, wall = env
+    g = Game("Jazz", "Clippers").install(kw, gw, yes_bid=yes_bid)
+    rec.pass_({wallet(0): [g.holding(wallet(0), "Clippers")]})
+    assert run_step(rec, book, kw, gw, wall)[0] == 0
+    assert rows(book, "SELECT status FROM copies") == [("open",)]
+    return g
+
+
+def _flags(book):
+    return [k for (k,) in rows(book, "SELECT kind FROM copy_flags ORDER BY rowid")]
+
+
+def _spy_steps(monkeypatch):
+    steps = []
+
+    class Spy(fc.Step):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            steps.append(self)
+    monkeypatch.setattr(fc, "Step", Spy)
+    return steps
+
+
+@pytest.mark.parametrize("over", [{"settlement_ts": "2026-11-17T21:00:00+00:00"},      # a time not ending in Z
+                                  {"settlement_value_dollars": 1.0},                    # a number, not a string
+                                  {"result": "no"}])                                    # a result against the value
+def test_a_market_kalshi_shows_finalized_is_never_closed_by_an_exit(env, monkeypatch, over):
+    """R61: a payout the parser cannot read keeps the copy open and flagged; no book read, no exit, ever."""
+    rec, book, kw, gw, wall = env
+    g = _copy_one(env)
+    steps = _spy_steps(monkeypatch)
+    m = g.markets["Clippers"]
+    m["status"] = "finalized"
+    kw.records[m["ticker"]] = dict({"ticker": m["ticker"], "market_type": "binary", "status": "finalized",
+                                    "result": "yes", "settlement_value_dollars": "1.0000",
+                                    "settlement_ts": "2026-11-17T21:00:00Z"}, **over)
+    wall.t += 5 * H
+    rec.pass_({wallet(0): []})                                        # the opener's EXIT
+    n = len(kw.calls)
+    assert run_step(rec, book, kw, gw, wall)[0] == 0
+    assert rows(book, "SELECT status, close_kind FROM copies") == [("open", None)]
+    assert _flags(book) == ["settlement_unreadable"] and "book" not in kw.kinds(n)
+    assert steps[-1].n["settle_unreadable"] == 1
+    n = len(kw.calls)                                                 # the next step reads the market again
+    assert run_step(rec, book, kw, gw, wall)[0] == 0
+    assert "market" in kw.kinds(n) and "book" not in kw.kinds(n)
+    assert _flags(book) == ["settlement_unreadable"] and steps[-1].n["settle_unreadable"] == 1   # flagged once
+    assert rows(book, "SELECT status FROM copies") == [("open",)]
+    out = io.StringIO()
+    assert fc.main(["counts", "--book", str(book)], out=out) == 0
+    assert "settlement_unreadable=1" in out.getvalue().replace(" ", "")
+
+
+def test_a_payout_that_reads_later_closes_the_flagged_copy_at_settlement(env):
+    rec, book, kw, gw, wall = env
+    g = _copy_one(env)
+    m = g.markets["Clippers"]
+    m["status"] = "finalized"
+    kw.records[m["ticker"]] = {"ticker": m["ticker"], "market_type": "binary", "status": "finalized", "result": "yes",
+                               "settlement_value_dollars": "1.0000", "settlement_ts": "2026-11-17T21:00:00+00:00"}
+    wall.t += 5 * H
+    rec.pass_({wallet(0): []})
+    run_step(rec, book, kw, gw, wall)
+    kw.records[m["ticker"]]["settlement_ts"] = "2026-11-17T21:00:00Z"
+    wall.t += H
+    run_step(rec, book, kw, gw, wall)
+    (c,) = rows(book, "SELECT status, close_kind, close_price FROM copies")
+    assert c == ("closed", "settled", 1.0)
+    assert "settlement_unreadable" in _flags(book)
+
+
+def test_a_match_read_before_the_wallets_read_makes_no_copy_and_no_request(env):
+    """R62, before any request: the host clock is behind the wallet's read."""
+    rec, book, kw, gw, wall = env
+    g = Game("Jazz", "Clippers").install(kw, gw)
+    rec.pass_({wallet(0): [g.holding(wallet(0), "Clippers")]})
+    wall.t = T0 - 2 * H
+    run_step(rec, book, kw, gw, wall)
+    assert skips(book) == {(wallet(0), g.tok["Clippers"]): "clock_before_read"}
+    assert kw.calls == [] and gw.calls == []
+
+
+class Backward:
+    """Kalshi's stand-in whose book answer is followed by the host clock being set back."""
+    def __init__(self, kw, wall, back_to):
+        self.kw, self.wall, self.back_to = kw, wall, back_to
+
+    def __call__(self, url):
+        out = self.kw(url)
+        if urllib.parse.urlsplit(url).path.endswith("/orderbook"):
+            self.wall.t = self.back_to
+        return out
+
+
+def test_a_match_read_stamped_before_the_wallets_read_is_no_copy_and_judges_a_later_holding_the_same(env):
+    """R62, the stamp: the read comes out before the wallet's read; the kept read judges the next holding too."""
+    rec, book, kw, gw, wall = env
+    g = Game("Jazz", "Clippers").install(kw, gw)
+    rec.pass_({wallet(0): [g.holding(wallet(0), "Clippers")], wallet(1): [g.holding(wallet(1), "Clippers")]})
+    run_step(rec, book, Backward(kw, wall, T0 - 2 * H), gw, wall)
+    assert skips(book) == {(wallet(0), g.tok["Clippers"]): "clock_before_read",
+                           (wallet(1), g.tok["Clippers"]): "clock_before_read"}
+    assert rows(book, "SELECT count(*) FROM copies")[0][0] == 0 and kw.kinds().count("book") == 1
+
+
+class Half:
+    """A clock whose sleep returns early: it advances only half of what it is asked."""
+    def __init__(self, t=1000.0):
+        self.t, self.asked = float(t), []
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, s):
+        self.asked.append(s)
+        self.t += s / 2
+
+
+def _plain_world_with_bad_markets(env, bad):
+    rec, book, kw, gw, wall = env
+    g = Game("Jazz", "Clippers").install(kw, gw)
+    kw.events["KXNBAGAME"].insert(0, {"event_ticker": "KXNBAGAME-X", "series_ticker": "KXNBAGAME", "title": "t",
+                                      "markets": bad})
+    return g
+
+
+@pytest.mark.parametrize("bad", [1, "x", {"a": 1}, [1], [None]])
+def test_a_nested_markets_that_is_not_a_list_of_dicts_is_a_failed_read_not_a_crash(env, bad):
+    rec, book, kw, gw, wall = env
+    g = _plain_world_with_bad_markets(env, bad)
+    rec.pass_({wallet(0): [g.holding(wallet(0), "Clippers")]})
+    raised = None
+    try:
+        run_step(rec, book, kw, gw, wall)
+    except Exception as e:                                           # the crash is what R63 removes
+        raised = e
+    assert raised is None, repr(raised)
+    assert skips(book) == {(wallet(0), g.tok["Clippers"]): "read_failed"}
+
+
+def test_an_open_copys_series_list_with_such_a_markets_is_a_failed_list_not_a_crash(env):
+    rec, book, kw, gw, wall = env
+    g = _copy_one(env)
+    kw.events["KXNBAGAME"].insert(0, {"event_ticker": "KXNBAGAME-X", "series_ticker": "KXNBAGAME", "title": "t",
+                                      "markets": 1})
+    wall.t += H
+    raised = None
+    try:
+        run_step(rec, book, kw, gw, wall)
+    except Exception as e:
+        raised = e
+    assert raised is None, repr(raised)
+    assert rows(book, "SELECT status FROM copies") == [("open",)]
+
+
+def _refused(fn, text):
+    try:
+        fn(text)
+    except Exception as e:
+        return type(e)
+    return None
+
+
+@pytest.mark.parametrize("text", ["inf", "-inf", "nan", "1e999"])
+def test_the_command_line_refuses_a_pause_or_cap_that_is_not_finite(env, text):
+    rec, book, kw, gw, wall = env
+    assert _refused(fc._pause, text) is argparse.ArgumentTypeError
+    assert _refused(fc._cap, text) is argparse.ArgumentTypeError
+    with pytest.raises(SystemExit):
+        run_step(rec, book, kw, gw, wall, pause=text)
+    with pytest.raises(SystemExit):
+        run_step(rec, book, kw, gw, wall, cap=text)
+
+
+def test_a_sleep_that_returns_early_never_sends_a_request_under_the_pause():
+    h = Half()
+    p = fc.StepPacer(10.0, 5, sleep=h.sleep, clock=h)
+    p.wait()
+    first = p.last
+    p.wait()
+    assert p.last - first >= 10.0 - 1e-6, (p.last - first, h.asked)
+
+
+def test_a_sleep_that_returns_early_never_breaks_the_pause_across_steps():
+    h = Half()
+    p = fc.StepPacer(10.0, 5, sleep=h.sleep, clock=h, wall=h, last_wall=h.t - 3.0)
+    p.wait()
+    assert h.t - (1000.0 - 3.0) >= 10.0 - 1e-6, h.asked
+
+
+def _hold_lock(book):
+    fd = os.open(str(book) + ".step.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+def test_a_second_step_on_a_book_in_use_exits_75_and_touches_nothing(env):
+    """R65: the test holds the lock itself from this process (no race). The row of the step 'running' stays so."""
+    rec, book, kw, gw, wall = env
+    _copy_one(env)
+    con = sqlite3.connect(str(book), isolation_level=None)
+    con.execute("INSERT INTO steps (started_ts, status) VALUES (?, 'running')", (T0,))
+    con.close()
+    before = hashlib.sha256(book.read_bytes()).hexdigest()
+    n, ng = len(kw.calls), len(gw.calls)
+    fd = _hold_lock(book)
+    try:
+        code, out = run_step(rec, book, kw, gw, wall)
+    finally:
+        os.close(fd)
+    assert code == 75 and "another step is running on this book" in out
+    assert len(kw.calls) == n and len(gw.calls) == ng
+    assert hashlib.sha256(book.read_bytes()).hexdigest() == before
+    assert rows(book, "SELECT status FROM steps WHERE status != 'done' ORDER BY step_id") == [("running",)]
+    assert run_step(rec, book, kw, gw, wall)[0] == 0                  # the lock let go: the next step runs
+    assert rows(book, "SELECT status FROM steps WHERE status='running'") == []
+
+
+def test_the_lock_is_held_to_the_end_of_the_step_and_dropped_when_it_dies(env):
+    rec, book, kw, gw, wall = env
+    lock = str(book) + ".step.lock"
+    seen = []
+
+    def hook(sql):
+        if not seen:
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                seen.append("free")
+            except BlockingIOError:
+                seen.append("held")
+            finally:
+                os.close(fd)
+            raise Died()
+    with pytest.raises(Died):
+        run_step(rec, book, kw, gw, wall, hook=hook)
+    assert seen == ["held"]
+    os.close(_hold_lock(book))                                        # taking it now shows it was dropped
+
+
+def test_creating_a_book_is_one_transaction_with_its_user_version(env, monkeypatch):
+    """R67(a): a creation that fails part way leaves nothing: the next step can create the book again."""
+    rec, book, kw, gw, wall = env
+    good = fc.BOOK_SCHEMA
+    monkeypatch.setattr(fc, "BOOK_SCHEMA", good + "\nINSERT INTO a_table_that_is_not_there VALUES (1);\n")
+    code, out = run_step(rec, book, kw, gw, wall)
+    assert code == fc.REFUSED and "could not be made" in out
+    assert not book.exists() or book.stat().st_size == 0, book.stat().st_size
+    monkeypatch.setattr(fc, "BOOK_SCHEMA", good)
+    assert run_step(rec, book, kw, gw, wall)[0] == 0
+
+
+# R66: another wallet's unclear read at that pass
+def _unclear_pass(env, b_held=(), **b_over):
+    """One pass: a holds the Clippers (qualifying); b's read as given; the step run. Returns (game, tok)."""
+    rec, book, kw, gw, wall = env
+    g = Game("Jazz", "Clippers").install(kw, gw)
+    a, b = wallet(0), wallet(1)
+    rec.pass_({a: [g.holding(a, "Clippers")], b: list(b_held)}, fail=b_over.get("fail", ()))
+    return g, g.tok["Clippers"]
+
+
+def test_another_wallets_failed_read_at_that_pass_makes_a_qualifying_holding_a_skip(env):
+    rec, book, kw, gw, wall = env
+    g, tok = _unclear_pass(env, fail=(wallet(1),))
+    run_step(rec, book, kw, gw, wall)
+    assert skips(book) == {(wallet(0), tok): "other_wallet_read_unclear"}
+    assert kw.calls == [] and gw.calls == []
+    assert rows(book, "SELECT count(*) FROM copies")[0][0] == 0
+
+
+def test_with_every_other_wallet_clean_the_holding_is_copied_as_before(env):
+    rec, book, kw, gw, wall = env
+    g, tok = _unclear_pass(env)
+    run_step(rec, book, kw, gw, wall)
+    assert rows(book, "SELECT kalshi_market FROM copies") == [(g.markets["Clippers"]["ticker"],)]
+
+
+def test_another_wallet_absent_from_the_pass_makes_the_holding_a_skip(env):
+    rec, book, kw, gw, wall = env
+    g, tok = _unclear_pass(env)
+    con = sqlite3.connect(str(rec.path), isolation_level=None)
+    con.execute("DELETE FROM wallet_reads WHERE wallet_key=?", (wallet(1),))
+    con.close()
+    run_step(rec, book, kw, gw, wall)
+    assert skips(book) == {(wallet(0), tok): "other_wallet_read_unclear"}
+
+
+def test_another_wallets_read_that_carried_rows_makes_the_holding_a_skip(env):
+    """b held the Jazz at its baseline; at a's pass b's rows conflict, so the record carries the Jazz (no EXIT)."""
+    rec, book, kw, gw, wall = env
+    g = Game("Jazz", "Clippers").install(kw, gw)
+    a, b = wallet(0), wallet(1)
+    rec.pass_({a: [], b: [g.holding(b, "Jazz")]})
+    wall.t += H
+    twin = dict(g.holding(b, "Jazz"), current_value=7000.0)
+    rec.pass_({a: [g.holding(a, "Clippers")], b: [g.holding(b, "Jazz"), twin]})
+    carried = rows(rec.path, "SELECT carried, rejects FROM wallet_reads WHERE wallet_key=? ORDER BY read_id DESC "
+                             "LIMIT 1", (b,))[0]
+    assert carried[0] > 0 and "conflicting_row" in carried[1], carried     # the record's own carried read
+    run_step(rec, book, kw, gw, wall)
+    assert skips(book)[(a, g.tok["Clippers"])] == "other_wallet_read_unclear"
+
+
+@pytest.mark.parametrize("sets, verdict", [("rejects='{\"missing_token\": 1}'", "other_wallet_read_unclear"),
+                                           ("carried=2, rejects='{}'", "other_wallet_read_unclear"),    # carried alone
+                                           ("rejects='{\"repeated_row\": 3}'", None)])   # a true repeat is still clean
+def test_another_wallets_rejected_or_carried_rows_make_the_read_unclear_but_a_repeat_does_not(env, sets, verdict):
+    rec, book, kw, gw, wall = env
+    g, tok = _unclear_pass(env)
+    con = sqlite3.connect(str(rec.path), isolation_level=None)
+    con.execute("UPDATE wallet_reads SET %s WHERE wallet_key=?" % sets, (wallet(1),))
+    con.close()
+    run_step(rec, book, kw, gw, wall)
+    if verdict:
+        assert skips(book) == {(wallet(0), tok): verdict}
+    else:
+        assert rows(book, "SELECT count(*) FROM copies")[0][0] == 1
+
+
+def test_a_flagged_unreadable_copy_is_held_even_when_the_market_later_shows_open_and_the_wallet_exited(env):
+    rec, book, kw, gw, wall = env
+    g = _copy_one(env)
+    m = g.markets["Clippers"]
+    m["status"] = "finalized"
+    kw.records[m["ticker"]] = {"ticker": m["ticker"], "market_type": "binary", "status": "finalized", "result": "yes",
+                               "settlement_value_dollars": "1.0000", "settlement_ts": "2026-11-17T21:00:00+00:00"}
+    wall.t += 5 * H
+    rec.pass_({wallet(0): []})
+    run_step(rec, book, kw, gw, wall)
+    assert _flags(book) == ["settlement_unreadable"]
+    m["status"] = "active"                                            # the list now shows the market open
+    wall.t += H
+    n = len(kw.calls)
+    run_step(rec, book, kw, gw, wall)
+    assert rows(book, "SELECT status FROM copies") == [("open",)] and "book" not in kw.kinds(n)
+
+
+DOC4 = ("open in the step's series list", "cannot sell on a closed market", "`parted_pm_closed_first` and held to Kalshi's "
+        "settlement", "a change of its text after that is not seen", "A new `--book` path starts a new test",
+        "reads its book once for each pass key", "per wait on the socket", "16 clubs seen on both venues",
+        "final skip for that holding", "another step is running on this book", "`settlement_unreadable`",
+        "`other_wallet_read_unclear`", "`clock_before_read`", "75 another step")
+
+
+def test_the_doc_states_the_addendum_4_plain_statements():
+    flat = " ".join((Path(__file__).resolve().parents[2] / "docs" / "forward-copier.md").read_text().split())
+    missing = [t for t in DOC4 if t not in flat.replace("**", "")]
+    assert missing == []
