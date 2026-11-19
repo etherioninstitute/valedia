@@ -284,8 +284,19 @@ In flight:
 - **NOW** copying leaders, historical (T47, roadmap 1.26); then T47d follow-ups (the final test must refuse
   cleanly where it cannot write; a missing boundary test; where memory is read; count the real store's
   markets before the analysis).
-- **WATCH** order-book loop with Elephant-1 (1.16): first fit not before 2026-11-19; the lead owes a copy of
-  the rows before that moment into a fresh file on 19 Nov, and the leakage checker before 22 Nov.
+- **WATCH** order-book loop with Elephant-1 (1.16): first fit not before 2026-11-19. **DONE 2026-11-19 1:33 AM
+  PST:** the copy of the rows before 2026-11-19 00:00 UTC is in a fresh read-only file on the internal disk,
+  `~/valedia-data/orderbook_loop_pre_scored_20261119.sqlite` (267 MB; sha256 beside it; counts equal to the
+  source's per table: 17,923 decisions, 361,530 trades, 107,851 snapshots, 7,444 heartbeats, 300 markets, 286
+  market drops, 87 events, 22 selections; no content read; paced in chunks under the collector's guard, 0 lost
+  decisions). The lead still owes the leakage checker before 22 Nov. **Scored period so far (from 4 PM on 18
+  Nov, read at 1:40 AM on 19 Nov): 1,626 decisions, 1,610 ok, 16 lost, all `model_unavailable`, 0 overruns:** 3
+  at 4:53 and 4:56 PM (Bionic, the second LM Studio app, started at 4:52:47: "Local inference is changing
+  ownership"; the collector reloaded `elephant-1` at 4:54:26), 2 at 7:08 PM (a burst of 4 network-change events;
+  no ownership entry; cause unproven), 11 from 12:55 to 12:58 AM (the classic LM Studio app was started at
+  12:54:51 and quit at 12:57:50, and local inference changed owner both times; the collector's own reload at
+  12:59:18 ended it). The earlier blame on Tailscale and LM Link for the 4:53 loss was wrong or incomplete. The
+  owner is asked to leave both LM Studio apps alone until 3 Dec.
 - **WATCH** public pick lists as a forecaster (1.19): grading waits for the hand audit of 40 picks; test line
   12 Dec.
 - **WATCH** Reddit chatter against Kalshi prices (1.20): 7 days of hand audit, then 28 days; no evaluation
