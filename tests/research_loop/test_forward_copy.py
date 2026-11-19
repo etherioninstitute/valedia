@@ -1233,6 +1233,21 @@ def test_a_cap_reached_in_the_settlement_checks_is_a_capped_step(env):
     assert code == 0, out
 
 
+def test_capped_settlement_checks_go_round_the_copies_from_where_the_last_step_stopped(env):
+    rec, book, kw, gw, wall = env
+    gs = games(kw, gw, 7)
+    rec.pass_({wallet(0): [g.holding(wallet(0), g.a) for g in gs]})
+    assert run_step(rec, book, kw, gw, wall)[0] == 0
+    kw.events["KXNBAGAME"] = []                               # every copy out of the list: one market read each
+    last = rows(book, "SELECT kalshi_market FROM copies ORDER BY copy_id DESC LIMIT 1")[0][0]
+    g = next(g for g in gs if g.markets[g.a]["ticker"] == last)
+    finalize(kw, g, g.a, True, T0 + H)                        # only the last copy is final
+    wall.t = T0 + 2 * H
+    for _ in range(2):                                        # the list and five market reads a step
+        assert run_step(rec, book, kw, gw, wall, cap=fc.MIN_CAP)[0] == fc.CAPPED
+    assert rows(book, "SELECT status, close_kind FROM copies WHERE kalshi_market=?", (last,)) == [("closed", "settled")]
+
+
 def _active_events(series):
     evs = json.loads(json.dumps(_events(series)))
     for e in evs:
@@ -1347,11 +1362,11 @@ def test_a_kept_match_read_judges_a_later_holding_by_its_own_stamp(env):
     g0, *more = games(kw, gw, 7)
     t0 = g0.markets[g0.a]["ticker"]
     kw.books[t0] = _book(0.02)                               # ask 0.98 at the kept read
+    g0.markets[g0.a]["close_time"] = iso(T0 + 3 * H)         # open at the kept read's stamp, closed by the late step
     rec.pass_({wallet(0): [g0.holding(wallet(0), g0.a)], wallet(1): [g.holding(wallet(1), g.a) for g in more],
                wallet(2): [g0.holding(wallet(2), g0.a)]})
     assert run_step(rec, book, kw, gw, wall, cap=fc.MIN_CAP)[0] == fc.CAPPED    # wallet 2 not reached
     assert (wallet(2), g0.tok[g0.a]) not in skips(book)
-    g0.markets[g0.a]["close_time"] = iso(T0 + 3 * H)         # closed since, but open at the kept read's stamp
     wall.t = T0 + 7 * H                                       # the step is late; the kept read is not
     n = len(kw.calls)
     run_step(rec, book, kw, gw, wall)
