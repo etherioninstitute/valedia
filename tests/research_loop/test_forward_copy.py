@@ -1659,6 +1659,138 @@ def test_properties_over_seeded_worlds(seed, tmp_path, monkeypatch):
     assert match_calls == len(books) + exits                 # one book read a market and pass, one an exit close
 
 
+# ------------------------------------------------------------------ addendum 3: one book read a market and pass
+MCI = "KXPREMIERLEAGUE-27-MCI"
+CITY_TITLE = "Will Manchester City win the 2026-27 English Premier League (EPL) Championship?"
+CITY_SLUG = "epl-2027-champion-20260701200428749"
+
+
+def _city(w, outcome):
+    yes, no = "5502", "5503"
+    return pos(w, yes if outcome == "Yes" else no, CITY, CITY_TITLE, outcome, CITY_SLUG,
+               opp=no if outcome == "Yes" else yes)
+
+
+def _city_world(tmp_path, tag, d_opens=True):
+    """Pass 1: wallet A holds City Yes (a copy of MCI yes). Pass 2: A has left (its EXIT) and, when `d_opens`,
+    wallet D holds City No: D's match read and A's exit are of ONE market (MCI) and ONE pass. The book moves:
+    0.40, then 0.22, then 0.13 as the best Yes bid."""
+    wall = Wall()
+    rec = Record(tmp_path / ("a3-%s.sqlite" % tag), wall)
+    kw, gw = KWorld(wall), GWorld()
+    kw.events["KXPREMIERLEAGUE"] = _active_events("KXPREMIERLEAGUE")
+    kw.seq[MCI] = [_book(0.45, 0.40), _book(0.45, 0.22), _book(0.45, 0.13)]
+    gw.markets[CITY] = dict(_pm(CITY + ".json")[0], closed=False)
+    a, d = wallet(0), wallet(1)
+    book = tmp_path / ("a3-%s-book.sqlite" % tag)
+    rec.pass_({a: [_city(a, "Yes")], d: []})
+    assert run_step(rec, book, kw, gw, wall)[0] == 0
+    assert rows(book, "SELECT side, ask, status FROM copies") == [("yes", 0.55, "open")]
+    wall.t = T0 + H
+    rec.pass_({a: [], d: [_city(d, "No")] if d_opens else []})
+    return rec, book, kw, gw, wall
+
+
+def _mci_books(kw, since=0):
+    return sum(1 for _t, path, _q in kw.calls[since:] if path == "/markets/%s/orderbook" % MCI)
+
+
+class DieOn:
+    def __init__(self, text):
+        self.text, self.done = text, False
+
+    def __call__(self, sql):
+        if not self.done and self.text in sql:
+            self.done = True
+            raise Died()
+
+
+def test_an_exit_and_a_match_read_of_one_market_and_pass_share_one_book_read(tmp_path):
+    """V220's first sequence: A exits MCI and D opens its other side in the same pass: ONE book read, and the exit is
+    priced at that read's bid."""
+    rec, book, kw, gw, wall = _city_world(tmp_path, "shared")
+    n = len(kw.calls)
+    assert run_step(rec, book, kw, gw, wall)[0] == 0
+    assert _mci_books(kw, n) == 1
+    got = sorted(rows(book, "SELECT side, ask, status, close_kind, close_price FROM copies"))
+    assert got == [("no", 0.78, "open", None, None), ("yes", 0.55, "closed", "exit", 0.22)], got
+
+
+def test_a_failed_exit_close_write_never_reads_the_book_again(tmp_path):
+    """V220's second sequence: the exit's close write fails; the next step finds the kept read and writes the same
+    close (0.22), with no second book request."""
+    rec, book, kw, gw, wall = _city_world(tmp_path, "close-dies", d_opens=False)
+    n = len(kw.calls)
+    with pytest.raises(Died):
+        run_step(rec, book, kw, gw, wall, hook=DieOn("close_kind='exit'"))
+    assert rows(book, "SELECT status FROM copies") == [("open",)]
+    assert run_step(rec, book, kw, gw, wall)[0] == 0
+    assert _mci_books(kw, n) == 1
+    assert rows(book, "SELECT status, close_kind, close_price FROM copies") == [("closed", "exit", 0.22)]
+
+
+def test_an_exit_whose_pass_read_failed_is_flagged_and_held_with_no_second_read(tmp_path):
+    rec, book, kw, gw, wall = _city_world(tmp_path, "failed")
+    kw.fail.add("/markets/%s/orderbook" % MCI)                # the pass's ONE book read fails
+    n = len(kw.calls)
+    assert run_step(rec, book, kw, gw, wall)[0] == 0
+    kw.fail.clear()
+    assert skips(book)[(wallet(1), "5503")] == "read_failed"
+    assert rows(book, "SELECT c.status, f.kind FROM copies c JOIN copy_flags f ON f.copy_id = c.copy_id") == \
+        [("open", "exit_read_failed")]
+    wall.t = T0 + 2 * H                                       # the next pass: nothing more, the exit was pass 2's
+    rec.pass_({wallet(0): [], wallet(1): [_city(wallet(1), "No")]})
+    assert run_step(rec, book, kw, gw, wall)[0] == 0
+    assert _mci_books(kw, n) == 1
+    assert rows(book, "SELECT status FROM copies") == [("open",)]
+
+
+def test_every_write_point_with_match_reads_and_exits_on_one_market_reads_its_book_once(tmp_path):
+    counter = Hook(0, 1)
+    rec, book, kw, gw, wall = _city_world(tmp_path, "count")
+    run_step(rec, book, kw, gw, wall, hook=counter)
+    assert counter.n > 8
+    for at in range(1, counter.n + 1):
+        rec, book, kw, gw, wall = _city_world(tmp_path, "d%d" % at)
+        n = len(kw.calls)
+        try:
+            run_step(rec, book, kw, gw, wall, hook=Hook(at, 1))
+        except Died:
+            pass
+        run_step(rec, book, kw, gw, wall)
+        run_step(rec, book, kw, gw, wall)
+        assert _mci_books(kw, n) <= 1, at                    # at most one book request a market and pass, ever
+        prices = [p for (p,) in rows(book, "SELECT close_price FROM copies")]
+        assert 0.13 not in prices, at
+        assert rows(book, "SELECT count(*) FROM copies WHERE ask = 0.87")[0][0] == 0, at
+        exit_closed = rows(book, "SELECT close_kind, close_price FROM copies WHERE side='yes'") == [("exit", 0.22)]
+        held = rows(book, "SELECT kind FROM copy_flags") == [("exit_read_failed",)]
+        assert exit_closed != held, at                        # closed at the one read's bid, or held for no read
+
+
+def test_a_holding_whose_opposite_token_is_unknown_is_not_copied(env):
+    """R59: the record cannot name the other outcome, so whether the leaders disagree cannot be told."""
+    rec, book, kw, gw, wall = env
+    g = Game("Jazz", "Clippers").install(kw, gw)
+    h = g.holding(wallet(0), "Clippers")
+    h["opposite_token_id"] = None
+    rec.pass_({wallet(0): [h]})
+    run_step(rec, book, kw, gw, wall)
+    assert skips(book).get((wallet(0), g.tok["Clippers"])) == "opposite_unknown"
+    assert rows(book, "SELECT count(*) FROM copies")[0][0] == 0
+    out = io.StringIO()
+    assert fc.main(["counts", "--book", str(book)], out=out) == 0
+    assert "opposite_unknown=1" in out.getvalue().replace(" ", "")
+
+
+def test_the_doc_states_the_three_plain_statements():
+    doc = (Path(__file__).resolve().parents[2] / "docs" / "forward-copier.md").read_text()
+    flat = " ".join(doc.split())
+    assert "until that wallet's next read replaces it" in flat
+    assert "older than 365 days" in flat
+    assert "`meta`, `steps`, `texts`, `pm_descriptions` and `near_book` can be changed by a person with the file" in flat
+
+
 # ------------------------------------------------------------------ the fixture record (real holdings)
 def test_the_real_fixture_record_through_one_step(tmp_path):
     wall = Wall()
