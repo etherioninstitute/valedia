@@ -70,7 +70,8 @@ PRICE_LO, PRICE_HI = 0.10, 0.90
 ASK_LO, ASK_HI = 0.05, 0.95
 MATCH_WINDOW = 6 * 3600.0                    # the match read falls within 6 hours of the pass's read of that wallet
 DAY = 86_400
-USER_VERSION = 5                             # 5: settlement_unreadable, clock_before_read, other_wallet_read_unclear
+USER_VERSION = 6                             # 6: token_not_in_market (5: settlement_unreadable, clock_before_read,
+                                             # other_wallet_read_unclear)
 WAIT_SECONDS = 5.0
 MAX_BODY = 8_000_000                         # an answer larger than this is a failed read (a list of 200 events)
 FETCH_TIMEOUT = 60.0
@@ -95,6 +96,7 @@ SKIP_REASONS = (
     "read_failed",               # a read that failed (Kalshi's list or book, or Polymarket's description)
     "no_unique_market",          # not exactly one Kalshi market for it
     "market_not_open",           # Kalshi's market not open at the match read
+    "token_not_in_market",       # Polymarket's description does not list the holding's token among its market's tokens
     "text_departs",              # a venue's text departs from the map's template, names and dates aside
     "already_open",              # a copy of that Kalshi market and side is already open (the wallet is noted on it)
     "ask_outside",               # the ask of the copy's side is outside 0.05 to 0.95, or there is none
@@ -117,6 +119,14 @@ class CapReached(Exception):
 
 class GammaError(RuntimeError):
     """Polymarket's description service could not be read, or answered in another shape."""
+
+
+class Defer(Exception):
+    """A series list or a description could not be read: no book read was made, so the holding is neither considered
+    nor skipped; a later step asks again, until the six hours end it (`late`)."""
+    def __init__(self, kind: str):
+        super().__init__(kind)
+        self.kind = kind
 
 
 class Skip(Exception):
@@ -343,6 +353,8 @@ def market_open(m: dict, at: float) -> bool:
 def check_texts(series: str, names: dict, ev: dict, m: dict, pm_text: str, fmap: dict) -> None:
     """Both venues' texts against the map's templates, names and dates aside; Skip(text_departs) otherwise."""
     tpl = fmap["_compiled"][series]
+    if any(t is not None and not isinstance(t, str) for t in (pm_text, m.get("rules_primary"), m.get("rules_secondary"))):
+        raise Skip("text_departs", "a text that is not a string")
     gp = tpl["polymarket"].fullmatch(normal(pm_text or ""))
     gk = tpl["kalshi_primary"].fullmatch(normal(m.get("rules_primary") or ""))
     gs = tpl["kalshi_secondary"].fullmatch(normal(m.get("rules_secondary") or ""))
@@ -723,6 +735,19 @@ class Book:
         return self.conn.execute(sql, params).fetchall()
 
 
+def _needs_recovery(e: sqlite3.Error) -> bool:
+    """SQLITE_READONLY_ROLLBACK (776): a read-only open met a hot journal."""
+    return getattr(e, "sqlite_errorcode", None) == 776 or "attempt to write a readonly database" in str(e)
+
+
+def _recover(path: Path) -> None:
+    conn = sqlite3.connect(str(path), timeout=WAIT_SECONDS)
+    try:
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchall()
+    finally:
+        conn.close()
+
+
 def open_book(path: Path, create: bool):
     """(Book connection, None) or (None, (code, words)). Only `step` creates a book, at its first run."""
     path = Path(path)
@@ -740,12 +765,24 @@ def open_book(path: Path, create: bool):
                 conn.close()
             return None, (REFUSED, "refused: the book %s could not be made (%s); nothing done" % (path, type(e).__name__))
         return conn, None
-    try:
-        why = book_shape_problem(path)
-    except sqlite3.Error as e:
-        if lm._busy(e):
-            return None, (BUSY, "refused: the book %s is busy; nothing done" % path)
-        return None, (UNREADABLE, "refused: %s is not readable as a book (%s); nothing done" % (path, type(e).__name__))
+    why = None
+    for attempt in (1, 2):
+        try:
+            why = book_shape_problem(path)
+            break
+        except sqlite3.Error as e:
+            if attempt == 1 and _needs_recovery(e):          # a write was cut short: a hot journal, which a read-only
+                if not create:                               # open cannot roll back
+                    return None, (UNREADABLE, "refused: the book %s needs a step to recover (a write was cut short); "
+                                              "nothing done" % path)
+                try:                                         # step opens it read-write once; SQLite recovers it
+                    _recover(path)
+                except sqlite3.Error:
+                    pass
+                continue
+            if lm._busy(e):
+                return None, (BUSY, "refused: the book %s is busy; nothing done" % path)
+            return None, (UNREADABLE, "refused: %s is not readable as a book (%s); nothing done" % (path, type(e).__name__))
     if why:
         return None, (OTHER_SHAPE, "refused: %s was made by another version of the copier, or is not its book (%s); "
                                    "nothing done" % (path, why))
@@ -791,7 +828,7 @@ def candidates(rec, considered: set) -> list:
                                 "token_id": r[0], "kind": "baseline", "change_id": None, **dict(zip(HCOLS, r[1:]))})
         for change_id, read_id, tok, read_ts, pass_id in rec.execute(
                 "SELECT c.change_id, c.read_id, c.token_id, c.read_ts, r.pass_id FROM changes c JOIN wallet_reads r "
-                "ON r.read_id = c.read_id WHERE c.wallet_key=? AND c.kind='NEW' AND c.vouched=1 ORDER BY c.read_id, "
+                "ON r.read_id = c.read_id WHERE c.wallet_key=? AND c.kind='NEW' AND c.vouched=1 AND r.good=1 ORDER BY c.read_id, "
                 "c.token_id", (key,)).fetchall():
             if (key, read_id, tok) in considered or pass_id in running:
                 continue
@@ -806,6 +843,16 @@ def candidates(rec, considered: set) -> list:
     return sorted(out, key=lambda h: (h["read_ts"], h["read_id"], h["wallet_key"], h["token_id"]))
 
 
+def _rejects_clean(text) -> bool:
+    """The record's rejects column is a JSON object of counts; clean when it holds none but "repeated_row". Anything
+    else (NULL, a list, null, not JSON) cannot be read as clean."""
+    try:
+        d = json.loads(text)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(d, dict) and not any(n for why, n in d.items() if why != "repeated_row")
+
+
 def unclear_wallets(rec, h: dict) -> list:
     """The other wallets of the fixed set with no CLEAN read in the holding's pass, in key order. A clean read is the
     record's own (the one that lets an EXIT be recorded, leaders_monitor.write_wallet): in that pass, wallet_reads
@@ -818,8 +865,7 @@ def unclear_wallets(rec, h: dict) -> list:
         got = [] if h.get("pass_id") is None else rec.execute(
             "SELECT carried, rejects FROM wallet_reads WHERE wallet_key=? AND pass_id=? AND good=1",
             (v, h["pass_id"])).fetchall()
-        clean = len(got) >= 1 and all(not c and not any(n for why, n in json.loads(r or "{}").items()
-                                                       if why != "repeated_row") for c, r in got)
+        clean = len(got) >= 1 and all(not c and _rejects_clean(r) for c, r in got)
         if not clean:
             out.append(v)
     return out
@@ -928,6 +974,8 @@ class Step:
         skip). May raise CapReached, before any write."""
         try:
             return self._consider(h)
+        except Defer as d:
+            return {"defer": d.kind}
         except Skip as s:
             out = {"skip": (s.reason, s.detail)}
             if s.reason == "no_same" and h.get("_near"):
@@ -1082,10 +1130,10 @@ class Step:
                     raise kd.KalshiDataError("an event not in Kalshi's shape")
                 self.lists[series] = events
             except (kd.KalshiDataError, kd.HttpError, ValueError, TypeError, AttributeError) as e:
-                self.lists[series] = Skip("read_failed", "Kalshi's list of %s: %s" % (series, type(e).__name__))
+                self.lists[series] = Defer("deferred_list")
         got = self.lists[series]
-        if isinstance(got, Skip):
-            raise Skip(got.reason, got.detail)
+        if isinstance(got, Defer):
+            raise Defer(got.kind)
         return got
 
     def _description(self, h: dict) -> dict:
@@ -1098,15 +1146,21 @@ class Step:
         if row:
             return {"cached": True, "description": row[0][1]}
         if cid in self.pm_failed:                        # a failed read is not asked again in the same step
-            raise Skip("read_failed", self.pm_failed[cid])
+            raise Defer("deferred_description")
         try:
             got = self.gamma.market(cid, closed_first=False)
         except GammaError as e:
             self.pm_failed[cid] = "Polymarket's description: %s" % e
-            raise Skip("read_failed", self.pm_failed[cid])
+            raise Defer("deferred_description")
         if got is None or not isinstance(got.get("description"), str):
             self.pm_failed[cid] = "Polymarket's description: no such market"
-            raise Skip("read_failed", self.pm_failed[cid])
+            raise Defer("deferred_description")
+        try:                                             # the answer must be for this market and list this token
+            listed = json.loads(got.get("clobTokenIds")) if isinstance(got.get("clobTokenIds"), str) else None
+        except ValueError:
+            listed = None
+        if not isinstance(listed, list) or h["token_id"] not in listed:
+            raise Skip("token_not_in_market", "the description does not list the holding's token")
         h["_pm"] = {"cached": False, "description": got["description"], "read_ts": self.wall(),
                     "question": got.get("question") if isinstance(got.get("question"), str) else None,
                     "outcomes": got.get("outcomes") if isinstance(got.get("outcomes"), str) else None,
@@ -1195,7 +1249,7 @@ class Step:
                                                      "copies WHERE copy_id=?", (copy_id,))[0]
         try:
             events = self._list(series)
-        except Skip:
+        except Defer:
             self.n["settle_list_failed"] += 1
             return
         listed = [(e, m) for e in events for m in (e.get("markets") or [])
@@ -1204,7 +1258,7 @@ class Step:
         if not shown:
             try:
                 rec = self.kalshi.market(ticker)
-            except (kd.KalshiDataError, kd.HttpError, ValueError):
+            except (kd.KalshiDataError, kd.HttpError, ValueError, TypeError, AttributeError):
                 self.n["settle_read_failed"] += 1
                 return
             got = settlement(rec, ticker, side, self.wall())
@@ -1251,6 +1305,8 @@ class Step:
             return [("pm_unresolved_at_settlement", str(pm.get("umaResolutionStatus"))[:40])]
         try:
             tokens, prices = json.loads(pm["clobTokenIds"]), json.loads(pm["outcomePrices"])
+            if not isinstance(tokens, list) or not isinstance(prices, list):
+                return [("part_check_failed", "Polymarket's token or price list is not a list")]
             paid = float(prices[tokens.index(tok)])
         except (KeyError, ValueError, TypeError, IndexError):
             return [("part_check_failed", "Polymarket's outcome for the token")]
@@ -1321,7 +1377,14 @@ def run_step(rec, book: Book, kalshi, pacer: StepPacer, gamma: GammaReader, fmap
     stage = "the new holdings"
     try:
         for h in todo:
+            if h["pass_id"] is not None and rec.execute("SELECT status FROM passes WHERE pass_id=?",
+                                                        (h["pass_id"],)).fetchone() == ("running",):
+                st.n["pass_still_running"] += 1       # a pass that started after the running ones were collected
+                continue
             out = st.consider(h)
+            if "defer" in out:                        # no book read was made: not considered, not skipped
+                st.n[out["defer"]] += 1
+                continue
             reasons[st.write(h, out, step_id)] += 1
             done += 1
         stage = "the settlement checks and their exits"
@@ -1334,12 +1397,14 @@ def run_step(rec, book: Book, kalshi, pacer: StepPacer, gamma: GammaReader, fmap
                            "considered=?, opened=?, closed=? WHERE step_id=?",
                            (wall(), status, pacer.count, gamma.requests, done, opened,
                             st.n["closed_settled"] + st.n["closed_exit"], step_id)))
+    deferred = " ".join("%s=%d" % (k, st.n[k]) for k in ("deferred_list", "deferred_description", "pass_still_running")
+                        if st.n[k])
     say("step %d: considered %d of %d (copies opened %d; skips %s); closed settled=%d exit=%d; settlement checks "
         "left for the next step %d; flags %s; Kalshi requests %d of the cap %d; Polymarket requests %d"
         % (step_id, done, len(todo), opened, " ".join("%s=%d" % (r, reasons[r]) for r in SKIP_REASONS if reasons[r])
            or "none", st.n["closed_settled"], st.n["closed_exit"], st.n["settle_left"],
            " ".join("%s=%d" % (k[5:], v) for k, v in sorted(st.n.items()) if k.startswith("flag_")) or "none",
-           pacer.count, pacer.cap, gamma.requests))
+           pacer.count, pacer.cap, gamma.requests) + ("; left for a later step: " + deferred if deferred else ""))
     if capped:
         say("STOPPED step %d at the cap of %d Kalshi requests, in %s: left for the next step %d holdings and %s "
             "(nothing considered is lost or made twice)"
@@ -1456,7 +1521,7 @@ def _lock_book(book: Path):
     """An exclusive, non-blocking flock on `<book>.step.lock` (made if missing; not part of the book's bytes): the fd,
     or (None, (code, words)). One step at a time on a book: two would read the same kalshi_last and send requests
     with no pause between them, and the second would mark the first `died` while it lives."""
-    path = Path(str(book) + ".step.lock")
+    path = Path(os.path.realpath(book) + ".step.lock")       # the real path: every spelling of a book is one lock
     try:
         fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
     except OSError as e:
