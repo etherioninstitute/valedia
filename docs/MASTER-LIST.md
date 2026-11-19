@@ -30,7 +30,17 @@ matched by keyword only, not read one by one. Item H-1 closes that.
 - **DONE 2026-11-17 20:30 PST** T51 fractional orders, build A (practice path only; live fractions stay
   refused): four slices, one blind check, merged (main `5d944d4`), 2,601 tests pass on main, the order-step
   job gate moved. **NEXT** the practice proof in market hours, then build B (section 2).
-- **NOW** T47 copying Polymarket's leaders (historical test): phase 1 read 189 of 192 wallets (35.3 million
+- **CLOSED, FAILED 2026-11-18 9:01 PM PST** T47 copying Polymarket's leaders (historical test). The development
+  stage was run once more on the finished data (the fifth amendment's one extra run; the first run had 0 trades):
+  1,718 copied trades from 1,175 events; mean MINUS 1.86 cents a contract at the rule's cost (3 cents); one-sided
+  p 0.9265; failed: mean not above zero, p above 0.05. By the locked document the idea FAILS at step 1 and the
+  sealed months (July to October 2026) are NOT opened, now never by this test. Information tables, which decide
+  nothing: cost 0 gives +1.14 cents, cost 2 gives -0.86, cost 4 gives -2.86; the leaders' own prices give +2.26
+  (the follower's later price takes about 4 cents); sports -2.10 cents (1,536 trades), everything else +0.13 (182
+  trades); first purchases over 10,000 dollars -0.26 (239 trades); a 6-hour delay -2.50, 24-hour -2.62; the 10-minute
+  figure had no trades (the price grain is 3 hours). The lead's stated expectation (between -4 cents and +1) held.
+  Ran 12:45 to 1:13 PM and 8:34 to 9:01 PM, main 312bfa4, the three page-limit wallets left out. History of the
+  entry follows. (Was: **NOW**) phase 1 read 189 of 192 wallets (35.3 million
   trade rows, a 69.7 GB store) and ended INCOMPLETE on 2026-11-18 01:15 PST: 4,705 market ids in the trades
   are one byte short and the service refuses any request holding one. Fourth amendment (a refused id is a
   market without a known resolution, counted) and T47e (the pull narrows a refused request and goes on)
@@ -132,7 +142,7 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   unit so no odd shape can stop a step; duplicate todo rows by (wallet, read, token); a book creation killed in
   the middle leaves a file `step` refuses (delete it); limits at a faster cadence than one pass a day: a deferred
   holding or an exit seen late can be priced from a later read than the first after its pass. **NEXT** the screen's program (T47f is merged: it can start), then the
-  screen ONCE (when T47 is closed, else from 24 Nov on data to June), the record pointed at its set, the
+  screen ONCE (T47 closed on 18 Nov, so the screen may run now; the historical test's FAIL is a prior against this forward test, which stays locked as written), the record pointed at its set, the
   copier beside each pass, more series read into the rule map (the other sports first).
   **OWNER** whether the leaders' pass runs more often than once a day (game positions resolve within the
   day; a change to his job's schedule is his to allow; asked 2026-11-18 14:15 PST).
