@@ -121,9 +121,17 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   read by Grok 4.7 and ChatGPT/Codex through his own seats (scrubbed bundle, no Claude tokens; 43 findings);
   the lead read each and confirmed six with gate tests (a finalized market with an unreadable payout sold at
   the bid; a clock set back; a malformed nested list crashing the step; an infinite pause; no lock between
-  two steps; one case of an unclear read of another wallet). Repair round R61 to R68 (ticket
-  T54a-addendum-4) with a Sonnet builder, then both off-family readers read the new diff and the gate runs it.
-  It runs on nothing real until a check passes and the wallet screen exists. **NEXT** the screen's program (T47f is merged: it can start), then the
+  two steps; one case of an unclear read of another wallet). Two repair rounds with a Sonnet builder (R61 to
+  R76: 212K and 273K tokens, against millions for the Opus rounds) and a third off-family reading: **MERGED
+  2026-11-18 about 8:12 PM, main 063e87d** (= the checked candidate 804fd55; 16 new files, nothing existing
+  changed; 140 tests pass on main through the gate). Accepted on a stop rule: no rule violation reachable from
+  real inputs confirmed; the rest is stated limits in docs/forward-copier.md. It still runs on nothing real until
+  the wallet screen exists and the owner runs `step`. **QUEUED (cheap, fail closed, from the third reading):** a
+  Polymarket answer of "no such market" at an exit must hold the sale and retry (today it sells at the bid); the
+  token's outcome word must agree with the Gamma outcome at its index (also on a cached description); one guard per
+  unit so no odd shape can stop a step; duplicate todo rows by (wallet, read, token); a book creation killed in
+  the middle leaves a file `step` refuses (delete it); limits at a faster cadence than one pass a day: a deferred
+  holding or an exit seen late can be priced from a later read than the first after its pass. **NEXT** the screen's program (T47f is merged: it can start), then the
   screen ONCE (when T47 is closed, else from 24 Nov on data to June), the record pointed at its set, the
   copier beside each pass, more series read into the rule map (the other sports first).
   **OWNER** whether the leaders' pass runs more often than once a day (game positions resolve within the
