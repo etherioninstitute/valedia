@@ -80,6 +80,7 @@ class PMWorld:
                        "crypto": [board_row(i + 1, wallet(i + 5)) for i in range(5)]}
         self.held: dict = {}
         self.wall, self.advance = wall, 0.0          # `advance`: seconds each wallet's read takes (reads apart)
+        self.fail: set = set()                       # wallets whose read fails in this pass
 
     def __call__(self, url):
         parts = urllib.parse.urlsplit(url)
@@ -89,6 +90,8 @@ class PMWorld:
         else:
             if self.advance and self.wall is not None:
                 self.wall.t += self.advance
+            if q["user"] in self.fail:
+                raise pd.HttpError(403, url)
             rows = self.held.get(q["user"], [])
         return json.dumps({"data": rows, "pagination": {"limit": 1000, "offset": 0, "has_more": False,
                                                         "next_cursor": None}}).encode()
@@ -105,9 +108,12 @@ class Record:
         return lm.main(argv + ["--store", str(self.path)], client=client, wall=self.wall, out=io.StringIO(),
                        memory=lambda: 10.0)
 
-    def pass_(self, held: dict):
+    def pass_(self, held: dict, fail=()):
         self.world.held = {w: list(rows) for w, rows in held.items()}
-        assert self._run(["pass"]) == 0
+        self.world.fail = set(fail)
+        code = self._run(["pass"])
+        self.world.fail = set()
+        assert code == 0 or fail, code
 
     def digest(self):
         return hashlib.sha256(self.path.read_bytes()).hexdigest()
@@ -225,6 +231,15 @@ class Game:
                                      "no_dollars": book_levels([(no_bid, 77.0), (no_bid - 0.03, 10.0)])}
         gw.markets[self.cid] = self.gamma()
         return self
+
+
+PAIRS = (("Jazz", "Clippers"), ("Hornets", "Lakers"), ("Celtics", "Knicks"), ("Heat", "Magic"), ("Suns", "Spurs"),
+         ("Nets", "Bulls"), ("Hawks", "Pacers"), ("Bucks", "Cavaliers"), ("76ers", "Raptors"), ("Pistons", "Wizards"),
+         ("Thunder", "Nuggets"), ("Warriors", "Kings"))
+
+
+def games(kw, gw, n, **k):
+    return [Game(a, b).install(kw, gw, **k) for a, b in PAIRS[:n]]
 
 
 def run_step(rec, book, kw, gw, wall, cap=60, pause=10.0, hook=None):
@@ -618,20 +633,20 @@ def test_the_first_read_judges_every_holding_of_that_pass_by_its_own_window(env)
 
 def test_a_failed_first_read_is_the_answer_for_that_pass_even_in_a_later_step(env):
     rec, book, kw, gw, wall = env
-    g1, g2 = Game("Jazz", "Clippers").install(kw, gw), Game("Hornets", "Lakers").install(kw, gw)
+    g1, *more = games(kw, gw, 7)
     kw.fail.add("/markets/%s/orderbook" % g1.markets["Clippers"]["ticker"])
-    rec.pass_({wallet(0): [g1.holding(wallet(0), "Clippers")], wallet(1): [g2.holding(wallet(1), "Hornets")],
+    rec.pass_({wallet(0): [g1.holding(wallet(0), "Clippers")], wallet(1): [g.holding(wallet(1), g.a) for g in more],
                wallet(2): [g1.holding(wallet(2), "Clippers")]})
-    assert run_step(rec, book, kw, gw, wall, cap=2)[0] == fc.CAPPED       # list, failed book; the cap
+    assert run_step(rec, book, kw, gw, wall, cap=fc.MIN_CAP)[0] == fc.CAPPED   # list, failed book, 4 books; cap
     kw.fail.clear()
     for _ in range(4):
-        if run_step(rec, book, kw, gw, wall, cap=2)[0] == 0:
+        if run_step(rec, book, kw, gw, wall, cap=fc.MIN_CAP)[0] == 0:
             break
     s = skips(book)
     assert s[(wallet(0), g1.tok["Clippers"])] == "read_failed" == s[(wallet(2), g1.tok["Clippers"])]
     books = [p for _t, p, _q in kw.calls if p.endswith("/orderbook")]
     assert books.count("/markets/%s/orderbook" % g1.markets["Clippers"]["ticker"]) == 1   # no second try
-    assert rows(book, "SELECT kalshi_market FROM copies") == [(g2.markets["Hornets"]["ticker"],)]
+    assert sorted(rows(book, "SELECT kalshi_market FROM copies")) == sorted((g.markets[g.a]["ticker"],) for g in more)
 
 
 def test_two_passes_in_one_step_have_each_their_own_first_read(env):
@@ -700,21 +715,20 @@ def test_an_unvouched_new_is_never_copied(env):
 
 def test_the_cap_stops_a_step_cleanly_and_the_next_carries_on(env, tmp_path):
     rec, book, kw, gw, wall = env
-    games = [Game(a, b).install(kw, gw) for a, b in (("Jazz", "Clippers"), ("Hornets", "Lakers"),
-                                                     ("Celtics", "Knicks"))]
-    rec.pass_({wallet(0): [g.holding(wallet(0), g.a) for g in games]})
+    gs = games(kw, gw, 8)
+    rec.pass_({wallet(0): [g.holding(wallet(0), g.a) for g in gs]})
     codes, per_step = [], []
     for _ in range(6):
         n = len(kw.calls)
-        code, out = run_step(rec, book, kw, gw, wall, cap=2)
+        code, out = run_step(rec, book, kw, gw, wall, cap=fc.MIN_CAP)
         codes.append(code)
         per_step.append(len(kw.calls) - n)
         if code == 0:
             break
-    assert codes[0] == fc.CAPPED and codes[-1] == 0 and max(per_step) <= 2
+    assert codes[0] == fc.CAPPED and codes[-1] == 0 and max(per_step) <= fc.MIN_CAP
     assert sorted(r[0] for r in rows(book, "SELECT kalshi_market FROM copies")) == \
-        sorted(g.markets[g.a]["ticker"] for g in games)
-    assert rows(book, "SELECT count(*) FROM considered")[0][0] == 3
+        sorted(g.markets[g.a]["ticker"] for g in gs)
+    assert rows(book, "SELECT count(*) FROM considered")[0][0] == 8
 
 
 def test_the_pause_is_never_under_five_seconds_and_spaces_every_request(env):
@@ -723,6 +737,8 @@ def test_the_pause_is_never_under_five_seconds_and_spaces_every_request(env):
         run_step(rec, book, kw, gw, wall, pause=4.9)
     with pytest.raises(SystemExit):
         run_step(rec, book, kw, gw, wall, cap=1)
+    with pytest.raises(SystemExit):
+        run_step(rec, book, kw, gw, wall, cap=fc.MIN_CAP - 1)
     with pytest.raises(ValueError):
         fc.StepPacer(4.99, 60)
     games = [Game(a, b).install(kw, gw) for a, b in (("Jazz", "Clippers"), ("Hornets", "Lakers"))]
@@ -734,11 +750,10 @@ def test_the_pause_is_never_under_five_seconds_and_spaces_every_request(env):
 
 def test_the_pause_holds_across_steps(env):
     rec, book, kw, gw, wall = env
-    games = [Game(a, b).install(kw, gw) for a, b in (("Jazz", "Clippers"), ("Hornets", "Lakers"),
-                                                     ("Celtics", "Knicks"), ("Heat", "Magic"))]
-    rec.pass_({wallet(0): [g.holding(wallet(0), g.a) for g in games]})
-    codes = [run_step(rec, book, kw, gw, wall, cap=2)[0] for _ in range(4)]   # one after another, no time between
-    assert codes[0] == fc.CAPPED and len(kw.calls) >= 5
+    gs = games(kw, gw, 8)
+    rec.pass_({wallet(0): [g.holding(wallet(0), g.a) for g in gs]})
+    codes = [run_step(rec, book, kw, gw, wall, cap=fc.MIN_CAP)[0] for _ in range(3)]   # one after another
+    assert codes[0] == fc.CAPPED and len(kw.calls) >= fc.MIN_CAP + 2
     times = [t for t, _p, _q in kw.calls]
     assert all(b - a >= 10.0 - 1e-9 for a, b in zip(times, times[1:])), times
     kept = float(rows(book, "SELECT value FROM meta WHERE key='kalshi_last'")[0][0])
@@ -1068,6 +1083,11 @@ def _two_steps(rec, book, kw, gw, wall, games, hook=None):
     except Died:
         pass
     run_step(rec, book, kw, gw, wall)
+    per: dict = {}
+    for _t, path, _q in kw.calls:
+        if path.endswith("/orderbook"):
+            per[path] = per.get(path, 0) + 1
+    assert max(per.values(), default=0) <= 1, per             # the match reads: one a market and pass (R53)
     g1, g2, _g3 = games
     finalize(kw, g2, "Hornets", True, T0 + H)
     gw.markets[g2.cid] = g2.gamma(closed=True, winner="Hornets")
@@ -1091,30 +1111,78 @@ class Hook:
             raise Died()
 
 
+def _orphans(book, gs):
+    """The tokens of the markets whose match read was BEGUN and never kept (R53): their holdings are read_failed."""
+    tables = {n for (n,) in rows(book, "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "match_begun" not in tables:
+        return set()
+    begun = set(rows(book, "SELECT kalshi_market, pass_key FROM match_begun")) - \
+        set(rows(book, "SELECT kalshi_market, pass_key FROM match_reads"))
+    tickers = {t for t, _p in begun}
+    return {g.tok[team] for g in gs for team in (g.a, g.b) if g.markets[team]["ticker"] in tickers}
+
+
+def _without(state, toks):
+    return tuple([r for r in part if not (set(map(str, r)) & toks)] for part in state)
+
+
 def test_a_step_that_dies_at_any_write_point_leaves_a_book_the_next_step_continues(tmp_path):
-    rec, kw, gw, wall, games = _died_world(tmp_path, "clean")
-    want = _two_steps(rec, tmp_path / "clean.sqlite", kw, gw, wall, games)
+    rec, kw, gw, wall, gs = _died_world(tmp_path, "clean")
+    want = _two_steps(rec, tmp_path / "clean.sqlite", kw, gw, wall, gs)
     assert want[2] and any(r[6] == "exit" for r in want[2]) and any(r[6] == "settled" for r in want[2])
     for phase in (1, 2):
         counter = Hook(0, phase)
-        rec, kw, gw, wall, games = _died_world(tmp_path, "count%d" % phase)
-        _two_steps(rec, tmp_path / ("count%d.sqlite" % phase), kw, gw, wall, games, hook=counter)
+        rec, kw, gw, wall, gs = _died_world(tmp_path, "count%d" % phase)
+        _two_steps(rec, tmp_path / ("count%d.sqlite" % phase), kw, gw, wall, gs, hook=counter)
         assert counter.n > 10
         for at in range(1, counter.n + 1):
-            rec, kw, gw, wall, games = _died_world(tmp_path, "d%d-%d" % (phase, at))
-            got = _two_steps(rec, tmp_path / ("d%d-%d.sqlite" % (phase, at)), kw, gw, wall, games,
-                             hook=Hook(at, phase))
-            assert got == want, (phase, at)
+            rec, kw, gw, wall, gs = _died_world(tmp_path, "d%d-%d" % (phase, at))
+            book = tmp_path / ("d%d-%d.sqlite" % (phase, at))
+            got = _two_steps(rec, book, kw, gw, wall, gs, hook=Hook(at, phase))
+            orph = _orphans(book, gs)
+            assert _without(got, orph) == _without(want, orph), (phase, at)
+            for _w, _r, tok, outcome in got[0]:
+                if tok in orph:
+                    assert outcome == "skip", (phase, at)
+            assert all(reason == "read_failed" for _w, tok, reason in got[1] if tok in orph), (phase, at)
+
+
+def test_a_match_read_is_never_sent_twice_whatever_write_fails(tmp_path):
+    """R53: the book holds that a market and pass is BEING read before the request is sent; a later step that finds
+    it begun and never kept takes the pass's first read as failed. Dying at every write point of the first step."""
+    def world(tag):
+        wall = Wall()
+        rec = Record(tmp_path / ("r53-%s.sqlite" % tag), wall)
+        kw, gw = KWorld(wall), GWorld()
+        g = Game("Jazz", "Clippers").install(kw, gw)
+        kw.seq[g.markets["Clippers"]["ticker"]] = [_book(0.02), _book(0.50)]       # 0.98 first; 0.50 a second time
+        rec.pass_({wallet(0): [g.holding(wallet(0), "Clippers")], wallet(1): [g.holding(wallet(1), "Clippers")]})
+        return rec, kw, gw, wall, g
+    counter = Hook(0, 1)
+    rec, kw, gw, wall, g = world("count")
+    run_step(rec, tmp_path / "r53-book-count.sqlite", kw, gw, wall, hook=counter)
+    assert counter.n > 5
+    for at in range(1, counter.n + 1):
+        rec, kw, gw, wall, g = world("d%d" % at)
+        book = tmp_path / ("r53-book-d%d.sqlite" % at)
+        try:
+            run_step(rec, book, kw, gw, wall, hook=Hook(at, 1))
+        except Died:
+            pass
+        run_step(rec, book, kw, gw, wall)
+        run_step(rec, book, kw, gw, wall)
+        assert kw.kinds().count("book") <= 1, at                                   # never a second request
+        assert rows(book, "SELECT count(*) FROM copies")[0][0] == 0, at             # never priced from a second
+        assert set(skips(book).values()) <= {"ask_outside", "read_failed"}, at
 
 
 def _capped_world(tmp_path, tag):
-    """Copies open on four games; then a pass with two exits, two settlements and two new holdings, so that one
+    """Copies open on four games; then a pass with two exits, two settlements and four new holdings, so that one
     step has new holdings, settlement reads and exit reads to make."""
     wall = Wall()
     rec = Record(tmp_path / ("cap-%s.sqlite" % tag), wall)
     kw, gw = KWorld(wall), GWorld()
-    gs = [Game(a, b).install(kw, gw) for a, b in (("Jazz", "Clippers"), ("Hornets", "Lakers"), ("Celtics", "Knicks"),
-                                                  ("Heat", "Magic"), ("Suns", "Spurs"), ("Nets", "Bulls"))]
+    gs = games(kw, gw, 8)
     rec.pass_({wallet(0): [g.holding(wallet(0), g.a) for g in gs[:4]], wallet(1): []})
     book = tmp_path / ("cap-%s-book.sqlite" % tag)
     assert run_step(rec, book, kw, gw, wall)[0] == 0
@@ -1123,7 +1191,7 @@ def _capped_world(tmp_path, tag):
     kw.events["KXNBAGAME"].remove(gs[3].event)               # one shown final in the list, one gone from it
     wall.t = T0 + 2 * H
     rec.pass_({wallet(0): [gs[2].holding(wallet(0), gs[2].a), gs[3].holding(wallet(0), gs[3].a)],
-               wallet(1): [gs[4].holding(wallet(1), gs[4].a), gs[5].holding(wallet(1), gs[5].a)]})
+               wallet(1): [g.holding(wallet(1), g.a) for g in gs[4:8]]})
     return rec, book, kw, gw, wall
 
 
@@ -1133,10 +1201,11 @@ def test_a_cap_at_every_request_count_ends_cleanly_and_later_steps_finish_the_sa
     code, out = run_step(rec, book, kw, gw, wall)
     assert code == 0, out
     total = len(kw.calls) - n
-    assert sorted(kw.kinds(n)) == sorted(["list", "book", "book", "market", "market", "book", "book"])
+    assert sorted(kw.kinds(n)) == sorted(["list"] + ["book"] * 4 + ["market"] * 2 + ["book"] * 2)
     want = _state(book)
     assert sorted((r[5], r[6] or "") for r in want[2]) == [("closed", "exit")] * 2 + [("closed", "settled")] * 2 + \
-        [("open", "")] * 2
+        [("open", "")] * 4
+    assert total > fc.MIN_CAP + 1
     for cap in range(fc.MIN_CAP, total):
         rec, book, kw, gw, wall = _capped_world(tmp_path, "c%d" % cap)
         n = len(kw.calls)
@@ -1153,16 +1222,181 @@ def test_a_cap_at_every_request_count_ends_cleanly_and_later_steps_finish_the_sa
 
 def test_a_cap_reached_in_the_settlement_checks_is_a_capped_step(env):
     rec, book, kw, gw, wall = env
-    games = [Game(a, b).install(kw, gw) for a, b in (("Jazz", "Clippers"), ("Hornets", "Lakers"),
-                                                     ("Celtics", "Knicks"))]
-    rec.pass_({wallet(0): [g.holding(wallet(0), g.a) for g in games]})
+    gs = games(kw, gw, 7)
+    rec.pass_({wallet(0): [g.holding(wallet(0), g.a) for g in gs]})
     assert run_step(rec, book, kw, gw, wall)[0] == 0
     kw.events["KXNBAGAME"] = []                               # every copy out of the list: one market read each
-    code, out = run_step(rec, book, kw, gw, wall, cap=2)      # the list, one market read; the cap
+    code, out = run_step(rec, book, kw, gw, wall, cap=fc.MIN_CAP)     # the list, five market reads; the cap
     assert code == fc.CAPPED and "in the settlement checks" in out and "2 settlement checks" in out, out
     assert rows(book, "SELECT status FROM steps ORDER BY step_id DESC LIMIT 1") == [("capped",)]
-    code, out = run_step(rec, book, kw, gw, wall, cap=4)      # the list and the three market reads
+    code, out = run_step(rec, book, kw, gw, wall, cap=8)      # the list and the seven market reads
     assert code == 0, out
+
+
+def _active_events(series):
+    evs = json.loads(json.dumps(_events(series)))
+    for e in evs:
+        for m in e["markets"]:
+            m.update(status="active", close_time="2099-01-01T00:00:00Z")
+    return evs
+
+
+def _three_series_world(tmp_path, tag):
+    """Open copies in all three listed SAME series (the real saved spread and EPL answers, made open), then a pass
+    with two exits, a settlement, a market gone from its list and two new holdings."""
+    wall = Wall()
+    rec = Record(tmp_path / ("s3-%s.sqlite" % tag), wall)
+    kw, gw = KWorld(wall), GWorld()
+    gs = games(kw, gw, 6)
+    for series in ("KXNBASPREAD", "KXPREMIERLEAGUE"):
+        kw.events[series] = _active_events(series)
+        for e in kw.events[series]:
+            for m in e["markets"]:
+                kw.books[m["ticker"]] = _book(0.45)
+    gw.markets[SPREAD] = dict(_pm(SPREAD + ".closed.json")[0], closed=False)
+    gw.markets[CITY] = dict(_pm(CITY + ".json")[0], closed=False)
+    spread = pos(wallet(0), "5501", SPREAD, "Spread: Lakers (-7.5)", "Lakers", "nba-cha-lal-2026-11-17")
+    city = pos(wallet(0), "5502", CITY, "Will Manchester City win the 2026-27 English Premier League (EPL) "
+               "Championship?", "Yes", "epl-2027-champion-20260701200428749")
+    rec.pass_({wallet(0): [g.holding(wallet(0), g.a) for g in gs[:4]] + [spread, city], wallet(1): []})
+    book = tmp_path / ("s3-%s-book.sqlite" % tag)
+    assert run_step(rec, book, kw, gw, wall)[0] == 0
+    assert sorted(r[0] for r in rows(book, "SELECT series FROM copies")) == \
+        ["KXNBAGAME"] * 4 + ["KXNBASPREAD", "KXPREMIERLEAGUE"]
+    finalize(kw, gs[2], gs[2].a, True, T0 + H)
+    kw.events["KXNBAGAME"].remove(gs[3].event)
+    wall.t = T0 + 2 * H
+    rec.pass_({wallet(0): [gs[2].holding(wallet(0), gs[2].a), gs[3].holding(wallet(0), gs[3].a), spread, city],
+               wallet(1): [g.holding(wallet(1), g.a) for g in gs[4:6]]})
+    return rec, book, kw, gw, wall
+
+
+def test_the_smallest_cap_lets_a_step_do_one_unit_after_its_lists(capsys):
+    lists = len({s for s, e in FMAP["series"].items() if e["class"] == "SAME"} & FMAP["_listed"])
+    assert lists == 3 and fc.MIN_CAP == lists + 3          # the lists, then the largest unit: market (2) + book (1)
+    with pytest.raises(SystemExit):
+        fc.main(["step", "--record", "r", "--book", "b", "--kalshi-cap", str(fc.MIN_CAP - 1)])
+    assert "at least %d" % fc.MIN_CAP in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("extra", [0, 1, 2])
+def test_capped_steps_reach_the_uncapped_book_within_the_bound(tmp_path, extra):
+    rec, book, kw, gw, wall = _three_series_world(tmp_path, "free")
+    holdings = 2
+    open_copies = rows(book, "SELECT count(*) FROM copies WHERE status='open'")[0][0]
+    assert run_step(rec, book, kw, gw, wall)[0] == 0
+    want = _state(book)
+    bound = holdings + open_copies + 1                      # the doc's bound: H + N + 1 steps
+    rec, book, kw, gw, wall = _three_series_world(tmp_path, "c%d" % extra)
+    reached = None
+    for i in range(1, bound + 1):
+        code, out = run_step(rec, book, kw, gw, wall, cap=fc.MIN_CAP + extra)
+        assert "no progress" not in out, out
+        if _state(book) == want:
+            reached = i
+            break
+    assert reached is not None and reached <= bound
+
+
+def _passes(rec, wall, passes):
+    """Pass 1 on the game's day; passes 2 to 4 after midnight UTC, the first read of the new day taking each wallet's
+    snapshot. Each item: (holdings, wallets whose read fails)."""
+    for i, (held, fail) in enumerate(passes):
+        wall.t = T0 + (0, 4.5, 5.0, 5.5)[i] * H
+        rec.pass_(held, fail=fail)
+    wall.t += 60
+
+
+def test_the_leaders_disagree_at_that_pass_even_when_the_other_left_since(env):
+    rec, book, kw, gw, wall = env
+    g = Game("Jazz", "Clippers").install(kw, gw)
+    a, b = wallet(0), wallet(1)
+    _passes(rec, wall, [({a: [], b: []}, ()), ({b: []}, (a,)),                # a's first read of day 2 fails
+                        ({a: [g.holding(a, "Clippers")], b: [g.holding(b, "Jazz")]}, ()),   # a's snapshot of day 2
+                        ({a: [g.holding(a, "Clippers")], b: []}, ())])                    # b has left since
+    run_step(rec, book, kw, gw, wall)
+    assert skips(book).get((a, g.tok["Clippers"])) == "leaders_disagree"
+    assert rows(book, "SELECT count(*) FROM copies")[0][0] == 0
+
+
+def test_a_wallet_that_opened_the_opposite_only_after_that_pass_is_no_disagreement_at_it(env):
+    rec, book, kw, gw, wall = env
+    g = Game("Jazz", "Clippers").install(kw, gw)
+    a, b = wallet(0), wallet(1)
+    _passes(rec, wall, [({a: [], b: []}, ()), ({b: []}, (a,)),
+                        ({a: [g.holding(a, "Clippers")], b: []}, ()),
+                        ({a: [g.holding(a, "Clippers")], b: [g.holding(b, "Jazz")]}, ())])  # b opens it after
+    run_step(rec, book, kw, gw, wall)
+    assert rows(book, "SELECT kalshi_market FROM copies") == [(g.markets["Clippers"]["ticker"],)]
+    assert skips(book)[(b, g.tok["Jazz"])] == "leaders_disagree"            # at ITS pass, a held Clippers
+
+
+def test_where_the_record_cannot_say_a_wallet_holds_what_it_held_at_its_last_good_read(env):
+    rec, book, kw, gw, wall = env
+    g = Game("Jazz", "Clippers").install(kw, gw)
+    a, b = wallet(0), wallet(1)
+    _passes(rec, wall, [({a: [], b: [g.holding(b, "Jazz")]}, ()), ({b: [g.holding(b, "Jazz")]}, (a,)),
+                        ({a: [g.holding(a, "Clippers")]}, (b,)),                 # b's read fails at a's pass
+                        ({a: [g.holding(a, "Clippers")], b: []}, ())])
+    run_step(rec, book, kw, gw, wall)
+    assert skips(book).get((a, g.tok["Clippers"])) == "leaders_disagree"
+
+
+def test_a_kept_match_read_judges_a_later_holding_by_its_own_stamp(env):
+    rec, book, kw, gw, wall = env
+    g0, *more = games(kw, gw, 7)
+    t0 = g0.markets[g0.a]["ticker"]
+    kw.books[t0] = _book(0.02)                               # ask 0.98 at the kept read
+    rec.pass_({wallet(0): [g0.holding(wallet(0), g0.a)], wallet(1): [g.holding(wallet(1), g.a) for g in more],
+               wallet(2): [g0.holding(wallet(2), g0.a)]})
+    assert run_step(rec, book, kw, gw, wall, cap=fc.MIN_CAP)[0] == fc.CAPPED    # wallet 2 not reached
+    assert (wallet(2), g0.tok[g0.a]) not in skips(book)
+    g0.markets[g0.a]["close_time"] = iso(T0 + 3 * H)         # closed since, but open at the kept read's stamp
+    wall.t = T0 + 7 * H                                       # the step is late; the kept read is not
+    n = len(kw.calls)
+    run_step(rec, book, kw, gw, wall)
+    assert skips(book)[(wallet(2), g0.tok[g0.a])] == "ask_outside"
+    assert "book" not in kw.kinds(n)
+
+
+def test_the_append_only_tables_refuse_insert_or_replace(env):
+    rec, book, kw, gw, wall = env
+    g = Game("Jazz", "Clippers").install(kw, gw)
+    near = pos(wallet(0), "9002", "0x" + "1" * 64, "Will Bitcoin dip to $80,000 in November?", "Yes", "x")
+    rec.pass_({wallet(0): [g.holding(wallet(0), "Clippers"), near], wallet(1): [g.holding(wallet(1), "Clippers")],
+               wallet(2): [Game("Hornets", "Lakers").holding(wallet(2), "Hornets", value=10.0)]})
+    run_step(rec, book, kw, gw, wall)
+    kw.books[g.markets["Clippers"]["ticker"]]["yes_dollars"] = []
+    wall.t += H
+    rec.pass_({wallet(0): [near], wallet(1): [g.holding(wallet(1), "Clippers")]})
+    run_step(rec, book, kw, gw, wall)                         # an exit with no bid: a flag
+    con = sqlite3.connect(str(book), isolation_level=None)
+    tables = {n for (n,) in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    checked = 0
+    for t in ("considered", "skips", "copies", "copy_wallets", "copy_flags", "match_reads", "match_begun",
+              "near_book", "texts", "pm_descriptions"):
+        if t not in tables:
+            continue
+        info = list(con.execute("PRAGMA table_info(%s)" % t))
+        cols = [r[1] for r in info]
+        before = con.execute("SELECT rowid, * FROM %s ORDER BY rowid" % t).fetchall()
+        assert before, t
+        row = list(before[0])
+        free = [i for i, r in enumerate(info) if not r[5]]                    # not part of the primary key
+        num = [i for i in free if isinstance(row[i + 1], (int, float))]
+        if num:
+            row[num[0] + 1] += 1
+        else:
+            row[next(i for i in free if cols[i] == "body") + 1] = "rewritten by hand"
+        sql = "INSERT OR REPLACE INTO %s (rowid, %s) VALUES (%s)" % (t, ", ".join(cols), ", ".join("?" * len(row)))
+        try:
+            con.execute(sql, row)
+        except sqlite3.IntegrityError:
+            pass
+        assert con.execute("SELECT rowid, * FROM %s ORDER BY rowid" % t).fetchall() == before, t
+        checked += 1
+    con.close()
+    assert checked >= 9
 
 
 # ------------------------------------------------------------------ 4. counts, and no result anywhere
@@ -1376,7 +1610,7 @@ def test_properties_over_seeded_worlds(seed, tmp_path, monkeypatch):
         wall.t += rnd.choice([60.0, H, 5 * H, 7 * H])
         for _ in range(60):
             before, n = rec.digest(), len(kw.calls)
-            cap = rnd.choice([2, 3, 5, 60])
+            cap = rnd.choice([fc.MIN_CAP, fc.MIN_CAP + 1, fc.MIN_CAP + 3, 60])
             opened.clear()
             code, out = run_step(rec, book, kw, gw, wall, cap=cap)
             assert rec.digest() == before                                     # nothing written to the record
