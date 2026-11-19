@@ -57,14 +57,14 @@ MAP_PATH = Path(__file__).with_name("forward_copy_map.json")
 DEFAULT_PAUSE = 10.0
 MIN_PAUSE = 5.0
 DEFAULT_CAP = 60
-MIN_CAP = 2                                  # one page of a series' list and one book: what one holding needs
+MAX_UNIT = 3       # the most Kalshi requests of one unit of work: a market read (two on a live 404) and an exit's book
 GAMMA_PAUSE = 0.34                          # the other Polymarket readers' manners: about three a second
 MIN_VALUE = 1000.0
 PRICE_LO, PRICE_HI = 0.10, 0.90
 ASK_LO, ASK_HI = 0.05, 0.95
 MATCH_WINDOW = 6 * 3600.0                    # the match read falls within 6 hours of the pass's read of that wallet
 DAY = 86_400
-USER_VERSION = 2                             # 2: the match reads kept; flags and notes append-only
+USER_VERSION = 3                             # 3: a match read marked begun before it is sent; no overwrite
 WAIT_SECONDS = 5.0
 MAX_BODY = 8_000_000                         # an answer larger than this is a failed read (a list of 200 events)
 FETCH_TIMEOUT = 60.0
@@ -122,6 +122,7 @@ def load_map(path: Path = MAP_PATH) -> dict:
     m["_compiled"] = {s: {k: compile_template(t) for k, t in e["templates"].items()} for s, e in m["series"].items()}
     m["_tables"] = {k: {r["polymarket"]: r for r in rows} for k, rows in m["names"].items()}
     m["_slugs"] = {r["slug"]: r for r in m["names"]["nba"]}
+    m["_lists"] = len({s for s, e in m["series"].items() if e.get("class") == "SAME"} & m["_listed"])
     return m
 
 
@@ -163,6 +164,11 @@ def compile_template(template: str):
         pos = m.end()
     out.append(re.escape(t[pos:]))
     return re.compile("".join(out))
+
+
+# The smallest cap a step accepts: the lists a step can need (one a listed SAME series, one page each), then one unit
+# of work. A list of more pages can still spend a step's cap: the step then says it made no progress.
+MIN_CAP = load_map()["_lists"] + MAX_UNIT
 
 
 def fill(template: str, **slots) -> str:
@@ -248,7 +254,6 @@ def kalshi_day(d: date) -> str:
 # ---------------------------------------------------------------- finding the Kalshi market
 def find_market(series: str, names: dict, events: list) -> tuple:
     """(event, market) for the holding: exactly one market of the series' open events, or Skip(no_unique_market)."""
-    found = []
     if series in ("KXNBAGAME", "KXNBASPREAD"):
         day = kalshi_day(names["date"])
         ca, cb = names["a"]["kalshi_code"], names["b"]["kalshi_code"]
@@ -269,15 +274,35 @@ def find_market(series: str, names: dict, events: list) -> tuple:
         held = names["held"]
         want = lambda ev, m: (m.get("ticker") == ev["event_ticker"] + "-" + held["kalshi_code"]
                               and m.get("yes_sub_title") == held["kalshi_words"])
-    for ev in events:
-        if ev.get("event_ticker") in evs:
-            found += [(ev, m) for m in ev.get("markets") or [] if isinstance(m, dict) and want(ev, m)]
+    found = _found(evs, want, events)
     if len(found) != 1:
         raise Skip("no_unique_market", "%d markets found" % len(found))
     ev, m = found[0]
     if not (isinstance(m.get("ticker"), str) and TICKER_RE.fullmatch(m["ticker"])):
         raise Skip("no_unique_market", "a ticker not in Kalshi's shape")
     return ev, m
+
+
+def candidate_tickers(series: str, names: dict) -> set:
+    """The tickers find_market can answer for the holding, from its names alone (no request): to look up a kept match
+    read before anything is judged against the clock."""
+    if series in ("KXNBAGAME", "KXNBASPREAD"):
+        day = kalshi_day(names["date"])
+        ca, cb = names["a"]["kalshi_code"], names["b"]["kalshi_code"]
+        evs = ("%s-%s%s%s" % (series, day, ca, cb), "%s-%s%s%s" % (series, day, cb, ca))
+        if series == "KXNBAGAME":
+            return {e + "-" + names["held"]["kalshi_code"] for e in evs}
+        return {"%s-%s%d" % (e, names["held"]["kalshi_code"], int(float(names["line"]) + 0.5)) for e in evs}
+    ev = {"KXPREMIERLEAGUE": "KXPREMIERLEAGUE-27", "KXPRESNOMD": "KXPRESNOMD-28"}[series]
+    return {ev + "-" + names["held"]["kalshi_code"]}
+
+
+def _found(evs, want, events) -> list:
+    found = []
+    for ev in events:
+        if ev.get("event_ticker") in evs:
+            found += [(ev, m) for m in ev.get("markets") or [] if isinstance(m, dict) and want(ev, m)]
+    return found
 
 
 def _num(v):
@@ -544,8 +569,10 @@ CREATE TABLE IF NOT EXISTS copy_wallets (copy_id INTEGER NOT NULL, wallet_key TE
 CREATE TABLE IF NOT EXISTS copy_flags (copy_id INTEGER NOT NULL, kind TEXT NOT NULL CHECK (kind IN (%(flags)s)),
     ts REAL NOT NULL, detail TEXT);
 CREATE TABLE IF NOT EXISTS match_reads (kalshi_market TEXT NOT NULL, pass_key INTEGER NOT NULL, stamp REAL NOT NULL,
-    ok INTEGER NOT NULL CHECK (ok IN (0, 1)), book_raw TEXT, detail TEXT, step_id INTEGER NOT NULL,
-    PRIMARY KEY (kalshi_market, pass_key));
+    ok INTEGER NOT NULL CHECK (ok IN (0, 1)), book_raw TEXT, detail TEXT, event_json TEXT, market_json TEXT,
+    step_id INTEGER NOT NULL, PRIMARY KEY (kalshi_market, pass_key));
+CREATE TABLE IF NOT EXISTS match_begun (kalshi_market TEXT NOT NULL, pass_key INTEGER NOT NULL, ts REAL NOT NULL,
+    step_id INTEGER NOT NULL, PRIMARY KEY (kalshi_market, pass_key));
 CREATE TABLE IF NOT EXISTS near_book (wallet_key TEXT NOT NULL, read_id INTEGER NOT NULL, token_id TEXT NOT NULL,
     condition_id TEXT, family TEXT NOT NULL, title TEXT, outcome TEXT, pass_read_ts REAL NOT NULL, ts REAL NOT NULL,
     step_id INTEGER NOT NULL, PRIMARY KEY (wallet_key, read_id, token_id));
@@ -589,7 +616,37 @@ CREATE TRIGGER IF NOT EXISTS match_reads_fixed BEFORE UPDATE ON match_reads
     BEGIN SELECT RAISE(ABORT, 'a match read never changes'); END;
 CREATE TRIGGER IF NOT EXISTS match_reads_kept BEFORE DELETE ON match_reads
     BEGIN SELECT RAISE(ABORT, 'a match read never changes'); END;
+CREATE TRIGGER IF NOT EXISTS match_begun_fixed BEFORE UPDATE ON match_begun
+    BEGIN SELECT RAISE(ABORT, 'a begun match read never changes'); END;
+CREATE TRIGGER IF NOT EXISTS match_begun_kept BEFORE DELETE ON match_begun
+    BEGIN SELECT RAISE(ABORT, 'a begun match read never changes'); END;
 """ % {"reasons": ", ".join("'%s'" % r for r in SKIP_REASONS), "flags": ", ".join("'%s'" % f for f in FLAG_KINDS)}
+
+# INSERT OR REPLACE over an existing row deletes it without firing a delete trigger: every append-only table refuses
+# an insert that meets an existing row (by its key or its rowid). The texts are kept by their hash, so a second insert
+# of one is quietly ignored there instead of refused (the program asks INSERT OR IGNORE).
+_KEPT = (("considered", ("wallet_key", "read_id", "token_id"), "ABORT"),
+         ("skips", ("wallet_key", "read_id", "token_id"), "ABORT"),
+         ("copies", ("copy_id",), "ABORT"),
+         ("copy_wallets", ("copy_id", "wallet_key", "read_id", "token_id"), "ABORT"),
+         ("copy_flags", (), "ABORT"),
+         ("match_reads", ("kalshi_market", "pass_key"), "ABORT"),
+         ("match_begun", ("kalshi_market", "pass_key"), "ABORT"),
+         ("near_book", ("wallet_key", "read_id", "token_id"), "ABORT"),
+         ("texts", ("text_hash",), "IGNORE"),
+         ("pm_descriptions", ("condition_id",), "IGNORE"))
+
+
+def _no_overwrite(table, key, how):
+    when = "NEW.rowid IN (SELECT rowid FROM %s)" % table
+    if key:
+        when += " OR EXISTS (SELECT 1 FROM %s WHERE %s)" % (table, " AND ".join("%s = NEW.%s" % (c, c) for c in key))
+    raise_ = "IGNORE" if how == "IGNORE" else "ABORT, 'an append-only row is never written over'"
+    return ("CREATE TRIGGER IF NOT EXISTS %s_no_overwrite BEFORE INSERT ON %s\n    WHEN %s\n"
+            "    BEGIN SELECT RAISE(%s); END;\n" % (table, table, when, raise_))
+
+
+BOOK_SCHEMA += "".join(_no_overwrite(*k) for k in _KEPT)
 
 
 def _master(conn) -> list:
@@ -725,18 +782,43 @@ def candidates(rec, considered: set) -> list:
 
 
 def leaders_disagree(rec, h: dict) -> bool:
-    """Another wallet of the set holds another outcome of the same market at that pass: in its holdings now (carried
-    ones too) or in a snapshot taken in that pass. Either is taken as holding it (the reading that makes fewer
-    copies)."""
+    """Another wallet of the set held another outcome of the same market AT THAT PASS, rebuilt from the record's
+    history and never from its holdings now: that wallet's last snapshot (its baseline or a daily one, carried rows
+    too; the read that took one is marked, also when the wallet held nothing) taken in a read of that pass or before, then its NEW (opened) and EXIT (left) changes after that snapshot up
+    to and including that pass. Where the record cannot say (the wallet's read in that pass failed or was carried),
+    no change is recorded, so the wallet counts as holding what it held at its last good read before (the reading
+    that makes fewer copies). A wallet with no good read up to that pass is not known to hold anything."""
     cid, key, tok = h.get("condition_id"), h["wallet_key"], h["token_id"]
     if cid is None:
         return False
-    if rec.execute("SELECT 1 FROM holdings_current WHERE condition_id=? AND wallet_key!=? AND token_id!=? LIMIT 1",
-                   (cid, key, tok)).fetchone():
-        return True
-    return rec.execute("SELECT 1 FROM snapshots s JOIN wallet_reads r ON r.read_id = s.read_id WHERE r.pass_id=? AND "
-                       "s.condition_id=? AND s.wallet_key!=? AND s.token_id!=? LIMIT 1",
-                       (h["pass_id"], cid, key, tok)).fetchone() is not None
+    others = {t for (t,) in rec.execute("SELECT token_id FROM snapshots WHERE condition_id=? UNION "
+                                        "SELECT token_id FROM holdings_current WHERE condition_id=?", (cid, cid))}
+    if h.get("opposite_token_id"):
+        others.add(h["opposite_token_id"])
+    others.discard(tok)
+    if not others:
+        return False
+    if h.get("pass_id") is not None:
+        bound, arg = "((r.pass_id IS NOT NULL AND r.pass_id <= ?) OR (r.pass_id IS NULL AND r.read_id <= ?))", \
+            (h["pass_id"], h["read_id"])
+    else:
+        bound, arg = "r.read_id <= ?", (h["read_id"],)
+    for (v,) in rec.execute("SELECT wallet_key FROM leaders WHERE wallet_key != ? ORDER BY wallet_key",
+                            (key,)).fetchall():
+        snap = rec.execute("SELECT MAX(r.read_id) FROM wallet_reads r WHERE r.wallet_key=? AND r.good=1 AND "
+                           "(r.snapshot_day IS NOT NULL OR r.baseline = 1) AND " + bound, (v,) + arg).fetchone()[0]
+        if snap is None:
+            continue
+        held = {t for (t,) in rec.execute("SELECT token_id FROM snapshots WHERE read_id=? AND wallet_key=?",
+                                          (snap, v)) if t in others}
+        for kind, t in rec.execute("SELECT c.kind, c.token_id FROM changes c JOIN wallet_reads r ON r.read_id = "
+                                   "c.read_id WHERE c.wallet_key=? AND c.read_id > ? AND c.kind IN ('NEW', 'EXIT') "
+                                   "AND " + bound + " ORDER BY c.read_id, c.change_id", (v, snap) + arg):
+            if t in others:
+                (held.add if kind == "NEW" else held.discard)(t)
+        if held:
+            return True
+    return False
 
 
 def first_exit(rec, wallet_key: str, token_id: str, after_read_id: int):
@@ -792,7 +874,6 @@ class Step:
         self.wall, self.say = wall, say
         self.lists: dict = {}            # series -> events, or the failure of this step's one list read
         self.pm_failed: dict = {}        # condition id -> the failure of this step's one description read
-        self.not_final: set = set()      # open copies this step showed not final (only these may close by an exit)
         self.step_id = 0
         self.n = Counter()
 
@@ -830,11 +911,15 @@ class Step:
         names = resolve_names(series, parts, self.fmap)
         if leaders_disagree(self.rec, h):
             raise Skip("leaders_disagree")
-        self._late(h)
-        events = self._list(series)
-        ev, m = find_market(series, names, events)
-        if not market_open(m, self.wall()):
-            raise Skip("market_not_open", "status %s" % m.get("status"))
+        kept = self._kept(h, series, names)          # looked up BEFORE anything is judged against the clock
+        if kept is not None:
+            stamp, raw, ev, m = kept
+        else:
+            self._late(h)                            # the clock decides only whether a read may still be made
+            events = self._list(series)
+            ev, m = find_market(series, names, events)
+            if not market_open(m, self.wall()):
+                raise Skip("market_not_open", "status %s" % m.get("status"))
         pm = self._description(h)
         check_texts(series, names, ev, m, pm["description"], self.fmap)
         side = names["side"]
@@ -842,7 +927,9 @@ class Step:
                              (m["ticker"], side))
         if opened:
             return {"skip": ("already_open", "copy %d" % opened[0][0]), "note": opened[0][0]}
-        stamp, book = self._match_read(h, m["ticker"])
+        if kept is None:
+            stamp, raw = self._match_read(h, ev, m)
+        book = json.loads(raw)
         parsed = {"yes": kd.normalize_levels(book.get("yes_dollars")), "no": kd.normalize_levels(book.get("no_dollars"))}
         if stamp - h["read_ts"] > MATCH_WINDOW:
             raise Skip("late", "the match read")
@@ -860,33 +947,55 @@ class Step:
         if self.wall() - h["read_ts"] > MATCH_WINDOW:
             raise Skip("late", "before any request")
 
-    def _match_read(self, h: dict, ticker: str) -> tuple:
-        """THE match read of `ticker` for the holding's pass: (stamp, raw book). For one Kalshi market and one pass the
-        program reads the book ONCE, the first time a holding of that pass needs it, and keeps the read in the book
-        (its own transaction, written before anything else is done); every later holding of that pass for that market,
-        in this step or a later one, is judged by it. A first read that failed is the answer too: read_failed."""
-        pk = pass_key(h)
-        got = self.book.q("SELECT stamp, ok, book_raw, detail FROM match_reads WHERE kalshi_market=? AND pass_key=?",
-                          (ticker, pk))
-        if not got:
-            self._late(h)
-            ok, raw, detail = 1, None, ""
-            try:
-                book = self.kalshi.orderbook_raw(ticker)
-                stamp = self.wall()
-                kd.normalize_levels(book.get("yes_dollars"))
-                kd.normalize_levels(book.get("no_dollars"))
-                raw = json.dumps(book, sort_keys=True)
-            except (kd.KalshiDataError, kd.HttpError, ValueError, TypeError, AttributeError) as e:
-                stamp, ok, detail = self.wall(), 0, "Kalshi's book: %s" % type(e).__name__
-            self.book.tx(lambda: self.book.w(
-                "INSERT INTO match_reads (kalshi_market, pass_key, stamp, ok, book_raw, detail, step_id) VALUES "
-                "(?, ?, ?, ?, ?, ?, ?)", (ticker, pk, stamp, ok, raw, detail, self.step_id)))
-            got = [(stamp, ok, raw, detail)]
-        stamp, ok, raw, detail = got[0]
+    def _kept(self, h: dict, series: str, names: dict):
+        """The match read already kept for the holding's market and pass: (stamp, raw book, event, market), the event
+        and market as they were found for it; None when no read of that market and pass was begun. A read BEGUN and
+        never kept (the step stopped between its marker and its result) is the pass's first read having failed."""
+        pk, tickers = pass_key(h), sorted(candidate_tickers(series, names))
+        marks = ", ".join("?" * len(tickers))
+        got = self.book.q("SELECT stamp, ok, book_raw, detail, event_json, market_json FROM match_reads WHERE "
+                          "pass_key=? AND kalshi_market IN (%s) ORDER BY kalshi_market" % marks, (pk, *tickers))
+        if len(got) > 1:
+            raise Skip("no_unique_market", "%d markets read for the pass" % len(got))
+        if got:
+            stamp, ok, raw, detail, ev, m = got[0]
+            if not ok:
+                raise Skip("read_failed", "%s (the pass's first read)" % detail)
+            return stamp, raw, json.loads(ev), json.loads(m)
+        if self.book.q("SELECT 1 FROM match_begun WHERE pass_key=? AND kalshi_market IN (%s)" % marks, (pk, *tickers)):
+            raise Skip("read_failed", "Kalshi's book: begun and never kept (the pass's first read)")
+        return None
+
+    def _match_read(self, h: dict, ev: dict, m: dict) -> tuple:
+        """THE match read of the market for the holding's pass: (stamp, raw book). For one Kalshi market and one pass
+        the program reads the book ONCE, the first time a holding of that pass needs it. BEFORE the request is sent
+        the book holds that the read is begun (its own committed write); after it, the read (with the event and market
+        it was found by) in another; every later holding of that pass for that market, in this step or a later one, is
+        judged by it. A first read that failed, or begun and never kept, is the answer too: read_failed."""
+        pk, ticker = pass_key(h), m["ticker"]
+        if self.pacer.count >= self.pacer.cap:       # no room for the request: stop before the marker, not after it
+            raise CapReached("the cap of %d Kalshi requests a step" % self.pacer.cap)
+        begun = self.wall()
+        self.book.tx(lambda: self.book.w("INSERT INTO match_begun (kalshi_market, pass_key, ts, step_id) VALUES "
+                                         "(?, ?, ?, ?)", (ticker, pk, begun, self.step_id)))
+        ok, raw, detail = 1, None, ""
+        try:
+            book = self.kalshi.orderbook_raw(ticker)
+            stamp = self.wall()
+            kd.normalize_levels(book.get("yes_dollars"))
+            kd.normalize_levels(book.get("no_dollars"))
+            raw = json.dumps(book, sort_keys=True)
+        except (kd.KalshiDataError, kd.HttpError, ValueError, TypeError, AttributeError) as e:
+            stamp, ok, detail = self.wall(), 0, "Kalshi's book: %s" % type(e).__name__
+        ev_json = json.dumps({k: v for k, v in ev.items() if k != "markets"}, sort_keys=True)
+        m_json = json.dumps(m, sort_keys=True)
+        self.book.tx(lambda: self.book.w(
+            "INSERT INTO match_reads (kalshi_market, pass_key, stamp, ok, book_raw, detail, event_json, market_json, "
+            "step_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (ticker, pk, stamp, ok, raw, detail, ev_json, m_json,
+                                                           self.step_id)))
         if not ok:
             raise Skip("read_failed", "%s (the pass's first read)" % detail)
-        return stamp, json.loads(raw)
+        return stamp, raw
 
     def _list(self, series: str) -> list:
         if series not in self.lists:
@@ -977,57 +1086,71 @@ class Step:
                     (text_hash(body), venue, body))
 
     # -- closes
-    def settle_open(self) -> None:
-        """(a) and (c), BEFORE the exits: each open copy's series list of open events is read once a step (the same
-        list the new holdings use); a copy whose market is in it and open needs no further read and is shown not
-        final; any other gets ONE market read, and a finalized one is closed at its settlement. A series whose list
-        failed is not checked this step (nor exited). The market reads start after the copy read last (kept in meta),
-        so a step stopped at the cap is carried on by the next one. A cap reached here stops the step: CapReached."""
+    def closes(self) -> None:
+        """Each open copy in one unit of work: its settlement check, then, when it is not final, its exit check.
+        (a) and (c): the copy's series list of open events is read once a step (the same list the new holdings use);
+        a copy whose market is in it and open needs no market read and is not final; any other gets ONE market read
+        (two on a live 404), and a finalized one is closed at its settlement. (b), "before that" (a market already
+        final is closed at its settlement): a copy shown NOT final this step, whose opening wallet's EXIT of that
+        token is in the record after the copy's read, and that is not held to settlement: Polymarket's market is read
+        first (closed there while Kalshi trades: the venues part, flagged and held), then ONE read of Kalshi's book,
+        the side's bid (none: flagged and held). A series whose list failed is not checked this step (nor exited).
+        The units start after the copy whose paid unit was done last (kept in meta), so a step stopped at the cap is
+        carried on by the next one; a cap reached inside a unit stops the step (CapReached) and the unit is done
+        again, whole, by the next step. A unit costs at most MAX_UNIT requests after the lists."""
         after = self.book.q("SELECT value FROM meta WHERE key='settle_after'")
         after = int(after[0][0]) if after else 0
-        open_copies = self.book.q("SELECT copy_id, series, kalshi_market, side, condition_id, token_id FROM copies "
-                                  "WHERE status='open' ORDER BY copy_id <= ?, copy_id", (after,))
-        for i, (copy_id, series, ticker, side, cid, tok) in enumerate(open_copies):
+        open_copies = self.book.q("SELECT copy_id FROM copies WHERE status='open' ORDER BY copy_id <= ?, copy_id",
+                                  (after,))
+        for i, (copy_id,) in enumerate(open_copies):
+            before = self.pacer.count
             try:
-                try:
-                    events = self._list(series)
-                except Skip:
-                    self.n["settle_list_failed"] += 1
-                    continue
-                listed = [m for e in events for m in (e.get("markets") or [])
-                          if isinstance(m, dict) and m.get("ticker") == ticker]
-                if len(listed) == 1 and market_open(listed[0], self.wall()):
-                    self.not_final.add(copy_id)
-                    continue
-                try:
-                    rec = self.kalshi.market(ticker)
-                except (kd.KalshiDataError, kd.HttpError, ValueError):
-                    self.n["settle_read_failed"] += 1
-                    continue
+                self._close_unit(copy_id)
             except CapReached:
                 self.n["settle_left"] = len(open_copies) - i
                 raise
-            got = settlement(rec, ticker, side, self.wall())
-            if got is None:
-                self.not_final.add(copy_id)
+            self.n["units"] += 1
+            if self.pacer.count > before:
                 self.book.tx(lambda: self.book.w("INSERT OR REPLACE INTO meta (key, value) VALUES ('settle_after', ?)",
                                                  (str(copy_id),)))
-                continue
-            value, ts, fair = got
-            flags = [("kalshi_fair_price", "")] if fair else []
-            flags += self._part_at_settlement(cid, tok, value)
-            now = self.wall()
 
-            def close_rows():
-                self.book.w("INSERT OR REPLACE INTO meta (key, value) VALUES ('settle_after', ?)", (str(copy_id),))
-                for kind, detail in flags:
-                    self.book.w("INSERT INTO copy_flags (copy_id, kind, ts, detail) VALUES (?, ?, ?, ?)",
-                                (copy_id, kind, now, detail))
-                self.book.w("UPDATE copies SET status='closed', close_kind='settled', close_ts=?, close_price=?, "
-                            "close_detail=? WHERE copy_id=? AND status='open'",
-                            (ts, value, "Kalshi finalized; read at %.0f" % now, copy_id))
-            self.book.tx(close_rows)
-            self.n["closed_settled"] += 1
+    def _close_unit(self, copy_id: int) -> None:
+        series, ticker, side, cid, tok = self.book.q("SELECT series, kalshi_market, side, condition_id, token_id FROM "
+                                                     "copies WHERE copy_id=?", (copy_id,))[0]
+        try:
+            events = self._list(series)
+        except Skip:
+            self.n["settle_list_failed"] += 1
+            return
+        listed = [m for e in events for m in (e.get("markets") or [])
+                  if isinstance(m, dict) and m.get("ticker") == ticker]
+        if not (len(listed) == 1 and market_open(listed[0], self.wall())):
+            try:
+                rec = self.kalshi.market(ticker)
+            except (kd.KalshiDataError, kd.HttpError, ValueError):
+                self.n["settle_read_failed"] += 1
+                return
+            got = settlement(rec, ticker, side, self.wall())
+            if got is not None:
+                self._settle(copy_id, cid, tok, got)
+                return
+        self._exit(copy_id)                          # shown not final this step
+
+    def _settle(self, copy_id: int, cid: str, tok: str, got: tuple) -> None:
+        value, ts, fair = got
+        flags = [("kalshi_fair_price", "")] if fair else []
+        flags += self._part_at_settlement(cid, tok, value)
+        now = self.wall()
+
+        def close_rows():
+            for kind, detail in flags:
+                self.book.w("INSERT INTO copy_flags (copy_id, kind, ts, detail) VALUES (?, ?, ?, ?)",
+                            (copy_id, kind, now, detail))
+            self.book.w("UPDATE copies SET status='closed', close_kind='settled', close_ts=?, close_price=?, "
+                        "close_detail=? WHERE copy_id=? AND status='open'",
+                        (ts, value, "Kalshi finalized; read at %.0f" % now, copy_id))
+        self.book.tx(close_rows)
+        self.n["closed_settled"] += 1
 
     def _part_at_settlement(self, cid: str, tok: str, value: float) -> list:
         """(c) at Kalshi's settlement: Polymarket still trading, settled otherwise, or not yet resolved."""
@@ -1050,47 +1173,42 @@ class Step:
             return [("parted_settled_differently", "")]
         return []
 
-    def exits(self) -> None:
-        """(b), after the settlement checks ("before that": a market already final is closed at its settlement): an
-        open copy this step showed NOT final, whose opening wallet's EXIT of that token is in the record after the
-        copy's read, and that is not held to settlement: Polymarket's market is read first (closed there while Kalshi
-        trades: the venues part, flagged and held), then ONE read of Kalshi's book, the side's bid (none: flagged and
-        held)."""
+    def _exit(self, copy_id: int) -> None:
         held = ", ".join("'%s'" % k for k in HOLD_FLAGS)
-        for copy_id, key, read_id, tok, cid, ticker, side in self.book.q(
-                "SELECT copy_id, wallet_key, read_id, token_id, condition_id, kalshi_market, side FROM copies c "
-                "WHERE status='open' AND NOT EXISTS (SELECT 1 FROM copy_flags f WHERE f.copy_id = c.copy_id AND "
-                "f.kind IN (%s)) ORDER BY copy_id" % held):
-            if copy_id not in self.not_final:
-                continue
-            ex = first_exit(self.rec, key, tok, read_id)
-            if ex is None:
-                continue
-            try:
-                pm = self.gamma.market(cid, closed_first=False)
-            except GammaError:
-                self.n["exit_pm_read_failed"] += 1
-                continue
-            if pm is not None and pm.get("closed") is True:
-                self._flag(copy_id, "parted_pm_closed_first", "exit change %d" % ex[0])
-                continue
-            try:
-                book = self.kalshi.orderbook(ticker)
-                stamp = self.wall()
-            except (kd.KalshiDataError, kd.HttpError, ValueError, TypeError, AttributeError):
-                self.n["exit_read_failed"] += 1
-                continue
-            bid = side_quote(book, side)["bid"]
-            if bid is None:
-                self._flag(copy_id, "exit_no_bid", "exit change %d" % ex[0])
-                continue
+        got = self.book.q("SELECT wallet_key, read_id, token_id, condition_id, kalshi_market, side FROM copies c "
+                          "WHERE copy_id=? AND status='open' AND NOT EXISTS (SELECT 1 FROM copy_flags f WHERE "
+                          "f.copy_id = c.copy_id AND f.kind IN (%s))" % held, (copy_id,))
+        if not got:
+            return
+        key, read_id, tok, cid, ticker, side = got[0]
+        ex = first_exit(self.rec, key, tok, read_id)
+        if ex is None:
+            return
+        try:
+            pm = self.gamma.market(cid, closed_first=False)
+        except GammaError:
+            self.n["exit_pm_read_failed"] += 1
+            return
+        if pm is not None and pm.get("closed") is True:
+            self._flag(copy_id, "parted_pm_closed_first", "exit change %d" % ex[0])
+            return
+        try:
+            book = self.kalshi.orderbook(ticker)
+            stamp = self.wall()
+        except (kd.KalshiDataError, kd.HttpError, ValueError, TypeError, AttributeError):
+            self.n["exit_read_failed"] += 1
+            return
+        bid = side_quote(book, side)["bid"]
+        if bid is None:
+            self._flag(copy_id, "exit_no_bid", "exit change %d" % ex[0])
+            return
 
-            def exit_rows():
-                self.book.w("UPDATE copies SET status='closed', close_kind='exit', close_ts=?, close_price=?, "
-                            "close_detail=? WHERE copy_id=? AND status='open'",
-                            (stamp, bid, "exit change %d read at %.0f" % (ex[0], ex[2]), copy_id))
-            self.book.tx(exit_rows)
-            self.n["closed_exit"] += 1
+        def exit_rows():
+            self.book.w("UPDATE copies SET status='closed', close_kind='exit', close_ts=?, close_price=?, "
+                        "close_detail=? WHERE copy_id=? AND status='open'",
+                        (stamp, bid, "exit change %d read at %.0f" % (ex[0], ex[2]), copy_id))
+        self.book.tx(exit_rows)
+        self.n["closed_exit"] += 1
 
     def _flag(self, copy_id: int, kind: str, detail: str) -> None:
         now = self.wall()
@@ -1117,10 +1235,8 @@ def run_step(rec, book: Book, kalshi, pacer: StepPacer, gamma: GammaReader, fmap
             out = st.consider(h)
             reasons[st.write(h, out, step_id)] += 1
             done += 1
-        stage = "the settlement checks"
-        st.settle_open()
-        stage = "the exit checks"
-        st.exits()
+        stage = "the settlement checks and their exits"
+        st.closes()
     except CapReached:
         capped = True
     opened = reasons.pop("copy", 0)
@@ -1136,11 +1252,15 @@ def run_step(rec, book: Book, kalshi, pacer: StepPacer, gamma: GammaReader, fmap
            " ".join("%s=%d" % (k[5:], v) for k, v in sorted(st.n.items()) if k.startswith("flag_")) or "none",
            pacer.count, pacer.cap, gamma.requests))
     if capped:
-        say("STOPPED step %d at the cap of %d Kalshi requests, in %s: left for the next step %d holdings%s and the "
-            "exit checks (nothing considered is lost or made twice)"
+        say("STOPPED step %d at the cap of %d Kalshi requests, in %s: left for the next step %d holdings and %s "
+            "(nothing considered is lost or made twice)"
             % (step_id, pacer.cap, stage, len(todo) - done,
-               ", %d settlement checks" % st.n["settle_left"] if st.n["settle_left"] else
-               (", every settlement check" if stage == "the new holdings" else "")))
+               "%d settlement checks, each with its exit check" % st.n["settle_left"] if st.n["settle_left"] else
+               "every settlement check and exit check"))
+        if done == 0 and st.n["units"] == 0:
+            say("NO PROGRESS in step %d: the cap of %d Kalshi requests was spent before one holding or one copy's "
+                "checks were done (Kalshi's lists ran to more pages than the cap allows); a larger --kalshi-cap is "
+                "needed" % (step_id, pacer.cap))
         return CAPPED
     say("DONE step %d" % step_id)
     return OK
@@ -1189,8 +1309,9 @@ def _pause(text: str) -> float:
 def _cap(text: str) -> int:
     v = int(text)
     if v < MIN_CAP:
-        raise argparse.ArgumentTypeError("the cap is at least %d (one list and one book: what one holding needs)"
-                                         % MIN_CAP)
+        raise argparse.ArgumentTypeError("the cap is at least %d: the %d series lists a step can need, then one unit "
+                                         "of work (a market read, two on a live 404, and an exit's book read); a "
+                                         "smaller cap could spend every step on the lists" % (MIN_CAP, MIN_CAP - MAX_UNIT))
     return v
 
 

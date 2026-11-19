@@ -17,7 +17,8 @@ python -m valedia_trader.research_loop.forward_copy counts --book PATH
 `step` opens the record READ ONLY (after the record's own shape check) and never writes it. It makes the book at its
 first run; later runs check the book's whole schema and `user_version` and refuse another (code 7), an unreadable file
 (8), a busy one (9). The last line is `DONE step N` (code 0) or `STOPPED step N at the cap ...` (code 5: work is left,
-wherever the cap was reached, in the new holdings, the settlement checks or the exit checks, and the line says what). `counts`
+wherever the cap was reached, in the new holdings or in the settlement checks and their exits, and the line says
+what; a step that could do no unit of work at all also says `NO PROGRESS`). `counts`
 refuses where there is no book (code 3) and makes none.
 
 `counts` prints COUNTS ONLY: copies opened, open and closed (settled, exit), Kalshi events (all, and with a closed
@@ -42,9 +43,9 @@ The skip reasons, in the order applied (each skip has exactly one; the first tha
 | 4 | `no_same` | no counterpart of class SAME in the map (the class is read from the map by the program); a holding of a NEAR family also gets a row in the NEAR book |
 | 5 | `not_listed` | its series is not in the listing table's rows of series seen listed as tradable (of the map's four: KXNBAGAME, KXNBASPREAD and KXPREMIERLEAGUE are; KXPRESNOMD, listed but NOT tradable on 2026-11-18, is not, so it gets no copy) |
 | 6 | `name_not_in_table` | a team, club or person not in the map's tables, or the title, slug and outcome do not agree |
-| 7 | `leaders_disagree` | another wallet of the set holds another outcome of that market at that pass |
-| 8 | `late` | the match read would fall later than 6 hours after the pass's read of that wallet (tested before any request, again before the book read, and on the match read's own stamp) |
-| 9 | `read_failed` | Kalshi's list of the series' open events, Polymarket's description, or the pass's ONE match read of that market could not be read (a failed read is the answer for every holding it serves: the list and the description for the step, the match read for the pass) |
+| 7 | `leaders_disagree` | another wallet of the set held another outcome of that market at that pass (rebuilt from the record's history, never from its holdings now: see "At that pass" below) |
+| 8 | `late` | the match read falls later than 6 hours after the pass's read of that wallet: when a match read of that market and pass is already kept, judged on THAT read's stamp only; otherwise tested before any request (the clock decides only whether a read may still be made) and on the new read's own stamp |
+| 9 | `read_failed` | Kalshi's list of the series' open events, Polymarket's description, or the pass's ONE match read of that market could not be read (a failed read is the answer for every holding it serves: the list and the description for the step, the match read for the pass; a match read begun and never kept counts as failed) |
 | 10 | `no_unique_market` | not exactly one Kalshi market for it in the series' open events |
 | 11 | `market_not_open` | the market is not `active` with a close time after the moment (the list's status, and its close time against the match read) |
 | 12 | `text_departs` | either venue's text, names and dates aside, departs from the map's template |
@@ -65,10 +66,16 @@ ONE read of Kalshi's public order book for that market after the pass, stamped w
 wall time when the answer is in). For ONE Kalshi market and ONE pass the program reads the book ONCE: the first time a
 holding of that pass needs it. **That pass** is the record's pass of the read that showed the holding
 (`wallet_reads.pass_id`; a read with no pass is its own). The read is kept in the book (`match_reads`, written in its
-own transaction before anything else is done), and every holding of that pass mapping to that market, in that step or a
-later one (after a cap), is judged by it: its own 6-hour window against that stamp, its own side's ask from that book,
-and "open" as of that stamp. A first read that failed is the answer too: every such holding is skipped `read_failed`,
-with no second try in that pass. A holding skipped before the book read (conditions 1 to 8, or `late` before any
+own transaction before anything else is done, with the event and market it was found by), and every holding of that
+pass mapping to that market, in that step or a later one (after a cap), is judged by it: its own 6-hour window against
+that stamp, its own side's ask from that book, and "open" as of that stamp (the market as found for that read). The
+kept read is looked up FIRST, from the holding's names alone, before anything is judged against the clock: a step that
+runs late still judges such a holding by the kept stamp. A first read that failed is the answer too: every such holding
+is skipped `read_failed`, with no second try in that pass. **Begun before it is sent**: before the book request is
+sent, the book holds that this market and pass is being read (`match_begun`, its own committed transaction, as the
+pacer keeps the request's time before sending; when the step's cap leaves no room for the request, nothing is marked).
+A later step that finds a read begun and never kept (the step stopped between the two writes) takes it as the pass's
+first read having FAILED: every holding of that pass and market is `read_failed`, and no second request is ever sent. A holding skipped before the book read (conditions 1 to 8, or `late` before any
 request) causes no read. When two passes are considered in one step, each has its own first read. The copy's side: Yes for a team's game market (the map's side mapping for the other
 series). Kalshi sends bids only: the ask of Yes is one less the best No bid, the ask of No one less the best Yes bid;
 the contracts on offer at that ask are that bid's size. The copy is ONE contract at that ask, with the read's time,
@@ -82,9 +89,10 @@ the ask, the contracts at it, the raw book, and both venues' texts and their SHA
   0 to 1 and a settlement time in the past (a `yes` or `no` result must agree with the value). The copy closes at what
   one contract of its side is settled at, at Kalshi's settlement time. A value strictly between 0 and 1 is Kalshi's
   "fair price" for a game not played: kept and flagged `kalshi_fair_price`.
-- **(b) exit**, checked AFTER (a) in each step ("before that"): a market already final is closed at its settlement,
-  never by an exit read afterwards. Only a copy this step showed NOT final (open in its series' list, or read and not
-  `finalized`) can close by an exit. The record shows the opening wallet's EXIT of that token in a read after the copy's
+- **(b) exit**, checked AFTER (a) for the same copy in each step ("before that"): a market already final is closed at
+  its settlement, never by an exit read afterwards. Each open copy is one unit of work: its settlement check, then, if
+  it is NOT final (open in its series' list, or read and not `finalized`), its exit check; only such a copy can close by
+  an exit. The record shows the opening wallet's EXIT of that token in a read after the copy's
   read (of a pass no longer running), and the copy is not held: Polymarket's market is read first (see (c)); then ONE read of Kalshi's book, and the copy closes at the
   bid of its side, stamped. No bid: flagged `exit_no_bid` and held to settlement.
 - **(c) the venues part**, as far as the two services show it, flagged and held to Kalshi's settlement:
@@ -103,19 +111,43 @@ the ask, the contracts at it, the raw book, and both venues' texts and their SHA
 
 A copy row is never updated except to close it, and a closed copy never changes: triggers refuse any other update, a
 delete, and a flag or a noted wallet on a closed copy. Flags (`copy_flags`), the wallets on a copy (`copy_wallets`) and
-the match reads are append-only: triggers refuse any update or delete.
+the match reads (and their begun marks) are append-only: triggers refuse any update or delete. **INSERT OR REPLACE**
+deletes the old row without firing a delete trigger, so every append-only table (`considered`, `skips`, `copies`,
+`copy_wallets`, `copy_flags`, `match_reads`, `match_begun`, `near_book`) also has a trigger that refuses an insert
+meeting an existing row by its key or its rowid; `texts` and `pm_descriptions`, kept by hash and condition id and
+written with INSERT OR IGNORE, quietly ignore such an insert instead. The triggers bind anyone writing through SQLite
+with the book's schema; a person with the file can still drop a trigger and then rewrite rows, edit the file's bytes,
+or delete or replace the whole file. The schema check at the next `step` refuses a book whose triggers were dropped
+(its schema differs), but rows rewritten and the triggers put back cannot be told apart: the book is a record kept by
+the program, not proof against its owner.
 
 ## Pacing and requests
 
 EVERY Kalshi request goes through ONE pacer, installed as the `KalshiData` client's own pacer, so every try of every
 call waits on it: `--kalshi-pause-seconds` between requests (default 10.0, never under 5.0: a collector on this machine
-reads the same host) and `--kalshi-cap` requests a step (default 60, at least 2). The client is built with one try a
+reads the same host) and `--kalshi-cap` requests a step (default 60, at least 6; a smaller cap is refused in words). The client is built with one try a
 call: a 429 or a server error is a failed read, never a retry. **The pause holds across steps**: the wall time of the
 last Kalshi request is kept in the book (`meta`, written before each request is sent), and the first request of a step
 waits until the pause has passed since it (a clock set back waits the full pause), so capped steps run one after
 another never ask faster than the pause. At the cap the step stops (the holding being worked on is written not at all),
-says what is left and ends with code 5, whether the cap came in the new holdings, the settlement checks or the exit
-checks; the next step carries on (the settlement checks' place is kept in the book).
+says what is left and ends with code 5, whether the cap came in the new holdings or in the settlement checks and
+their exits; the next step carries on (the place of the settlement checks is kept in the book). A wall clock set
+FORWARD between steps makes the gap look longer, so the first request of the next step may wait less than the pause or
+not at all: that is accepted as it is (the pause between the requests inside a step is measured on the monotonic clock
+and holds whatever the wall clock does).
+
+**The smallest cap, and progress.** The smallest cap is `MIN_CAP = L + 3 = 6`: `L = 3` the lists a step can need (one
+for each listed SAME series of the map: KXNBAGAME, KXNBASPREAD, KXPREMIERLEAGUE), then the largest unit of work, a copy
+whose settlement check costs a market read twice (a live 404, then the historical tier) and whose exit then costs one
+book read. A unit is one new holding (at most one book read after its list) or one open copy's settlement check with
+its exit check (at most 3). A cap reached inside a unit stops before the request, writes nothing of that unit, and the
+next step does the unit again whole; the settlement checks start after the copy whose paid unit was done last. So with
+any accepted cap and one page per list, every step finishes at least one unit, and on an unchanged record capped steps
+reach the same book as one uncapped step within **H + N + 1 steps**, where H is the holdings not yet considered and N
+the copies open at the start (each step considers at least one holding until none is left, then does at least one
+copy's checks, going round the copies from where the last stopped; the last step finds nothing left). A list of more
+pages than the cap allows can still spend a whole step: the step then says `NO PROGRESS` and that a larger cap is
+needed.
 
 **Kalshi's requests go to Kalshi only.** The copier hands the client its own fetch (`kalshi_urllib_get`), not the
 collector's: GET only, https, the host `api.elections.kalshi.com` and exactly the `/trade-api/v2/` addresses the copier
@@ -148,7 +180,8 @@ the market's state at that moment.
 | Table | What it holds |
 | --- | --- |
 | `meta` | where the settlement checks carry on; the time of the last Kalshi request |
-| `match_reads` | THE match read of each Kalshi market for each pass: its stamp, whether it was read, the raw book |
+| `match_reads` | THE match read of each Kalshi market for each pass: its stamp, whether it was read, the raw book, the event and market it was found by |
+| `match_begun` | each match read begun (written before its request is sent): market, pass, time, step |
 | `steps` | each step: start, end, status (`running`, `done`, `capped`, `died`), Kalshi and Polymarket requests, considered, opened, closed |
 | `considered` | each holding considered: wallet, read, token, baseline or new (with its change), the pass and its read time, the step, `copy` or `skip` |
 | `skips` | one row per skipped holding with its one reason and a short detail |
@@ -166,14 +199,19 @@ One holding's rows are written together or not at all; a step that dies leaves a
 
 - **The value at that read** is known only while the record keeps the holding's row at that read (its snapshot or its
   current holdings); otherwise the holding is skipped (`holding_not_in_record`), a reason the ticket's list lacked.
-- **"At that pass"** for the leaders' disagreement: another wallet counts as holding the opposite outcome when its
-  current holdings (carried ones too) or a snapshot taken in that pass show it. So a wallet whose read failed in that
-  pass, or whose holdings were carried, still counts as disagreeing with what the record last showed (recorded, not
-  ordered: the reading that makes fewer copies; it stands).
+- **"At that pass"** for the leaders' disagreement is rebuilt from the record's history, never from its holdings now:
+  for each other wallet of the set, its last snapshot (baseline or daily, carried rows too) in a read of that pass or an
+  earlier one, then its NEW (opened) and EXIT (left) changes after that snapshot up to and including that pass. The
+  other outcomes of the market are the tokens of the holding's condition seen in the record, and its opposite token.
+  Where the record cannot say (that wallet's read in that pass failed or was carried) no change is recorded, so the
+  wallet counts as holding what it held at its last good read before (the reading that makes fewer copies); a wallet
+  with no good read yet up to that pass is not known to hold anything. A wallet that opened the opposite outcome only
+  AFTER the holding's pass did not hold it at that pass: no disagreement for that holding (the document's words, "at
+  that pass"); its own holding, at its own later pass, meets the first wallet's and is skipped `leaders_disagree`.
 - **"After the pass"**: a pass the record still shows `running` is not over, so its holdings and exits are left for a
   later step (they may then be late: fewer copies).
-- **"Open at the match read"** for a holding judged by a match read kept from an earlier step: the market must be open
-  in this step's list AND have a close time after the kept stamp (fewer copies).
+- **"Open at the match read"** for a holding judged by a match read kept from an earlier step: the market as it was
+  found for that read must have a close time after the kept stamp; the step's clock and list are not asked.
 - **"Open at the match read"**: Kalshi's book carries no status, so the market's status is the step's list read
   (minutes before), and its close time is checked against the match read's stamp.
 - **"Departs from the template"**: the map quotes fragments; the templates here are the whole texts read on
@@ -183,7 +221,7 @@ One holding's rows are written together or not at all; a step that dies leaves a
   Kalshi request.
 - **An exit with no bid** is held to settlement and flagged; an exit after Polymarket closed is the venues parting.
 - **An exit whose copy's settlement check failed or was not reached in the step** waits: only a copy shown not final in
-  the same step closes by an exit. A series whose list read failed has neither its settlement checks nor its exits
+  the same unit closes by an exit. A series whose list read failed has neither its settlement checks nor its exits
   done in that step.
 - **The wallets of the set** are the record's `leaders` table: pointing the record at the screened set is the lead's
   step before the first `step`.
