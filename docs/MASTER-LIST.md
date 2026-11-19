@@ -512,6 +512,18 @@ Lessons so far (each is also a "do not repeat"):
 
 ## 11. Valedia beyond the trader (Hermes, messaging, pages, skills)
 
+- **DONE 2026-11-19 2:41 AM PST** the "Mission" tab inside Hermes Desktop's Live page (the owner's ask: goals,
+  to-dos, the path to live trading and the maps in one place, as a tab and not a new button). Built by the
+  Paperclip session (page-only install, no gateway restart; reviewed by ChatGPT/Codex through the lead; hardened
+  once). It shows the two tracks of the path to live trading, what waits on the owner, status figures, backlog
+  counts, the seats' state and two generated maps (trading system; Hermes and orchestration, read from the config
+  files by names only). REFRESH after any change of this list: `~/valedia-live/tools/refresh-mission.sh` (it runs
+  `tools/mission_board_data.py`, `tools/hermes_topology.py`, `tools/mission_maps.py` of this repo first; the curated
+  rows live in `tools/mission_board_data.py` and are edited by hand). A nightly refresh and a drift check (the map
+  against the config, both ways) are NOT built: a repeating job needs his yes. Research report:
+  `~/reports/Living architecture maps for Hermes.md` (no Hermes plugin draws a map from live config; our own
+  generator is the route; no plugin installed).
+
 Workers on one board (the owner's wish of 2026-11-17: Paperclip used cleanly with RuFlo, its work appearing
 in Hermes's Kanban, the workers watchable on the Live page, coding done by the strongest local model that can
 run beside MiroFish and Elephant-1):
