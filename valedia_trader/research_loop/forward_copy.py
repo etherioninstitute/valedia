@@ -14,6 +14,10 @@ with this program's own clock) and writes ONE paper contract of that side at the
 after the copy's read: one book read, the side's bid; (c) the venues part, as far as the two services show it:
 flagged, held to Kalshi's settlement. `counts` prints counts only.
 
+One step at a time on a book: `step` takes an exclusive, non-blocking flock on `<book>.step.lock` (a file beside the
+book, not part of its bytes) before it reads or sends anything and holds it to the end; a second step exits with
+code 75, "another step is running on this book", with no request, no write and no `died` marking.
+
 No command, function or test here computes, stores or prints a result, a profit, a mean or a sum of prices of copies
 (the document: no result before the count is reached; the one read is a later slice). Nothing here sends an order,
 previews one, holds a key, or runs itself: whether and when `step` runs is the owner's decision.
@@ -36,9 +40,11 @@ text is asked once and kept by condition id.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import math
+import os
 import re
 import sqlite3
 import sys
@@ -64,11 +70,12 @@ PRICE_LO, PRICE_HI = 0.10, 0.90
 ASK_LO, ASK_HI = 0.05, 0.95
 MATCH_WINDOW = 6 * 3600.0                    # the match read falls within 6 hours of the pass's read of that wallet
 DAY = 86_400
-USER_VERSION = 4                             # 4: one book read a market and pass for exits too; opposite_unknown
+USER_VERSION = 5                             # 5: settlement_unreadable, clock_before_read, other_wallet_read_unclear
 WAIT_SECONDS = 5.0
 MAX_BODY = 8_000_000                         # an answer larger than this is a failed read (a list of 200 events)
 FETCH_TIMEOUT = 60.0
 OK, REFUSED, CAPPED, OTHER_SHAPE, UNREADABLE, BUSY = 0, 3, 5, 7, 8, 9
+STEP_RUNNING = 75        # another step holds the book's lock
 
 # The skip reasons, in the order they are applied (see docs/forward-copier.md for why the order cannot change which
 # copies are made). `late` and `read_failed` are tested more than once along the way; the first failing test decides.
@@ -80,7 +87,10 @@ SKIP_REASONS = (
     "not_listed",                # its series is not in the listing table
     "name_not_in_table",         # a team, club or person not in the map's tables (never guessed)
     "opposite_unknown",          # the other outcome's token is not known: whether the leaders disagree cannot be told
+    "other_wallet_read_unclear", # another wallet of the set has no clean read in that pass: nobody can say it does not
+                                 # hold the opposite outcome (fail closed)
     "leaders_disagree",          # another wallet of the set holds the opposite outcome at that pass
+    "clock_before_read",         # this host's clock stands before the wallet's read (before the request, or at the stamp)
     "late",                      # the match read would fall (or fell) later than 6 hours after the pass's read
     "read_failed",               # a read that failed (Kalshi's list or book, or Polymarket's description)
     "no_unique_market",          # not exactly one Kalshi market for it
@@ -91,8 +101,8 @@ SKIP_REASONS = (
 )
 FLAG_KINDS = ("exit_no_bid", "exit_read_failed", "parted_pm_closed_first", "parted_pm_trading_at_settlement",
               "parted_settled_differently", "pm_unresolved_at_settlement", "part_check_failed",
-              "kalshi_fair_price")
-HOLD_FLAGS = ("exit_no_bid", "exit_read_failed", "parted_pm_closed_first")          # a copy so flagged is held to Kalshi's settlement
+              "kalshi_fair_price", "settlement_unreadable")
+HOLD_FLAGS = ("exit_no_bid", "exit_read_failed", "parted_pm_closed_first", "settlement_unreadable")          # a copy so flagged is held to Kalshi's settlement
 TICKER_RE = re.compile(r"[A-Z][A-Z0-9.\-]{0,79}")
 CONDITION_RE = re.compile(r"0x[0-9a-f]{64}")
 MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
@@ -403,19 +413,29 @@ class StepPacer:
         self.last: float | None = None
         self.count = 0
 
+    def _sleep_for(self, seconds: float) -> None:
+        """Wait `seconds` by the pacer's clock: a sleep that returns early is asked again for the rest. A clock that
+        does not move at all across a sleep (a stand-in) cannot be waited on, so the wait ends there."""
+        end = self.clock() + seconds
+        while seconds > 1e-9:
+            before = self.clock()
+            self.sleep(seconds)
+            after = self.clock()
+            if after <= before:
+                return
+            seconds = end - after
+
     def wait(self) -> None:
         if self.count >= self.cap:
             raise CapReached("the cap of %d Kalshi requests a step" % self.cap)
         if self.last is not None:
-            gap = self.clock() - self.last
-            if gap < self.pause:
-                self.sleep(self.pause - gap)
+            self._sleep_for(self.pause - (self.clock() - self.last))
         elif self.last_wall is not None and self.wall is not None:
             gap = self.wall() - self.last_wall
             if gap < 0.0:                                 # the clock was set back: the full pause, never none
-                self.sleep(self.pause)
-            elif gap < self.pause:
-                self.sleep(self.pause - gap)
+                self._sleep_for(self.pause)
+            else:
+                self._sleep_for(self.pause - gap)
         if self.keep is not None and self.wall is not None:
             self.keep(self.wall())
         self.last = self.clock()
@@ -709,11 +729,15 @@ def open_book(path: Path, create: bool):
     if not path.exists() or path.stat().st_size == 0:
         if not create:
             return None, (REFUSED, "refused: no book at %s (only step makes one); nothing done" % path)
+        conn = None
         try:
             conn = sqlite3.connect(str(path), timeout=WAIT_SECONDS, isolation_level=None)
-            conn.executescript(BOOK_SCHEMA)
-            conn.execute("PRAGMA user_version = %d" % USER_VERSION)
+            # ONE transaction, user_version with it: a creation that stops part way (the connection closed with the
+            # transaction open) leaves no file content to refuse
+            conn.executescript("BEGIN IMMEDIATE;\n" + BOOK_SCHEMA + "\nPRAGMA user_version = %d;\nCOMMIT;" % USER_VERSION)
         except sqlite3.Error as e:
+            if conn is not None:
+                conn.close()
             return None, (REFUSED, "refused: the book %s could not be made (%s); nothing done" % (path, type(e).__name__))
         return conn, None
     try:
@@ -782,13 +806,33 @@ def candidates(rec, considered: set) -> list:
     return sorted(out, key=lambda h: (h["read_ts"], h["read_id"], h["wallet_key"], h["token_id"]))
 
 
+def unclear_wallets(rec, h: dict) -> list:
+    """The other wallets of the fixed set with no CLEAN read in the holding's pass, in key order. A clean read is the
+    record's own (the one that lets an EXIT be recorded, leaders_monitor.write_wallet): in that pass, wallet_reads
+    good = 1, carried = 0 and no rejected rows (the column rejects holds none but "repeated_row"). A failed read, a
+    carried or rejecting one, and a wallet with no read in the pass are all unclear. A holding with no pass has no
+    pass to read the others in: every other wallet is unclear."""
+    out = []
+    for (v,) in rec.execute("SELECT wallet_key FROM leaders WHERE wallet_key != ? ORDER BY wallet_key",
+                            (h["wallet_key"],)).fetchall():
+        got = [] if h.get("pass_id") is None else rec.execute(
+            "SELECT carried, rejects FROM wallet_reads WHERE wallet_key=? AND pass_id=? AND good=1",
+            (v, h["pass_id"])).fetchall()
+        clean = len(got) >= 1 and all(not c and not any(n for why, n in json.loads(r or "{}").items()
+                                                       if why != "repeated_row") for c, r in got)
+        if not clean:
+            out.append(v)
+    return out
+
+
 def leaders_disagree(rec, h: dict) -> bool:
     """Another wallet of the set held another outcome of the same market AT THAT PASS, rebuilt from the record's
     history and never from its holdings now: that wallet's last snapshot (its baseline or a daily one, carried rows
     too; the read that took one is marked, also when the wallet held nothing) taken in a read of that pass or before, then its NEW (opened) and EXIT (left) changes after that snapshot up
     to and including that pass. Where the record cannot say (the wallet's read in that pass failed or was carried),
-    no change is recorded, so the wallet counts as holding what it held at its last good read before (the reading
-    that makes fewer copies). A wallet with no good read up to that pass is not known to hold anything."""
+    no change is recorded; the step never asks here: a wallet with no clean read in the pass has already made the
+    holding a skip (unclear_wallets, other_wallet_read_unclear). A wallet with no good read up to that pass is not
+    known to hold anything."""
     cid, key, tok = h.get("condition_id"), h["wallet_key"], h["token_id"]
     if cid is None:
         return False
@@ -914,6 +958,9 @@ class Step:
         if not (isinstance(opp, str) and opp.strip()):
             raise Skip("opposite_unknown", "the other outcome's token is not known: whether the leaders disagree "
                                            "cannot be told")
+        unclear = unclear_wallets(self.rec, h)
+        if unclear:                                  # nobody can say those wallets do not hold the opposite outcome
+            raise Skip("other_wallet_read_unclear", "%d wallets, first %s" % (len(unclear), unclear[0]))
         if leaders_disagree(self.rec, h):
             raise Skip("leaders_disagree")
         kept = self._kept(h, series, names)          # looked up BEFORE anything is judged against the clock
@@ -940,6 +987,8 @@ class Step:
             stamp, raw = self._match_read(h, ev, m)
         book = json.loads(raw)
         parsed = {"yes": kd.normalize_levels(book.get("yes_dollars")), "no": kd.normalize_levels(book.get("no_dollars"))}
+        if stamp < h["read_ts"]:                     # a read cannot come before the read it follows (own stamp)
+            raise Skip("clock_before_read", "the match read")
         if stamp - h["read_ts"] > MATCH_WINDOW:
             raise Skip("late", "the match read")
         if not market_open(m, stamp):
@@ -953,7 +1002,10 @@ class Step:
                          "pm_text": pm["description"], "kalshi_text": kalshi_text(m)}}
 
     def _late(self, h: dict) -> None:
-        if self.wall() - h["read_ts"] > MATCH_WINDOW:
+        now = self.wall()
+        if now < h["read_ts"]:                       # this host's clock stands before the wallet's read: no request
+            raise Skip("clock_before_read", "before any request")
+        if now - h["read_ts"] > MATCH_WINDOW:
             raise Skip("late", "before any request")
 
     def _kept(self, h: dict, series: str, names: dict):
@@ -1024,7 +1076,9 @@ class Step:
             try:
                 events = self.kalshi.pages("/events", {"series_ticker": series, "status": "open",
                                                        "with_nested_markets": "true", "limit": 200}, "events")
-                if not all(isinstance(e, dict) and isinstance(e.get("event_ticker"), str) for e in events):
+                if not all(isinstance(e, dict) and isinstance(e.get("event_ticker"), str) and
+                           ("markets" not in e or (isinstance(e["markets"], list) and
+                                                   all(isinstance(m, dict) for m in e["markets"]))) for e in events):
                     raise kd.KalshiDataError("an event not in Kalshi's shape")
                 self.lists[series] = events
             except (kd.KalshiDataError, kd.HttpError, ValueError, TypeError, AttributeError) as e:
@@ -1156,6 +1210,14 @@ class Step:
             got = settlement(rec, ticker, side, self.wall())
             if got is not None:
                 self._settle(copy_id, cid, tok, got)
+                return
+            if isinstance(rec, dict) and rec.get("status") == "finalized":
+                # Kalshi has settled it and its payout cannot be read here: no book read, no exit; the copy stays open
+                # and is flagged once, and every later step reads the market again
+                self.n["settle_unreadable"] += 1
+                if not self.book.q("SELECT 1 FROM copy_flags WHERE copy_id=? AND kind='settlement_unreadable'",
+                                   (copy_id,)):
+                    self._flag(copy_id, "settlement_unreadable", "")
                 return
         self._exit(copy_id, *(listed[0] if shown else (None, None)))   # shown not final this step
 
@@ -1328,12 +1390,16 @@ def counts(conn, wall, say) -> int:
 # ---------------------------------------------------------------- command line
 def _pause(text: str) -> float:
     v = float(text)
+    if not math.isfinite(v):
+        raise argparse.ArgumentTypeError("the pause is a finite number of seconds")
     if not v >= MIN_PAUSE:
         raise argparse.ArgumentTypeError("the pause is never under %.1f seconds" % MIN_PAUSE)
     return v
 
 
 def _cap(text: str) -> int:
+    if not math.isfinite(float(text)):
+        raise argparse.ArgumentTypeError("the cap is a finite whole number of requests")
     v = int(text)
     if v < MIN_CAP:
         raise argparse.ArgumentTypeError("the cap is at least %d: the %d series lists a step can need, then one unit "
@@ -1373,14 +1439,44 @@ def main(argv=None, *, kalshi_fetch=None, gamma_fetch=None, wall: Callable[[], f
             return counts(conn, wall, say)
         finally:
             conn.close()
+    if Path(args.book).resolve() == Path(args.record).resolve():
+        say("REFUSED refused: the book cannot be the record; nothing done")
+        return REFUSED
+    lock, bad = _lock_book(Path(args.book))                  # before anything is read or sent
+    if bad:
+        say(bad[1])
+        return bad[0]
+    try:
+        return _step(args, say, kalshi_fetch, gamma_fetch, wall, sleep, clock, write_hook, fmap)
+    finally:
+        os.close(lock)                                       # (the operating system drops it too if the process dies)
+
+
+def _lock_book(book: Path):
+    """An exclusive, non-blocking flock on `<book>.step.lock` (made if missing; not part of the book's bytes): the fd,
+    or (None, (code, words)). One step at a time on a book: two would read the same kalshi_last and send requests
+    with no pause between them, and the second would mark the first `died` while it lives."""
+    path = Path(str(book) + ".step.lock")
+    try:
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        return None, (REFUSED, "refused: the lock %s could not be made (%s); nothing done" % (path, type(e).__name__))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        os.close(fd)
+        if isinstance(e, BlockingIOError):
+            return None, (STEP_RUNNING, "refused: another step is running on this book; nothing done")
+        return None, (REFUSED, "refused: the lock %s could not be taken (%s); nothing done" % (path, type(e).__name__))
+    return fd, None
+
+
+def _step(args, say, kalshi_fetch, gamma_fetch, wall, sleep, clock, write_hook, fmap) -> int:
     rec, bad = open_record(Path(args.record))
     if bad:
         say("REFUSED " + bad[1] if bad[0] == REFUSED else bad[1])
         return bad[0]
     try:
-        if Path(args.book).resolve() == Path(args.record).resolve():
-            say("REFUSED refused: the book cannot be the record; nothing done")
-            return REFUSED
         conn, bad = open_book(Path(args.book), create=True)
         if bad:
             say(bad[1])
