@@ -130,9 +130,10 @@ matched by keyword only, not read one by one. Item H-1 closes that.
   test activities overlapping with their scratch on NIMROD_SSD cost 3 of 9 decisions inside three and a half
   minutes; the same overlap with scratch on the internal disk, four arms and 16 minutes with the kill suite
   among them, cost 0 of 39. THE RULE NOW: all test scratch on the internal disk, and every test run of every
-  session through the machine-wide gate `~/valedia-data/bin/test-slot` (TWO activities at once since 13:25
-  PST, after the owner asked for parallel work instead of time slots; one run a name, 20-minute cap, a shared
-  log at `~/valedia-data/locks/test-activity.log`). Today's losses: 36 decisions (3 the pull's start, 30 the
+  session through the machine-wide gate `~/valedia-data/bin/test-slot` (two activities at once since 13:25
+  PST, after the owner asked for parallel work instead of time slots, THREE since 15:41 after an eight-minute
+  arm of three at once cost 0 of 27 decisions; one run a name, 20-minute cap, a shared log at
+  `~/valedia-data/locks/test-activity.log`; it passes a test's error output through since 14:16). Today's losses: 36 decisions (3 the pull's start, 30 the
   lead's copy, 3 the comparison's SSD arm) and one `model_unavailable` at 13:03 (cause not known), all in the
   development period. NEW 13:49 PST: the collector reads Kalshi's public data host, and a study worker's 86
   requests to that host in one minute (the project's own reader at its 3 a second) sat one cycle before the
@@ -501,9 +502,15 @@ run beside MiroFish and Elephant-1):
 - Not measured by the trial: a 27B loaded and IDLE beside the collector (no decision fell in those 43
   seconds); the two decisions made while it was loading were normal.
 
-- **OWNER** 2026-11-18 about 15:26 PST: this Mac's Tailscale name stopped resolving (Tailscale off, or its
-  name service down). Seen through git (it took the commit author from that name; commits now pass the same
-  author by hand, no setting changed). Hermes' Honcho and the phone's access to Hermes use Tailscale.
+- **OWNER, IT COSTS THE COLLECTOR** Tailscale on this Mac. On 2026-11-18 its app changed state at 14:25:30 PST
+  and its session went up and down for a quarter of an hour; each change is a network change for the whole
+  machine, and the collector's reads of Kalshi stalled: 34 decisions not ok from 14:27 to 14:42 (10 late, 24
+  stale, 2 overruns; the system log's bursts of network changes match its bad minutes; that hour has 0 to 1
+  on other days). It was before the scored period. Later bursts (14:55, 15:11 to 15:23, 15:50) cost nothing,
+  and Tailscale reads Connected again, but its name for this Mac no longer resolves (git took the commit
+  author from that name; commits now pass the same author by hand, no setting changed). During the 14
+  scored days a repeat costs scored decisions: his to look at (was it restarted, updated or re-signed in?),
+  and best left alone until 3 December. Hermes' Honcho and the phone's access to Hermes use Tailscale.
 - **WATCH** Telegram is on and has dropped its connection before; Signal is parked (possible relink about
   11 Dec; its job is not installed).
 - **QUEUED** the Live page (its session's summary of 2026-11-17, the owner calling that work done): a model
