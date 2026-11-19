@@ -72,6 +72,27 @@ def backlog_counts() -> list:
     return out
 
 
+def collector_row(asof: str):
+    """The collector's counts since the scored period began (2026-11-18 16:00 PST), read from its store: status and time only,
+    never a decision's content. Falls back to None when the store cannot be read."""
+    import calendar
+    t0 = float(calendar.timegm((2026, 11, 19, 0, 0, 0)))
+    path = "/Volumes/NIMROD_SSD/Qwen-Weight-Space/valedia-trader/memory/orderbook_loop.sqlite"
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=5)
+        rows = con.execute("select status, count(*), max(decision_ts) from decisions where decision_ts >= ? group by status", (t0,)).fetchall()
+        ov = con.execute("select count(*) from events where kind = 'overrun' and ts >= ?", (t0,)).fetchone()[0]
+        con.close()
+    except sqlite3.Error:
+        return None
+    total = sum(n for _, n, _ in rows)
+    ok = sum(n for st, n, _ in rows if st == "ok")
+    last = max((m for _, _, m in rows if m), default=0)
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(last)) if last else "none"
+    return ("Order-book collector, scored period", "%d decisions, %d ok, %d lost, %d overruns; latest at %s" % (total, ok, total - ok, ov, when),
+            "Collector store: status and time only", time.strftime("%Y-%m-%d %H:%M"))
+
+
 def main() -> int:
     out = Path(sys.argv[1])
     asof = sys.argv[2] if len(sys.argv) > 2 else time.strftime("%Y-%m-%d %H:%M %Z")
@@ -80,7 +101,8 @@ def main() -> int:
     files = {
         "path_live.json": [dict(zip(keys, r)) for r in PATH_LIVE],
         "owner_waiting.json": [dict(zip(("n", "item", "unblocks"), r)) for r in OWNER_WAITING],
-        "status_now.json": [dict(zip(("metric", "value", "source", "as_of"), r)) for r in STATUS_NOW],
+        "status_now.json": [dict(zip(("metric", "value", "source", "as_of"), r)) for r in
+                            [(collector_row(asof) if r[0].startswith("Order-book collector") and collector_row(asof) else r) for r in STATUS_NOW]],
         "backlog_counts.json": [{"tag": t, "count": n} for t, n in backlog_counts()],
     }
     for name, rows in files.items():
