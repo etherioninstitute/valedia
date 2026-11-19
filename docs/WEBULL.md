@@ -555,9 +555,10 @@ of that venue, `memory/order_step-VENUE_NAME.owner-preview.json`, beside the sta
 readable by its owner only (a new preview replaces the one before; no run, reconcile, ticket, journal reader, alert
 or owner's page reads that file, so it is never a fault). A preview on a root with no `memory` folder yet creates
 that folder to hold the file. A pending file that is not a preview the command
-wrote (a field missing or of another type, a mark that is not an object with a finite price, a code that is not six
-digits: a file edited by hand) is "not an owner-entry preview": the confirm refuses in words, spends it and writes
-nothing. Run again with the same arguments and `--confirm CODE`
+wrote (any of its eleven fields missing, `close` included, or of another type, a mark that is not an object with a
+finite price, a code that is not six digits: a file edited by hand) is "not an owner-entry preview", and one that
+cannot be read at all (not readable, not UTF-8, not JSON, or JSON nested too deeply to parse) is "the pending preview
+cannot be read": either way the confirm refuses in words, spends it and writes nothing. Run again with the same arguments and `--confirm CODE`
 within a ticket's life (`TICKET_LIFE_SECONDS`), it asks the quotes AGAIN and writes the entry, at the confirm's own
 marks, only when every mark is within `TICKET_QUOTE_MOVE` of the preview's and nothing else differs: the arguments
 (kind, figures, symbol, who, note), the chain's last hash (no entry since), the ledger's fills and orders as the
@@ -566,7 +567,8 @@ not opened or closed meanwhile). Otherwise it refuses in words saying what moved
 holds the run lock and before anything is written, it reads the ledger's fills and orders and the owner's entries
 AGAIN and writes only if the figures read what was valued (the same digest of the ledger as the book's figures read
 it, the same last hash of the chain, the same funds held); otherwise it refuses, "a fill or an order arrived while the
-entry was being confirmed" (or "an owner's entry arrived ..."), and writes nothing. No quote is asked under the lock:
+entry was being confirmed" (or "an owner's entry arrived ..."; a ledger read when the entry was valued and gone now,
+or one that cannot be read again, is said so), and writes nothing. No quote is asked under the lock:
 the marks are the confirm's own, and the lock is never held across the network. Nothing the figures read can arrive
 between that second read and the write: every writer of fill and order rows to the ledger (the order step's practice
 and live runs, and the event practice on a venue of the same name) writes them only while holding this same lock

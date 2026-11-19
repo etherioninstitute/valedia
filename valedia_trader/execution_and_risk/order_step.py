@@ -1046,6 +1046,8 @@ _OWNER_ARGUMENTS = ("amount", "units", "ratio", "symbol")
 _ENTRY_HASH = re.compile(r"[0-9a-f]{64}")
 _ENTRY_NUMBER = re.compile(r"[1-9][0-9]*")
 OWNER_PREVIEW_KIND = "order-step owner-entry preview"   # T51c S4b: what the pending preview's file says it is
+_PREVIEW_FIELDS = ("what", "venue", "code", "created", "expires", "marks", "arguments", "head", "ledger", "held",
+                   "close")                               # addendum 2 (R38): every field a confirm reads
 # T51c S4b: the ledger's fields that book_figures reads; a confirm holds them against its preview's
 _FIGURED_FILL_FIELDS = ("id", "tag", "symbol", "units", "price", "price_covers_units", "fee", "time")
 _FIGURED_ORDER_FIELDS = ("tag", "units", "order_type", "limit_price", "collar_price", "fee", "state", "finished_at",
@@ -1076,7 +1078,7 @@ def _spend_preview(path: Path, record: dict | None) -> str:
         now_there = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return "; the preview is spent"
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):        # addendum 2 (R38): whatever reading, decoding or parsing raises
         now_there = None
     if record is not None and isinstance(now_there, dict) and now_there.get("code") != record.get("code"):
         return "; a newer preview was made meanwhile and stays pending"
@@ -1126,24 +1128,36 @@ def _ledger_digest(fills, orders) -> str:
     return hashlib.sha256(json.dumps(rows, default=repr, separators=(",", ":")).encode()).hexdigest()
 
 
-def _owner_arrived(ledger_path: Path, state_path: Path, day: str, now: float, valued: dict) -> str | None:
+def _owner_arrived(ledger_path: Path, state_path: Path, day: str, now: float, valued: dict,
+                   ledger_was_there: bool) -> str | None:
     """T51c S4b addendum 1 (R35): under the run lock, the ledger's fills and orders and the owner's entries read AGAIN;
     what arrived since the entry was valued (`valued`: its ledger digest, chain head and set of funds held), in words,
-    or None when the figures read what was valued. No quote is asked: the lock is never held across the network."""
+    or None when the figures read what was valued. No quote is asked: the lock is never held across the network.
+    Addendum 2 (R38): a ledger that was read when the entry was valued and is gone now, or that cannot be read again,
+    is said so (`ledger_was_there`: the first read found the file)."""
     from valedia_trader.execution_and_risk.orders import open_read_only
-    try:
-        fills, orders = [], []
-        if ledger_path.exists():
+    fills, orders = [], []
+    if ledger_path.exists():
+        try:
             ro = open_read_only(ledger_path)
             try:
                 fills, orders = ro.fills(), ro.orders()
             finally:
                 ro.close()
+        except (OrderStepError, OrderError, sqlite3.Error, OSError) as exc:
+            return f"the ledger could not be read again under the lock ({_cut(str(exc), 300)})"
+    elif ledger_was_there:
+        return ("the ledger is gone: it was read when the entry was valued and is not there under the lock (a person "
+                "must look)")
+    try:
         entries = _owner_entries_read_only(Path(state_path))
+    except (OrderStepError, OrderError, sqlite3.Error, OSError) as exc:
+        return f"the owner's entries could not be read again under the lock ({_cut(str(exc), 300)})"
+    try:
         head = entries[-1]["hash"] if entries else _GENESIS
         held = sorted(book_figures(fills, orders, entries, {}, day, now=now).unmarked)
-    except (OrderStepError, OrderError, sqlite3.Error, OSError) as exc:
-        return f"the ledger and the owner's entries could not be read again under the lock ({_cut(str(exc), 300)})"
+    except (OrderStepError, OrderError) as exc:
+        return f"the book's figures could not be read again under the lock ({_cut(str(exc), 300)})"
     if head != valued["head"]:
         return "an owner's entry arrived while the entry was being confirmed"
     if _ledger_digest(fills, orders) != valued["ledger"] or held != valued["held"]:
@@ -1225,6 +1239,11 @@ def _read_preview(path: Path, venue: str) -> dict | None:
         record = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
+    except RecursionError:                                # addendum 2 (R38): JSON nested too deeply to parse
+        raise ValueError("it is nested too deeply to parse") from None
+    # addendum 2 (R38): every one of the fields a confirm reads is PRESENT (a missing key is not read as null)
+    if not (isinstance(record, dict) and all(key in record for key in _PREVIEW_FIELDS)):
+        raise ValueError("it is not an owner-entry preview of this venue")
     # addendum 1 (R36): every field a confirm reads is checked here, so a file edited by hand is refused, not a crash:
     # the code (compared), created and expires (the life), each mark's price (the band), and the fields compared
     # whole with the figures now (arguments, head, ledger, held, close), of the types the preview writes.
@@ -1377,7 +1396,8 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None, *
     journal_dir = Path(paths.journal)
     try:                                                  # every refusal is decided here, before anything is created,
         fills, orders = [], []                            # taken or opened for writing
-        if ledger_path.exists():
+        ledger_was_there = ledger_path.exists()
+        if ledger_was_there:
             ro = open_read_only(ledger_path)
             try:
                 fills, orders = ro.fills(), ro.orders()
@@ -1436,7 +1456,7 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None, *
         # or an order row (the order step's runs, practice and live, and the event practice) writes them only while
         # holding this same lock (<state file>.lock), and so does every writer of an owner's entry; nothing the
         # figures read can arrive between this read and the write below.
-        arrived = _owner_arrived(ledger_path, Path(state_path), day, now, now_record)
+        arrived = _owner_arrived(ledger_path, Path(state_path), day, now, now_record, ledger_was_there)
         if arrived is not None:
             return _owner_refuse(f"{arrived}; nothing was written{spent}")
         try:
