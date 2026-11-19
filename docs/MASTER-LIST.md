@@ -411,6 +411,9 @@ Items:
   operating-system wall the Paperclip session builds. His alone: the single key paste, the gateway restart, any
   download. Same evening he made etherion serve `hs27b` at 262144 context (2 parallel): a local Implementer seat
   is possible; first agent request to be watched against the collector's cycle.
+  **DONE 7:38 PM:** he pasted the key and restarted the gateway; one `valedia-coder` request went through end to
+  end (Cloudflare GLM-4.7-flash, first try). He kept OVH in the chain himself ("Gemini Carbon said OVH is ZDR");
+  its terms are still unread by us (its public pages say no training, no storage; no contract seen).
 - **QUEUED** L-2 lessons by idea family, and a stop on a family after N failures (roadmap 2.3).
 - **QUEUED** L-3 a check on the critic itself (roadmap 2.5).
 - **QUEUED** L-4 scores earn weight (roadmap 1.5).
