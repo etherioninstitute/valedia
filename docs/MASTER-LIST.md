@@ -378,7 +378,7 @@ Items:
   NOT USED YET: no real filing has been made. The daily review (L-1) is its first intended caller.
 - **OWNER** a three-seat coding pipeline (planner, implementer, blind reviewer) built from Paperclip's own
   review and approval stages: a design in that session, with the lead's four changes; not built until he says.
-- **UPDATE 2026-11-18 about 7:40 PM PST:** he said yes ("Yes, please route"; "i just want coding to happen ...
+- **UPDATE 2026-11-18 about 6:50 PM PST:** he said yes ("Yes, please route"; "i just want coding to happen ...
   mostly by local models ... checked by a good frontier model ... if I run out of Anthropic credits, it will
   just choose another") and set all four Paperclip agents to the Hermes harness himself. That session found
   they would all run as his default Hermes home (one model, approvals skipped, no walls): NOTHING assigned;
@@ -402,7 +402,7 @@ Items:
   Cloudflare, and Ollama's hosted service by name, for FreeLLMAPI only. No build is needed any more. Left to
   do there (light, 09:45 to 11:00 PST): the guard code and its tests, the separate Hermes root for the one
   coding profile, one toy prompt. The app can read his files like any app he runs; that was his choice.
-- **UPDATE 2026-11-18 about 7:45 PM PST (the lead's decision, on his word "decide and respond ... so it isnt
+- **UPDATE 2026-11-18 about 6:57 PM PST (the lead's decision, on his word "decide and respond ... so it isnt
   waiting on my response"):** the simple wiring replaces the plan above. The existing `valedia-coder` profile
   is repointed to the fixed `coding` chain (zero-retention providers only; OVH and its no-key access out until
   its terms are read; no fallback either way); a key-leak hook only; trading code allowed on zero-retention

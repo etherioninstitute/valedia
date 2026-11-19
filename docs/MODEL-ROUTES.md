@@ -10,7 +10,7 @@ profiles' own settings (model and provider lines only; no key was read), the tra
 | Seat | Where it runs | State on 2026-11-18 | Fit |
 | --- | --- | --- | --- |
 | `elephant-1` (9B decision model) | THIS Mac, LM Studio | loaded, one slot, 8K window | the order-book collector's own; nothing else may load it down while its test is scored (to 3 Dec) |
-| `qwen3.8-27b` as `hs27b` | etherion's computer, through LM Link | loaded, 2 parallel, 262144 window (the owner raised it on 2026-11-18 evening; `lms ps` about 7:35 PM) | short jobs AND agent work (Hermes needs 64K: met); the picks reader shares its two slots; first agent request to be watched against the collector's cycle |
+| `qwen3.8-27b` as `hs27b` | etherion's computer, through LM Link | loaded, 2 parallel, 262144 window (the owner raised it on 2026-11-18 evening; `lms ps` about 6:55 PM) | short jobs AND agent work (Hermes needs 64K: met); the picks reader shares its two slots; first agent request to be watched against the collector's cycle |
 | `ternary-bonsai-2-27b` as `bonsai2` | etherion's computer, through LM Link | not in `lms ps` at the same check | a second opinion when loaded |
 | arex-2, bonsai-27b | the Mac mini, through LM Link | listed, not loaded | spare |
 | the 27B's local builds (`qwen/qwen3.8-27b`, `qwen3.8-27b`) | THIS Mac | NOT loaded | naming them makes LM Studio load 16 to 19 GB here, beside the collector |
