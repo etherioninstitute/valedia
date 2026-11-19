@@ -22,12 +22,16 @@ Requests. EVERY request to Kalshi goes through ONE pacer (StepPacer, installed a
 so every try of every call waits on it): a pause between requests (--kalshi-pause-seconds, default 10.0, never under
 5.0: a collector on this machine reads the same host) and a cap a step (--kalshi-cap, default 60). At the cap the step
 stops cleanly between holdings (the holding being worked on is written not at all) and says so; the next step carries
-on. KalshiData is built with tries=1, so a 429 or a server error is a failed read, never a retry. The calls used:
-`pages("/events", ...)` (one list of a series' open events with their markets, per series reached in a step),
-`orderbook` (the match read; an exit's bid read) and `market` (a settlement check; on a 404 from the live tier it asks
-the historical tier, so a check costs one request, two on that 404). Polymarket's market-description service is read
-by GammaReader here: GET only, one host, one path, the parameters condition_ids and closed, the generic client name,
-no key, its own pause; a market's text is asked once and kept by condition id.
+on. KalshiData is built with tries=1, so a 429 or a server error is a failed read, never a retry, and with this
+module's OWN fetch (kalshi_urllib_get: GET only, https, Kalshi's one host and its /trade-api/v2/ paths the copier
+uses, no redirect followed, no proxy, the generic client name, a size limit and a timeout). The pause holds across
+steps: the time of the last Kalshi request is kept in the book. The calls used: `pages("/events", ...)` (one list of a
+series' open events with their markets, per series reached in a step by a new holding or by an open copy),
+`orderbook` (the match read: ONE for a Kalshi market and a pass, kept in the book; an exit's bid read) and `market`
+(a settlement check, only for an open copy whose market is not open in its series' list; on a 404 from the live tier
+it asks the historical tier). Polymarket's market-description service is read by GammaReader here: GET only, one
+host, one path, the parameters condition_ids and closed, the generic client name, no key, its own pause; a market's
+text is asked once and kept by condition id.
 """
 from __future__ import annotations
 
@@ -60,8 +64,10 @@ PRICE_LO, PRICE_HI = 0.10, 0.90
 ASK_LO, ASK_HI = 0.05, 0.95
 MATCH_WINDOW = 6 * 3600.0                    # the match read falls within 6 hours of the pass's read of that wallet
 DAY = 86_400
-USER_VERSION = 1
+USER_VERSION = 2                             # 2: the match reads kept; flags and notes append-only
 WAIT_SECONDS = 5.0
+MAX_BODY = 8_000_000                         # an answer larger than this is a failed read (a list of 200 events)
+FETCH_TIMEOUT = 60.0
 OK, REFUSED, CAPPED, OTHER_SHAPE, UNREADABLE, BUSY = 0, 3, 5, 7, 8, 9
 
 # The skip reasons, in the order they are applied (see docs/forward-copier.md for why the order cannot change which
@@ -354,15 +360,20 @@ def kalshi_text(m: dict) -> str:
 # ---------------------------------------------------------------- the readers
 class StepPacer:
     """The ONE pacer of a step's Kalshi requests: at least `pause` seconds between the starts of two requests, and at
-    most `cap` requests; the request past the cap raises CapReached before it is sent."""
+    most `cap` requests; the request past the cap raises CapReached before it is sent. The pause holds across steps:
+    the first request of a step waits until `pause` has passed since `last_wall` (the wall time of the step before's
+    last Kalshi request, kept in the book; a clock set back waits the full pause), and `keep(wall time)` is called
+    before every request is sent, so the book always holds the time of the last one."""
 
     def __init__(self, pause: float, cap: int, sleep: Callable[[float], Any] = time.sleep,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, wall: Callable[[], float] | None = None,
+                 last_wall: float | None = None, keep: Callable[[float], Any] | None = None):
         if not pause >= MIN_PAUSE:
             raise ValueError("the pause between Kalshi requests is never under %.1f s" % MIN_PAUSE)
         if not (isinstance(cap, int) and cap >= 1):
             raise ValueError("the cap is a whole number of at least 1")
         self.pause, self.cap, self.sleep, self.clock = float(pause), cap, sleep, clock
+        self.wall, self.last_wall, self.keep = wall, last_wall, keep
         self.last: float | None = None
         self.count = 0
 
@@ -373,6 +384,14 @@ class StepPacer:
             gap = self.clock() - self.last
             if gap < self.pause:
                 self.sleep(self.pause - gap)
+        elif self.last_wall is not None and self.wall is not None:
+            gap = self.wall() - self.last_wall
+            if gap < 0.0:                                 # the clock was set back: the full pause, never none
+                self.sleep(self.pause)
+            elif gap < self.pause:
+                self.sleep(self.pause - gap)
+        if self.keep is not None and self.wall is not None:
+            self.keep(self.wall())
         self.last = self.clock()
         self.count += 1
 
@@ -386,27 +405,67 @@ def kalshi_client(fetch: Callable[[str], Any], pacer: StepPacer) -> kd.KalshiDat
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 GAMMA_URL = re.compile(re.escape(GAMMA_BASE) + r"/markets\?condition_ids=0x[0-9a-f]{64}&closed=(?:true|false)")
+_T = r"[A-Z][A-Z0-9.\-]{0,79}"                       # a Kalshi ticker (TICKER_RE)
+KALSHI_URL = re.compile(re.escape(kd.BASE_URL) + "(?:" + "|".join((
+    r"/events\?series_ticker=[A-Z][A-Z0-9]{0,39}&status=open&with_nested_markets=true&limit=200"
+    r"(?:&cursor=[A-Za-z0-9%_.\-]{1,500})?",
+    r"/markets/" + _T + r"/orderbook\?depth=\d{1,3}",
+    r"/markets/" + _T,
+    r"/historical/markets/" + _T)) + ")")
+_HANDLERS: tuple = ()          # extra urllib handlers; empty here (a test puts a stand-in for the network in it)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+        return None                                    # a redirect is never followed: the answer is an HTTP error
 
 
-def gamma_urllib_get(url: str, timeout: float = 60.0) -> bytes:
+def _opener():
+    """urllib with no proxy (the request goes to the host named, nowhere else) and no redirect followed."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), *_HANDLERS, _NoRedirect())
+
+
+def _get(url: str, timeout: float) -> bytes:
+    """GET `url` (already allowed); its body, at most MAX_BODY bytes. Raises urllib's errors, or ValueError (size)."""
+    req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": kd.USER_AGENT},
+                                 method="GET")
+    with _opener().open(req, timeout=timeout) as resp:
+        code = getattr(resp, "status", None) or resp.getcode()
+        if code != 200:
+            raise urllib.error.HTTPError(url, code, "not 200", resp.headers, None)
+        body = resp.read(MAX_BODY + 1)
+    if len(body) > MAX_BODY:
+        raise ValueError("an answer over the size limit of %d bytes" % MAX_BODY)
+    return body
+
+
+def kalshi_urllib_get(url: str, timeout: float = FETCH_TIMEOUT) -> bytes:
+    """The copier's OWN fetch for Kalshi's public API (the allow-list KALSHI_URL: https, the one host, the paths the
+    copier asks); any other address is refused before anything is sent; a redirect is a failed read (HttpError with
+    its status); not a 200 is HttpError; no network or too large an answer is KalshiDataError."""
+    if not (isinstance(url, str) and KALSHI_URL.fullmatch(url)):
+        raise kd.KalshiDataError("refused: %s is not an address this copier asks" % lm._safe(str(url))[:200])
+    try:
+        return _get(url, timeout)
+    except urllib.error.HTTPError as e:
+        raise kd.HttpError(e.code, url) from None
+    except ValueError as e:
+        raise kd.KalshiDataError(str(e)) from None
+    except (urllib.error.URLError, OSError) as e:
+        raise kd.KalshiDataError(type(e).__name__) from None
+
+
+def gamma_urllib_get(url: str, timeout: float = FETCH_TIMEOUT) -> bytes:
     """GET one address of Polymarket's description service (the allow-list: one host, one path, two parameters);
     any other address is refused before anything is sent; a redirect is never followed; not a 200 is an error."""
     if not (isinstance(url, str) and GAMMA_URL.fullmatch(url)):
         raise GammaError("refused: %s is not an address this reader asks" % url)
-    req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": kd.USER_AGENT},
-                                 method="GET")
     try:
-        with urllib.request.build_opener(_NoRedirect()).open(req, timeout=timeout) as resp:
-            if (getattr(resp, "status", None) or resp.getcode()) != 200:
-                raise GammaError("HTTP %s" % resp.getcode())
-            return resp.read()
+        return _get(url, timeout)
     except urllib.error.HTTPError as e:
         raise GammaError("HTTP %s" % e.code) from None
+    except ValueError as e:
+        raise GammaError(str(e)) from None
     except (urllib.error.URLError, OSError) as e:
         raise GammaError(type(e).__name__) from None
 
@@ -484,6 +543,9 @@ CREATE TABLE IF NOT EXISTS copy_wallets (copy_id INTEGER NOT NULL, wallet_key TE
     PRIMARY KEY (copy_id, wallet_key, read_id, token_id));
 CREATE TABLE IF NOT EXISTS copy_flags (copy_id INTEGER NOT NULL, kind TEXT NOT NULL CHECK (kind IN (%(flags)s)),
     ts REAL NOT NULL, detail TEXT);
+CREATE TABLE IF NOT EXISTS match_reads (kalshi_market TEXT NOT NULL, pass_key INTEGER NOT NULL, stamp REAL NOT NULL,
+    ok INTEGER NOT NULL CHECK (ok IN (0, 1)), book_raw TEXT, detail TEXT, step_id INTEGER NOT NULL,
+    PRIMARY KEY (kalshi_market, pass_key));
 CREATE TABLE IF NOT EXISTS near_book (wallet_key TEXT NOT NULL, read_id INTEGER NOT NULL, token_id TEXT NOT NULL,
     condition_id TEXT, family TEXT NOT NULL, title TEXT, outcome TEXT, pass_read_ts REAL NOT NULL, ts REAL NOT NULL,
     step_id INTEGER NOT NULL, PRIMARY KEY (wallet_key, read_id, token_id));
@@ -515,6 +577,18 @@ CREATE TRIGGER IF NOT EXISTS skips_fixed BEFORE UPDATE ON skips
     BEGIN SELECT RAISE(ABORT, 'a skip never changes'); END;
 CREATE TRIGGER IF NOT EXISTS skips_kept BEFORE DELETE ON skips
     BEGIN SELECT RAISE(ABORT, 'a skip never changes'); END;
+CREATE TRIGGER IF NOT EXISTS flags_fixed BEFORE UPDATE ON copy_flags
+    BEGIN SELECT RAISE(ABORT, 'a flag never changes'); END;
+CREATE TRIGGER IF NOT EXISTS flags_kept BEFORE DELETE ON copy_flags
+    BEGIN SELECT RAISE(ABORT, 'a flag never changes'); END;
+CREATE TRIGGER IF NOT EXISTS wallets_fixed BEFORE UPDATE ON copy_wallets
+    BEGIN SELECT RAISE(ABORT, 'a wallet on a copy never changes'); END;
+CREATE TRIGGER IF NOT EXISTS wallets_kept BEFORE DELETE ON copy_wallets
+    BEGIN SELECT RAISE(ABORT, 'a wallet on a copy never changes'); END;
+CREATE TRIGGER IF NOT EXISTS match_reads_fixed BEFORE UPDATE ON match_reads
+    BEGIN SELECT RAISE(ABORT, 'a match read never changes'); END;
+CREATE TRIGGER IF NOT EXISTS match_reads_kept BEFORE DELETE ON match_reads
+    BEGIN SELECT RAISE(ABORT, 'a match read never changes'); END;
 """ % {"reasons": ", ".join("'%s'" % r for r in SKIP_REASONS), "flags": ", ".join("'%s'" % f for f in FLAG_KINDS)}
 
 
@@ -619,13 +693,15 @@ HCOLS = ("condition_id", "opposite_token_id", "outcome_index", "size", "avg_pric
 def candidates(rec, considered: set) -> list:
     """Every holding not yet considered: each holding of a wallet's first good read (its baseline), and each vouched
     NEW of a later good read; in the order of the pass's read time, then wallet and token (a fixed order, so which
-    wallet opens a copy and which is noted is fixed too)."""
+    wallet opens a copy and which is noted is fixed too). A holding of a pass the record still shows running is left
+    for a later step: the match read is the first read AFTER the pass."""
     cols = ", ".join(HCOLS)
+    running = {p for (p,) in rec.execute("SELECT pass_id FROM passes WHERE status='running'")}
     out = []
     for (key,) in rec.execute("SELECT wallet_key FROM leaders ORDER BY wallet_key"):
         base = rec.execute("SELECT read_id, read_ts, pass_id, baseline FROM wallet_reads WHERE wallet_key=? AND good=1 "
                            "ORDER BY read_id LIMIT 1", (key,)).fetchone()
-        if base is not None and base[3] == 1:
+        if base is not None and base[3] == 1 and base[2] not in running:
             for r in rec.execute("SELECT token_id, %s FROM snapshots WHERE read_id=? AND wallet_key=? AND "
                                  "kind='baseline' ORDER BY token_id" % cols, (base[0], key)):
                 if (key, base[0], r[0]) not in considered:
@@ -635,7 +711,7 @@ def candidates(rec, considered: set) -> list:
                 "SELECT c.change_id, c.read_id, c.token_id, c.read_ts, r.pass_id FROM changes c JOIN wallet_reads r "
                 "ON r.read_id = c.read_id WHERE c.wallet_key=? AND c.kind='NEW' AND c.vouched=1 ORDER BY c.read_id, "
                 "c.token_id", (key,)).fetchall():
-            if (key, read_id, tok) in considered:
+            if (key, read_id, tok) in considered or pass_id in running:
                 continue
             row = rec.execute("SELECT %s FROM snapshots WHERE read_id=? AND wallet_key=? AND token_id=?" % cols,
                               (read_id, key, tok)).fetchone() or \
@@ -664,10 +740,18 @@ def leaders_disagree(rec, h: dict) -> bool:
 
 
 def first_exit(rec, wallet_key: str, token_id: str, after_read_id: int):
-    """The opening wallet's first EXIT of that token in a read after the copy's read: (change_id, read_id, read_ts)."""
-    return rec.execute("SELECT change_id, read_id, read_ts FROM changes WHERE wallet_key=? AND token_id=? AND "
-                       "kind='EXIT' AND read_id>? ORDER BY read_id LIMIT 1",
-                       (wallet_key, token_id, after_read_id)).fetchone()
+    """The opening wallet's first EXIT of that token in a read after the copy's read, of a pass no longer running:
+    (change_id, read_id, read_ts)."""
+    return rec.execute("SELECT c.change_id, c.read_id, c.read_ts FROM changes c JOIN wallet_reads r ON r.read_id = "
+                       "c.read_id LEFT JOIN passes p ON p.pass_id = r.pass_id WHERE c.wallet_key=? AND c.token_id=? "
+                       "AND c.kind='EXIT' AND c.read_id>? AND (p.status IS NULL OR p.status != 'running') "
+                       "ORDER BY c.read_id LIMIT 1", (wallet_key, token_id, after_read_id)).fetchone()
+
+
+def pass_key(h: dict) -> int:
+    """THAT PASS of a holding: the record's pass of the read that showed it (wallet_reads.pass_id); a read with no
+    pass is its own (minus its read id)."""
+    return h["pass_id"] if h.get("pass_id") is not None else -int(h["read_id"])
 
 
 # ---------------------------------------------------------------- the quotes
@@ -707,6 +791,9 @@ class Step:
         self.rec, self.book, self.kalshi, self.pacer, self.gamma, self.fmap = rec, book, kalshi, pacer, gamma, fmap
         self.wall, self.say = wall, say
         self.lists: dict = {}            # series -> events, or the failure of this step's one list read
+        self.pm_failed: dict = {}        # condition id -> the failure of this step's one description read
+        self.not_final: set = set()      # open copies this step showed not final (only these may close by an exit)
+        self.step_id = 0
         self.n = Counter()
 
     # -- considering one holding: every read first, then its rows in one transaction
@@ -736,6 +823,8 @@ class Step:
         if what[0] != "same":
             raise Skip("no_same", what[1])
         series, parts = what[1], what[2]
+        if self.fmap["series"][series].get("class") != "SAME":          # the map's class, read by the program
+            raise Skip("no_same", "%s is of class %s" % (series, self.fmap["series"][series].get("class")))
         if series not in self.fmap["_listed"]:
             raise Skip("not_listed", series)
         names = resolve_names(series, parts, self.fmap)
@@ -753,14 +842,8 @@ class Step:
                              (m["ticker"], side))
         if opened:
             return {"skip": ("already_open", "copy %d" % opened[0][0]), "note": opened[0][0]}
-        self._late(h)
-        try:
-            book = self.kalshi.orderbook_raw(m["ticker"])
-            stamp = self.wall()
-            parsed = {"yes": kd.normalize_levels(book.get("yes_dollars")),
-                      "no": kd.normalize_levels(book.get("no_dollars"))}
-        except (kd.KalshiDataError, kd.HttpError, ValueError, TypeError, AttributeError) as e:
-            raise Skip("read_failed", "Kalshi's book: %s" % type(e).__name__)
+        stamp, book = self._match_read(h, m["ticker"])
+        parsed = {"yes": kd.normalize_levels(book.get("yes_dollars")), "no": kd.normalize_levels(book.get("no_dollars"))}
         if stamp - h["read_ts"] > MATCH_WINDOW:
             raise Skip("late", "the match read")
         if not market_open(m, stamp):
@@ -776,6 +859,34 @@ class Step:
     def _late(self, h: dict) -> None:
         if self.wall() - h["read_ts"] > MATCH_WINDOW:
             raise Skip("late", "before any request")
+
+    def _match_read(self, h: dict, ticker: str) -> tuple:
+        """THE match read of `ticker` for the holding's pass: (stamp, raw book). For one Kalshi market and one pass the
+        program reads the book ONCE, the first time a holding of that pass needs it, and keeps the read in the book
+        (its own transaction, written before anything else is done); every later holding of that pass for that market,
+        in this step or a later one, is judged by it. A first read that failed is the answer too: read_failed."""
+        pk = pass_key(h)
+        got = self.book.q("SELECT stamp, ok, book_raw, detail FROM match_reads WHERE kalshi_market=? AND pass_key=?",
+                          (ticker, pk))
+        if not got:
+            self._late(h)
+            ok, raw, detail = 1, None, ""
+            try:
+                book = self.kalshi.orderbook_raw(ticker)
+                stamp = self.wall()
+                kd.normalize_levels(book.get("yes_dollars"))
+                kd.normalize_levels(book.get("no_dollars"))
+                raw = json.dumps(book, sort_keys=True)
+            except (kd.KalshiDataError, kd.HttpError, ValueError, TypeError, AttributeError) as e:
+                stamp, ok, detail = self.wall(), 0, "Kalshi's book: %s" % type(e).__name__
+            self.book.tx(lambda: self.book.w(
+                "INSERT INTO match_reads (kalshi_market, pass_key, stamp, ok, book_raw, detail, step_id) VALUES "
+                "(?, ?, ?, ?, ?, ?, ?)", (ticker, pk, stamp, ok, raw, detail, self.step_id)))
+            got = [(stamp, ok, raw, detail)]
+        stamp, ok, raw, detail = got[0]
+        if not ok:
+            raise Skip("read_failed", "%s (the pass's first read)" % detail)
+        return stamp, json.loads(raw)
 
     def _list(self, series: str) -> list:
         if series not in self.lists:
@@ -801,12 +912,16 @@ class Step:
                           "t.text_hash = p.text_hash WHERE p.condition_id=?", (cid,))
         if row:
             return {"cached": True, "description": row[0][1]}
+        if cid in self.pm_failed:                        # a failed read is not asked again in the same step
+            raise Skip("read_failed", self.pm_failed[cid])
         try:
             got = self.gamma.market(cid, closed_first=False)
         except GammaError as e:
-            raise Skip("read_failed", "Polymarket's description: %s" % e)
+            self.pm_failed[cid] = "Polymarket's description: %s" % e
+            raise Skip("read_failed", self.pm_failed[cid])
         if got is None or not isinstance(got.get("description"), str):
-            raise Skip("read_failed", "Polymarket's description: no such market")
+            self.pm_failed[cid] = "Polymarket's description: no such market"
+            raise Skip("read_failed", self.pm_failed[cid])
         h["_pm"] = {"cached": False, "description": got["description"], "read_ts": self.wall(),
                     "question": got.get("question") if isinstance(got.get("question"), str) else None,
                     "outcomes": got.get("outcomes") if isinstance(got.get("outcomes"), str) else None,
@@ -863,26 +978,38 @@ class Step:
 
     # -- closes
     def settle_open(self) -> None:
-        """(a) and (c): every open copy's market read once a step; a finalized one is closed at its settlement. The
-        checks start after the copy checked last (kept in meta), so a step stopped at the cap is carried on by the
-        next one instead of asking the same markets again."""
+        """(a) and (c), BEFORE the exits: each open copy's series list of open events is read once a step (the same
+        list the new holdings use); a copy whose market is in it and open needs no further read and is shown not
+        final; any other gets ONE market read, and a finalized one is closed at its settlement. A series whose list
+        failed is not checked this step (nor exited). The market reads start after the copy read last (kept in meta),
+        so a step stopped at the cap is carried on by the next one. A cap reached here stops the step: CapReached."""
         after = self.book.q("SELECT value FROM meta WHERE key='settle_after'")
         after = int(after[0][0]) if after else 0
-        rows = self.book.q("SELECT copy_id, kalshi_market, side, condition_id, token_id FROM copies WHERE "
-                           "status='open' ORDER BY copy_id <= ?, copy_id", (after,))
-        for i, (copy_id, ticker, side, cid, tok) in enumerate(rows):
+        open_copies = self.book.q("SELECT copy_id, series, kalshi_market, side, condition_id, token_id FROM copies "
+                                  "WHERE status='open' ORDER BY copy_id <= ?, copy_id", (after,))
+        for i, (copy_id, series, ticker, side, cid, tok) in enumerate(open_copies):
             try:
-                rec = self.kalshi.market(ticker)
+                try:
+                    events = self._list(series)
+                except Skip:
+                    self.n["settle_list_failed"] += 1
+                    continue
+                listed = [m for e in events for m in (e.get("markets") or [])
+                          if isinstance(m, dict) and m.get("ticker") == ticker]
+                if len(listed) == 1 and market_open(listed[0], self.wall()):
+                    self.not_final.add(copy_id)
+                    continue
+                try:
+                    rec = self.kalshi.market(ticker)
+                except (kd.KalshiDataError, kd.HttpError, ValueError):
+                    self.n["settle_read_failed"] += 1
+                    continue
             except CapReached:
-                # every new holding and every exit of this step is done: the checks left wait for the next step,
-                # which starts with them, so the step is not stopped by them
-                self.n["settle_left"] = len(rows) - i
-                return
-            except (kd.KalshiDataError, kd.HttpError, ValueError):
-                self.n["settle_read_failed"] += 1
-                rec = None
-            got = None if rec is None else settlement(rec, ticker, side, self.wall())
+                self.n["settle_left"] = len(open_copies) - i
+                raise
+            got = settlement(rec, ticker, side, self.wall())
             if got is None:
+                self.not_final.add(copy_id)
                 self.book.tx(lambda: self.book.w("INSERT OR REPLACE INTO meta (key, value) VALUES ('settle_after', ?)",
                                                  (str(copy_id),)))
                 continue
@@ -891,7 +1018,7 @@ class Step:
             flags += self._part_at_settlement(cid, tok, value)
             now = self.wall()
 
-            def rows():
+            def close_rows():
                 self.book.w("INSERT OR REPLACE INTO meta (key, value) VALUES ('settle_after', ?)", (str(copy_id),))
                 for kind, detail in flags:
                     self.book.w("INSERT INTO copy_flags (copy_id, kind, ts, detail) VALUES (?, ?, ?, ?)",
@@ -899,7 +1026,7 @@ class Step:
                 self.book.w("UPDATE copies SET status='closed', close_kind='settled', close_ts=?, close_price=?, "
                             "close_detail=? WHERE copy_id=? AND status='open'",
                             (ts, value, "Kalshi finalized; read at %.0f" % now, copy_id))
-            self.book.tx(rows)
+            self.book.tx(close_rows)
             self.n["closed_settled"] += 1
 
     def _part_at_settlement(self, cid: str, tok: str, value: float) -> list:
@@ -924,14 +1051,18 @@ class Step:
         return []
 
     def exits(self) -> None:
-        """(b): an open copy whose opening wallet's EXIT of that token is in the record after the copy's read, and
-        that is not held to settlement: Polymarket's market is read first (closed there while Kalshi trades: the
-        venues part, flagged and held), then ONE read of Kalshi's book, the side's bid (none: flagged and held)."""
+        """(b), after the settlement checks ("before that": a market already final is closed at its settlement): an
+        open copy this step showed NOT final, whose opening wallet's EXIT of that token is in the record after the
+        copy's read, and that is not held to settlement: Polymarket's market is read first (closed there while Kalshi
+        trades: the venues part, flagged and held), then ONE read of Kalshi's book, the side's bid (none: flagged and
+        held)."""
         held = ", ".join("'%s'" % k for k in HOLD_FLAGS)
         for copy_id, key, read_id, tok, cid, ticker, side in self.book.q(
                 "SELECT copy_id, wallet_key, read_id, token_id, condition_id, kalshi_market, side FROM copies c "
                 "WHERE status='open' AND NOT EXISTS (SELECT 1 FROM copy_flags f WHERE f.copy_id = c.copy_id AND "
                 "f.kind IN (%s)) ORDER BY copy_id" % held):
+            if copy_id not in self.not_final:
+                continue
             ex = first_exit(self.rec, key, tok, read_id)
             if ex is None:
                 continue
@@ -954,11 +1085,11 @@ class Step:
                 self._flag(copy_id, "exit_no_bid", "exit change %d" % ex[0])
                 continue
 
-            def rows():
+            def exit_rows():
                 self.book.w("UPDATE copies SET status='closed', close_kind='exit', close_ts=?, close_price=?, "
                             "close_detail=? WHERE copy_id=? AND status='open'",
                             (stamp, bid, "exit change %d read at %.0f" % (ex[0], ex[2]), copy_id))
-            self.book.tx(rows)
+            self.book.tx(exit_rows)
             self.n["closed_exit"] += 1
 
     def _flag(self, copy_id: int, kind: str, detail: str) -> None:
@@ -976,16 +1107,20 @@ def run_step(rec, book: Book, kalshi, pacer: StepPacer, gamma: GammaReader, fmap
     considered = {tuple(r) for r in book.q("SELECT wallet_key, read_id, token_id FROM considered")}
     todo = candidates(rec, considered)
     st = Step(rec, book, kalshi, pacer, gamma, fmap, wall, say)
+    st.step_id = step_id
     reasons: Counter = Counter()
     done = 0
     capped = False
+    stage = "the new holdings"
     try:
         for h in todo:
             out = st.consider(h)
             reasons[st.write(h, out, step_id)] += 1
             done += 1
-        st.exits()
+        stage = "the settlement checks"
         st.settle_open()
+        stage = "the exit checks"
+        st.exits()
     except CapReached:
         capped = True
     opened = reasons.pop("copy", 0)
@@ -1001,8 +1136,11 @@ def run_step(rec, book: Book, kalshi, pacer: StepPacer, gamma: GammaReader, fmap
            " ".join("%s=%d" % (k[5:], v) for k, v in sorted(st.n.items()) if k.startswith("flag_")) or "none",
            pacer.count, pacer.cap, gamma.requests))
     if capped:
-        say("STOPPED step %d at the cap of %d Kalshi requests: %d holdings and the closes not reached wait for the "
-            "next step (nothing considered is lost or made twice)" % (step_id, pacer.cap, len(todo) - done))
+        say("STOPPED step %d at the cap of %d Kalshi requests, in %s: left for the next step %d holdings%s and the "
+            "exit checks (nothing considered is lost or made twice)"
+            % (step_id, pacer.cap, stage, len(todo) - done,
+               ", %d settlement checks" % st.n["settle_left"] if st.n["settle_left"] else
+               (", every settlement check" if stage == "the new holdings" else "")))
         return CAPPED
     say("DONE step %d" % step_id)
     return OK
@@ -1100,10 +1238,17 @@ def main(argv=None, *, kalshi_fetch=None, gamma_fetch=None, wall: Callable[[], f
             say(bad[1])
             return bad[0]
         try:
-            pacer = StepPacer(args.kalshi_pause_seconds, args.kalshi_cap, sleep, clock)
-            kalshi = kalshi_client(kalshi_fetch or kd.urllib_get, pacer)
+            book = Book(conn, write_hook)
+            last = book.q("SELECT value FROM meta WHERE key='kalshi_last'")
+
+            def keep(t: float) -> None:                  # the time of the last Kalshi request, before it is sent
+                book.tx(lambda: book.w("INSERT OR REPLACE INTO meta (key, value) VALUES ('kalshi_last', ?)",
+                                       (repr(float(t)),)))
+            pacer = StepPacer(args.kalshi_pause_seconds, args.kalshi_cap, sleep, clock, wall=wall,
+                              last_wall=float(last[0][0]) if last else None, keep=keep)
+            kalshi = kalshi_client(kalshi_fetch or kalshi_urllib_get, pacer)
             gamma = GammaReader(gamma_fetch or gamma_urllib_get, sleep=sleep, clock=clock)
-            return run_step(rec, Book(conn, write_hook), kalshi, pacer, gamma, fmap or load_map(), wall, say)
+            return run_step(rec, book, kalshi, pacer, gamma, fmap or load_map(), wall, say)
         finally:
             conn.close()
     finally:

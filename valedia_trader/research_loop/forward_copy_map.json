@@ -93,7 +93,14 @@
   {"series": "KXNFLGAME", "seen": "2026-11-13", "how": "probe, test environment"},
   {"series": "KXNHLGAME", "seen": "2026-11-13", "how": "probe, test environment"},
   {"series": "KXNCAAFGAME", "seen": "2026-11-13", "how": "probe, test environment"},
-  {"series": "KXNCAAMBGAME", "seen": "2026-11-13", "how": "probe, test environment"}
+  {"series": "KXNCAAMBGAME", "seen": "2026-11-13", "how": "probe, test environment"},
+  {"series": "KXNBASPREAD", "seen": "2026-11-18", "how": "probe, test environment"},
+  {"series": "KXPREMIERLEAGUE", "seen": "2026-11-18", "how": "probe, test environment"},
+  {"series": "KXNBA", "seen": "2026-11-18", "how": "probe, test environment"},
+  {"series": "KXSB", "seen": "2026-11-18", "how": "probe, test environment"},
+  {"series": "KXNBAWCFQUAL", "seen": "2026-11-18", "how": "probe, test environment"},
+  {"series": "KXBTCMINY", "seen": "2026-11-18", "how": "probe, test environment"},
+  {"series": "KXETHMINY", "seen": "2026-11-18", "how": "probe, test environment"}
  ],
  "near_families": [
   {"family": "crypto price level by a date", "map_words": "Crypto price levels \"by a date\"",
