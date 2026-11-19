@@ -143,6 +143,13 @@ cancelled; the account ended with no open order and no holding):
 - **Fees.** A purchase carries no fee (an empty list; the adapter reports none). A sale carries a list of three
   fee entries as soon as it is filled; the adapter reported 0.03 dollars on a sale of 1 SPY at 754.18, unchanged
   a minute later.
+- **A fee that cannot be read (T51c R33a, 2026-11-18).** The stock, fund and crypto order status answer carries
+  `fee_unreadable`: true when Webull gives a commission or fee entry that cannot be read (the fee is then None,
+  never a partial sum), false when no fee is given (commission {} and fees [] on a purchase) or the fee is read.
+  The ledger keeps a true value as the notice `fee_unreadable` on the order (it blocks nothing and changes no
+  figure) and closes it itself when a later report of the order gives a fee that is read. Event orders are read
+  as before. ROLL-BACK COST: code from before this build treats that notice as blocking and refuses orders on a
+  ledger that holds one, until a person closes it. Not yet seen: what a real purchase sends in `commission`.
 - **Quantities.** Up to 5 decimals (a sixth is refused, `OPENAPI_FRACT_QTY_SCALE_LESS_5`). A limit order for less
   than one share is refused unless it is marketable (`OPENAPI_FRACT_NO_MKT_LMT_QTY_GREAT_1`); 1.5 and 1.12345
   shares were accepted as limit orders; a market order for 0.5 filled.
