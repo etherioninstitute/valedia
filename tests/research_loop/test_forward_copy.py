@@ -1140,11 +1140,21 @@ def test_a_step_that_dies_at_any_write_point_leaves_a_book_the_next_step_continu
             book = tmp_path / ("d%d-%d.sqlite" % (phase, at))
             got = _two_steps(rec, book, kw, gw, wall, gs, hook=Hook(at, phase))
             orph = _orphans(book, gs)
+            held = rows(book, "SELECT c.kalshi_market, c.status FROM copies c JOIN copy_flags f ON f.copy_id = "
+                              "c.copy_id WHERE f.kind='exit_read_failed'")
+            assert all(st == "open" and {t for t, _p in rows(book, "SELECT kalshi_market, pass_key FROM match_begun "
+                                                                    "EXCEPT SELECT kalshi_market, pass_key FROM "
+                                                                    "match_reads")} >= {m} for m, st in held), (phase, at)
+            got = got[:5] + ([k for k in got[5] if k != ("exit_read_failed",)],)   # an exit whose read was begun: held
             assert _without(got, orph) == _without(want, orph), (phase, at)
-            for _w, _r, tok, outcome in got[0]:
-                if tok in orph:
-                    assert outcome == "skip", (phase, at)
-            assert all(reason == "read_failed" for _w, tok, reason in got[1] if tok in orph), (phase, at)
+            begun = rows(book, "SELECT kalshi_market, pass_key FROM match_begun EXCEPT SELECT kalshi_market, pass_key "
+                               "FROM match_reads")
+            for tok, outcome, reason in rows(book, "SELECT c.token_id, c.outcome, s.reason FROM considered c LEFT JOIN "
+                                                   "skips s USING (wallet_key, read_id, token_id) WHERE c.pass_id IN "
+                                                   "(%s)" % ",".join(str(p) for _t, p in begun) if begun else
+                                             "SELECT 1, 2, 3 WHERE 0"):
+                if tok in orph:                              # a holding of the pass whose read was begun, never kept
+                    assert (outcome, reason) == ("skip", "read_failed"), (phase, at)
 
 
 def test_a_match_read_is_never_sent_twice_whatever_write_fails(tmp_path):
@@ -1270,9 +1280,9 @@ def _three_series_world(tmp_path, tag):
                 kw.books[m["ticker"]] = _book(0.45)
     gw.markets[SPREAD] = dict(_pm(SPREAD + ".closed.json")[0], closed=False)
     gw.markets[CITY] = dict(_pm(CITY + ".json")[0], closed=False)
-    spread = pos(wallet(0), "5501", SPREAD, "Spread: Lakers (-7.5)", "Lakers", "nba-cha-lal-2026-11-17")
+    spread = pos(wallet(0), "5501", SPREAD, "Spread: Lakers (-7.5)", "Lakers", "nba-cha-lal-2026-11-17", opp="5511")
     city = pos(wallet(0), "5502", CITY, "Will Manchester City win the 2026-27 English Premier League (EPL) "
-               "Championship?", "Yes", "epl-2027-champion-20260701200428749")
+               "Championship?", "Yes", "epl-2027-champion-20260701200428749", opp="5503")
     rec.pass_({wallet(0): [g.holding(wallet(0), g.a) for g in gs[:4]] + [spread, city], wallet(1): []})
     book = tmp_path / ("s3-%s-book.sqlite" % tag)
     assert run_step(rec, book, kw, gw, wall)[0] == 0
@@ -1500,7 +1510,7 @@ def _world(seed, tmp_path, monkeypatch):
         else:
             gw.markets[g.cid] = g.gamma()
         truth_k[g.cid] = g
-    extras = [pos(None, "88%02d" % i, "0x" + ("%02d" % i) * 32, t, o, s) for i, (t, o, s) in enumerate((
+    extras = [pos(None, "88%02d" % i, "0x" + ("%02d" % i) * 32, t, o, s, opp="89%02d" % i) for i, (t, o, s) in enumerate((
         ("Will Arsenal win the 2026-27 English Premier League (EPL) Championship?", "Yes",
          "epl-2027-champion-20260701200428749"),
         ("Will Bitcoin dip to $80,000 in November?", "Yes", "x"), ("Spread: Lakers (-7.5)", "Hornets", games[1].slug),
@@ -1654,9 +1664,10 @@ def test_properties_over_seeded_worlds(seed, tmp_path, monkeypatch):
     books = [(p, pk) for p, pk in rows(book, "SELECT kalshi_market, pass_key FROM match_reads")]
     assert len(books) == len(set(books))
     match_calls = sum(1 for _t, path, _q in kw.calls if path.endswith("/orderbook"))
-    exits = rows(book, "SELECT count(*) FROM copies WHERE close_kind='exit'")[0][0] + \
-        rows(book, "SELECT count(*) FROM copy_flags WHERE kind='exit_no_bid'")[0][0]
-    assert match_calls == len(books) + exits                 # one book read a market and pass, one an exit close
+    assert match_calls == len(books)                         # ONE book read a market and pass, match or exit
+    for ticker, close_ts in rows(book, "SELECT kalshi_market, close_ts FROM copies WHERE close_kind='exit'"):
+        assert rows(book, "SELECT count(*) FROM match_reads WHERE kalshi_market=? AND stamp=? AND ok=1",
+                    (ticker, close_ts))[0][0] == 1               # priced from THE kept read
 
 
 # ------------------------------------------------------------------ addendum 3: one book read a market and pass
