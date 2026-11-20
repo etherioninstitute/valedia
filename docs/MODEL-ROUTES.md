@@ -7,6 +7,8 @@ profiles' own settings (model and provider lines only; no key was read), the tra
 
 ## 1. The seats that exist today
 
+**2026-11-19, owner: etherion is too slow, so it is OFF for Hermes until he says otherwise.** The default profile no longer names `hs27b` (delegation: only `paid_frontier`, the ChatGPT plan; the two auxiliary entries removed; backup `config.yaml.before-etherion-off-20261119-203909`); `seat-implementer` was told to move off it. The Mac mini (`ultimatetraders-Mac-Mini.local`, LM Link) lists arex-2, prism-ml/bonsai-27b and qwen3.8-27b-splash, none loaded; a model must be loaded ON the mini (never from this Mac: a load that lands here evicts the collector's model) before any route names it. The rows below describe the seats as they were built.
+
 | Seat | Where it runs | State on 2026-11-18 | Fit |
 | --- | --- | --- | --- |
 | `elephant-1` (9B decision model) | THIS Mac, LM Studio | loaded, one slot, 8K window | the order-book collector's own; nothing else may load it down while its test is scored (to 3 Dec) |

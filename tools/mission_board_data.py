@@ -59,7 +59,7 @@ STATUS_NOW = [
     ("Forward copier tests on main", "140 passed", "Gate run, main 063e87d, 8:12 PM 18 Nov", "2026-11-18"),
     ("Paperclip seats on Hermes harness", "3 seats cut over 10:52 PM 18 Nov; 0 runs; nothing assigned", "Paperclip session report", "2026-11-19"),
     ("FreeLLMAPI coding chain", "End to end OK 7:38 PM 18 Nov (Cloudflare GLM-4.7-flash, first try)", "FreeLLMAPI session report", "2026-11-18"),
-    ("Local worker model (etherion, through LM Link)", "hs27b, 262144 window, 2 parallel", "lms ps, 6:55 PM 18 Nov", "2026-11-18"),
+    ("Local worker model", "etherion's hs27b is OFF for Hermes (owner: too slow); the Mac mini's arex-2, bonsai-27b and splash are linked but not loaded", "Owner 19 Nov; lms ls", "2026-11-19"),
     ("Claude weekly limit (owner's figure)", "73% used on 18 Nov at 5:55 PM", "Owner's message", "2026-11-18"),
 ]
 
