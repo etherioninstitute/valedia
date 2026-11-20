@@ -522,6 +522,7 @@ Lessons so far (each is also a "do not repeat"):
 
 ## 11. Valedia beyond the trader (Hermes, messaging, pages, skills)
 
+- **2026-11-19 (read from the Hermes Apex session, 9:45 PM)** `elephant-code-mode`, a Hermes plugin built there (source `~/hermes-apex/plugins/elephant-code-mode`, installed in the DEFAULT profile only, enabled 6:40 PM on the owner's yes, NOT live until he restarts the gateway): a keyword router (no model) plus a risk gate that, in INTERACTIVE sessions only, asks the shared `elephant-1` (`/v1/systemone`, one question, about 600 tokens, one request in flight a process, 1.5 s budget) before a tool call that can change something; it checks `lms ps` for idle and queue 0 first and never loads or unloads. Config touched: plugins.enabled, tools.tool_search.defer, platform_toolsets.cli, one SOUL.md block (backups `.bak-elephant-20261119-184047`). The reducer plugin was never installed; that session built no email triage (whose it is: asked, unknown). It assumes parallel 1. Open: a race where an evicted instance meets a just-in-time-loading server (the classic app has it on). `/v1/systemone` was verified working on the classic app at 9:31 PM.
 - **DONE 2026-11-19 2:41 AM PST** the "Mission" tab inside Hermes Desktop's Live page (the owner's ask: goals,
   to-dos, the path to live trading and the maps in one place, as a tab and not a new button). Built by the
   Paperclip session (page-only install, no gateway restart; reviewed by ChatGPT/Codex through the lead; hardened
