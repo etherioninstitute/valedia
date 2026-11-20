@@ -439,6 +439,14 @@ Items:
   decisions above 8 s, any not ok, or a new overrun or model_load event) pauses the agents and writes `run/overnight-STOP`
   until the lead clears it; the run starts only after the lead's "go" on the plan; report `run/overnight-20261120-report.md`.
   The lead reviews and merges by guarded cherry-pick; nothing from the night is accepted unseen.
+  **RESULT (2:59 AM): HALTED, nothing completed, 0 model tokens, collector untouched.** Watchdog (rules a to f) built and proven both
+  ways, still watching. The first Planner wake was refused by the session's own launcher (a SHA-256 revision digest looked like a key;
+  fixed narrowly, merged `720e526`, blind-checked); then the harness DENIED re-assigning the issue (a peer's relay cannot stand in for
+  the owner's yes to waking seats that talk to gpt-6.2-sol); the session did not work around it. **OWNER, one line each:** (1) yes to
+  sending sandbox code (the pipeline's own tools and tests) to gpt-6.2-sol for the planner and reviewer seats, or a permission rule
+  for it; (2) apply the `HERMES_HOME` sink (branch `cutover-sink`) so Paperclip's skill sync stops linking `paperclip`, `complain`,
+  `suggestion-box` into his default Hermes skills (three links made 2:26 AM, still there, harmless); (3) leakage-checker definition is
+  the lead's to write before a later night. Hand-over: `~/valedia-orchestration/run/overnight-20261120-report.md`.
 - **OWNER** FreeLLMAPI as free hosted capacity for coding workhorses (his request of 2026-11-18 00:00 PST; a
   nested session on Opus 5.5 read the whole repository; nothing installed). Its picks, waiting for his
   answers there: a native run inside a file-access sandbox on 127.0.0.1, NOT Docker for now (the Mac is about
