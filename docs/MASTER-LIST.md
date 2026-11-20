@@ -444,9 +444,11 @@ Items:
   fixed narrowly, merged `720e526`, blind-checked); then the harness DENIED re-assigning the issue (a peer's relay cannot stand in for
   the owner's yes to waking seats that talk to gpt-6.2-sol); the session did not work around it. **OWNER, one line each:** (1) yes to
   sending sandbox code (the pipeline's own tools and tests) to gpt-6.2-sol for the planner and reviewer seats, or a permission rule
-  for it; (2) apply the `HERMES_HOME` sink (branch `cutover-sink`) so Paperclip's skill sync stops linking `paperclip`, `complain`,
-  `suggestion-box` into his default Hermes skills (three links made 2:26 AM, still there, harmless); (3) leakage-checker definition is
-  the lead's to write before a later night. Hand-over: `~/valedia-orchestration/run/overnight-20261120-report.md`.
+  for it; (2) apply the `HERMES_HOME` sink (`cutover --apply`, merged in the orchestration repo, not applied) so Paperclip's skill
+  sync stops linking `paperclip`, `complain`, `suggestion-box` into his default Hermes skills (the three links made 2:26 AM were
+  removed 3:08 AM after a check, and come back on the next seat run until the sink is applied); the watchdog loop is stopped (no seat
+  can run), restart with `bin/overnight-watchdog --every 30`; (3) leakage-checker definition is the lead's to write before a later
+  night. Hand-over: `~/valedia-orchestration/run/overnight-20261120-report.md`.
 - **OWNER** FreeLLMAPI as free hosted capacity for coding workhorses (his request of 2026-11-18 00:00 PST; a
   nested session on Opus 5.5 read the whole repository; nothing installed). Its picks, waiting for his
   answers there: a native run inside a file-access sandbox on 127.0.0.1, NOT Docker for now (the Mac is about
