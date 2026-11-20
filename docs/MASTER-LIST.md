@@ -449,6 +449,13 @@ Items:
   removed 3:08 AM after a check, and come back on the next seat run until the sink is applied); the watchdog loop is stopped (no seat
   can run), restart with `bin/overnight-watchdog --every 30`; (3) leakage-checker definition is the lead's to write before a later
   night. Hand-over: `~/valedia-orchestration/run/overnight-20261120-report.md`.
+  **UPDATE 10:30 AM, owner awake, audit asked:** the pipeline is running (VAL-10 re-assigned 10:17 AM; Planner wrote VAL-11; the Engineer
+  runs on `splash27`; the `HERMES_HOME` sink is applied, his skills folder has no links). Models read from the Hermes session records
+  (Paperclip itself shows "auto, unpriced"): Planner and Reviewer were both gpt-6.2-sol (ChatGPT plan), Engineer `splash27` on the mini.
+  His wish is local except the Reviewer, so `seat-planner` was moved to `splash27` (same route as the implementer, no Grok fallback;
+  backup `profiles/seat-planner/config.yaml.before-local-planner-20261120-102811`; `seat-hermes --check` 7 of 7; a probe plan took
+  43 s and the collector stayed at 3.7 to 3.9 s). Open: the Reviewer's automatic fallback to Grok 4.7 (his call); the watchdog loop is
+  stopped while seats run; 3 decisions lost 5:03 AM, cause unknown (nothing of the pipeline ran then).
 - **OWNER** FreeLLMAPI as free hosted capacity for coding workhorses (his request of 2026-11-18 00:00 PST; a
   nested session on Opus 5.5 read the whole repository; nothing installed). Its picks, waiting for his
   answers there: a native run inside a file-access sandbox on 127.0.0.1, NOT Docker for now (the Mac is about
