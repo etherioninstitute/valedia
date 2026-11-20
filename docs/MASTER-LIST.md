@@ -307,14 +307,14 @@ In flight:
   **Test 19 Nov, 9:31 PM (the owner asked for 4 parallel):** a separately named 4-parallel instance, loaded for about 30 s in the quiet part of
   a minute, cost the collector nothing and routes exactly, but gives NO speed-up (4 requests took 4 times one) and its probabilities differ
   from the 1-parallel instance's by up to 0.057 on identical input: it cannot replace the locked instance. Unloaded again.
-  **Shared copy for other processes (owner, 20 Nov, 12 AM): `elephant-1-trader`, NOT yet usable.** A byte-identical copy (APFS clone, no extra
-  disk) sits in LM Studio's library under `debackerl/elephant-1-trader-Q8_0-GGUF/`, imported with `lms import --hard-link`; the running
-  classic app has not indexed it (`lms ls` and `lms load elephant-1-trader` do not see it; the models folder is a symlink to the SSD, so its
-  watcher likely misses changes). Nothing else was changed; the collector lost nothing. Needs ONE rescan of the app's library (a click on My
-  Models, which the owner declined to let me do, or an app restart, not before 3 Dec). Then: load with the collector's settings in the quiet
-  part of a minute, check identical answers and the 1,869-token state, watch collector latency (baseline 3.86 s) and the GPU. A second
-  instance of the SAME model key under another identifier is not safe beside the scored test (requests naming `elephant-1` could be answered
-  by it). Clients (Apex gate, email triage) switch to `model: elephant-1-trader` only after that load is verified.
+  **Shared copy for other processes (owner, 20 Nov, 1:07 AM): `elephant-1-trader` is LOADED and verified.** A byte-identical copy (APFS clone,
+  no extra disk) in LM Studio's library under `debackerl/elephant-1-trader-Q8_0-GGUF/`; the app indexed it after "Refresh model list" in
+  Library, models-directory menu (its file watcher misses the symlinked models folder). Loaded by REST at second 39 of a minute with
+  context 8192, parallel 1, physical and eval batch 2048 (9.7 s). On the same input `elephant-1` and `elephant-1-trader` give IDENTICAL
+  answers (0.000000 probability difference) at 646, 1,159 and 5,605 input tokens, each deterministic run to run. The collector lost nothing
+  during the test (5 of 5 ok, 3.82 to 3.87 s against a 3.86 s median, 0 overruns). Idle GPU 0 to 8 percent with the collector's usual spikes;
+  system memory free fell from 55 to 32 percent. Other processes name `model: elephant-1-trader` (separate key: requests for `elephant-1`
+  can never reach it); they own the speed they cause (a 5,605-token state takes about 5 s) and must not load a second `elephant-1`.
 - **WATCH** public pick lists as a forecaster (1.19): grading waits for the hand audit of 40 picks; test line
   12 Dec.
 - **WATCH** Reddit chatter against Kalshi prices (1.20): 7 days of hand audit, then 28 days; no evaluation
