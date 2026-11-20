@@ -432,6 +432,13 @@ Items:
   it builds dedicated profiles, a launcher without `--yolo`, walls kept by the operating system, writer and
   checker of different families, failover that stops rather than merging unchecked. Paperclip Runner: its
   verdict so far is not to enable it (Hermes is not a Runner harness; its telemetry is unproven); report due.
+  **Overnight run (owner asleep from about 2 AM, 20 Nov; lead's brief sent to the Paperclip session 1:55 AM):** baseline
+  tag `pre-overnight-20261120` on the trader repo (af9ec61); branch-only (`overnight/<issue>`), no merges or pushes, nothing
+  in the order path; implementer on `splash27` (the mini), planner and reviewer on gpt-6.2-sol, FreeLLMAPI `valedia-coder`
+  for small tickets; at most 4 issues, 90 minutes each, one at a time; a collector watchdog (trip: any of the last 3
+  decisions above 8 s, any not ok, or a new overrun or model_load event) pauses the agents and writes `run/overnight-STOP`
+  until the lead clears it; the run starts only after the lead's "go" on the plan; report `run/overnight-20261120-report.md`.
+  The lead reviews and merges by guarded cherry-pick; nothing from the night is accepted unseen.
 - **OWNER** FreeLLMAPI as free hosted capacity for coding workhorses (his request of 2026-11-18 00:00 PST; a
   nested session on Opus 5.5 read the whole repository; nothing installed). Its picks, waiting for his
   answers there: a native run inside a file-access sandbox on 127.0.0.1, NOT Docker for now (the Mac is about
