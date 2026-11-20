@@ -301,6 +301,9 @@ In flight:
   (23 `model_unavailable` while the app's server was on another port, 10 `tag_mismatch` until the collector's reload at 9:00:24);
   the scored period stands at 53 lost of 4,954; every OK decision carries the same model identity (elephant-1 q8_0, digest
   652c102967ef). The classic app runs with just-in-time loading ACTIVE: to be turned off.
+  **Update 19 Nov, 9:25 PM:** the owner tried to give `elephant-1` 4 parallel slots (a second instance): 7 more decisions lost
+  (about 60 in all). The collector reloads its own instance with parallel 1, context 8192 on any missing or mismatched model;
+  those settings are the locked test's and stay until 3 Dec. He also loaded `ternary-bonsai-2-27b` locally (8.26 GB, 200K context).
 - **WATCH** public pick lists as a forecaster (1.19): grading waits for the hand audit of 40 picks; test line
   12 Dec.
 - **WATCH** Reddit chatter against Kalshi prices (1.20): 7 days of hand audit, then 28 days; no evaluation
