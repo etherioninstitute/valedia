@@ -297,6 +297,10 @@ In flight:
   12:54:51 and quit at 12:57:50, and local inference changed owner both times; the collector's own reload at
   12:59:18 ended it). The earlier blame on Tailscale and LM Link for the 4:53 loss was wrong or incomplete. The
   owner is asked to leave both LM Studio apps alone until 3 Dec.
+  **Update 19 Nov, 9:10 PM:** the owner moved from Bionic to the classic LM Studio app at 8:49 PM; 33 more decisions were lost
+  (23 `model_unavailable` while the app's server was on another port, 10 `tag_mismatch` until the collector's reload at 9:00:24);
+  the scored period stands at 53 lost of 4,954; every OK decision carries the same model identity (elephant-1 q8_0, digest
+  652c102967ef). The classic app runs with just-in-time loading ACTIVE: to be turned off.
 - **WATCH** public pick lists as a forecaster (1.19): grading waits for the hand audit of 40 picks; test line
   12 Dec.
 - **WATCH** Reddit chatter against Kalshi prices (1.20): 7 days of hand audit, then 28 days; no evaluation
