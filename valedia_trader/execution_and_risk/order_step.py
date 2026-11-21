@@ -171,6 +171,17 @@ Live mode (`live`, T22d-1) adds five checks to a ticket run; a practice run neve
    again;
  - the max_capital check works out this ledger's exposure afresh at each order, at the marks the gate has just used.
 
+The shared run (`shared`, T51c S4c; practice only, docs/WEBULL.md "The shared run"): the account is also the owner's,
+and the fund book is judged on its OWN figures (`book_figures`, from the ledger's fills and the owner's entries). Before
+anything is read from the account the state file latches (an owner's entry refuses a run that is not shared: stage
+`state`), its entries are compared with the journal (`state`), every tag with the ledger (`reconcile`) and the book
+must have its opening entry (`targets`). The reconcile is one-sided: the account holding LESS than the book stops the
+run at stage `shortfall` (a skipped session for the ladder); the baseline is never sold, priced or counted. The prices
+come first and the book's value at them is the capital (`--capital` is refused); a held fund far from its last
+`book_nav` mark stops at `marks`; the position limit, the count of positions, the day's loss and the drawdown are the
+book's (the loss and the drawdown on the value per unit, from `book_nav`; the old `equity` table is neither read nor
+written); purchases are bounded by the book's usable cash too; a ticket binds the book's value.
+
 What the summary says for the stake ladder (T34b-2, docs/specs/2026-11-14-caps-ladder-design.md D4, D5, D6, D8):
  - `faults`, a list, only when not empty, on practice and live runs, done or stopped: `reconcile` when the final
    reconcile's own result is not clean for any reason but three (the run still ends as it would): a position
