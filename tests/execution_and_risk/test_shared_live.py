@@ -14,6 +14,7 @@ import argparse
 import json
 import re
 import socket
+import sqlite3
 from decimal import Decimal as D
 
 import pytest
@@ -551,6 +552,7 @@ def test_the_count_of_positions_is_the_books_on_the_live_path(mkl):
 def test_the_day_stop_trips_on_the_loss_of_the_value_per_unit(lw):
     lw.open_book("10000")
     lw.seed_nav("2026-11-12", "1.05", units="10000")      # yesterday the unit was worth 1.05; today the book is at 1.0
+    journal_look(lw, "2026-11-12", "1.05")
     out = lw.propose()
     assert out["status"] == "done" and out["day_stop"]["pct"] == pytest.approx(100 * 0.05 / 1.05, rel=1e-9), out
     assert out["day_stop"]["limit"] == 1.0 and out["day_stop"]["wall"] is False, out
@@ -562,6 +564,7 @@ def test_the_day_stop_trips_on_the_loss_of_the_value_per_unit(lw):
 def test_the_owners_deposits_and_withdrawals_are_no_loss_to_the_live_day_stop(lw):
     lw.open_book("10000")
     lw.seed_nav("2026-11-12", "1.0", units="10000")
+    journal_look(lw, "2026-11-12", "1.0")
     lw.owner("cash_out", "--amount", "5000")              # half the book's money leaves: not a loss
     out = lw.propose()
     assert out["status"] == "done" and "day_stop" not in out and out["refused"] == [], out
@@ -1148,3 +1151,85 @@ def test_a_decimal_signal_while_reading_a_row_is_a_state_fault_in_the_run_and_a_
         code, out_text, err = accept(w, "2026-11-12")
         assert code == 2 and out_text == "" and "nothing was written" in err and "Traceback" not in err, (units, low, err)
         assert w.journal_events("history_accepted") == []
+
+
+# ---- T51c S4d repair round 6: the checks run on every row always; the base a first lost summary is held against
+
+def test_with_no_summary_in_the_journal_every_rows_day_and_figures_are_still_judged(mkl):
+    for day in ("2026-11-12", "2026-11-12z", "2026-11-99"):
+        w = mkl()
+        w.open_book("10000")                              # the book's first live runs: the journal holds no summary
+        w.seed_nav(day, "0.90", None)                     # a hand-inserted row: the opening entry's value per unit is 1
+        out = w.propose()
+        assert out["status"] == "stopped" and out["stage"] == "state", (day, out)
+        assert w.venue.calls == [] and "a person must look" in out["reason"], out["reason"]
+    w = mkl()                                             # the same with only today's summary in the journal
+    w.open_book("10000")
+    journal_look(w, "2026-11-13", "1.00")
+    w.seed_nav("2026-11-12", "0.90", None)
+    assert w.propose()["stage"] == "state"
+
+
+def test_a_row_before_today_with_no_summary_is_held_against_the_opening_base_lower_stops_higher_is_accepted(mkl):
+    low = mkl()
+    low.open_book("10000")
+    low.seed_nav("2026-11-12", "0.90", None)
+    _row(low, batch="lost-first")
+    assert low.propose()["stage"] == "state"
+    code, out, err = accept(low, "2026-11-12")
+    assert code == 2 and "lower than the journal's figure for 2026-11-12" in err and low.journal_events("history_accepted") == []
+    assert low.propose()["stage"] == "state"
+    high = mkl()
+    high.open_book("10000")
+    high.seed_nav("2026-11-12", "1.02", None)
+    _row(high, batch="lost-first")
+    assert high.propose()["stage"] == "state"
+    code, preview, err = accept(high, "2026-11-12")
+    assert code == 0, err
+    assert "the journal holds no summary of 2026-11-12" in preview and "opening" in preview, preview   # where the figure comes from
+    assert "the journal's last summary of 2026-11-12 says" not in preview
+    (number,) = re.findall(r"^code: ([0-9]{6})$", preview, re.M)
+    high.clock.t += 1.0
+    assert accept(high, "2026-11-12", confirm=number)[0] == 0
+    out = high.propose()
+    assert out["status"] == "done" and D(out["shared"]["previous_value_per_unit"]) == D("1.02"), out
+    hand = mkl()                                          # a hand-written line below the base is ignored at run time
+    hand.open_book("10000")
+    hand.seed_nav("2026-11-12", "0.90", None)
+    _row(hand, batch="lost-first")
+    record = {"type": "order_step", "venue": VENUE, "event": "history_accepted", "accepted_day": "2026-11-12",
+              "row_id": 1, "row_batch": "lost-first", "value_per_unit": "0.90", "value_per_unit_high": "0.90",
+              "journal_had": {"value_per_unit": "1", "value_per_unit_high": "1"}, "prev_hash": "", "who": "o", "note": "n"}
+    record["hash"] = osx._accepted_hash(record)
+    hand.journal.write("2026-11-13", record)
+    assert hand.propose()["stage"] == "state"
+
+
+def test_the_preview_of_an_ordinary_day_says_the_journals_last_summary_and_names_the_day(mkl):
+    w = mkl()
+    _three_days(w)
+    _lost(w)
+    code, out, err = accept(w, "2026-11-12")
+    assert code == 0 and "the journal's last summary of 2026-11-12 says" in out, (out, err)
+
+
+def test_a_failed_final_reprice_leaves_the_summary_and_the_row_consistent_and_the_next_run_goes_on(lw, monkeypatch):
+    lw.open_book("10000")
+    out = lw.propose()
+    number = out["ticket_number"]
+    lw.later(1)
+    real = osx.OrderStepState.reprice_book_nav
+
+    def failing(self, row, nav):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(osx.OrderStepState, "reprice_book_nav", failing)    # the final look's reprice (after the purchase)
+    done = lw.approve(number)
+    assert done["status"] == "done" and done["orders_sent"] == 1, done
+    monkeypatch.setattr(osx.OrderStepState, "reprice_book_nav", real)
+    row = lw.nav()[-1]
+    assert done["shared"]["value_per_unit"] == row["value_per_unit"], (done["shared"], row)   # one set of figures
+    assert lw.journal_events("summary")[-1]["shared"]["value_per_unit"] == row["value_per_unit"]
+    assert D(done["broker_equity"]) == D(row["value_low"]) or abs(done["broker_equity"] - float(row["value_low"])) < 1e-9
+    lw.later()
+    out = lw.propose()
+    assert out["status"] in ("done",) and out["stage"] is None, out          # not stopped at `state`

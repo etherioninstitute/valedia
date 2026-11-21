@@ -1188,7 +1188,7 @@ def _decimal_or_none(text) -> Decimal | None:
     return figure if figure.is_finite() else None
 
 
-def _scan_shared_looks(entries, venue: str) -> tuple[list[dict], str, set]:
+def _scan_shared_looks(entries, venue: str, floor: dict | None = None) -> tuple[list[dict], str, set]:
     """T51c S4d: (looks, last_accepted_hash, batches), from the journal's entries in the journal's order.
     `looks`: the shared looks the journal's summaries of `venue` recorded: each summary with a `shared` block that holds
     a finite `value_per_unit` (the lower figure of its last look, the text the run's `book_nav` row holds) gives
@@ -1200,7 +1200,8 @@ def _scan_shared_looks(entries, venue: str) -> tuple[list[dict], str, set]:
     own fields' and its `prev_hash` is the hash of the acceptance before it, AND its figures are not below the day's last
     look before it (lower figure, and upper where known else lower): the tighten rule, read again (a line that only looks
     like an acceptance, or one that would loosen, is ignored and does not move the chain).
-    `batches`: every batch a summary of `venue` names, whatever it holds."""
+    `batches`: every batch a summary of `venue` names, whatever it holds. `floor` (`_entry_base`): what an acceptance of a day
+    with no earlier journaled day is held against."""
     looks, last, batches = [], "", set()
     for e in entries:
         if not (isinstance(e, dict) and e.get("type") == "order_step" and e.get("venue") == venue):
@@ -1211,8 +1212,9 @@ def _scan_shared_looks(entries, venue: str) -> tuple[list[dict], str, set]:
                     and e["hash"] == _accepted_hash(e) and isinstance(e.get("accepted_day"), str)):
                 before = [x for x in looks if x["day"] == e["accepted_day"]]      # the tighten rule, read again here:
                 if not before:                                                     # a day with no look yet: the last day's
-                    earlier = [x for x in looks if x["day"] < e["accepted_day"]]   # figures before it
-                    before = [x for x in earlier if x["day"] == max(y["day"] for y in earlier)] if earlier else []
+                    earlier = [x for x in looks if x["day"] < e["accepted_day"]]   # figures before it, or with no such day
+                    before = ([x for x in earlier if x["day"] == max(y["day"] for y in earlier)] if earlier else
+                              [floor] if floor is not None else [])                # the base book_loss falls back to (`floor`)
                 if before and low >= before[-1]["low"] and (                       # an acceptance counts only when it is
                         high if high is not None else low) >= (                   # not below the day's last figures
                         before[-1]["high"] if before[-1]["high"] is not None else before[-1]["low"]):
@@ -1308,11 +1310,27 @@ def _row_day(row: dict, today: str) -> str:
     return day
 
 
-def _nav_history(rows, looks, today: str) -> dict:
+def _entry_base(entries, today: str):
+    """The value per unit `book_loss` falls back to when no row of an earlier day gives one: the value per unit after the
+    latest owner entry of an earlier day, else after the opening (first) entry, as {"low", "high", "has_high", "entry"} (the
+    one figure for both bounds), or None when there is none. The same choice as book_loss's, in the same order."""
+    before = [e for e in entries or () if str(e["day"]) < today and e.get("value_per_unit_after") is not None]
+    if before:
+        e, what = max(before, key=lambda e: int(e["id"])), "the latest earlier owner entry"
+    elif entries and entries[0].get("value_per_unit_after") is not None:
+        e, what = entries[0], "the opening owner entry (the book was opened today)"
+    else:
+        return None
+    figure = _dec(e["value_per_unit_after"], f"entry {e['id']}'s value per unit")
+    return {"low": figure, "high": figure, "has_high": True, "entry": f"{what}, entry {e['id']}"}
+
+
+def _nav_history(rows, looks, today: str, entries=None) -> dict:
     """T51c S4d: the state file's `book_nav` rows against the journal's looks (see _live_nav_history): {"lacking": the
     days with a look and no row, "changed": per day the look and the day's latest row where they differ, "unheld": the days
     with a row, no look and a place between the last day the journal holds before `today` and `today` (such a row would be
-    the previous value per unit `book_loss` takes: see _live_nav_history), "base": the last look of that last day, "peak":
+    the previous value per unit `book_loss` takes: see _live_nav_history), "base": the last look of that last day, or with
+    no such day the value per unit `book_loss` falls back to (_entry_base: the owner's entries), "peak":
     the highest figure the rows hold (a row's upper figure where finite, else its lower), "seen": the journal's, or None}.
     Every row's day must be a standard date not after `today` (_row_day)."""
     latest, peak = {}, None
@@ -1343,8 +1361,8 @@ def _nav_history(rows, looks, today: str) -> dict:
     earlier = [d for d in last if d < today]
     base_day = max(earlier, default="")
     unheld = sorted(d for d in latest if d not in last and base_day < d < today)
-    return {"lacking": lacking, "changed": changed, "unheld": unheld, "base": last[base_day] if earlier else None,
-            "peak": peak, "seen": seen}
+    base = last[base_day] if earlier else _entry_base(entries, today)       # no earlier journaled day: book_loss's own
+    return {"lacking": lacking, "changed": changed, "unheld": unheld, "base": base, "peak": peak, "seen": seen}
 
 
 def _row_batch_of(rows, day: str):
@@ -1958,9 +1976,10 @@ def _accept_judge(state_path: Path, lines, venue: str, day: str, today: str) -> 
     has no route here (the real state file is put back, or the lead decides by hand). The day must have a look in the
     journal, the state file must have a row of it, the two must differ, and, as an extra refusal that the safety does not
     depend on, the row's run (its batch) must have no summary in the journal at all (a lost summary's row)."""
-    looks, last_hash, batches = _scan_shared_looks(lines, venue)
+    owner_entries = _owner_entries_read_only(state_path)
+    looks, last_hash, batches = _scan_shared_looks(lines, venue, _entry_base(owner_entries, today))
     rows = _nav_rows_read_only(state_path)
-    found = _nav_history(rows, looks, today)
+    found = _nav_history(rows, looks, today, owner_entries)
     mine = [look for look in looks if look["day"] == day]
     if not mine and day not in found["unheld"]:
         return None, (f"the journal holds no shared summary with a value per unit for {day} (an acceptance is of a day the "
@@ -1972,11 +1991,11 @@ def _accept_judge(state_path: Path, lines, venue: str, day: str, today: str) -> 
     if day in found["unheld"]:                            # a row with no summary: held against the last day's figures
         base = found["base"]
         if base is None:
-            return None, (f"the journal holds no figure of an earlier day to hold the row of {day} against; the real state "
-                          "file is needed (or the lead, by hand)")
+            return None, (f"there is no figure (no earlier journaled day, no owner entry's value per unit) to hold the row of "
+                          f"{day} against; the real state file is needed (or the lead, by hand)")
         latest_row = [r for r in rows if r["day"] == day][-1]
         low, high = _row_figures(latest_row)
-        change = {"look": base, "now": {"low": low, "high": high, "row": latest_row}}
+        change = {"look": base, "now": {"low": low, "high": high, "row": latest_row}, "unheld": True}
     elif day not in found["changed"]:
         return None, f"nothing differs for {day}: the state file's latest row of the day reads what the journal's last summary says"
     else:
@@ -2005,8 +2024,13 @@ def _accept_judge(state_path: Path, lines, venue: str, day: str, today: str) -> 
                   "row": [str(c["now"]["low"]), None if c["now"]["high"] is None else str(c["now"]["high"]),
                           int(c["now"]["row"]["id"]), str(c["now"]["row"]["batch"])]}
               for d, c in sorted(found["changed"].items()) if d != day}
+    against = None
+    if change.get("unheld"):
+        against = (f"the journal's last summary of {look['day']}" if "day" in look and "entry" not in look else
+                   f"the value per unit after {look['entry']}, which is what the day stop falls back to when no row of an "
+                   "earlier day gives one")
     return {"day": day, "figures": figures, "last_hash": last_hash, "others": others, "lacking": list(found["lacking"]),
-            "unheld": [d for d in found["unheld"] if d != day], "look": look, "now": now}, None
+            "unheld": [d for d in found["unheld"] if d != day], "look": look, "now": now, "against": against}, None
 
 
 def _accept_code(venue: str, info: dict) -> str:
@@ -2086,8 +2110,12 @@ def accept_history_command(args, paths, clock: Callable[[], float] | None = None
     if confirm is None:
         f, had = info["figures"], info["figures"]["journal_had"]
         print(f"preview: accept the state file's latest book_nav row of {day} as the day's figure, for {venue}; NOTHING was written")
-        print(f"  the journal's last summary of {day} says: value per unit {had['value_per_unit']} (upper "
-              f"{had['value_per_unit_high'] if info['look']['has_high'] else 'not journaled'})")
+        if info["against"] is None:
+            print(f"  the journal's last summary of {day} says: value per unit {had['value_per_unit']} (upper "
+                  f"{had['value_per_unit_high'] if info['look']['has_high'] else 'not journaled'})")
+        else:
+            print(f"  the journal holds no summary of {day}; the row is held against {info['against']}: value per unit "
+                  f"{had['value_per_unit']} (upper {had['value_per_unit_high'] if info['look']['has_high'] else 'not journaled'})")
         print(f"  the state file's latest row of {day} (row {f['row_id']}, batch {f['row_batch']}) says: value per unit "
               f"{f['value_per_unit']} (upper {f['value_per_unit_high'] if f['value_per_unit_high'] is not None else 'not known'})")
         print(f"  the row is not below the journal's figure on either bound, and its run has no summary in the journal; this "
@@ -3472,7 +3500,6 @@ class _Run:
         self.live_marks: dict[str, float] = {}           # ... the exposure is worked out again at each order
         self.live_buys: list[float] = []                 # ... with the buys passed so far, in order
         self.journal_peak: float | None = None           # T22d-1 (A4): the highest equity the journal holds for this venue
-        self.journal_looks: list[dict] = []              # T51c S4d (live, shared): the value per unit it holds, look by look
         self._ticket_expired_seen = False                # once a reading is past the ticket's expiry, it stays expired
         self.disagreements: list[dict] = []
         self.ticket: dict | None = None                  # approve: the ticket's row; propose: the ticket written
@@ -3935,10 +3962,11 @@ class _Run:
         that cannot be made leaves the row as the last judged look had it."""
         if self.nav_row is None:
             return
+        info, equity, last = dict(self.shared_info), self.broker_equity, self.last_fig
         try:
             self._shared_account(self.in_hand, 0, look=False)
         except Exception:
-            pass
+            self.shared_info, self.broker_equity, self.last_fig = info, equity, last   # the summary says what the row holds
 
     def _shortfall_stop(self, first, second, still: list[dict]) -> str | None:
         """R24: the words of a stop at stage `shortfall`, or None. The ledger stands in the way only because the account
@@ -4140,11 +4168,10 @@ class _Run:
         where it is finite, the drawdown's basis, else its lower) must not be below the journal's. A day with no such
         summary is not required to have a row. Otherwise the run stops at `state`, a fault: a person must look. The old
         `equity` table is not read."""
-        looks = self.journal_looks
-        if not looks:
-            return
+        looks = _scan_shared_looks(self.journal_lines or [], self.name, _entry_base(self.entries, self.day))[0]
+                                                         # (no look at all: the rows' days and figures are still judged)
         try:
-            found = _nav_history(self._nav_rows(), looks, self.day)
+            found = _nav_history(self._nav_rows(), looks, self.day, self.entries)
         except OrderStepError as exc:
             raise _Stop("state", f"the state file's book_nav rows cannot be read the way the day stop and the drawdown read "
                                  f"them: {exc}; nothing is sent") from None
@@ -4152,8 +4179,8 @@ class _Run:
             said = ([f"no book_nav row for {', '.join(found['lacking'][:5])}"] if found["lacking"] else [])
             for day in found["unheld"][:5]:
                 said.append(f"a book_nav row of {day} (batch {_cut(str(_row_batch_of(self._nav_rows(), day)))}) on a day the "
-                            "journal holds no summary for, after the last day it does: it would be taken as the previous "
-                            "value per unit")
+                            "journal holds no summary for, after the last day it does (or with none before today): it would "
+                            "be taken as the previous value per unit")
             for day in list(found["changed"])[:5]:
                 look, now = found["changed"][day]["look"], found["changed"][day]["now"]
                 said.append(f"{day}: the journal's last summary says {_figures_said(look['low'], look['high'], look['has_high'])}, "
@@ -4167,7 +4194,7 @@ class _Run:
                                  f"--venue {self.name} --who WHO --note NOTE (a preview, then --confirm CODE; the command "
                                  "cannot tell a lost summary from a copy, and a lower row has no command route); nothing is sent")
         peak, seen = found["peak"], found["seen"]
-        if peak is None or peak < seen:
+        if seen is not None and (peak is None or peak < seen):
             held = "no value per unit" if peak is None else f"a highest value per unit of {peak}"
             raise _Stop("state", f"the order step's state file holds {held} in its book_nav rows (the upper figure where it "
                                  f"is known) and the journal recorded a value per unit of {seen} for {self.name}: the state "
@@ -4810,8 +4837,8 @@ class _Run:
         self._scan_verdicts(entries)                     # T34b-3: every file, every run (no cut-off)
         self.torn_lines = [{"file": name, "line": n} for name, n, _ in torn]
         if self.live is not None:                        # T22d-1 (A4): the highest equity journaled for this venue
-            if self.shared:                              # T51c S4d (R27): the book's own, the value per unit, in Decimal
-                self.journal_looks = _journal_shared_looks(entries, self.name)
+            if self.shared:                              # T51c S4d (R27): the book's own looks are read from journal_lines
+                pass
             else:
                 keys = {"summary": "broker_equity", "ticket": "equity"}
                 seen = [_as_float(e.get(keys[e.get("event")])) for e in entries if e.get("type") == "order_step"

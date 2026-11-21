@@ -748,8 +748,18 @@ shared run", above), under the four locks and every live rule, with these differ
   before today): such a row stops the run at `state` too ("on a day the journal holds no summary for ... it would be taken as
   the previous value per unit"). A row on a day with no summary that cannot be that base (before the last journaled day, or
   today's own) can only raise the peak and is left alone. The accept command may take such a row, held against the last
-  journaled day's figures by the same tighten rule (never lower on either figure); with no earlier journaled day it has no
-  route. A decimal signal while a row is read (Overflow, Underflow, InvalidOperation, DivisionByZero: units like 1E-999999)
+  journaled day's figures by the same tighten rule (never lower on either figure). **These checks run on every row always,
+  with or without a summary in the journal** (the book's first live runs included): with no journaled day before today the
+  row is held against the value per unit `book_loss` itself falls back to when no row of an earlier day gives one, the value
+  per unit after the latest owner entry of an earlier day, else after the opening entry (the preview names it), and the
+  accept command takes a row at or above it by the same tighten rule, so a lost first summary has a route; a row below it,
+  or with no owner entry's figure to hold it against, has none (the real state file, or the lead by hand). **A known
+  limit, with its stage:** a first day's only summary lost leaves that day's row without a summary, so the next day's FIRST
+  run stops at `state` ("... on a day the journal holds no summary for ..."); the accept command clears it when the row is
+  at or above the opening base, and a lower row has no command route (the lead, by hand). **The run's own last look**
+  (after the final reconcile) updates the row and the summary's figures together: when the reprice fails (a locked or
+  failing state file) the summary is put back to the figures of the row actually written, so the summary and the row never
+  disagree and the next run is not stopped at `state` for it. A decimal signal while a row is read (Overflow, Underflow, InvalidOperation, DivisionByZero: units like 1E-999999)
   is the same `state` fault in the run and a refusal writing nothing in the command, never an `unexpected` stop or a traceback. A day with no such summary (a run that stopped before its
   first look) is not required to have a row. So an older state file put back, or a row removed, changed or ADDED (see below), stops the run at
   `state`, a fault ("the state file lacks the book's value history the journal holds: a copy put back?"): without it, a
