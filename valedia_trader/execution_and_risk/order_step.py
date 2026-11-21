@@ -1169,14 +1169,15 @@ def _nav_rows_of(db) -> list[dict]:
 
 
 def _accepted_hash(record: dict) -> str:
-    """The hash of an owner's acceptance of a day's figure (`history_accepted`, S4d): every field but who, note and the
-    hash itself (the journal's writer may redact the first two, as for an owner's entry), chained by `prev_hash`."""
+    """The hash of an owner's acceptance of a day's figure (`history_accepted`, S4d): every field but the hash itself,
+    who and note included (a line edited afterwards, or one whose who or note the journal's writer redacted, is no longer
+    an acceptance), chained by `prev_hash`. No secret is in it: whoever can write the journal can write a valid line."""
     fields = {k: v for k, v in record.items() if k in _ACCEPTED_FIELDS}
     return hashlib.sha256(json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
 
 
 _ACCEPTED_FIELDS = ("venue", "event", "accepted_day", "row_id", "row_batch", "value_per_unit", "value_per_unit_high",
-                    "journal_had", "prev_hash")
+                    "journal_had", "prev_hash", "who", "note")
 
 
 def _decimal_or_none(text) -> Decimal | None:
@@ -1255,9 +1256,14 @@ def _nav_history(rows, looks) -> dict:
         look, got = last[day], latest.get(day)
         if got is None:
             lacking.append(day)
-        elif got["low"] != look["low"] or (look["has_high"] and got["high"] != look["high"]):
+            continue
+        fits = [look]                                    # the day's latest row reads the last look ...
+        if look.get("accepted"):                         # ... or, when that is an acceptance, the last SUMMARY before it
+            fits += [x for x in looks if x["day"] == day and not x.get("accepted")][-1:]   # (the real state file back)
+        if not any(got["low"] == x["low"] and (not x["has_high"] or got["high"] == x["high"]) for x in fits):
             changed[day] = {"look": look, "now": got}
-    seen = max((look["high"] if look["high"] is not None else look["low"] for look in looks), default=None)
+    seen = max((look["high"] if look["high"] is not None else look["low"] for look in looks if not look.get("accepted")),
+               default=None)                              # an acceptance is of a row the state file holds: no peak of its own
     return {"lacking": lacking, "changed": changed, "peak": peak, "seen": seen}
 
 
@@ -1861,12 +1867,13 @@ def _nav_rows_read_only(path: Path) -> list[dict]:
 
 def _accept_judge(state_path: Path, lines, venue: str, day: str) -> tuple[dict | None, str | None]:
     """T51c S4d: what accepting the state file's latest `book_nav` row of `day` as the day's figure would write, or why not.
-    Only a row the journal does not know a summary of can be accepted: the day must have a look in the journal, the state
-    file must have a row of it, the two must differ, and the row's run (its batch) must have no summary in the journal at
-    all, which is what a summary that never reached the journal looks like (the row was written at the run's first look and
-    the run ended, or died, before its summary). A row of a run whose summary the journal DOES hold that differs from it is
-    not a lost summary's: it is an older state file put back, or a row changed, and accepting it could lower the figure the
-    day stop and the drawdown are judged from, so it is refused: only the real state file clears it."""
+    AN ACCEPTANCE MAY ONLY TIGHTEN, NEVER LOOSEN: the row's lower figure and its upper figure (the day stop's base; the lower
+    where the upper is not known) must both be at least the journal's last figures of the day (an earlier acceptance of the
+    day is the journal's last figure). A row lower on either is refused: accepting it would loosen the day stop and the
+    drawdown, and the command cannot tell a real fall between a summary and a lost one from a copy put back, so a lower row
+    has no route here (the real state file is put back, or the lead decides by hand). The day must have a look in the
+    journal, the state file must have a row of it, the two must differ, and, as an extra refusal that the safety does not
+    depend on, the row's run (its batch) must have no summary in the journal at all (a lost summary's row)."""
     looks, last_hash, batches = _scan_shared_looks(lines, venue)
     mine = [look for look in looks if look["day"] == day]
     if not mine:
@@ -1881,25 +1888,39 @@ def _accept_judge(state_path: Path, lines, venue: str, day: str) -> tuple[dict |
         return None, f"nothing differs for {day}: the state file's latest row of the day reads what the journal's last summary says"
     look, now = found["changed"][day]["look"], found["changed"][day]["now"]
     row = now["row"]
+    with localcontext() as ctx:
+        ctx.prec = _BOOK_PREC
+        jbasis = look["high"] if look["high"] is not None else look["low"]
+        rbasis = now["high"] if now["high"] is not None else now["low"]
+        lower = now["low"] < look["low"] or rbasis < jbasis
+    if lower:
+        return None, (f"the row is lower than the journal's figure for {day} (the row reads {_figures_said(now['low'], now['high'])}"
+                      f", the journal's last figure {_figures_said(look['low'], look['high'], look['has_high'])}); accepting it would "
+                      "loosen the day stop and the drawdown; put the real state file back, or ask the lead (a lower row, a real "
+                      "fall between a summary and a lost one or a copy, has no command route)")
     if row["batch"] in batches:
-        return None, (f"the state file's latest row of {day} (batch {_cut(str(row['batch']))}) belongs to a run whose summary "
-                      "the journal holds, so it is not a summary that never reached the journal: it is an older state file "
-                      "put back (a copy) or a row changed, and accepting it could lower the day's figure the day stop and "
-                      "the drawdown are judged from; only the real state file clears it")
+        return None, (f"the state file's latest row of {day} (batch {_cut(str(row['batch']))}) belongs to a run whose summary the "
+                      "journal holds: an acceptance is only of the row of a run the journal has no summary of; put the real "
+                      "state file back")
     figures = {"row_id": int(row["id"]), "row_batch": str(row["batch"]), "value_per_unit": str(now["low"]),
                "value_per_unit_high": None if now["high"] is None else str(now["high"]),
                "journal_had": {"value_per_unit": str(look["low"]),
                                "value_per_unit_high": None if look["high"] is None else str(look["high"])}}
-    others = sorted(d for d in found["changed"] if d != day) + [d for d in found["lacking"]]
-    return {"day": day, "figures": figures, "last_hash": last_hash, "others": others, "look": look, "now": now}, None
+    others = {d: {"journal": [str(c["look"]["low"]), None if c["look"]["high"] is None else str(c["look"]["high"])],
+                  "row": [str(c["now"]["low"]), None if c["now"]["high"] is None else str(c["now"]["high"]),
+                          int(c["now"]["row"]["id"]), str(c["now"]["row"]["batch"])]}
+              for d, c in sorted(found["changed"].items()) if d != day}
+    return {"day": day, "figures": figures, "last_hash": last_hash, "others": others, "lacking": list(found["lacking"]),
+            "look": look, "now": now}, None
 
 
 def _accept_code(venue: str, info: dict) -> str:
-    """The six digits that bind a confirm to the preview it came from: a digest of exactly what the preview shows (the
-    venue, the day, the row and its figures, the journal's figures, the chain's last hash). Run again, the command
-    recomputes it from the files as they are: a code that does not match means something changed or the code is wrong."""
-    text = json.dumps({"venue": venue, "day": info["day"], "figures": info["figures"], "last_hash": info["last_hash"]},
-                      sort_keys=True, separators=(",", ":"))
+    """The six digits that bind a confirm to the preview it came from: a digest of everything the preview shows (the venue,
+    the day, the row and its figures, the journal's figures, the chain's last hash, and every other day that differs or
+    lacks a row, with its figures). Run again, the command recomputes it from the files as they are: a code that does not
+    match means something changed, on any listed day, or the code is wrong."""
+    text = json.dumps({"venue": venue, "day": info["day"], "figures": info["figures"], "last_hash": info["last_hash"],
+                       "others": info["others"], "lacking": info["lacking"]}, sort_keys=True, separators=(",", ":"))
     return f"{int(hashlib.sha256(text.encode()).hexdigest(), 16) % 10 ** 6:06d}"
 
 
@@ -1968,9 +1989,13 @@ def accept_history_command(args, paths, clock: Callable[[], float] | None = None
               f"{had['value_per_unit_high'] if info['look']['has_high'] else 'not journaled'})")
         print(f"  the state file's latest row of {day} (row {f['row_id']}, batch {f['row_batch']}) says: value per unit "
               f"{f['value_per_unit']} (upper {f['value_per_unit_high'] if f['value_per_unit_high'] is not None else 'not known'})")
-        print("  that row's run has no summary in the journal: a summary that never reached it (not an older state file put back)")
-        if info["others"]:
-            print(f"  still differing, and still stopping the run after this: {', '.join(info['others'][:10])}")
+        print(f"  the row is not below the journal's figure on either bound, and its run has no summary in the journal; this "
+              "command does not tell a summary that never reached the journal from anything else that makes the row differ: it "
+              "only ever takes a row that tightens the day stop and the drawdown")
+        if info["others"] or info["lacking"]:
+            listed = [*(f"{d} (row {c['row'][2]}, batch {c['row'][3]}: {c['row'][0]}; the journal {c['journal'][0]})"
+                        for d, c in info["others"].items()), *(f"{d} (no row)" for d in info["lacking"])]
+            print(f"  still differing, and still stopping the run after this (the code covers them): {'; '.join(listed[:10])}")
         print(f"to write it, run the same command again with --confirm {code}; it writes one journal line and nothing else")
         print(f"code: {code}")
         return 0
@@ -4027,9 +4052,10 @@ class _Run:
             raise _Stop("state", f"the state file lacks the book's value history the journal holds: a copy put back? Or a run's "
                                  f"summary that never reached the journal (its row is in the state file, its summary is not "
                                  f"in the journal)? ({'; '.join(said)}), so the day's loss and the drawdown cannot be judged; "
-                                 "a person must look: a copy put back is cured only by the real state file; a lost summary is "
-                                 "accepted by the owner with order-step --live --accept-history DAY --venue "
-                                 f"{self.name} --who WHO --note NOTE (a preview, then --confirm CODE); nothing is sent")
+                                 "a person must look: a copy put back is cured only by the real state file; a row that is not below "
+                                 "the journal's figure may be accepted by the owner with order-step --live --accept-history DAY "
+                                 f"--venue {self.name} --who WHO --note NOTE (a preview, then --confirm CODE; the command "
+                                 "cannot tell a lost summary from a copy, and a lower row has no command route); nothing is sent")
         peak, seen = found["peak"], found["seen"]
         if peak is None or peak < seen:
             held = "no value per unit" if peak is None else f"a highest value per unit of {peak}"
