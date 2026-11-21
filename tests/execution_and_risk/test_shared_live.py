@@ -1066,3 +1066,85 @@ def test_a_hand_written_acceptance_below_the_journals_summary_is_ignored_when_th
     _row(other, batch="lost-x")
     other.journal.write("2026-11-13", ok)
     assert other.propose()["status"] == "done"
+
+
+# ---- T51c S4d repair round 5: every row's day is a real date not after today; a row no journal day holds; decimal signals
+
+def test_a_row_whose_day_is_not_a_standard_date_or_is_after_today_is_a_state_fault_and_is_never_accepted(mkl):
+    for odd in ("2026-11-12z", "2026-11-12 ", "2026-02-30", "2026-11-14", "20261112", "2026-1-12", "", "2026-11-12\n"):
+        w = mkl()
+        _three_days(w)
+        w.seed_nav(odd, "0.90", None)                     # a hand-inserted row at 0.90: the real 11-12 row still matches
+        out = w.propose()
+        assert out["status"] == "stopped" and out["stage"] == "state", (odd, out)
+        assert "a person must look" in out["reason"] and "day" in out["reason"], (odd, out["reason"])
+        assert w.venue.calls == []
+        before = {p.name: p.read_bytes() for p in (w.tmp / "journal").glob("*.jsonl")}
+        for day in ("2026-11-12", odd.strip() or "2026-11-12"):
+            if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", day):
+                continue
+            code, out_text, err = accept(w, day)
+            assert code == 2 and out_text == "" and "nothing was written" in err and "Traceback" not in err, (odd, day, err)
+        assert {p.name: p.read_bytes() for p in (w.tmp / "journal").glob("*.jsonl")} == before
+        assert w.journal_events("history_accepted") == []
+
+
+def test_a_row_of_a_day_the_journal_holds_no_summary_for_that_could_become_the_previous_figure_is_a_fault(mkl):
+    w = mkl()
+    w.open_book("10000")
+    history(w, [("2026-11-10", "1.05", None)])
+    w.seed_nav("2026-11-12", "0.90", None)               # added: no summary of 11-12, after the last day the journal holds
+    out = w.propose()                                     # (book_loss would take it as the previous value per unit)
+    assert out["status"] == "stopped" and out["stage"] == "state", out
+    assert "2026-11-12" in out["reason"] and "no summary" in out["reason"] and "previous value per unit" in out["reason"], out
+    code, _, err = accept(w, "2026-11-12")                # lower than the last day's figure: no route
+    assert code == 2 and "lower than the journal's figure" in err and w.journal_events("history_accepted") == []
+    assert w.propose()["stage"] == "state"
+
+
+def test_a_row_on_a_day_without_a_summary_that_cannot_be_the_previous_figure_is_harmless(mkl):
+    w = mkl()
+    w.open_book("10000")
+    history(w, [("2026-11-10", "1.05", None), ("2026-11-12", "1.05", None)])
+    w.seed_nav("2026-11-11", "0.90", None)               # between two journaled days: 11-12's row is the previous one
+    w.seed_nav("2026-11-13", "0.90", None)               # today's own: never the previous figure
+    out = w.propose()
+    assert out["status"] == "done" and D(out["shared"]["previous_value_per_unit"]) == D("1.05"), out
+
+
+def test_an_unheld_days_higher_row_is_accepted_against_the_last_days_figure_and_the_run_goes_on(mkl):
+    w = mkl()
+    w.open_book("10000")
+    history(w, [("2026-11-10", "1.05", None)])
+    w.seed_nav("2026-11-12", "1.07", None)               # a run of 11-12 whose summary never reached the journal
+    _row(w, batch="lost-run")
+    assert w.propose()["stage"] == "state"
+    accepted(w, "2026-11-12")
+    (line,) = w.journal_events("history_accepted")
+    assert line["accepted_day"] == "2026-11-12" and D(line["journal_had"]["value_per_unit"]) == D("1.05")
+    out = w.propose()
+    assert out["status"] == "done" and D(out["shared"]["previous_value_per_unit"]) == D("1.07"), out
+    other = mkl()                                         # a hand-written line for such a day, below the last day's figure
+    other.open_book("10000")
+    history(other, [("2026-11-10", "1.05", None)])
+    other.seed_nav("2026-11-12", "0.90", None)
+    _row(other, batch="lost-run")
+    record = {"type": "order_step", "venue": VENUE, "event": "history_accepted", "accepted_day": "2026-11-12",
+              "row_id": 2, "row_batch": "lost-run", "value_per_unit": "0.90", "value_per_unit_high": "0.90",
+              "journal_had": {"value_per_unit": "1.05", "value_per_unit_high": "1.05"}, "prev_hash": "", "who": "o", "note": "n"}
+    record["hash"] = osx._accepted_hash(record)
+    other.journal.write("2026-11-13", record)
+    assert other.propose()["stage"] == "state"
+
+
+def test_a_decimal_signal_while_reading_a_row_is_a_state_fault_in_the_run_and_a_refusal_in_the_command(mkl):
+    for units, low in (("1E-999999", "1E+999999"), ("1E+999999", "1E-999999"), ("1E+999999", "1E+999999")):
+        w = mkl()
+        _three_days(w)
+        _row(w, units_outstanding=units, value_low=low, value_high=None)
+        out = w.propose()
+        assert out["status"] == "stopped" and out["stage"] == "state", (units, low, out)       # not `unexpected`
+        assert "2026-11-12" in out["reason"] and "a person must look" in out["reason"], out["reason"]
+        code, out_text, err = accept(w, "2026-11-12")
+        assert code == 2 and out_text == "" and "nothing was written" in err and "Traceback" not in err, (units, low, err)
+        assert w.journal_events("history_accepted") == []

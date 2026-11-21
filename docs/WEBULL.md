@@ -738,8 +738,20 @@ shared run", above), under the four locks and every live rule, with these differ
   decision. A row whose text disagrees with `value_low` over the units (the writer stores that very quotient, at 60
   digits, so they are equal exactly, with no rounding between them), or whose units, `value_low`, `value_high` or text are
   not finite numbers (NaN, words), or whose units are not above nothing, or whose `value_high` is below its `value_low`,
-  stops the run at `state`, a fault, in words, and the accept command refuses it, writing nothing. A day with no such summary (a run that stopped before its
-  first look) is not required to have a row. So an older state file put back, or a row removed or changed, stops the run at
+  stops the run at `state`, a fault, in words, and the accept command refuses it, writing nothing.
+  **Every row's day** must be a standard date: exactly `YYYY-MM-DD`, a real calendar date, and not after the run's New York
+  session day; anything else ('2026-11-12z', '2026-11-12 ', '2026-02-30', a future day) is the same `state` fault, because the
+  history check looks days up as text and `book_loss` orders them as text, so a day that only looks like a date would
+  escape the one and sort after the real day in the other. **An added row** on a standard date can lower the base
+  `book_loss` uses (the previous value per unit is the upper figure of the latest row of an earlier day) when the journal
+  holds no summary of its day and the day lies after the last journaled day before today (or there is no journaled day
+  before today): such a row stops the run at `state` too ("on a day the journal holds no summary for ... it would be taken as
+  the previous value per unit"). A row on a day with no summary that cannot be that base (before the last journaled day, or
+  today's own) can only raise the peak and is left alone. The accept command may take such a row, held against the last
+  journaled day's figures by the same tighten rule (never lower on either figure); with no earlier journaled day it has no
+  route. A decimal signal while a row is read (Overflow, Underflow, InvalidOperation, DivisionByZero: units like 1E-999999)
+  is the same `state` fault in the run and a refusal writing nothing in the command, never an `unexpected` stop or a traceback. A day with no such summary (a run that stopped before its
+  first look) is not required to have a row. So an older state file put back, or a row removed, changed or ADDED (see below), stops the run at
   `state`, a fault ("the state file lacks the book's value history the journal holds: a copy put back?"): without it, a
   removed later day would change the previous value per unit and the day stop would be missed. The peak is judged as well:
   the highest figure the rows hold (a row's UPPER figure where it is finite, the drawdown's basis, else its lower) must not

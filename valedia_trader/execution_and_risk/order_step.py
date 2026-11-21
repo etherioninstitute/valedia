@@ -273,7 +273,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, Decimal, InvalidOperation, localcontext
+from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, Decimal, DecimalException, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Callable
 
@@ -1210,6 +1210,9 @@ def _scan_shared_looks(entries, venue: str) -> tuple[list[dict], str, set]:
             if (low is not None and e.get("prev_hash") == last and isinstance(e.get("hash"), str)
                     and e["hash"] == _accepted_hash(e) and isinstance(e.get("accepted_day"), str)):
                 before = [x for x in looks if x["day"] == e["accepted_day"]]      # the tighten rule, read again here:
+                if not before:                                                     # a day with no look yet: the last day's
+                    earlier = [x for x in looks if x["day"] < e["accepted_day"]]   # figures before it
+                    before = [x for x in earlier if x["day"] == max(y["day"] for y in earlier)] if earlier else []
                 if before and low >= before[-1]["low"] and (                       # an acceptance counts only when it is
                         high if high is not None else low) >= (                   # not below the day's last figures
                         before[-1]["high"] if before[-1]["high"] is not None else before[-1]["low"]):
@@ -1245,7 +1248,15 @@ def _row_figures(row: dict) -> tuple[Decimal, Decimal | None]:
     not finite numbers (NaN, text), units that are not above nothing, a value_high below its value_low, and a `value_per_unit`
     text that is not value_low over the units (the writer stores `value / units_outstanding` from the same division at
     _BOOK_PREC digits, so the two are equal exactly, with no rounding allowed between them)."""
-    where = f"book_nav row {row.get('id')} of {row.get('day')}"
+    try:
+        return _row_figures_unguarded(row)
+    except DecimalException as exc:                      # Overflow, Underflow, InvalidOperation, DivisionByZero ...
+        raise OrderStepError(f"book_nav row {row.get('id')} of {_cut(repr(row.get('day')))} cannot be read as the day stop "
+                             f"reads it ({type(exc).__name__}: its figures are out of range); a person must look") from None
+
+
+def _row_figures_unguarded(row: dict) -> tuple[Decimal, Decimal | None]:
+    where = f"book_nav row {row.get('id')} of {_cut(repr(row.get('day')))}"
 
     def need(key: str, optional: bool = False):
         raw = row.get(key)
@@ -1276,14 +1287,39 @@ def _row_figures(row: dict) -> tuple[Decimal, Decimal | None]:
     return low, high
 
 
-def _nav_history(rows, looks) -> dict:
+_ROW_DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def _row_day(row: dict, today: str) -> str:
+    """A `book_nav` row's day, which must be a standard date: exactly YYYY-MM-DD and a real calendar date, and not after
+    `today` (the run's New York session day). The history check looks days up as text and `book_loss` orders them as text,
+    so a day that only looks like a date ('2026-11-12z', '2026-11-12 ', '2026-02-30') would escape the one and sort oddly in
+    the other. Anything else is OrderStepError in words: a state fault, a person must look."""
+    day = row.get("day")
+    where = f"book_nav row {row.get('id')} of the day {_cut(repr(day))}"
+    if not (isinstance(day, str) and _ROW_DAY.fullmatch(day)):
+        raise OrderStepError(f"{where}: a row's day must be exactly YYYY-MM-DD; a person must look")
+    try:
+        date.fromisoformat(day)
+    except ValueError:
+        raise OrderStepError(f"{where}: that is not a real calendar date; a person must look") from None
+    if day > today:
+        raise OrderStepError(f"{where}: that day is after today's session day {today}; a person must look")
+    return day
+
+
+def _nav_history(rows, looks, today: str) -> dict:
     """T51c S4d: the state file's `book_nav` rows against the journal's looks (see _live_nav_history): {"lacking": the
-    days with a look and no row, "changed": per day the look and the day's latest row where they differ, "peak": the
-    highest figure the rows hold (a row's upper figure where finite, else its lower), "seen": the journal's, or None}."""
+    days with a look and no row, "changed": per day the look and the day's latest row where they differ, "unheld": the days
+    with a row, no look and a place between the last day the journal holds before `today` and `today` (such a row would be
+    the previous value per unit `book_loss` takes: see _live_nav_history), "base": the last look of that last day, "peak":
+    the highest figure the rows hold (a row's upper figure where finite, else its lower), "seen": the journal's, or None}.
+    Every row's day must be a standard date not after `today` (_row_day)."""
     latest, peak = {}, None
     with localcontext() as ctx:
         ctx.prec = _BOOK_PREC
         for row in rows:                                 # by id: a later row of a day replaces an earlier one
+            _row_day(row, today)
             low, high = _row_figures(row)                # the day stop's own basis, value_low and value_high over units
             basis = high if high is not None else low
             peak = basis if peak is None or basis > peak else peak
@@ -1304,7 +1340,15 @@ def _nav_history(rows, looks) -> dict:
             changed[day] = {"look": look, "now": got}
     seen = max((look["high"] if look["high"] is not None else look["low"] for look in looks if not look.get("accepted")),
                default=None)                              # an acceptance is of a row the state file holds: no peak of its own
-    return {"lacking": lacking, "changed": changed, "peak": peak, "seen": seen}
+    earlier = [d for d in last if d < today]
+    base_day = max(earlier, default="")
+    unheld = sorted(d for d in latest if d not in last and base_day < d < today)
+    return {"lacking": lacking, "changed": changed, "unheld": unheld, "base": last[base_day] if earlier else None,
+            "peak": peak, "seen": seen}
+
+
+def _row_batch_of(rows, day: str):
+    return [r["batch"] for r in rows if r["day"] == day][-1]
 
 
 def _figures_said(low, high, has_high=True) -> str:
@@ -1905,7 +1949,7 @@ def _nav_rows_read_only(path: Path) -> list[dict]:
         db.close()
 
 
-def _accept_judge(state_path: Path, lines, venue: str, day: str) -> tuple[dict | None, str | None]:
+def _accept_judge(state_path: Path, lines, venue: str, day: str, today: str) -> tuple[dict | None, str | None]:
     """T51c S4d: what accepting the state file's latest `book_nav` row of `day` as the day's figure would write, or why not.
     AN ACCEPTANCE MAY ONLY TIGHTEN, NEVER LOOSEN: the row's lower figure and its upper figure (the day stop's base; the lower
     where the upper is not known) must both be at least the journal's last figures of the day (an earlier acceptance of the
@@ -1915,18 +1959,29 @@ def _accept_judge(state_path: Path, lines, venue: str, day: str) -> tuple[dict |
     journal, the state file must have a row of it, the two must differ, and, as an extra refusal that the safety does not
     depend on, the row's run (its batch) must have no summary in the journal at all (a lost summary's row)."""
     looks, last_hash, batches = _scan_shared_looks(lines, venue)
-    mine = [look for look in looks if look["day"] == day]
-    if not mine:
-        return None, (f"the journal holds no shared summary with a value per unit for {day} (an acceptance is of a day the "
-                      "journal holds)")
     rows = _nav_rows_read_only(state_path)
-    found = _nav_history(rows, looks)
+    found = _nav_history(rows, looks, today)
+    mine = [look for look in looks if look["day"] == day]
+    if not mine and day not in found["unheld"]:
+        return None, (f"the journal holds no shared summary with a value per unit for {day} (an acceptance is of a day the "
+                      "journal holds, or of a day with a row that the journal has no summary for, after the last day it "
+                      "does)")
     if day in found["lacking"]:
         return None, (f"the state file has no book_nav row for {day}: a row that is not there cannot be accepted (a state "
                       "file put back is cured only by the real state file)")
-    if day not in found["changed"]:
+    if day in found["unheld"]:                            # a row with no summary: held against the last day's figures
+        base = found["base"]
+        if base is None:
+            return None, (f"the journal holds no figure of an earlier day to hold the row of {day} against; the real state "
+                          "file is needed (or the lead, by hand)")
+        latest_row = [r for r in rows if r["day"] == day][-1]
+        low, high = _row_figures(latest_row)
+        change = {"look": base, "now": {"low": low, "high": high, "row": latest_row}}
+    elif day not in found["changed"]:
         return None, f"nothing differs for {day}: the state file's latest row of the day reads what the journal's last summary says"
-    look, now = found["changed"][day]["look"], found["changed"][day]["now"]
+    else:
+        change = found["changed"][day]
+    look, now = change["look"], change["now"]
     row = now["row"]
     with localcontext() as ctx:
         ctx.prec = _BOOK_PREC
@@ -1951,7 +2006,7 @@ def _accept_judge(state_path: Path, lines, venue: str, day: str) -> tuple[dict |
                           int(c["now"]["row"]["id"]), str(c["now"]["row"]["batch"])]}
               for d, c in sorted(found["changed"].items()) if d != day}
     return {"day": day, "figures": figures, "last_hash": last_hash, "others": others, "lacking": list(found["lacking"]),
-            "look": look, "now": now}, None
+            "unheld": [d for d in found["unheld"] if d != day], "look": look, "now": now}, None
 
 
 def _accept_code(venue: str, info: dict) -> str:
@@ -1960,7 +2015,8 @@ def _accept_code(venue: str, info: dict) -> str:
     lacks a row, with its figures). Run again, the command recomputes it from the files as they are: a code that does not
     match means something changed, on any listed day, or the code is wrong."""
     text = json.dumps({"venue": venue, "day": info["day"], "figures": info["figures"], "last_hash": info["last_hash"],
-                       "others": info["others"], "lacking": info["lacking"]}, sort_keys=True, separators=(",", ":"))
+                       "others": info["others"], "lacking": info["lacking"], "unheld": info["unheld"]},
+                      sort_keys=True, separators=(",", ":"))
     return f"{int(hashlib.sha256(text.encode()).hexdigest(), 16) % 10 ** 6:06d}"
 
 
@@ -2020,8 +2076,8 @@ def accept_history_command(args, paths, clock: Callable[[], float] | None = None
     def judged() -> tuple[dict | None, str | None]:
         try:
             lines = Journal(journal_dir).read() if journal_dir.is_dir() else []
-            return _accept_judge(state_path, lines, venue, day)
-        except (OrderStepError, sqlite3.Error, OSError) as exc:
+            return _accept_judge(state_path, lines, venue, day, today)
+        except (OrderStepError, sqlite3.Error, OSError, DecimalException) as exc:
             return None, _cut(str(exc), 600)
     info, why = judged()
     if why is not None:
@@ -2037,9 +2093,10 @@ def accept_history_command(args, paths, clock: Callable[[], float] | None = None
         print(f"  the row is not below the journal's figure on either bound, and its run has no summary in the journal; this "
               "command does not tell a summary that never reached the journal from anything else that makes the row differ: it "
               "only ever takes a row that tightens the day stop and the drawdown")
-        if info["others"] or info["lacking"]:
+        if info["others"] or info["lacking"] or info["unheld"]:
             listed = [*(f"{d} (row {c['row'][2]}, batch {c['row'][3]}: {c['row'][0]}; the journal {c['journal'][0]})"
-                        for d, c in info["others"].items()), *(f"{d} (no row)" for d in info["lacking"])]
+                        for d, c in info["others"].items()), *(f"{d} (no row)" for d in info["lacking"]),
+                      *(f"{d} (a row, and no summary in the journal)" for d in info["unheld"])]
             print(f"  still differing, and still stopping the run after this (the code covers them): {'; '.join(listed[:10])}")
         print(f"to write it, run the same command again with --confirm {code}; it writes one journal line and nothing else")
         print(f"code: {code}")
@@ -4087,12 +4144,16 @@ class _Run:
         if not looks:
             return
         try:
-            found = _nav_history(self._nav_rows(), looks)
+            found = _nav_history(self._nav_rows(), looks, self.day)
         except OrderStepError as exc:
             raise _Stop("state", f"the state file's book_nav rows cannot be read the way the day stop and the drawdown read "
                                  f"them: {exc}; nothing is sent") from None
-        if found["lacking"] or found["changed"]:
+        if found["lacking"] or found["changed"] or found["unheld"]:
             said = ([f"no book_nav row for {', '.join(found['lacking'][:5])}"] if found["lacking"] else [])
+            for day in found["unheld"][:5]:
+                said.append(f"a book_nav row of {day} (batch {_cut(str(_row_batch_of(self._nav_rows(), day)))}) on a day the "
+                            "journal holds no summary for, after the last day it does: it would be taken as the previous "
+                            "value per unit")
             for day in list(found["changed"])[:5]:
                 look, now = found["changed"][day]["look"], found["changed"][day]["now"]
                 said.append(f"{day}: the journal's last summary says {_figures_said(look['low'], look['high'], look['has_high'])}, "
