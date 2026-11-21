@@ -727,11 +727,17 @@ shared run", above), under the four locks and every live rule, with these differ
   upper value is not known (no upper bound) is refused the same way: it cannot be shown to be at most the ceiling.
   The per-order checks (`max_order_value`, the money at work against `max_capital`, the second price source on every
   mark held and every order's quote) are as before; the money at work is the BOOK's holdings.
-- *The state file's counters* (T22d-1 A4) read the book's own figures: the `book_nav` rows must know at least the
-  highest value per unit the journal's summaries of this venue recorded (`shared.value_per_unit`, the lower figure each
-  look writes, the same text the row holds), both exact decimals compared as decimals (never an SQL MAX over text); a
-  state file that knows less (an older copy put back) stops the run at `state`. A ticket's `equity` is not counted in a
-  shared run (a later look may lower the row it was made at). The old `equity` table is neither read nor written.
+- *The state file's value history* (T22d-1 A4, for the book), judged before anything is read from the account: every New
+  York day on which this venue's journal holds a shared summary with a value per unit must have a `book_nav` row of that
+  day, and the day's LATEST row must read what the journal's LAST such summary of the day says: the lower value per unit
+  (`shared.value_per_unit`) and the upper one (`shared.value_per_unit_high`, journaled from S4d; None when the upper value
+  was not known), exact decimals compared as decimals, never text. A day with no such summary (a run that stopped before its
+  first look) is not required to have a row. So an older state file put back, or a row removed or changed, stops the run at
+  `state`, a fault ("the state file lacks the book's value history the journal holds: a copy put back?"): without it, a
+  removed later day would change the previous value per unit and the day stop would be missed. The peak is judged as well:
+  the highest figure the rows hold (a row's UPPER figure where it is finite, the drawdown's basis, else its lower) must not
+  be below the journal's, by the same basis, in Decimal (never an SQL MAX over text). A ticket's `equity` is not counted in
+  a shared run (a later look may lower the row it was made at). The old `equity` table is neither read nor written.
 - *The day stop* (T34b-2) is judged on the loss of the value per unit at each look but the run's last, so the owner's
   deposits and withdrawals are never a loss; a loss at or above the working stop refuses every purchase (stage of the
   order: `day stop`), as on the ordinary live account.
@@ -740,6 +746,12 @@ shared run", above), under the four locks and every live rule, with these differ
   approval recomputes the book's value after the prices and refuses beyond `TICKET_QUOTE_MOVE` (R26).
 - *The shortfall (R24), the latch (R25), the marks (R28) and every limit on her book alone (R31)* hold as on practice; the
   owner's own holdings of a fund (the baseline) are never priced or second-sourced.
+
+**Known limits of the live section:** the engine called directly (`run_order_step(live=..., shared=False)`) still runs
+live without shared (unreachable from the command line; a live state file that holds an owner's entry refuses it at
+`state`); `--live --check` is as it was (it judges the locks and sends nothing, and takes no `--shared`); and `--root`
+on the owner's entry names any folder (the entry's state file is that folder's `memory/`, unlike a live run, which reads
+the repository only).
 
 **What is still missing on live:** the alerts on the owner's page and the combined holding per fund (S4e); an owner entry
 kind `mark` for a real move beyond `max_drawdown_pct` (R34, S4e; the `marks` stop stays until a `split` entry or the

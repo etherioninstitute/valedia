@@ -1150,25 +1150,36 @@ def far_quotes(last_row: dict | None, entries, quotes: dict, held, limit_pct) ->
     return out
 
 
-def _journal_vpu_peak(entries, venue: str) -> Decimal | None:
-    """T51c S4d: the highest value per unit (exact decimal) the journal's summaries of `venue` recorded in their `shared`
-    block (the lower figure of a look, the text the run's `book_nav` row holds), or None. A figure that is not a finite
-    decimal is not counted; a ticket's `equity` never is (a later look may lower the row it was made at)."""
-    best = None
+def _journal_shared_looks(entries, venue: str) -> list[dict]:
+    """T51c S4d: the shared looks the journal's summaries of `venue` recorded, in the journal's order: each summary with a
+    `shared` block that holds a finite `value_per_unit` (the lower figure of its last look, the text the run's `book_nav`
+    row holds) gives {"day", "low", "high", "has_high"}: its New York day, the lower figure and the upper one
+    (`value_per_unit_high`, a decimal or None when the upper value was not known; `has_high` False for a summary written
+    before the upper figure was journaled). A summary without a readable figure is not counted (a run that stopped before
+    its first look has none); a ticket's `equity` never is (a later look may lower the row it was made at)."""
+    out = []
     for e in entries:
         if not (isinstance(e, dict) and e.get("type") == "order_step" and e.get("venue") == venue
-                and e.get("event") == "summary" and isinstance(e.get("shared"), dict)):
+                and e.get("event") == "summary" and isinstance(e.get("shared"), dict) and isinstance(e.get("day"), str)):
             continue
-        text = e["shared"].get("value_per_unit")
-        if not isinstance(text, str):
-            continue
+        block = e["shared"]
         try:
-            figure = Decimal(text)
-        except (InvalidOperation, ValueError):
+            low = Decimal(block["value_per_unit"])
+        except (KeyError, InvalidOperation, TypeError, ValueError):
             continue
-        if figure.is_finite() and (best is None or figure > best):
-            best = figure
-    return best
+        if not low.is_finite():
+            continue
+        has_high = "value_per_unit_high" in block
+        high = None
+        if has_high and isinstance(block["value_per_unit_high"], str):
+            try:
+                high = Decimal(block["value_per_unit_high"])
+            except (InvalidOperation, ValueError):
+                high = None
+            if high is not None and not high.is_finite():
+                high = None
+        out.append({"day": e["day"], "low": low, "high": high, "has_high": has_high})
+    return out
 
 
 def _shortfall_figures(shorts: dict) -> dict:
@@ -3099,7 +3110,7 @@ class _Run:
         self.live_marks: dict[str, float] = {}           # ... the exposure is worked out again at each order
         self.live_buys: list[float] = []                 # ... with the buys passed so far, in order
         self.journal_peak: float | None = None           # T22d-1 (A4): the highest equity the journal holds for this venue
-        self.journal_vpu_peak: Decimal | None = None     # T51c S4d (live, shared): the highest value per unit it holds
+        self.journal_looks: list[dict] = []              # T51c S4d (live, shared): the value per unit it holds, look by look
         self._ticket_expired_seen = False                # once a reading is past the ticket's expiry, it stays expired
         self.disagreements: list[dict] = []
         self.ticket: dict | None = None                  # approve: the ticket's row; propose: the ticket written
@@ -3421,6 +3432,8 @@ class _Run:
                                    "--venue NAME ...), written by the owner; nothing is read from the account and nothing "
                                    "is sent")
         self.entries = entries
+        if self.live is not None:                        # T51c S4d (A4 for the book): the value history the journal holds
+            self._live_nav_history()
 
     def _shared_units(self, applied_only: bool = False) -> dict[str, float]:
         """The book's units per symbol after the owner's entries (a units_out, a split), as book_figures reads them: of
@@ -3517,7 +3530,8 @@ class _Run:
         loss = book_loss(self._nav_rows(), self.entries, self.day, low=figures.value_per_unit, high=high)
         self.shared_info.update(
             book_value=float(figures.value), book_value_high=None if figures.value_high is None else float(figures.value_high),
-            value_per_unit=str(figures.value_per_unit), units_outstanding=str(figures.units_outstanding),
+            value_per_unit=str(figures.value_per_unit), value_per_unit_high=None if high is None else str(high),
+            units_outstanding=str(figures.units_outstanding),
             cash_bounded=figures.cash_bounded, fees_taken_as_none=figures.fees_taken_as_none,
             fees_bounded={"count": len(figures.bounded_orders), "orders": sorted(_cut(t) for t in figures.bounded_orders)[:20]},
             day_loss_pct=float(loss.daily_loss_pct), drawdown_pct=float(loss.drawdown_pct),
@@ -3744,9 +3758,8 @@ class _Run:
                                  f"{self.day} and the order ledger holds {on_ledger} sent that day: the state file knows "
                                  "less than the ledger (an older copy put back?), so the day's cap cannot be judged; "
                                  "a person must look; nothing is sent")
-        if self.shared:                                  # T51c S4d (R27): the book's own figures, never the equity table
-            self._live_nav_peak()
-            return
+        if self.shared:                                  # T51c S4d (R27): the book's own figures, never the equity table:
+            return                                       # judged in `_latch`, before anything is read from the account
         peak, seen = self.state.peak(), self.journal_peak
         if seen is not None and (peak is None or peak < seen):
             held = "no equity" if peak is None else f"an equity peak of {peak:,.2f}"
@@ -3754,29 +3767,56 @@ class _Run:
                                  f"{seen:,.2f} for {self.name}: the state file knows less than the journal (an older copy "
                                  "put back?), so the drawdown cannot be judged; a person must look; nothing is sent")
 
-    def _live_nav_peak(self) -> None:
-        """T51c S4d (A4 for the shared book, R27): the state file's `book_nav` rows must know at least the value per unit
-        the journal's summaries of this venue recorded (the lower figure each look wrote, the same text the row holds),
-        or an older state file put back would lower the peak the drawdown is judged against. Both are exact decimals,
-        compared as such: never an SQL MAX over text, in which "9.5" is above "10.5". The old `equity` table is not read."""
-        seen = self.journal_vpu_peak
-        if seen is None:
+    def _live_nav_history(self) -> None:
+        """T51c S4d (A4 for the shared book, R27), before anything is read from the account: the state file's `book_nav`
+        rows must hold the value history the journal's summaries of this venue recorded, or an older state file put back
+        would change the previous value per unit (the day stop) or lower the peak (the drawdown). (a) Every New York day on
+        which the journal holds a shared summary with a value per unit must have a row of that day, and the day's LATEST
+        row must read what the journal's LAST such summary of the day says: the lower figure, and the upper one where the
+        summary journals it (exact decimals, never text). (b) The highest figure the rows hold (the UPPER figure of a row
+        where it is finite, the drawdown's basis, else its lower) must not be below the journal's. A day with no such
+        summary is not required to have a row. Otherwise the run stops at `state`, a fault: a person must look. The old
+        `equity` table is not read."""
+        looks = self.journal_looks
+        if not looks:
             return
-        peak = None
-        for row in self._nav_rows():
-            try:
-                figure = Decimal(row["value_per_unit"])
-            except (InvalidOperation, TypeError, ValueError):
-                raise OrderStepError(f"book_nav row {row['id']} holds a value per unit that is not a number; a person "
-                                     "must look") from None
-            if figure.is_finite() and (peak is None or figure > peak):
-                peak = figure
+        latest, peak = {}, None
+        with localcontext() as ctx:
+            ctx.prec = _BOOK_PREC
+            for row in self._nav_rows():                 # by id: a later row of a day replaces an earlier one
+                try:
+                    low = Decimal(row["value_per_unit"])
+                except (InvalidOperation, TypeError, ValueError):
+                    raise OrderStepError(f"book_nav row {row['id']} holds a value per unit that is not a number; a person "
+                                         "must look") from None
+                _, high = _nav_vpu(row)
+                basis = high if high is not None else low
+                peak = basis if peak is None or basis > peak else peak
+                latest[str(row["day"])] = (low, high)
+        last = {}
+        for look in looks:                               # the journal's order: the last summary of a day wins
+            last[look["day"]] = look
+        lacking, changed = [], []
+        for day in sorted(last):
+            look, got = last[day], latest.get(day)
+            if got is None:
+                lacking.append(day)
+            elif got[0] != look["low"] or (look["has_high"] and got[1] != look["high"]):
+                changed.append(day)
+        if lacking or changed:
+            said = ([f"no book_nav row for {', '.join(lacking[:5])}"] if lacking else []) + (
+                [f"the latest row of {', '.join(changed[:5])} reads a value per unit (or its upper figure) other than the "
+                 "journal's last summary of the day"] if changed else [])
+            raise _Stop("state", f"the state file lacks the book's value history the journal holds: a copy put back? "
+                                 f"({'; '.join(said)}), so the day's loss and the drawdown cannot be judged; a person must "
+                                 "look; nothing is sent")
+        seen = max(look["high"] if look["high"] is not None else look["low"] for look in looks)
         if peak is None or peak < seen:
             held = "no value per unit" if peak is None else f"a highest value per unit of {peak}"
-            raise _Stop("state", f"the order step's state file holds {held} in its book_nav rows and the journal recorded "
-                                 f"a value per unit of {seen} for {self.name}: the state file knows less than the journal "
-                                 "(an older copy put back?), so the drawdown cannot be judged; a person must look; nothing "
-                                 "is sent")
+            raise _Stop("state", f"the order step's state file holds {held} in its book_nav rows (the upper figure where it "
+                                 f"is known) and the journal recorded a value per unit of {seen} for {self.name}: the state "
+                                 "file knows less than the journal (an older copy put back?), so the drawdown cannot be "
+                                 "judged; a person must look; nothing is sent")
 
     # -- T34b-2: the faults the summary carries, and (live mode) the working stop and the day stop
     def _judge_final(self, final) -> None:
@@ -4415,7 +4455,7 @@ class _Run:
         self.torn_lines = [{"file": name, "line": n} for name, n, _ in torn]
         if self.live is not None:                        # T22d-1 (A4): the highest equity journaled for this venue
             if self.shared:                              # T51c S4d (R27): the book's own, the value per unit, in Decimal
-                self.journal_vpu_peak = _journal_vpu_peak(entries, self.name)
+                self.journal_looks = _journal_shared_looks(entries, self.name)
             else:
                 keys = {"summary": "broker_equity", "ticket": "equity"}
                 seen = [_as_float(e.get(keys[e.get("event")])) for e in entries if e.get("type") == "order_step"

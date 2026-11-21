@@ -345,27 +345,121 @@ def test_a_state_file_without_the_book_nav_rows_the_journal_saw_stops_the_live_r
     assert lw.journal_events("summary")[-1]["shared"]["value_per_unit"]
     lw.sql("DELETE FROM book_nav")                        # an older state file put back
     lw.later()
-    lw.venue.calls.clear()
+    lw.venue.calls.clear(), lw.quote_calls.clear(), lw.second.calls.clear()
     out = lw.propose()
     assert out["status"] == "stopped" and out["stage"] == "state", out
-    assert "value per unit" in out["reason"] and "a person must look" in out["reason"], out["reason"]
-    assert lw.venue.submits() == [] and not any(c[0] in ("positions", "cash") for c in lw.venue.calls)
-    assert lw.state_path.name in {p.name for p in lw.state_path.parent.iterdir()}
+    assert "value history the journal holds" in out["reason"] and "a person must look" in out["reason"], out["reason"]
+    assert lw.venue.calls == [] and lw.quote_calls == [] and lw.second.calls == []     # before anything is read
+
+
+def _look_line(low, high=None, day_figures=True):
+    """The `shared` block of a journaled summary as a run writes it: the lower value per unit and, from S4d, the upper."""
+    block = {} if low is None else {"value_per_unit": low}
+    if day_figures and low is not None:
+        block["value_per_unit_high"] = high
+    return {"type": "order_step", "venue": VENUE, "event": "summary", "status": "done", "shared": block}
+
+
+def journal_look(w, day, low, high="same", with_high=True):
+    w.journal.write(day, _look_line(low, low if high == "same" else high, with_high))
+
+
+def history(w, rows):
+    """A state file and a journal that agree: each (day, low, high) is a book_nav row and the journal's summary of it."""
+    for day, low, high in rows:
+        w.seed_nav(day, low, high)
+        journal_look(w, day, low, high or low)
 
 
 def test_the_state_files_peak_is_compared_in_decimal_never_as_text(lw):
     lw.open_book("10000")
-    lw.journal.write("2026-11-12", {"type": "order_step", "venue": VENUE, "event": "summary", "status": "done",
-                                    "shared": {"value_per_unit": "10.5"}})      # the journal saw 10.5
-    lw.seed_nav("2026-11-11", "10.5")
-    lw.seed_nav("2026-11-12", "9.5")                      # as text "9.5" is above "10.5": a text MAX would stop the run
+    history(lw, [("2026-11-11", "10.5", None), ("2026-11-12", "9.5", None)])   # as text "9.5" is above "10.5"
     out = lw.propose()
-    assert out["status"] == "done" and out["stage"] is None, out                 # the Decimal peak 10.5 knows as much
-    lw.journal.write("2026-11-12", {"type": "order_step", "venue": VENUE, "event": "summary", "status": "done",
-                                    "shared": {"value_per_unit": "10.51"}})
-    lw.later()
-    out = lw.propose()
+    assert out["status"] == "done" and out["stage"] is None, out              # a text MAX over the rows would stop it
+
+
+def test_the_peak_is_the_upper_figure_where_it_is_finite_not_only_the_lower(mkl):
+    w = mkl()
+    w.open_book("10000")
+    journal_look(w, "2026-11-12", "1.00", "1.20")        # an earlier run of the day looked at 1.00 to 1.20 ...
+    journal_look(w, "2026-11-12", "1.00", "1.00")        # ... a later one at exactly 1.00
+    w.seed_nav("2026-11-12", "1.00", "1.00")             # the state file kept the later row only: the lower peak is 1.00
+    out = w.propose()
     assert out["status"] == "stopped" and out["stage"] == "state", out
+    assert "1.20" in out["reason"] and "drawdown" in out["reason"] and w.venue.calls == [], out
+    ok = mkl()                                           # with the earlier row kept, as it would be, it goes on
+    ok.open_book("10000")
+    ok.seed_nav("2026-11-12", "1.00", "1.20")
+    journal_look(ok, "2026-11-12", "1.00", "1.20")
+    assert ok.propose()["status"] == "done"
+
+
+def _three_days(w):
+    w.open_book("10000")
+    history(w, [("2026-11-10", "1.05", None), ("2026-11-11", "1.00", None), ("2026-11-12", "1.05", None)])
+
+
+def test_a_later_days_row_removed_from_the_state_file_stops_the_run_and_a_clean_history_goes_on(mkl):
+    w = mkl()
+    _three_days(w)
+    out = w.propose()                                     # the history is whole: yesterday's 1.05 is the previous figure
+    assert out["status"] == "done" and out["shared"]["previous_value_per_unit"] == "1.05", out
+    assert out["day_stop"]["pct"] == pytest.approx(100 * 0.05 / 1.05, rel=1e-9), out
+    w2 = mkl()                                            # the same journal, the 11-12 row gone: an older copy put back
+    _three_days(w2)
+    w2.sql("DELETE FROM book_nav WHERE day = '2026-11-12'")
+    peak = w2.sql("SELECT MAX(CAST(value_per_unit AS REAL)) AS m FROM book_nav")[0]["m"]
+    assert peak == 1.05                                    # the highest figure is still there: the peak check alone passes
+    out = w2.propose()
+    assert out["status"] == "stopped" and out["stage"] == "state", out
+    for words in ("lacks the book's value history the journal holds", "a copy put back?", "2026-11-12"):
+        assert words in out["reason"], (words, out["reason"])
+    assert out["stage"] not in stake_ladder.SKIP_STAGES and w2.venue.calls == [] and "day_stop" not in out
+
+
+def test_a_row_that_is_there_but_changed_stops_the_run(mkl):
+    for column, value in (("value_per_unit", "1.01"), ("value_high", "104000"), ("value_high", None)):
+        w = mkl()
+        _three_days(w)
+        w.sql(f"UPDATE book_nav SET {column} = ? WHERE day = '2026-11-11'", (value,))
+        out = w.propose()
+        assert out["status"] == "stopped" and out["stage"] == "state" and "2026-11-11" in out["reason"], (column, out)
+        assert w.venue.calls == []
+
+
+def test_only_the_latest_row_of_a_day_is_compared_and_a_day_without_a_figure_is_not_required(mkl):
+    w = mkl()
+    _three_days(w)
+    w.seed_nav("2026-11-12", "1.05", None)               # a later run of the day wrote another row: the latest row is read
+    w.sql("UPDATE book_nav SET value_per_unit = '0.5' WHERE day = '2026-11-12' AND id = (SELECT MIN(id) FROM book_nav "
+          "WHERE day = '2026-11-12')")                   # ... and an earlier row of that day is not
+    w.journal.write("2026-11-12", _look_line(None))      # a run that stopped before its first look: no figure to hold
+    w.journal.write("2026-11-09", _look_line(None))      # a day with no figure at all: no row is required of it
+    w.journal.write("2026-11-08", {"type": "order_step", "venue": VENUE, "event": "summary", "status": "stopped"})
+    out = w.propose()
+    assert out["status"] == "done" and out["stage"] is None, out
+
+
+def test_a_day_the_journal_holds_a_figure_for_must_have_a_row_whatever_else_is_in_the_state_file(mkl):
+    w = mkl()
+    w.open_book("10000")
+    journal_look(w, "2026-11-09", "1.00")                # the journal saw 11-09; the state file has only a later row
+    w.seed_nav("2026-11-12", "1.00", None)
+    out = w.propose()
+    assert out["status"] == "stopped" and out["stage"] == "state" and "2026-11-09" in out["reason"], out
+
+
+def test_a_real_runs_summary_carries_the_upper_figure_the_state_file_reads_back(lw):
+    lw.open_book("10000")
+    out = lw.buy()
+    shared = out["shared"]
+    assert D(shared["value_per_unit_high"]) == D(lw.nav()[-1]["value_high"]) / D(lw.nav()[-1]["units_outstanding"])
+    assert lw.journal_events("summary")[-1]["shared"]["value_per_unit_high"] == shared["value_per_unit_high"]
+    assert lw.propose()["status"] == "done"              # the history the runs wrote is whole: the next run goes on
+    lw.later()
+    lw.sql("UPDATE book_nav SET value_high = NULL WHERE id = (SELECT MAX(id) FROM book_nav)")   # its upper figure gone
+    out = lw.propose()
+    assert out["status"] == "stopped" and out["stage"] == "state" and "upper" in out["reason"], out
 
 
 def test_a_live_ticket_event_and_an_unreadable_figure_do_not_stop_a_state_that_knows_what_the_summaries_say(lw):
