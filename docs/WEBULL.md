@@ -800,7 +800,7 @@ shared run", above), under the four locks and every live rule, with these differ
   afterwards clears nothing.
   **Known limits:** a LOWER row (a real fall between a summary and a lost one, or a copy put back) has no command route: it
   is cured by putting the real state file back, or by the lead by hand. A day whose row is missing from the state file has
-  no route either. A summary lost on a day with no later journaled day is held like any other (the unheld-row rule above: the next run stops at `state` until the owner accepts the row or the real state file is put back); once a LATER day has a journaled summary, the lost day's row can no longer be the previous figure and is left alone. The acceptance's hash holds
+  no route either. A summary lost on a day with no later journaled day is held like any other (the unheld-row rule above: the next day's first run stops at `state` (a later run the same day is not stopped, and its summary holds the day again) until the owner accepts the row or the real state file is put back); once a LATER day has a journaled summary, the lost day's row can no longer be the previous figure and is left alone. The acceptance's hash holds
   no secret: anyone who can write the journal can write a valid line (as they can write any summary line, which carries
   no hash at all); the chain only shows a line that does not follow the one before it, and the batch refusal is a courtesy,
   not a guard.
