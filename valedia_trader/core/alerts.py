@@ -23,6 +23,12 @@ with `level` "cleared" and the same key is written. An alert is open while the l
     mode:unknown:<day>          a summary today whose `mode` is neither absent (the unattended run) nor exactly `propose` or
                                 `approve`: neither kind of run, never counted as one, one warning a day
     practice-stopped:<m>:<day>  a propose or approve run today stopped at a stage other than ticket or session: a warning of its own
+    shared-shortfall:<venue>:<day>  a SHARED run (T51c S4e) of that venue today ended `done` and its last reconcile found the account
+                                holding less than the book counts as its own (its summary's `shared.shortfalls` is not empty): a
+                                warning of its own, once for the venue and day; it clears when a later shared summary of that venue the
+                                same day is `done` with none. (A shared run that STOPS at stage shortfall, marks or state is already an
+                                alert of the two lines above: `step-stopped` for the unattended run, `practice-stopped` for propose and
+                                approve, live included; the order ledger's own block is `orders:<ledger>`.)
     job:<label>                 a scheduled com.valedia.* job is not loaded, or its last exit code is not 0
     collector:heartbeat         the order-book collector's newest heartbeat is older than 10 minutes
     picks:no-end                the hourly pick-list log has no "end" line in the last 3 hours
@@ -916,6 +922,58 @@ def check_modes(env: Env) -> CheckResult:
     return out
 
 
+_SHORT_SYMBOL = re.compile(r"[A-Za-z0-9./-]{1,24}")       # the order step's own plain symbol; anything else is not named
+SHORT_FUNDS_SHOWN = 2
+
+
+def _short_figure(x) -> str | None:
+    return f"{x:g}" if isinstance(x, (int, float)) and not isinstance(x, bool) and x == x and abs(x) != float("inf") else None
+
+
+def _short_words(shorts: dict) -> str:
+    """The shortfalls of a summary's `shared.shortfalls` in words: for each fund (at most SHORT_FUNDS_SHOWN, in order), what the
+    book counts, what the account holds and how much is short. Built from the figures only; a fund whose name is not a plain
+    symbol is not named, and a figure that is not a finite number is said as unknown."""
+    parts = []
+    for sym in sorted(shorts, key=str):
+        d = shorts[sym]
+        name = sym if isinstance(sym, str) and _SHORT_SYMBOL.fullmatch(sym) else "a fund whose name is not plain"
+        d = d if isinstance(d, dict) else {}
+        book, held, short = (_short_figure(d.get(k)) or "unknown" for k in ("book", "venue", "short"))
+        parts.append(f"{name}: counted {book}, held {held} ({short} short)")
+    more = f" and {len(parts) - SHORT_FUNDS_SHOWN} more" if len(parts) > SHORT_FUNDS_SHOWN else ""
+    return "; ".join(parts[:SHORT_FUNDS_SHOWN]) + more
+
+
+def check_shared_shortfall(env: Env) -> CheckResult:
+    """T51c S4e (R24, R33): for today in New York, per venue, a SHARED run (a summary with a `shared` block) that ended `done` and
+    whose last reconcile found a shortfall (`shared.shortfalls` a non-empty record) is a warning of its own, once for the venue
+    and day: nothing else is raised for such a run (it is not a stop). A later shared summary of that venue the same day with the
+    status exactly `done` and no shortfall clears it. A stop of a shared run (any stage) neither raises nor clears it: a stop at
+    stage shortfall, marks or state is already `step-stopped` or `practice-stopped`. The words come from the summary's figures only
+    (the venue, the day, the funds and their units, the ordinary causes), never an order's tag or an account."""
+    out = CheckResult()
+    found: dict[str, dict] = {}
+    for e in todays_step_summaries(env):
+        shared = e.get("shared")
+        if not isinstance(shared, dict) or not (isinstance(e.get("status"), str) and e["status"] == DONE):
+            continue
+        venue = str(e.get("venue"))
+        shorts = shared.get("shortfalls")
+        if isinstance(shorts, dict) and shorts:
+            found[venue] = e
+        else:
+            found.pop(venue, None)
+    for venue, e in sorted(found.items()):
+        day = str(e.get("day"))[:10]
+        out.alerts.append(Alert(
+            f"shared-shortfall:{_key_part(venue)}:{day}", "warning", "The account holds less than the book counts as its own",
+            f"{day} {clean(venue, 60)}: found by the run's last reconcile (stage after). The owner sold shares the book counts as its "
+            "own, or a split; the next run stops until the shares are back or the owner writes a units_out or split entry. "
+            f"{_short_words(e['shared']['shortfalls'])}."))
+    return out
+
+
 def check_jobs(env: Env) -> CheckResult:
     out = CheckResult()
     try:
@@ -1083,6 +1141,7 @@ CHECKS: list[tuple[str, tuple[str, ...], Callable[[Env], CheckResult]]] = [
     ("order step", ("step-stopped:", "step-unreadable:"), check_order_step),
     ("approval", ("approval:",), check_approval_refused),
     ("order-step modes", ("mode:", "practice-stopped:"), check_modes),
+    ("shared book", ("shared-shortfall:",), check_shared_shortfall),
     ("scheduled jobs", ("job:",), check_jobs),
     ("order-book collector", ("collector:",), check_collector),
     ("pick-list log", ("picks:",), check_picks),
