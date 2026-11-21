@@ -1131,6 +1131,10 @@ def main(argv=None) -> int:
     owner.add_argument("--owner-entry-rejournal", default=None, metavar="N",
                        help="repair: write the missing journal line of the LAST entry N (with --hash, --who, --note)")
     owner.add_argument("--hash", default=None, help="with --owner-entry-rejournal: the entry's hash, as printed")
+    owner.add_argument("--accept-history", default=None, metavar="DAY",
+                       help="live repair (T51c S4d): accept the state file's latest book_nav row of DAY (YYYY-MM-DD) as the "
+                            "day's figure when its run's summary never reached the journal; with --live --venue --who "
+                            "--note, a preview first, then --confirm CODE")
     p = sub.add_parser("critic")
     p.add_argument("--narrate", help="backend that puts the findings into words, e.g. hermes:valedia-trading-auditor")
     p.add_argument("--days", type=int, default=7)
@@ -1148,6 +1152,9 @@ def main(argv=None) -> int:
     p.add_argument("--agent-timeout", type=float, default=None, help="seconds one research agent may take (default: no limit)")
     args = ap.parse_args(argv)
     venue = None
+    if args.cmd == "order-step" and args.accept_history is not None:        # T51c S4d: the live book's repair
+        from valedia_trader.execution_and_risk import order_step
+        return order_step.accept_history_command(args, LoopPaths(Path(args.root).resolve()) if args.root else LoopPaths())
     if args.cmd == "order-step" and (args.owner_entry is not None or args.owner_entry_rejournal is not None
                                      or args.confirm is not None or args.hash is not None):
         # T51c S3: the owner's entry; no venue is built (S4b: its preview, its confirm and its repair too)

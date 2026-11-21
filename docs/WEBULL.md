@@ -738,6 +738,30 @@ shared run", above), under the four locks and every live rule, with these differ
   the highest figure the rows hold (a row's UPPER figure where it is finite, the drawdown's basis, else its lower) must not
   be below the journal's, by the same basis, in Decimal (never an SQL MAX over text). A ticket's `equity` is not counted in
   a shared run (a later look may lower the row it was made at). The old `equity` table is neither read nor written.
+- *When that stop is not a copy put back* (the recovery route). The same stop follows a run whose `book_nav` row was
+  written at its first look and whose summary never reached the journal (the summary write raised, or the process died
+  between the first look and the summary): the day's latest row is then newer than the journal's last summary, and every
+  later live run would stop at `state` for ever. The stop's words name both causes, the day(s), the journal's last figures
+  and the state file's latest row (its run's batch), and the way out. The way out is the owner's, on the owner-entry
+  pattern and needing no hand-editing of the journal or the state file:
+  `order-step --live --accept-history DAY --venue webull-production --who WHO --note NOTE` PRINTS what differs (the
+  journal's last summary of DAY, the state file's latest row and its run, the other days that still differ) and a
+  six-digit code, and writes nothing; run again with `--confirm CODE` it writes ONE journal line (`history_accepted`: the
+  day, the row, its figures, what the journal had, a hash over them chained to the acceptance before it, who and why) and
+  nothing else (the state file is never written). After it the check takes that row as the day's figure and still stops
+  on every other difference (another day, the same day's row changed afterwards, the peak). The code is a digest of
+  exactly what the preview showed, recomputed from the files as they are, so a confirm after anything changed is refused;
+  the confirm needs the run lock. It refuses, writing nothing: when nothing differs for the day, for a day the journal
+  holds no figure of, for a day with no row (a row that is not there cannot be accepted), without `--live` or with a
+  practice name, with any other flag, and **for a row of a run whose summary the journal holds**. That last rule is what
+  tells a lost summary from a copy put back: a lost summary's row belongs to a run the journal has NO summary of; an
+  older state file's latest row of a day belongs to a run whose summary the journal holds (a later run's summary is there
+  too), and a row changed by hand keeps its run's summary. A lower row is not in itself a copy (a fund may fall between a
+  summary and a lost one), so direction does not decide; accepting a copy's row could lower the figure the day stop and
+  the drawdown are judged from, so a copy is cured only by putting the real state file back. A line that only looks like
+  an acceptance (a hash that is not its fields', or one not chained to the acceptance before it) clears nothing. Known
+  limit: a day whose row is missing from the state file has no route here (the real state file is needed), and a summary
+  lost on a day that had no earlier summary is not held to anything.
 - *The day stop* (T34b-2) is judged on the loss of the value per unit at each look but the run's last, so the owner's
   deposits and withdrawals are never a loss; a loss at or above the working stop refuses every purchase (stage of the
   order: `day stop`), as on the ordinary live account.

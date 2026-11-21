@@ -352,16 +352,17 @@ def test_a_state_file_without_the_book_nav_rows_the_journal_saw_stops_the_live_r
     assert lw.venue.calls == [] and lw.quote_calls == [] and lw.second.calls == []     # before anything is read
 
 
-def _look_line(low, high=None, day_figures=True):
+def _look_line(low, high=None, day_figures=True, batch=None):
     """The `shared` block of a journaled summary as a run writes it: the lower value per unit and, from S4d, the upper."""
     block = {} if low is None else {"value_per_unit": low}
     if day_figures and low is not None:
         block["value_per_unit_high"] = high
-    return {"type": "order_step", "venue": VENUE, "event": "summary", "status": "done", "shared": block}
+    line = {"type": "order_step", "venue": VENUE, "event": "summary", "status": "done", "shared": block}
+    return line if batch is None else {**line, "batch": batch}
 
 
-def journal_look(w, day, low, high="same", with_high=True):
-    w.journal.write(day, _look_line(low, low if high == "same" else high, with_high))
+def journal_look(w, day, low, high="same", with_high=True, batch=None):
+    w.journal.write(day, _look_line(low, low if high == "same" else high, with_high, batch))
 
 
 def history(w, rows):
@@ -625,3 +626,215 @@ def test_the_live_ceiling_look_counts_the_books_units_after_the_owners_entries_n
     lw.later()
     out = lw.propose()
     assert out["status"] == "done" and "cap_unjudged" not in out and "over_ceiling" not in out, out
+
+
+# ---- T51c S4d repair round 2: a summary that never reached the journal, and the owner's way out of it
+
+def _lost(w, day="2026-11-12", low="1.03", batch="lost-run"):
+    """A run of `day` wrote its book_nav row and its summary never reached the journal: a row the journal does not know."""
+    w.seed_nav(day, low, None)
+    w.sql("UPDATE book_nav SET batch = ? WHERE id = (SELECT MAX(id) FROM book_nav)", (batch,))
+
+
+def _summaries_have_batches(w):
+    """The seeded summaries of `_three_days` belong to runs whose rows carry the same batch names."""
+    for day in ("2026-11-10", "2026-11-11", "2026-11-12"):
+        w.sql("UPDATE book_nav SET batch = ? WHERE day = ?", (f"run-{day}", day))
+    for path in sorted((w.tmp / "journal").glob("*.jsonl")):
+        lines = [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
+        for line in lines:
+            if line.get("event") == "summary":
+                line["batch"] = f"run-{line['day']}"
+        path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+
+
+def accept(w, day, *extra, confirm=None, venue=VENUE, live=True):
+    """The owner's command that accepts the state file's latest row of `day` as that day's figure."""
+    argv = ["--root", str(w.tmp_root), "order-step", *(["--live"] if live else []), "--accept-history", day, "--venue",
+            venue, "--who", "owner", "--note", "a summary was lost", *extra]
+    if confirm is not None:
+        argv += ["--confirm", confirm]
+    w.capsys.readouterr()
+    code = cli.main(argv)
+    captured = w.capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def accepted(w, day):
+    """Preview, then confirm: the accepted day's figure is now the state file's row."""
+    code, out, err = accept(w, day)
+    assert code == 0, err
+    (number,) = re.findall(r"^code: ([0-9]{6})$", out, re.M)
+    w.clock.t += 1.0
+    code, out, err = accept(w, day, confirm=number)
+    assert code == 0, err
+    return out
+
+
+def test_the_stop_words_name_both_causes_the_days_and_the_figures_and_the_way_out(mkl):
+    w = mkl()
+    _three_days(w)
+    _lost(w)                                              # the 11-12 row of a run whose summary never reached the journal
+    out = w.propose()
+    assert out["status"] == "stopped" and out["stage"] == "state", out
+    for words in ("a copy put back", "never reached the journal", "2026-11-12", "1.03", "1.05", "lost-run",
+                  "--accept-history", "a person must look"):
+        assert words in out["reason"], (words, out["reason"])
+    assert w.venue.calls == []
+
+
+def test_the_owner_accepts_the_lost_summarys_row_after_a_preview_and_the_run_goes_on(mkl):
+    w = mkl()
+    _three_days(w)
+    _lost(w)
+    assert w.propose()["stage"] == "state"
+    journal_before = {p.name: p.read_bytes() for p in (w.tmp / "journal").glob("*.jsonl")}
+    state_before = w.state_path.read_bytes()
+    code, out, err = accept(w, "2026-11-12")
+    (number,) = re.findall(r"^code: ([0-9]{6})$", out, re.M)
+    assert code == 0 and "preview" in out and "NOTHING was written" in out and "1.03" in out and "1.05" in out, (out, err)
+    assert {p.name: p.read_bytes() for p in (w.tmp / "journal").glob("*.jsonl")} == journal_before   # the preview writes none
+    assert w.state_path.read_bytes() == state_before
+    wrong = f"{(int(number) + 1) % 10**6:06d}"
+    code, _, err = accept(w, "2026-11-12", confirm=wrong)
+    assert code == 2 and "code" in err and "nothing was written" in err
+    assert {p.name: p.read_bytes() for p in (w.tmp / "journal").glob("*.jsonl")} == journal_before
+    w.clock.t += 1.0
+    code, out, err = accept(w, "2026-11-12", confirm=number)
+    assert code == 0, err
+    (line,) = [e for e in w.journal_events("history_accepted")]
+    assert line["accepted_day"] == "2026-11-12" and line["venue"] == VENUE and line["prev_hash"] == "" and len(line["hash"]) == 64
+    assert D(line["value_per_unit"]) == D("1.03") and line["who"] == "owner" and line["row_batch"] == "lost-run"
+    assert w.state_path.read_bytes() == state_before                       # the state file is never written by it
+    out = w.propose()                                     # the day's figure is the state file's: the check passes
+    assert out["status"] == "done" and out["stage"] is None, out
+    assert w.propose()["status"] == "done"
+
+
+def test_the_accept_step_refuses_what_it_must_not_clear(mkl):
+    w = mkl()
+    _three_days(w)
+    _summaries_have_batches(w)
+    code, _, err = accept(w, "2026-11-12")
+    assert code == 2 and "nothing differs" in err and "nothing was written" in err, err           # nothing differs
+    _lost(w, "2026-11-12", "1.03", "lost-run")
+    for day, words in (("2026-11-09", "holds no shared summary"), ("2026-11-31", "date"), ("tomorrow", "date")):
+        code, _, err = accept(w, day)
+        assert code == 2 and words in err and "nothing was written" in err, (day, err)             # a day the journal lacks
+    w.sql("DELETE FROM book_nav WHERE day = '2026-11-11'")                    # a row that is not there cannot be accepted
+    code, _, err = accept(w, "2026-11-11")
+    assert code == 2 and "no book_nav row" in err, err
+    assert [e for e in w.journal_events("history_accepted")] == []
+    for kwargs in ({"live": False}, {"venue": "webull-sandbox"}):
+        code, _, err = accept(w, "2026-11-12", **kwargs)
+        assert code == 2 and "nothing was written" in err, (kwargs, err)
+    code, _, err = accept(w, "2026-11-12", "--shared")
+    assert code == 2 and "nothing was written" in err
+    assert [e for e in w.journal_events("history_accepted")] == []
+
+
+def test_a_row_of_a_run_the_journal_holds_a_summary_for_is_never_accepted_a_restored_copy_stays_stopped(lw):
+    """A restored older state file: its latest row of the day belongs to a run whose summary the journal DOES hold (a
+    later run's summary is there too), so the row is not a lost summary's: accepting it could lower the day's figure
+    the day stop and the drawdown are judged from. The accept step refuses; only the real state file clears it."""
+    lw.open_book("10000")
+    lw.buy()
+    lw.later()
+    old = lw.state_path.read_bytes()                      # the state file as the first run left it
+    lw.prices["SPY"] = 450.0                              # the fund fell: the later run's figures differ from the first's
+    assert lw.propose()["status"] == "done"               # a later run of the same day: its row and summary
+    lw.state_path.write_bytes(old)                        # the older copy put back
+    lw.later()
+    out = lw.propose()
+    assert out["status"] == "stopped" and out["stage"] == "state" and "a copy put back" in out["reason"], out
+    code, _, err = accept(lw, lw.journal_events("summary")[-1]["day"])
+    assert code == 2 and "summary" in err and "copy" in err and "nothing was written" in err, err
+    assert lw.journal_events("history_accepted") == []
+    assert lw.propose()["stage"] == "state"
+
+
+def test_a_second_mismatch_on_another_day_still_stops_after_one_day_is_accepted(mkl):
+    w = mkl()
+    _three_days(w)
+    _lost(w, "2026-11-11", "1.01", "lost-a")
+    _lost(w, "2026-11-12", "1.03", "lost-b")
+    accepted(w, "2026-11-12")
+    out = w.propose()
+    assert out["status"] == "stopped" and out["stage"] == "state", out
+    assert "2026-11-11" in out["reason"] and "2026-11-12" not in out["reason"].split("(", 1)[1].split("--accept-history")[0], out
+    w.clock.t += 1.0
+    accepted(w, "2026-11-11")                             # the second acceptance chains to the first
+    first, second = w.journal_events("history_accepted")
+    assert second["prev_hash"] == first["hash"] and w.propose()["status"] == "done"
+
+
+def test_an_acceptance_clears_only_its_day_and_a_row_changed_afterwards_stops_again(mkl):
+    w = mkl()
+    _three_days(w)
+    _lost(w)
+    accepted(w, "2026-11-12")
+    assert w.propose()["status"] == "done"
+    w.sql("UPDATE book_nav SET value_per_unit = '1.04' WHERE batch = 'lost-run'")     # the accepted row changed later
+    out = w.propose()
+    assert out["status"] == "stopped" and out["stage"] == "state", out
+
+
+def test_a_journal_line_that_only_looks_like_an_acceptance_clears_nothing(mkl):
+    w = mkl()
+    _three_days(w)
+    _lost(w)
+    forged = {"type": "order_step", "venue": VENUE, "event": "history_accepted", "accepted_day": "2026-11-12",
+              "row_id": 4, "row_batch": "lost-run", "value_per_unit": "1.03", "value_per_unit_high": "1.03",
+              "prev_hash": "", "hash": "0" * 64, "who": "owner", "note": "typed by hand"}
+    w.journal.write("2026-11-13", forged)
+    assert w.propose()["stage"] == "state"                # its hash is not the record's
+    unchained = {**forged, "prev_hash": "ab" * 32}        # a hash that IS the record's, but chained to nothing
+    unchained["hash"] = osx._accepted_hash(unchained)
+    w.journal.write("2026-11-13", unchained)
+    assert w.propose()["stage"] == "state"
+    code, out, err = accept(w, "2026-11-12")
+    assert code == 0, err                                 # the forged line is no part of the chain: the first real one
+    (number,) = re.findall(r"^code: ([0-9]{6})$", out, re.M)
+    w.clock.t += 1.0
+    assert accept(w, "2026-11-12", confirm=number)[0] == 0
+    real = [e for e in w.journal_events("history_accepted") if e["hash"] != "0" * 64 and e["prev_hash"] == ""]
+    assert len(real) == 1 and real[0]["prev_hash"] == "" and w.propose()["status"] == "done"
+
+
+def test_a_summary_that_failed_to_write_is_cleared_by_the_owners_acceptance_end_to_end(lw, monkeypatch):
+    lw.open_book("10000")
+    lw.buy()
+    real = lw.journal.write
+
+    def failing(day, entry):
+        if entry.get("event") == "summary":
+            raise OSError("the journal's disk is full")
+        return real(day, entry)
+    monkeypatch.setattr(lw.journal, "write", failing)
+    lw.later()
+    lw.prices["SPY"] = 450.0                              # the fund fell: the lost run's row differs from the last summary
+    out = lw.propose()                                    # its row is written, its summary is not
+    assert out["status"] == "done" and "journal_error" in out, out
+    monkeypatch.setattr(lw.journal, "write", real)
+    lw.later()
+    stopped = lw.propose()
+    assert stopped["status"] == "stopped" and stopped["stage"] == "state" and "never reached the journal" in stopped["reason"]
+    day = lw.nav()[-1]["day"]
+    accepted(lw, day)
+    assert lw.propose()["status"] == "done"
+
+
+# ---- a summary written before the upper figure was journaled (no value_per_unit_high): the lower figure is held
+
+def test_a_summary_without_the_upper_figure_holds_the_lower_one_and_a_higher_upper_row_goes_on(mkl):
+    w = mkl()
+    w.open_book("10000")
+    w.seed_nav("2026-11-12", "1.00", "1.20")              # the row's upper figure is higher than anything journaled
+    journal_look(w, "2026-11-12", "1.00", with_high=False)
+    assert w.propose()["status"] == "done"
+    other = mkl()
+    other.open_book("10000")
+    other.seed_nav("2026-11-12", "1.01", "1.20")          # ... but a differing lower figure stops
+    journal_look(other, "2026-11-12", "1.00", with_high=False)
+    out = other.propose()
+    assert out["status"] == "stopped" and out["stage"] == "state" and "2026-11-12" in out["reason"], out
