@@ -1188,7 +1188,7 @@ def _decimal_or_none(text) -> Decimal | None:
     return figure if figure.is_finite() else None
 
 
-def _scan_shared_looks(entries, venue: str, floor: dict | None = None) -> tuple[list[dict], str, set]:
+def _scan_shared_looks(entries, venue: str) -> tuple[list[dict], str, set]:
     """T51c S4d: (looks, last_accepted_hash, batches), from the journal's entries in the journal's order.
     `looks`: the shared looks the journal's summaries of `venue` recorded: each summary with a `shared` block that holds
     a finite `value_per_unit` (the lower figure of its last look, the text the run's `book_nav` row holds) gives
@@ -1200,10 +1200,14 @@ def _scan_shared_looks(entries, venue: str, floor: dict | None = None) -> tuple[
     own fields' and its `prev_hash` is the hash of the acceptance before it, AND its figures are not below the day's last
     look before it (lower figure, and upper where known else lower): the tighten rule, read again (a line that only looks
     like an acceptance, or one that would loosen, is ignored and does not move the chain).
-    `batches`: every batch a summary of `venue` names, whatever it holds. `floor` (`_entry_base`): what an acceptance of a day
-    with no earlier journaled day is held against."""
-    looks, last, batches = [], "", set()
+    `batches`: every batch a summary of `venue` names, whatever it holds. An acceptance of a day with no earlier journaled day
+    is held against the base `book_loss` falls back to (`_entry_base`) AS IT STOOD when its line was written: the journal's
+    own owner-entry lines before it, on its own day, never an entry made after it (a later ordinary entry cannot cancel it)."""
+    looks, last, batches, owners = [], "", set(), []
     for e in entries:
+        if isinstance(e, dict) and e.get("type") == "owner_entry" and e.get("venue") == venue:
+            owners.append(e)                             # the owner's entries so far, in the journal's order
+            continue
         if not (isinstance(e, dict) and e.get("type") == "order_step" and e.get("venue") == venue):
             continue
         if e.get("event") == "history_accepted":
@@ -1213,8 +1217,12 @@ def _scan_shared_looks(entries, venue: str, floor: dict | None = None) -> tuple[
                 before = [x for x in looks if x["day"] == e["accepted_day"]]      # the tighten rule, read again here:
                 if not before:                                                     # a day with no look yet: the last day's
                     earlier = [x for x in looks if x["day"] < e["accepted_day"]]   # figures before it, or with no such day
+                    try:                                                           # the floor AS IT STOOD when the line was
+                        floor = _entry_base(owners, str(e.get("day") or e["accepted_day"]))   # written: the owner's entries
+                    except (OrderStepError, KeyError, TypeError, ValueError):                # before it in the journal,
+                        floor = None                                               # never those made after it
                     before = ([x for x in earlier if x["day"] == max(y["day"] for y in earlier)] if earlier else
-                              [floor] if floor is not None else [])                # the base book_loss falls back to (`floor`)
+                              [floor] if floor is not None else [])                # the base book_loss falls back to
                 if before and low >= before[-1]["low"] and (                       # an acceptance counts only when it is
                         high if high is not None else low) >= (                   # not below the day's last figures
                         before[-1]["high"] if before[-1]["high"] is not None else before[-1]["low"]):
@@ -1977,7 +1985,7 @@ def _accept_judge(state_path: Path, lines, venue: str, day: str, today: str) -> 
     journal, the state file must have a row of it, the two must differ, and, as an extra refusal that the safety does not
     depend on, the row's run (its batch) must have no summary in the journal at all (a lost summary's row)."""
     owner_entries = _owner_entries_read_only(state_path)
-    looks, last_hash, batches = _scan_shared_looks(lines, venue, _entry_base(owner_entries, today))
+    looks, last_hash, batches = _scan_shared_looks(lines, venue)
     rows = _nav_rows_read_only(state_path)
     found = _nav_history(rows, looks, today, owner_entries)
     mine = [look for look in looks if look["day"] == day]
@@ -2026,7 +2034,8 @@ def _accept_judge(state_path: Path, lines, venue: str, day: str, today: str) -> 
               for d, c in sorted(found["changed"].items()) if d != day}
     against = None
     if change.get("unheld"):
-        against = (f"the journal's last summary of {look['day']}" if "day" in look and "entry" not in look else
+        against = ((f"the owner's acceptance of {look['day']}" if look.get("accepted") else
+                    f"the journal's last summary of {look['day']}") if "day" in look and "entry" not in look else
                    f"the value per unit after {look['entry']}, which is what the day stop falls back to when no row of an "
                    "earlier day gives one")
     return {"day": day, "figures": figures, "last_hash": last_hash, "others": others, "lacking": list(found["lacking"]),
@@ -2111,7 +2120,9 @@ def accept_history_command(args, paths, clock: Callable[[], float] | None = None
         f, had = info["figures"], info["figures"]["journal_had"]
         print(f"preview: accept the state file's latest book_nav row of {day} as the day's figure, for {venue}; NOTHING was written")
         if info["against"] is None:
-            print(f"  the journal's last summary of {day} says: value per unit {had['value_per_unit']} (upper "
+            source = (f"the owner's acceptance of {day} (the journal's last figure of the day)" if info["look"].get("accepted")
+                      else f"the journal's last summary of {day}")
+            print(f"  {source} says: value per unit {had['value_per_unit']} (upper "
                   f"{had['value_per_unit_high'] if info['look']['has_high'] else 'not journaled'})")
         else:
             print(f"  the journal holds no summary of {day}; the row is held against {info['against']}: value per unit "
@@ -3909,15 +3920,16 @@ class _Run:
         self.last_fig = figures
         return figures
 
-    def _shared_look(self, marks: dict) -> tuple[BookFigures, BookLoss]:
+    def _shared_look(self, marks: dict) -> tuple[BookFigures, BookLoss, dict]:
         """One look at the book: its figures at `marks`, the day's loss and the drawdown on the value per unit, and the
-        summary's account of them (said again at each look)."""
+        summary's account of them (said again at each look), which the caller applies to `shared_info` only once the
+        row of that look is written (_shared_account): the summary carries the figures of the row actually written."""
         figures = self._book_look(marks)
         with localcontext() as ctx:
             ctx.prec = _BOOK_PREC
             high = None if figures.value_high is None else figures.value_high / figures.units_outstanding
         loss = book_loss(self._nav_rows(), self.entries, self.day, low=figures.value_per_unit, high=high)
-        self.shared_info.update(
+        info = dict(
             book_value=float(figures.value), book_value_high=None if figures.value_high is None else float(figures.value_high),
             value_per_unit=str(figures.value_per_unit), value_per_unit_high=None if high is None else str(high),
             units_outstanding=str(figures.units_outstanding),
@@ -3926,7 +3938,7 @@ class _Run:
             day_loss_pct=float(loss.daily_loss_pct), drawdown_pct=float(loss.drawdown_pct),
             previous_value_per_unit=str(loss.previous), previous_from=loss.previous_from,
             day_loss_upper_open=loss.upper_open)
-        return figures, loss
+        return figures, loss, info
 
     def _nav_sync(self, figures: BookFigures, marks: dict) -> None:
         """This run's `book_nav` row at the figures: written at the first look, set again at a later one when it changed."""
@@ -3948,8 +3960,9 @@ class _Run:
         """The account the risk gate judges, in a shared run: the BOOK's value at the marks in hand (the lower bound) as
         its equity, the day's loss and the drawdown on its value per unit, the funds it holds as the count (R27, R31).
         In live mode every look but the run's last may trip the day stop, on the loss of the value per unit (S4d)."""
-        figures, loss = self._shared_look(marks)
-        self._nav_sync(figures, marks)
+        figures, loss, info = self._shared_look(marks)
+        self._nav_sync(figures, marks)                   # the row first: a failure leaves the summary as the last row was
+        self.shared_info.update(info)
         self.broker_equity = float(figures.value)
         if look and self.live is not None:               # T34b-2 (S2) as the ordinary account's look does it
             self._look(float(loss.daily_loss_pct))
@@ -4168,7 +4181,7 @@ class _Run:
         where it is finite, the drawdown's basis, else its lower) must not be below the journal's. A day with no such
         summary is not required to have a row. Otherwise the run stops at `state`, a fault: a person must look. The old
         `equity` table is not read."""
-        looks = _scan_shared_looks(self.journal_lines or [], self.name, _entry_base(self.entries, self.day))[0]
+        looks = _scan_shared_looks(self.journal_lines or [], self.name)[0]
                                                          # (no look at all: the rows' days and figures are still judged)
         try:
             found = _nav_history(self._nav_rows(), looks, self.day, self.entries)

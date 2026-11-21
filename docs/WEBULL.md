@@ -756,12 +756,14 @@ shared run", above), under the four locks and every live rule, with these differ
   or with no owner entry's figure to hold it against, has none (the real state file, or the lead by hand). **A known
   limit, with its stage:** a first day's only summary lost leaves that day's row without a summary, so the next day's FIRST
   run stops at `state` ("... on a day the journal holds no summary for ..."); the accept command clears it when the row is
-  at or above the opening base, and a lower row has no command route (the lead, by hand). **The run's own last look**
-  (after the final reconcile) updates the row and the summary's figures together: when the reprice fails (a locked or
-  failing state file) the summary is put back to the figures of the row actually written, so the summary and the row never
-  disagree and the next run is not stopped at `state` for it. A decimal signal while a row is read (Overflow, Underflow, InvalidOperation, DivisionByZero: units like 1E-999999)
-  is the same `state` fault in the run and a refusal writing nothing in the command, never an `unexpected` stop or a traceback. A day with no such summary (a run that stopped before its
-  first look) is not required to have a row. So an older state file put back, or a row removed, changed or ADDED (see below), stops the run at
+  at or above the opening base, and a lower row has no command route (the lead, by hand). **The run's own looks**
+  (each one in the run, and the last after the final reconcile) update the row first and the summary's figures only once the
+  row is written, so the summary always carries the figures of the row actually written: when a reprice fails (a locked or
+  failing state file) the summary keeps the figures of the row as it was, so the two never disagree and the next run is not
+  stopped at `state` for it. A decimal signal while a row is read (Overflow, Underflow, InvalidOperation, DivisionByZero:
+  units like 1E-999999) is the same `state` fault in the run and a refusal writing nothing in the command, never an
+  `unexpected` stop or a traceback. A day with no such summary (a run that stopped before its first look) is not required
+  to have a row. So an older state file put back, or a row removed, changed or ADDED (see below), stops the run at
   `state`, a fault ("the state file lacks the book's value history the journal holds: a copy put back?"): without it, a
   removed later day would change the previous value per unit and the day stop would be missed. The peak is judged as well:
   the highest figure the rows hold (a row's UPPER figure where it is finite, the drawdown's basis, else its lower) must not
@@ -788,14 +790,17 @@ shared run", above), under the four locks and every live rule, with these differ
   with a practice name, with any other flag, and (an extra refusal the safety does not depend on) for a row of a run
   whose summary the journal holds. At run time an acceptance line counts only if its figures are again not below the day's last figures before it (the same
   tighten rule, read again, on the journal's lines); a hand-written line that would loosen is ignored, does not move the
-  chain, and the day stays stopped. After an acceptance the check passes a day whose latest row reads the journal's last
+  chain, and the day stays stopped. The floor an acceptance is read against is the one AS IT STOOD when its line was written: the day's earlier
+  journaled figures and, with none, the owner's entries journaled BEFORE it (never one made after it), so a later ordinary
+  owner entry whose value per unit is higher cannot cancel an acceptance; a hand-written line that was below its own floor at
+  its own time stays ignored. After an acceptance the check passes a day whose latest row reads the journal's last
   look (the acceptance) OR the last summary before it, so the real state file put back after a copy's higher row was
   accepted passes by itself; the check still stops on every other difference (another day, the same row changed
   afterwards, the peak: an acceptance adds no peak of its own). Who and note are in the hash: an acceptance edited
   afterwards clears nothing.
   **Known limits:** a LOWER row (a real fall between a summary and a lost one, or a copy put back) has no command route: it
   is cured by putting the real state file back, or by the lead by hand. A day whose row is missing from the state file has
-  no route either. A summary lost on a day that had no earlier summary is not held to anything. The acceptance's hash holds
+  no route either. A summary lost on a day with no later journaled day is held like any other (the unheld-row rule above: the next run stops at `state` until the owner accepts the row or the real state file is put back); once a LATER day has a journaled summary, the lost day's row can no longer be the previous figure and is left alone. The acceptance's hash holds
   no secret: anyone who can write the journal can write a valid line (as they can write any summary line, which carries
   no hash at all); the chain only shows a line that does not follow the one before it, and the batch refusal is a courtesy,
   not a guard.

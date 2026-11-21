@@ -1233,3 +1233,96 @@ def test_a_failed_final_reprice_leaves_the_summary_and_the_row_consistent_and_th
     lw.later()
     out = lw.propose()
     assert out["status"] in ("done",) and out["stage"] is None, out          # not stopped at `state`
+
+
+# ---- T51c S4d repair round 7: an acceptance is held against the floor as it stood when it was made
+
+def test_a_later_owner_entry_does_not_cancel_an_acceptance_made_against_the_earlier_base(lw, monkeypatch):
+    """The S8 sequence: a day's buy, a rise, every summary of that day lost; the next day the run stops and the owner accepts
+    the day's last row (1.015) against the opening base (1); the book gains again and the owner makes an ordinary entry whose
+    value per unit after (1.045) is above 1.015, with no run in between. The acceptance still counts."""
+    lw.open_book("10000")
+    real = lw.journal.write
+
+    def failing(day, entry):
+        if entry.get("event") == "summary":
+            raise OSError("the journal's disk is full")
+        return real(day, entry)
+    monkeypatch.setattr(lw.journal, "write", failing)
+    out = lw.propose()
+    lw.later(1)
+    assert lw.approve(out["ticket_number"])["orders_sent"] == 1          # 11-13: the book buys 10 SPY
+    lw.later(1)
+    lw.prices["SPY"] = 520.0                              # the fund rises: the book is worth 1.015 a unit
+    assert lw.propose()["status"] == "done"               # the day's last row, 1.015; no summary of 11-13 reaches the journal
+    monkeypatch.setattr(lw.journal, "write", real)
+    assert [e for e in lw.journal_events("summary") if e["venue"] == VENUE] == []
+    lw.next_day()                                         # 11-16
+    stopped = lw.propose()
+    assert stopped["status"] == "stopped" and stopped["stage"] == "state", stopped
+    accepted(lw, "2026-11-13")
+    assert D(lw.journal_events("history_accepted")[0]["value_per_unit"]) == D("1.015")
+    lw.prices["SPY"] = 550.0
+    lw.owner("cash_in", "--amount", "100")                # an ordinary entry: value per unit after 1.045, above 1.015
+    assert D(lw.entries()[-1]["value_per_unit_after"]) == D("1.045"), lw.entries()[-1]
+    lw.next_day()                                         # 11-17
+    out = lw.propose()
+    assert out["status"] == "done" and out["stage"] is None, out
+    assert D(out["shared"]["previous_value_per_unit"]) == D("1.015"), out["shared"]   # what book_loss gives on intact summaries
+
+
+def test_a_hand_written_line_below_its_own_floor_at_its_own_time_is_still_ignored_when_entries_come_later(lw):
+    lw.open_book("10000")
+    lw.seed_nav("2026-11-12", "0.90", None)
+    _row(lw, batch="lost-first")
+    record = {"type": "order_step", "venue": VENUE, "event": "history_accepted", "accepted_day": "2026-11-12",
+              "row_id": 1, "row_batch": "lost-first", "value_per_unit": "0.90", "value_per_unit_high": "0.90",
+              "journal_had": {"value_per_unit": "1", "value_per_unit_high": "1"}, "prev_hash": "", "who": "o", "note": "n"}
+    record["hash"] = osx._accepted_hash(record)
+    lw.journal.write("2026-11-13", record)                # 0.90 is below the opening base (1) at its own time
+    lw.next_day()
+    lw.owner("cash_in", "--amount", "10")                 # a later entry makes no difference to a line below its floor
+    lw.next_day()
+    assert lw.propose()["stage"] == "state"
+    assert [x for x in osx._journal_shared_looks(lw.journal.read(), VENUE) if x.get("accepted")] == []
+
+
+def test_an_in_run_reprice_failure_leaves_the_summary_with_the_figures_of_the_row_actually_written(lw, monkeypatch):
+    lw.open_book("10000")
+    lw.buy()                                              # the book holds 10 SPY
+    lw.later()
+    lw.paper = T.paper({"a": {"SPY": 120.0, "QQQ": 50.0}})            # two purchases: QQQ first (the larger), then SPY
+    out = lw.propose()
+    assert len(out["ticket"]["orders"]) == 2, out
+    number = out["ticket_number"]
+    lw.later(1)
+    for symbol in ("SPY", "QQQ"):
+        lw.quote_age[symbol] = 19.5 * 60                  # fresh now, stale after the first send: asked again
+    T._later_submit(lw, 2, then=lambda w: w.prices.update(SPY=520.0))      # the held fund moves between the two orders
+    real_reprice = osx.OrderStepState.reprice_book_nav
+
+    def failing(self, row, nav):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(osx.OrderStepState, "reprice_book_nav", failing)
+    stopped = lw.approve(number)
+    monkeypatch.setattr(osx.OrderStepState, "reprice_book_nav", real_reprice)
+    assert stopped["status"] == "stopped" and stopped["stage"] == "send", stopped
+    row = lw.nav()[-1]
+    assert stopped["shared"]["value_per_unit"] == row["value_per_unit"], (stopped["shared"], row)
+    assert lw.journal_events("summary")[-1]["shared"]["value_per_unit"] == row["value_per_unit"]
+    lw.venue.submit = type(lw.venue).submit.__get__(lw.venue)
+    lw.later()
+    lw.quote_age.clear()
+    out = lw.propose()
+    assert out["stage"] != "state", out                   # the next run is not stopped at state for the lost reprice
+
+
+def test_the_preview_names_an_earlier_acceptance_as_the_base_when_it_is(mkl):
+    w = mkl()
+    _three_days(w)
+    _lost(w, "2026-11-12", "1.07", "lost-1")
+    accepted(w, "2026-11-12")
+    _lost(w, "2026-11-12", "1.09", "lost-2")              # a later row of the day, higher than the accepted figure
+    code, out, err = accept(w, "2026-11-12")
+    assert code == 0, err
+    assert "the owner's acceptance of 2026-11-12" in out and "the journal's last summary of 2026-11-12 says" not in out, out
