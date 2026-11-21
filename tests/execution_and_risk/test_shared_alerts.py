@@ -1,16 +1,17 @@
 """T51c S4e (addendum 7, R24; ruling R2): the alerts of a shared run.
 
-What is held here:
-- every stop of a shared run (practice or live, unattended, propose or approve) at stage `shortfall`, `marks` or
-  `state` ALREADY raises an alert through the watchdog's own checks, and S4e leaves those checks alone: the unattended
-  run's `step-stopped:<venue>` (critical) and the approval flow's `practice-stopped:<mode>:<day>` (warning). Each names
-  the venue, the stage, the day and the plain words of the stop, never an id; a repeated stop of one cause on one day is
-  one alert, not one a run;
-- the one gap: a run that ENDS done whose last reconcile found a shortfall (summary `shared.shortfalls` not empty)
-  raised nothing but the ledger's own `orders:<ledger>` block, which carries no words. S4e adds ONE check for it,
-  `shared-shortfall:<venue>:<day>` (a warning), built from the summary's figures only: the venue, the day, the funds and
-  their units, the two ordinary causes, and what clears it. One alert for a repeat of the same venue and day; it clears
-  when a later shared run of that venue the same day is done with no shortfall.
+What is held here (repair round 2):
+- a stop of a shared run (practice or live; unattended, propose or approve) is an alert that reflects the book's PRESENT state, not the
+  day: `shared-stopped:<venue>:<class>:<stage>`, class `unattended` (critical) or `attended` (propose and approve, a warning). It is
+  open while the latest shared summary of that venue and class is a stop at that stage (any day), and clears only when a later summary
+  of the same venue and class is `done` with no shortfall (or stops at another stage); a run of the other class never clears it;
+  ordinary skips (a closed market, `ticket`, `session` for propose and approve) neither open nor clear;
+- a shared summary is judged whatever other keys it carries (`Mode`, `mode` "both" or empty); the stages that alert, old and new per
+  mode, are shown equal where the old rules judged the mode;
+- the gap a stop does not cover, a run that ENDS done whose last reconcile found a shortfall: `shared-shortfall:<venue>:<class>`
+  (a warning), open while the latest summary of that class is done with a shortfall, with the count of short funds and every name
+  first in its 300 characters (or "and K more"), the figures after;
+- an old merged key is cleared only in a watch where the shared check ran; a run that is not shared keeps its two old keys.
 Everything runs on stand-in venues, clocks and journals in a temporary folder; nothing opens a socket."""
 import json
 import socket
@@ -92,22 +93,27 @@ WORDS = {"shortfall": "the account holds less than the book counts as its own: S
          "state": "the state file and the journal differ on the owner's entries; a person must look"}
 
 
-# ---- the stops of a shared run: one alert per venue, stage and day (repair round 1)
+# ---- the stops of a shared run: the book's present state, per venue and class of run (repair round 2)
 
-def sk(venue, stage, day=DAY):
-    return f"shared-stopped:{venue}:{stage}:{day}"
+def sk(venue, stage, cls="unattended"):
+    return f"shared-stopped:{venue}:{cls}:{stage}"
+
+
+def cls_of(mode):
+    return "unattended" if mode is None else "attended"
 
 
 @pytest.mark.parametrize("live", [False, True])
 @pytest.mark.parametrize("mode", [None, "propose", "approve"])
 @pytest.mark.parametrize("stage", ["shortfall", "marks", "state"])
-def test_every_shared_stop_at_these_stages_raises_one_alert_keyed_by_venue_stage_and_day(mk, stage, mode, live):
+def test_every_shared_stop_at_these_stages_raises_one_alert_keyed_by_venue_class_and_stage(mk, stage, mode, live):
     w = mk()
     venue = "webull-production" if live else w.venue.name
     stop_line(w, stage, WORDS[stage], mode=mode, venue=venue, live=live)
     got = step_alerts(w)
-    assert set(got) == {sk(venue, stage)}, sorted(got)
-    a = got[sk(venue, stage)]
+    key = sk(venue, stage, cls_of(mode))
+    assert set(got) == {key}, sorted(got)
+    a = got[key]
     assert f"stage {stage}" in a.title
     for words in (DAY, venue, WORDS[stage][:40]):
         assert words in a.detail, (words, a.detail)
@@ -128,47 +134,142 @@ def test_a_practice_stop_then_a_live_stop_of_another_stage_the_same_day_are_two_
     stop_line(w, "marks", WORDS["marks"], mode="propose", venue="webull-sandbox")
     stop_line(w, "shortfall", WORDS["shortfall"], mode="propose", venue="webull-production", live=True)
     got = step_alerts(w)
-    assert set(got) == {sk("webull-sandbox", "marks"), sk("webull-production", "shortfall")}, sorted(got)
-    assert "webull-production" in got[sk("webull-production", "shortfall")].detail
-    assert "stage shortfall" in got[sk("webull-production", "shortfall")].title
+    assert set(got) == {sk("webull-sandbox", "marks", "attended"), sk("webull-production", "shortfall", "attended")}, sorted(got)
+    assert "webull-production" in got[sk("webull-production", "shortfall", "attended")].detail
 
 
 def test_a_practice_and_a_live_stop_of_the_same_stage_the_same_day_are_two_alerts(mk):
     w = mk()
     stop_line(w, "marks", WORDS["marks"], mode="propose", venue="webull-sandbox")
     stop_line(w, "marks", WORDS["marks"], mode="propose", venue="webull-production", live=True)
-    assert set(step_alerts(w)) == {sk("webull-sandbox", "marks"), sk("webull-production", "marks")}
+    assert set(step_alerts(w)) == {sk("webull-sandbox", "marks", "attended"), sk("webull-production", "marks", "attended")}
 
 
-def test_an_unattended_marks_stop_after_a_shortfall_stop_raises_its_own_alert_the_checkers_second_repro(mk):
+def test_a_stop_at_another_stage_replaces_the_one_before_in_its_class_the_checkers_second_repro(mk, tmp_path):
     w = mk()
+    path = tmp_path / "alerts.jsonl"
     stop_line(w, "shortfall", WORDS["shortfall"])
+    assert set(step_alerts(w)) == {sk(w.venue.name, "shortfall")}
+    alerts.watch(env_of(w), path=path)
     stop_line(w, "marks", WORDS["marks"])
     got = step_alerts(w)
-    assert set(got) == {sk(w.venue.name, "shortfall"), sk(w.venue.name, "marks")}, sorted(got)
-    assert "stage marks" in got[sk(w.venue.name, "marks")].title
-
-
-def test_a_repeat_of_one_cause_the_same_day_stays_one_alert_in_any_mode_mix(mk):
-    w = mk()
-    stop_line(w, "shortfall", WORDS["shortfall"])
-    stop_line(w, "shortfall", WORDS["shortfall"], mode="propose")
-    stop_line(w, "shortfall", WORDS["shortfall"], mode="approve")
-    stop_line(w, "shortfall", WORDS["shortfall"])
-    got = step_alerts(w)
-    assert set(got) == {sk(w.venue.name, "shortfall")} and got[sk(w.venue.name, "shortfall")].level == "critical"
-
-
-def test_the_next_day_is_a_new_alert_and_the_old_days_clears_when_the_day_passes(mk, tmp_path):
-    w = mk()
-    stop_line(w, "shortfall", WORDS["shortfall"])
-    path = tmp_path / "alerts.jsonl"
-    alerts.watch(env_of(w), path=path)
-    w.clock.t += 86400
-    stop_line(w, "shortfall", WORDS["shortfall"], day="2026-11-14")
+    assert set(got) == {sk(w.venue.name, "marks")} and "stage marks" in got[sk(w.venue.name, "marks")].title
     res = alerts.watch(env_of(w), path=path)
-    assert [a.key for a in res.raised] == [sk(w.venue.name, "shortfall", "2026-11-14")]
-    assert [a.key for a in res.cleared] == [sk(w.venue.name, "shortfall")]
+    assert sk(w.venue.name, "marks") in {a.key for a in res.raised} and sk(w.venue.name, "shortfall") in {a.key for a in res.cleared}
+
+
+def test_an_attended_stop_first_and_an_unattended_one_after_are_two_keys_the_later_one_critical(mk, tmp_path):
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    stop_line(w, "orders", "the ledger is blocked", mode="propose")
+    alerts.watch(env_of(w), path=path)
+    stop_line(w, "orders", "the ledger is blocked")
+    res = alerts.watch(env_of(w), path=path)
+    got = {a.key: a for a in res.raised}
+    assert got[sk(w.venue.name, "orders")].level == "critical", sorted(got)           # raised, and as critical
+    assert {a["key"]: a["level"] for a in res.open}[sk(w.venue.name, "orders", "attended")] == "warning"
+
+
+def test_a_repeat_of_one_cause_stays_one_alert_per_class(mk):
+    w = mk()
+    for mode in (None, "propose", "approve", None, "propose"):
+        stop_line(w, "shortfall", WORDS["shortfall"], mode=mode)
+    got = step_alerts(w)
+    assert set(got) == {sk(w.venue.name, "shortfall"), sk(w.venue.name, "shortfall", "attended")}
+    assert got[sk(w.venue.name, "shortfall")].level == "critical" and got[sk(w.venue.name, "shortfall", "attended")].level == "warning"
+
+
+def test_a_stop_stays_open_over_a_weekend_with_no_runs_and_is_never_cleared_by_the_day_passing(mk, tmp_path):
+    """The checker's third repro: a Friday stop that nothing fixed was cleared at New York midnight."""
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    stop_line(w, "marks", WORDS["marks"], day="2026-11-13")
+    key = sk(w.venue.name, "marks")
+    assert alerts.watch(env_of(w), path=path).raised[0].key == key
+    for days in (1, 2, 3, 10):                                        # Saturday, Sunday, Monday, the week after: no run, no summary
+        w.clock.t += 86400 if days <= 3 else 7 * 86400
+        res = alerts.watch(env_of(w), path=path)
+        assert res.cleared == [] and key in {a["key"] for a in res.open}, days
+    assert key in {a["key"] for a in alerts.open_alerts(path)}
+
+
+def test_a_stop_first_seen_by_a_watch_after_midnight_is_raised(mk, tmp_path):
+    w = mk()
+    stop_line(w, "state", WORDS["state"], day="2026-11-13")
+    w.clock.t += 86400                                                # the first watch to see it is the next day's
+    res = alerts.watch(env_of(w), path=tmp_path / "alerts.jsonl")
+    assert sk(w.venue.name, "state") in {a.key for a in res.raised}
+
+
+def test_an_attended_clean_run_never_clears_an_unattended_stop_nor_the_reverse_the_checkers_first_repro(mk):
+    w = mk()
+    stop_line(w, "orders", "the ledger is blocked")
+    stop_line(w, "orders", "the ledger is blocked", mode="propose")
+    stop_line(w, None, None, status="done", mode="propose")           # a clean propose run
+    assert set(step_alerts(w)) == {sk(w.venue.name, "orders")}, "the unattended stop is still open"
+    stop_line(w, "orders", "the ledger is blocked", mode="approve")
+    stop_line(w, None, None, status="done")                           # a clean unattended run
+    assert set(step_alerts(w)) == {sk(w.venue.name, "orders", "attended")}, "the attended stop is still open"
+    stop_line(w, None, None, status="done", mode="approve")
+    assert step_alerts(w) == {}
+
+
+def test_only_a_clean_run_of_the_same_venue_and_class_clears_and_a_done_run_with_a_shortfall_changes_the_state(mk):
+    w = mk()
+    stop_line(w, "marks", WORDS["marks"], venue="webull-sandbox")
+    stop_line(w, "marks", WORDS["marks"], venue="webull-production", live=True)
+    stop_line(w, None, None, status="done", venue="webull-production")                     # the other venue's clean run
+    assert set(step_alerts(w)) == {sk("webull-sandbox", "marks")}
+    stop_line(w, None, None, status="done", venue="webull-sandbox",
+              shared={"shortfalls": {"SPY": {"book": 1.0, "venue": 0.0, "short": 1.0}}})
+    got = step_alerts(w)
+    assert set(got) == {"shared-shortfall:webull-sandbox:unattended"}, sorted(got)         # the stop is over; the shortfall is open
+    stop_line(w, None, None, status="done", venue="webull-sandbox")
+    assert step_alerts(w) == {}
+
+
+def test_ordinary_skips_neither_open_nor_clear(mk):
+    w = mk()
+    stop_line(w, "marks", WORDS["marks"])
+    stop_line(w, "marks", WORDS["marks"], mode="propose")
+    stop_line(w, "session", "2026-11-13 (Friday) is not a trading day")                    # an ordinary closed market
+    stop_line(w, "session", "outside the regular session window 09:35 to 15:45 New York time (it is 08:00)", mode="propose")
+    stop_line(w, "ticket", "no ticket", mode="approve")
+    assert {k for k in step_alerts(w) if k.startswith("shared-")} == {sk(w.venue.name, "marks"), sk(w.venue.name, "marks", "attended")}
+    w2 = mk()
+    stop_line(w2, "session", "2026-11-13 (Friday) is not a trading day")
+    stop_line(w2, "session", "x", mode="propose")
+    stop_line(w2, "ticket", "no ticket", mode="approve")
+    assert not any(k.startswith("shared-stopped:") for k in step_alerts(w2))
+    stop_line(w2, "session", "the calendar did not answer")                                # not ordinary: an alert, as before
+    assert {k for k in step_alerts(w2) if k.startswith("shared-")} == {sk(w2.venue.name, "session")}
+
+
+MODES = {"none": {}, "propose": {"mode": "propose"}, "approve": {"mode": "approve"}, "both": {"mode": "both"},
+         "Mode key": {"Mode": "propose"}, "empty mode": {"mode": ""}}
+STAGES = ["session", "ticket", "targets", "state", "reconcile", "shortfall", "marks", "prices", "lock", "send", "after", "journal",
+          "unexpected"]
+
+
+@pytest.mark.parametrize("name", list(MODES))
+def test_the_stages_that_alert_old_and_new_per_mode_and_nothing_shared_falls_between_the_checks(mk, name):
+    """Old = the judgement of a run that is not shared (`step-stopped`, `practice-stopped`); new = the same summary of a shared run
+    (`shared-stopped`). Where the old rules judged a mode (a `Mode` key reads as the unattended run), the two lists are equal. A
+    summary the old rules left out (`mode` "both" or empty) is judged by the new check, as an attended run."""
+    old, new = set(), set()
+    for stage in STAGES:
+        for shared, found in ((False, old), (True, new)):
+            w = mk()
+            stop_line(w, stage, "the calendar did not answer", shared=shared, **MODES[name])
+            got = step_alerts(w)
+            if any(k.startswith(("step-stopped:", "practice-stopped:", "shared-stopped:")) for k in got):
+                found.add(stage)
+    judged = {"none": set(STAGES), "Mode key": set(STAGES), "propose": set(STAGES) - {"ticket", "session"}, "approve": set(STAGES) - {"ticket", "session"}}
+    if name in judged:
+        assert old == new == judged[name], (name, sorted(old), sorted(new))
+    else:
+        assert old == set(), (name, sorted(old))                       # the old rules left these summaries out
+        assert new == set(STAGES) - {"ticket", "session"}, (name, sorted(new))
 
 
 @pytest.mark.parametrize("stage", ["shortfall", "marks", "state"])
@@ -207,7 +308,7 @@ def test_a_real_live_run_stopped_at_the_stage_raises_its_alert(mkl, stage):
     out = w.propose()
     assert out["status"] == "stopped" and out["stage"] == stage, out
     got = step_alerts(w)
-    key = sk("webull-production", stage)
+    key = sk("webull-production", stage, "attended")
     assert key in got and f"stage {stage}" in got[key].title, sorted(got)
     assert DAY in got[key].detail
     assert out["reason"][:60] in got[key].detail, (out["reason"], got[key].detail)
@@ -230,53 +331,46 @@ def test_a_repeated_real_stop_is_one_alert_and_the_watch_writes_its_line_once(mk
     assert sum(1 for x in lines if x["key"] == key) == 1, lines
 
 
-def test_a_later_clean_shared_run_of_that_venue_the_same_day_clears_its_stops_and_no_other_does(mk):
-    w = mk()
-    stop_line(w, "marks", WORDS["marks"], venue="webull-sandbox")
-    stop_line(w, "marks", WORDS["marks"], venue="webull-production", live=True)
-    stop_line(w, None, None, status="done", venue="webull-production")                     # the other venue's clean run
-    assert set(step_alerts(w)) == {sk("webull-sandbox", "marks")}
-    stop_line(w, None, None, status="done", venue="webull-sandbox",
-              shared={"shortfalls": {"SPY": {"book": 1.0, "venue": 0.0, "short": 1.0}}})
-    assert sk("webull-sandbox", "marks") in step_alerts(w), "a done run with a shortfall is not clean"
-    stop_line(w, None, None, status="done", venue="webull-sandbox")
-    assert set(step_alerts(w)) == {sk("webull-sandbox", "shortfall")} or step_alerts(w) == {} or True
-    assert not any(k.startswith("shared-stopped:") for k in step_alerts(w))
-
-
-def test_a_stop_after_the_clean_run_is_open_again_and_an_ordinary_session_stop_is_no_alert(mk):
-    w = mk()
-    stop_line(w, "marks", WORDS["marks"])
-    stop_line(w, None, None, status="done")
-    stop_line(w, "marks", WORDS["marks"])
-    assert set(step_alerts(w)) == {sk(w.venue.name, "marks")}
-    w2 = mk()
-    stop_line(w2, "session", "2026-11-13 (Friday) is not a trading day")
-    stop_line(w2, "session", "outside the regular session window 09:35 to 15:45 New York time (it is 08:00)", mode="propose")
-    stop_line(w2, "ticket", "no ticket", mode="approve")
-    assert not any(k.startswith("shared-stopped:") for k in step_alerts(w2))
-
-
 def test_old_keys_open_for_shared_stops_are_cleared_by_the_next_watch_and_the_new_key_is_raised(mk, tmp_path):
-    """After the change the old merged keys are no longer produced for a shared stop, so the watch writes a `cleared` line for each
-    (they are neither left open for ever nor dropped without a line) and raises the per-venue, stage and day alert."""
+    """The old merged keys (and round 1's day keys) are no longer produced for a shared stop, so the watch writes a `cleared` line for
+    each (neither left open for ever nor dropped without a line) and raises the per-venue, class and stage alert in the same watch."""
     w = mk()
     path = tmp_path / "alerts.jsonl"
     old = [("step-stopped:" + w.venue.name, "critical"), (f"practice-stopped:propose:{DAY}", "warning"),
-           ("step-stopped:webull-elsewhere", "critical")]
+           (f"shared-stopped:{w.venue.name}:marks:{DAY}", "warning"), ("step-stopped:webull-elsewhere", "critical")]
     path.write_text("".join(json.dumps({"time": "2026-11-13T14:00:00Z", "level": lv, "key": k, "title": "old", "detail": "old"}) + "\n"
                             for k, lv in old))
     stop_line(w, "marks", WORDS["marks"], mode="propose")
     stop_line(w, "shortfall", WORDS["shortfall"])
     stop_line(w, "marks", WORDS["marks"], venue="webull-elsewhere", shared=False)       # a run that is not shared keeps its key
     res = alerts.watch(env_of(w), path=path)
-    assert {a.key for a in res.cleared} == {"step-stopped:" + w.venue.name, f"practice-stopped:propose:{DAY}"}
-    assert {a.key for a in res.raised if a.key.startswith("shared-stopped:")} == {sk(w.venue.name, "marks"),
+    assert {a.key for a in res.cleared} == {k for k, _ in old[:3]}
+    assert {a.key for a in res.raised if a.key.startswith("shared-stopped:")} == {sk(w.venue.name, "marks", "attended"),
                                                                                  sk(w.venue.name, "shortfall")}
-    assert {a["key"] for a in res.open} >= {"step-stopped:webull-elsewhere", sk(w.venue.name, "marks")}
-    assert "step-stopped:" + w.venue.name not in {a["key"] for a in res.open}
+    assert {a["key"] for a in res.open} >= {"step-stopped:webull-elsewhere", sk(w.venue.name, "marks", "attended")}
     again = alerts.watch(env_of(w), path=path)
-    assert again.raised == [] and again.cleared == []                # nothing more to do: no old key is left to clear
+    assert again.raised == [] and again.cleared == []
+
+
+def test_an_old_key_is_cleared_only_in_a_watch_where_the_shared_check_ran(mk, tmp_path, monkeypatch):
+    """The checker's fifth finding: when check_shared_stops fails in the first watch after the upgrade, the old key stays open (no
+    `cleared` line); the next watch, where it runs, clears it and raises the replacement."""
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    old = f"step-stopped:{w.venue.name}"
+    path.write_text(json.dumps({"time": "2026-11-13T14:00:00Z", "level": "critical", "key": old, "title": "old", "detail": "old"}) + "\n")
+    stop_line(w, "marks", WORDS["marks"])
+    real = alerts.check_shared_stops
+
+    def broken(env):
+        raise OSError("the journal is busy")
+    monkeypatch.setattr(alerts, "CHECKS", [(n, p, broken if fn is real else fn) for n, p, fn in alerts.CHECKS])
+    res = alerts.watch(env_of(w), path=path)
+    assert res.cleared == [] and old in {a["key"] for a in res.open} and any("busy" in f for f in res.failures)
+    assert not any(a.key.startswith("shared-stopped:") for a in res.raised)
+    monkeypatch.undo()
+    res = alerts.watch(env_of(w), path=path)
+    assert old in {a.key for a in res.cleared} and sk(w.venue.name, "marks") in {a.key for a in res.raised}
 
 
 def test_the_stop_alerts_of_a_run_that_is_not_shared_are_unchanged_the_unattended_one_clears_on_a_later_done_run(mk):
@@ -306,7 +400,7 @@ def test_a_done_run_whose_last_reconcile_found_a_shortfall_raises_one_alert_with
     out = a_done_run_with_a_shortfall(w)
     short = out["shared"]["shortfalls"]["QQQ"]
     got = step_alerts(w)
-    key = f"shared-shortfall:{w.venue.name}:{DAY}"
+    key = f"shared-shortfall:{w.venue.name}:unattended"
     assert key in got, sorted(got)
     a = got[key]
     assert a.level == "warning" and "less than the book counts as its own" in a.title
@@ -317,13 +411,13 @@ def test_a_done_run_whose_last_reconcile_found_a_shortfall_raises_one_alert_with
     assert not any(k.startswith(("step-stopped:", "practice-stopped:")) for k in got), "the run was done: no stop alert"
 
 
-def test_the_shortfall_alert_is_one_for_a_repeat_of_the_same_venue_and_day_and_clears_when_a_later_run_is_done_clean(mk, tmp_path):
+def test_the_shortfall_alert_is_one_for_a_repeat_and_clears_when_a_later_run_of_its_class_is_done_clean(mk, tmp_path):
     w = mk(Lag())
     a_done_run_with_a_shortfall(w)
     w.journal.write(DAY, {"type": "order_step", "event": "summary", "day": DAY, "venue": w.venue.name, "status": "done",
                           "stage": None, "reason": None, "shared": {"shortfalls": {"QQQ": {"book": 100.0, "venue": 60.0,
                                                                                             "unapplied": 0.0, "short": 40.0}}}})
-    key = f"shared-shortfall:{w.venue.name}:{DAY}"
+    key = f"shared-shortfall:{w.venue.name}:unattended"
     assert [k for k in step_alerts(w) if k.startswith("shared-shortfall:")] == [key]
     path = tmp_path / "alerts.jsonl"
     alerts.watch(env_of(w), path=path)
@@ -378,11 +472,42 @@ def test_the_count_and_every_fund_name_come_first_in_the_alert_detail_the_figure
         assert words in a.detail, (words, a.detail)
 
 
+def test_a_long_list_of_short_funds_says_how_many_more_inside_the_300_characters(mk):
+    w = mk(venue=None)
+    names = [f"FUND{i:02d}" for i in range(40)]
+    shorts = {sym: {"book": 100.0, "venue": 60.0, "unapplied": 0.0, "short": 40.0} for sym in names}
+    w.journal.write(DAY, {"type": "order_step", "event": "summary", "day": DAY, "venue": "webull-production", "status": "done",
+                          "shared": {"shortfalls": shorts}})
+    (a,) = alerts.check_shared_shortfall(env_of(w)).alerts
+    assert len(a.detail) <= 300 and "…" not in a.detail, a.detail
+    assert "40 funds short: FUND00, FUND01" in a.detail, a.detail
+    shown = [n for n in names if n in a.detail.split(" counted")[0]]
+    assert f", and {40 - len(shown)} more" in a.detail and 0 < len(shown) < 40, (shown, a.detail)
+    for words in ("units_out", "webull-production", DAY):
+        assert words in a.detail, (words, a.detail)
+
+
+def test_a_shortfall_alert_follows_the_latest_summary_of_its_class_over_days_and_runs_of_the_other_class_leave_it(mk, tmp_path):
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    bad = {"shortfalls": {"SPY": {"book": 1.0, "venue": 0.0, "short": 1.0}}}
+    stop_line(w, None, None, status="done", shared=bad, day="2026-11-13")
+    key = "shared-shortfall:" + w.venue.name + ":unattended"
+    alerts.watch(env_of(w), path=path)
+    w.clock.t += 3 * 86400                                              # no runs for the weekend
+    res = alerts.watch(env_of(w), path=path)
+    assert res.cleared == [] and key in {a["key"] for a in res.open}
+    stop_line(w, None, None, status="done", mode="propose", day="2026-11-13")             # a clean attended run: another class
+    assert key in step_alerts(w)
+    stop_line(w, None, None, status="done", day="2026-11-13")                              # a clean unattended run
+    assert key not in step_alerts(w)
+
+
 def test_the_new_check_is_in_the_watch_list_with_its_prefix_and_is_documented():
     assert any("shared-shortfall:" in prefixes and fn is alerts.check_shared_shortfall for _, prefixes, fn in alerts.CHECKS)
-    assert "shared-shortfall:<venue>:<day>" in alerts.__doc__
+    assert "shared-shortfall:<venue>:<class>" in alerts.__doc__
     assert any("shared-stopped:" in prefixes and fn is alerts.check_shared_stops for _, prefixes, fn in alerts.CHECKS)
-    assert "shared-stopped:<venue>:<stage>:<day>" in alerts.__doc__
+    assert "shared-stopped:<venue>:<class>:<stage>" in alerts.__doc__
 
 
 def test_a_failing_new_check_holds_only_its_own_keys(mk, monkeypatch):

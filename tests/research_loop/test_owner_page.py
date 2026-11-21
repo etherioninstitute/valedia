@@ -1280,13 +1280,13 @@ def add_shared_book(w, venue=SHARED, ledger=True, state=True, rows=True, surplus
                            "note": "accepted the lost summary's row", "hash": "h"})
     lines = [{"time": iso(NOW - 500), "level": "critical", "key": f"step-stopped:{venue}", "title": "The order step stopped at stage marks",
               "detail": f"{DAY2} {venue}: SPY quotes 700, and the book's last mark of it was 500"},
-             {"time": iso(NOW - 400), "level": "warning", "key": f"shared-shortfall:{venue}:{DAY2}",
+             {"time": iso(NOW - 400), "level": "warning", "key": f"shared-shortfall:{venue}:unattended",
               "title": "The account holds less than the book counts as its own", "detail": f"{DAY2} {venue}: QQQ short"},
              {"time": iso(NOW - 300), "level": "warning", "key": f"practice-stopped:propose:{DAY2}",
               "title": "A propose run stopped at stage shortfall", "detail": f"{DAY2} {venue}: the account holds less"},
-             {"time": iso(NOW - 250), "level": "warning", "key": f"shared-stopped:{venue}:shortfall:{DAY2}",
+             {"time": iso(NOW - 250), "level": "warning", "key": f"shared-stopped:{venue}:unattended:shortfall",
               "title": "A shared run stopped at stage shortfall", "detail": f"{DAY2} {venue}: the account holds less"},
-             {"time": iso(NOW - 240), "level": "critical", "key": f"shared-stopped:webull-sandbox:shortfall:{DAY2}",
+             {"time": iso(NOW - 240), "level": "critical", "key": f"shared-stopped:webull-sandbox:unattended:shortfall",
               "title": "Another venue's shared stop", "detail": f"{DAY2} webull-sandbox: the account holds less"},
              {"time": iso(NOW - 200), "level": "critical", "key": "step-stopped:webull-sandbox", "title": "Another venue stopped",
               "detail": f"{DAY2} webull-sandbox: unrelated"}]
@@ -1343,8 +1343,8 @@ def test_a_history_accepted_line_is_shown_with_its_day_figures_who_and_note(worl
 def test_the_open_alerts_of_this_book_are_shown_and_another_venues_are_not(world):
     add_shared_book(world)
     text = shared_text(world)
-    for words in (f"step-stopped:{SHARED}", f"shared-shortfall:{SHARED}:{DAY2}", f"practice-stopped:propose:{DAY2}",
-                  f"shared-stopped:{SHARED}:shortfall:{DAY2}",
+    for words in (f"step-stopped:{SHARED}", f"shared-shortfall:{SHARED}:unattended", f"practice-stopped:propose:{DAY2}",
+                  f"shared-stopped:{SHARED}:unattended:shortfall",
                   "The order step stopped at stage marks"):
         assert words in text, (words, text)
     assert "webull-sandbox" not in text and "Another venue" not in text

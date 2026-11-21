@@ -653,7 +653,7 @@ skipped; a fault is a fault):
    ordinary cause exists (the owner sold shares the book counts as its own). The stop and the summary carry the
    ledger's words (the symbol, both figures, the two ordinary causes) and `shared.shortfalls` (the book's units, the
    account's, the unapplied fills' and the units short); the ledger is blocked, which the alerts already show
-   (`orders:<ledger>`), and a stopped run is the alert `shared-stopped:<venue>:shortfall:<day>` ("The alerts and the owner's page", below). It is cleared only by the shares coming back
+   (`orders:<ledger>`), and a stopped run is the alert `shared-stopped:<venue>:<class>:shortfall` ("The alerts and the owner's page", below). It is cleared only by the shares coming back
    or by the owner's `units_out` (the shares he took) or `split` entry. It is never taken as "the venue could not be
    read" (`venue_read`): a shortfall in the first reconcile whose second positions read failed is still `shortfall`.
    After the last reconcile of a run a shortfall in a symbol this run's own orders touched (open at the venue, or of
@@ -827,26 +827,34 @@ owner's page and the `mark` entry (S4e) hold on live as on practice ("The alerts
 ### The alerts and the owner's page (T51c S4e)
 
 **The alerts** (`core/alerts.py`, the watchdog's own checks over the journal's summaries; no new way of delivery).
-*A stop of a shared run* (practice or live; unattended, propose or approve) is one alert per VENUE, STAGE and DAY:
-`shared-stopped:<venue>:<stage>:<day>` (critical when the unattended run stopped, else a warning). It names the venue, the stage, the
-day and the run's own words (the stop's reason, R2), and never an order's id, a key or an account number (the watchdog's cleaning). It
-counts the same stops the old keys did: for the unattended run any stage but an ordinary closed market, for propose and approve any
-stage but `ticket` and `session`. A repeat of one cause (same venue, stage and day) is ONE alert, not one a run; a practice stop and a
-live stop of the same stage, or two stages of one venue, are separate alerts, so a live stop is never hidden by a practice one. It
-clears when a LATER shared summary of that venue the same day is `done` with no shortfall (a run of any mode; a clean run of another
-venue clears nothing, and a done run that found a shortfall is not clean); otherwise it clears when the day passes (the day is in the
-key, so the next day's stop is a new alert). *Before this repair* these stops raised `step-stopped:<venue>` (no stage or day) and
-`practice-stopped:<mode>:<day>` (no venue or stage), which merged causes; a shared stop no longer raises either, so an alert still open
-under one of them is cleared by the next watch (a `cleared` line is written for it) and the stop is raised again under the new key. A
-run that is NOT shared keeps both old keys and their rules (so two stages of one non-shared venue still merge there, as they did).
-The order ledger's own block (`orders:<ledger>`) stays as well.
+*A stop of a shared run* (practice or live; unattended, propose or approve) is an alert that reflects the book's PRESENT STATE, not
+the day: `shared-stopped:<venue>:<class>:<stage>`. The class is `unattended` (a summary with no `mode` key, whatever other keys it
+carries; critical) or `attended` (any `mode` key: propose, approve, and anything else; a warning); the two classes are separate keys,
+so an attended stop that is open as a warning can never keep an unattended stop from being raised as critical. It names the venue, the
+stage, the day of the stop and the run's own words (the stop's reason, R2), and never an order's id, a key or an account number (the
+watchdog's cleaning). It is open while the LATEST shared summary of that venue and class (read from the journal's last 30 days, any
+day) is a stop at that stage. So a stop that nothing has fixed stays open over a weekend, and a stop that a watch first sees after
+midnight is raised. It clears only when a later summary of the same venue AND the same class is `done` with no shortfall, or stops at
+another stage (which opens that stage's key); a clean run of the other class, or of another venue, clears nothing, and a later `done`
+that found a shortfall ends the stop (the run got past it) and opens the shortfall alert below. Ordinary skips neither open nor clear:
+a closed market (the unattended run's stage `session` with its two ordinary reasons), and stages `ticket` and `session` of an attended
+run, as before. What counts as a stop is what the old keys judged, with one fix: a shared summary is judged here whatever other keys it
+carries (a `Mode` key reads as the unattended run; `mode` "both" or empty as an attended one), so none falls between the checks; a test
+lists the stages that alert, old and new, per mode. A repeat of one cause is ONE alert, not one a run; a practice stop and a live stop
+are separate alerts. *Before this repair* these stops raised `step-stopped:<venue>` (no stage) and `practice-stopped:<mode>:<day>` (no
+venue or stage), which merged causes and let a clean propose run clear an unattended stop, and the key held the day, which cleared
+a standing stop at New York midnight; a shared stop no longer raises either old key, so an alert still open under one of them (or under
+the day form of the new key) is cleared by the next watch IN WHICH THE SHARED CHECK RAN, and the stop is raised again under the new key
+(a watch where that check failed leaves the old keys open). A run that is NOT shared keeps both old keys and their rules (so two stages
+of one non-shared venue still merge there). The order ledger's own block (`orders:<ledger>`) stays as well. A stop is read from the
+last 30 days of the journal, so one with no summary after it for 30 days falls out of it.
 *The one gap S4e closes*: a run that ENDS `done` whose last reconcile found a shortfall (its summary's `shared.shortfalls` not empty: the
 owner's sale of shares the book counts as its own, seen after the run's orders) raised nothing but that block. It now raises
-`shared-shortfall:<venue>:<day>` (a warning), one alert for the venue and day however many runs repeat it, clearing when a later shared
-summary of that venue the same day is `done` with no shortfall (otherwise when the day passes). Its detail is cut by the watchdog at
-300 characters, so it opens with the venue, the day, the stage (the run's last reconcile), the COUNT of short funds and EVERY fund's
-name, then the two ordinary causes and what clears it, and last the figures of the first two funds (what the book counts, what the
-account holds, the units short); the figures are the ones that can be cut. Built from the summary's figures only.
+`shared-shortfall:<venue>:<class>` (a warning), under the same state rule: open while the latest relevant summary of that venue and
+class is such a run, whatever the day, closed by a later `done` with none or by a stop of that class. Its detail is cut by the watchdog
+at 300 characters, so it opens with the venue, the day, the stage (the run's last reconcile), the COUNT of short funds and the fund
+names that fit (then ", and K more" for the rest), then the two ordinary causes and what clears it, and last the figures of the first
+funds that still fit (what the book counts, what the account holds, the units short). Built from the summary's figures only.
 
 **The owner's page** (`research_loop/owner_page.py`) has a ninth section, "Shared book", when a venue has a shared book (its
 state file holds an owner's entry, or the journal holds one of that venue's; otherwise the page is as it was). For each such
