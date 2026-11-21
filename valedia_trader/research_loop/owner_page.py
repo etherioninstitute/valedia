@@ -5,7 +5,14 @@
 Writes one self-contained HTML file (inline style and inline SVG, no script, no link, no request to anything outside
 it; default `artifacts/owner/index.html`). Eight sections, each under its own heading and each saying the time of its
 newest data: Strategies, Paper account, Broker (paper), Forecasters, Tax so far, Limits and switches, Research tests in
-progress, Health.
+progress, Health. A ninth, Shared book (T51c S4e), appears only when a venue has a shared book (its state file holds an
+owner's entry, or the journal holds one of that venue's): the book's value per unit (lower and upper) and units outstanding,
+the figure the day stop measures from and the peak, the open alerts for it, the owner's entries (latest first, with kind,
+figures, who, note and time, the `mark` entry among them), the owner's acceptances of a day's figure (`history_accepted`), and
+one line per fund with the book's units and the owner's own units side by side. The combined holding is INFORMATION ONLY
+(R31: no limit reads it; nothing that judges an order reads this page). The state file is opened read-only on this module's
+own connection (a missing, busy or odd one says so in plain words, never a traceback), and the order ledger and the journal
+only read.
 
 The page only reads. Every sqlite file is opened by this module itself, read-only (`mode=ro`) and waiting at most 5
 seconds in all for a writer, never through a class that can write, recover or migrate, and is read through its own
@@ -37,6 +44,7 @@ import math
 import os
 import sys
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 from valedia_trader.core import alerts as al
@@ -631,8 +639,192 @@ def health_section(env: al.Env, ctx: Context) -> tuple[list, str]:
     return times, "".join(body)
 
 
+# ---- T51c S4e: the shared book (read only)
+
+ENTRIES_SHOWN = 100
+
+
+def dec(x, nd: int = 6) -> str:
+    """A decimal figure (text, Decimal or number) to `nd` places with thousands separators; `n/a` when it is not one."""
+    try:
+        d = Decimal(str(x))
+    except Exception:
+        return "n/a"
+    return f"{d:,.{nd}f}" if d.is_finite() else "n/a"
+
+
+def shared_venue_names(env: al.Env, ctx: Context) -> list[str]:
+    """The venues that may have a shared book: those with an order step's state file beside the ledgers (not its ticket file),
+    and those the journal holds an owner's entry for."""
+    names: set[str] = set()
+    try:
+        for p in Path(env.paths.memory).glob("order_step-*.sqlite"):
+            name = p.name[len("order_step-"):-len(".sqlite")]
+            if name and not name.endswith(".tickets"):
+                names.add(name)
+    except OSError:
+        pass
+    try:
+        names |= {e["venue"] for e in ctx.journal()[0] if e.get("type") == "owner_entry" and isinstance(e.get("venue"), str)}
+    except Exception:
+        pass                                              # the Health section says when the journal cannot be read
+    return sorted(names)
+
+
+def entry_figures(e: dict) -> str:
+    """What an owner's entry says, in words: its figure, or the fund and the mark it took."""
+    kind, sym = e.get("kind"), e.get("symbol")
+    if kind in ("cash_in", "cash_out"):
+        return f"{E(e.get('amount'))}"
+    if kind == "units_out":
+        return f"{E(e.get('units'))} {E(sym)} at {E(e.get('mark'))}"
+    if kind == "split":
+        return f"{E(sym)}: {E(e.get('ratio'))} new units per old"
+    if kind == "mark":
+        return f"{E(sym)} taken as the new mark at {E(e.get('mark'))}"
+    return "n/a"
+
+
+def alert_is_of_venue(row: dict, venue: str, ledger_stem: str) -> bool:
+    """An open alert that is about this venue's book: the unattended run's stop and the shortfall of a done run (the venue is in
+    the key), the ledger's block (its file's name), the approval flow's stop (the venue is in its words)."""
+    key, kp = str(row.get("key")), al._key_part(venue)
+    if key == f"step-stopped:{kp}" or key.startswith(f"shared-shortfall:{kp}:") or key == f"orders:{al._key_part(ledger_stem)}":
+        return True
+    return key.startswith("practice-stopped:") and f" {al.clean(venue, 60)}:" in str(row.get("detail"))
+
+
+def book_part(osx, env: al.Env, entries: list, rows: list) -> tuple[list, str]:
+    """The book's own figures from the state file: units outstanding after the last entry, and from the latest `book_nav` row its
+    value per unit (lower and upper), the figure the day stop measures from and the peak (book_loss, as a run reads them)."""
+    units = ["Units outstanding", dec(entries[-1]["units_after"], 4)]
+    times = [entries[-1]["time"]]
+    if not rows:
+        return times, table(["", ""], [units]) + para("No look yet: no shared run has priced the book, so it has no value per "
+                                                      "unit here.")
+    row = rows[-1]
+    low, high = osx._nav_vpu(row)
+    if low is None:
+        raise ValueError("the latest look has no value per unit that can be read")
+    loss = osx.book_loss(rows, entries, osx._ny_day(env.now), low=low, high=high)
+    kv = [["Latest look", f"{E(row['day'])}, {E(when(float(row['time'])))}"], ["Value per unit, lower", dec(low)],
+          ["Value per unit, upper", dec(high) if high is not None else "not known"], units,
+          ["Previous value per unit (the day stop measures from it)", f"{dec(loss.previous)} ({E(loss.previous_from)})"],
+          ["Peak value per unit", dec(loss.peak)]]
+    return times + [row["time"]], table(["", ""], kv)
+
+
+def funds_part(osx, env: al.Env, name: str, entries: list) -> tuple[list, str]:
+    """One line per fund: the book's units, the owner's own units (what the account holds beyond the book, from the ledger's last
+    reconcile) and the two together. INFORMATION ONLY: nothing that judges an order reads it (R31)."""
+    path = osx.ledger_path_for(env.paths.memory, name)
+    if not path.is_file():
+        raise al.SourceMissing(f"the order ledger ({path.name}) is not there")
+    led = al.open_order_ledger(path, lambda: env.now)
+    try:
+        fills, orders, last = led.fills(), led.orders(), led.last_reconcile()
+    finally:
+        led.close()
+    figures = osx.book_figures(fills, orders, entries, {}, osx._ny_day(env.now), now=env.now)
+    book = {sym: u for sym, u in figures.units.items() if u != 0}
+    surplus = None
+    summary = last["summary"] if last else None
+    if isinstance(summary, dict) and isinstance(summary.get("owner_surplus"), dict):
+        surplus = {}
+        for sym, d in summary["owner_surplus"].items():
+            if isinstance(sym, str) and isinstance(d, dict) and _finite(d.get("surplus")):
+                surplus[sym] = Decimal(repr(float(d["surplus"])))
+    lines = []
+    for sym in sorted(set(book) | set(surplus or {})):
+        mine = book.get(sym, Decimal(0))
+        own = None if surplus is None else surplus.get(sym, Decimal(0))
+        lines.append([E(sym), dec(mine, 4), "not known" if own is None else dec(own, 4),
+                      "not known" if own is None else dec(mine + own, 4)])
+    when_text = E(when(last["time"])) if last else "never"
+    note = ("The combined holding is information only and is never a limit: the position limit and the count of positions are "
+            "judged on the book's own units alone. The owner's own units are what the account held beyond the book as of the "
+            f"last reconcile ({when_text})."
+            + ("" if surplus is not None else " That reconcile was not one-sided (or there is none), so the owner's own units "
+                                              "are not known."))
+    return [last["time"]] if last else [], (table(["Fund", "Book's units", "Owner's own units", "Combined"], lines) if lines
+                                            else para("The book holds no fund.")) + para(note, "muted")
+
+
+def shared_part(env: al.Env, ctx: Context, name: str):
+    """One venue's shared book as (times, html), or None when it has none. A missing state file the journal knows of, and any
+    state file that cannot be read, are said in plain words; the file is opened read-only and never changed."""
+    from valedia_trader.execution_and_risk import order_step as osx
+    try:
+        journal = ctx.journal()[0]
+    except Exception:
+        journal = []
+    lines = [e for e in journal if e.get("type") == "owner_entry" and e.get("venue") == name]
+    state = osx.state_path_for(osx.ledger_path_for(env.paths.memory, name), name)
+    head = f"<h3>{E(name)}</h3>"
+    if not state.is_file():
+        if not lines:
+            return None
+        return [], head + para(f"Not available: the state file is not there, but the journal holds {len(lines)} owner's "
+                               f"entr{'y' if len(lines) == 1 else 'ies'} of this venue.", "problem")
+    conn = al.open_readonly(state, timeout=al.WAIT_BUDGET_S, row_factory=False)
+    try:
+        entries = osx.owner_entries_of(conn, state.name)
+        rows = osx._nav_rows_of(conn) if entries else []
+    finally:
+        conn.close()
+    if not entries:
+        if not lines:
+            return None                                   # a state file with no owner's entry: no shared book here
+        return [], head + para(f"Not available: the state file holds no owner's entry, but the journal holds {len(lines)} of "
+                               "this venue.", "problem")
+    body = [head]
+    times, h = guarded(lambda: book_part(osx, env, entries, rows), "the book's figures")
+    body.append(h)
+    body.append("<h3>Open alerts for this book</h3>")
+    try:
+        found, _ = al.read_alert_file(al.alerts_file(env.root))
+        mine = [r for r in found if alert_is_of_venue(r, name, f"orders-{osx._safe_name(name)}")]
+        body.append(table(["Level", "Key", "What", "Since"],
+                          [[E(r.get("level"), 20), E(r.get("key"), 80), f"{E(r.get('title'), 200)}: {E(r.get('detail'), 300)}",
+                            E(r.get("time"), 40)] for r in mine]) if mine else para("No open alert for this book."))
+    except Exception as exc:
+        body.append(problem(exc, "alerts"))
+    cut = "" if len(entries) <= ENTRIES_SHOWN else f" (the last {ENTRIES_SHOWN} of {len(entries)})"
+    body.append(f"<h3>The owner's entries, latest first{cut}</h3>")
+    body.append(table(["No.", "Kind", "Figures", "Units after", "Value per unit after", "Who", "Note", "Time"],
+                      [[E(e["id"]), E(e["kind"]), entry_figures(e), dec(e["units_after"], 4),
+                        dec(e["value_per_unit_after"]) if e.get("value_per_unit_after") is not None else "none",
+                        E(e["who"], 200), E(e["note"], 300), E(when(float(e["time"])))]
+                       for e in reversed(entries[-ENTRIES_SHOWN:])]))
+    body.append("<h3>History accepted by the owner (a day's figure taken from the state file)</h3>")
+    accepted = [e for e in journal if e.get("type") == "order_step" and e.get("event") == "history_accepted"
+                and e.get("venue") == name]
+    body.append(table(["Day", "Value per unit, lower", "Value per unit, upper", "Who", "Note", "Written"],
+                      [[E(e.get("accepted_day"), 12), E(e.get("value_per_unit"), 40), E(e.get("value_per_unit_high"), 40),
+                        E(e.get("who"), 200), E(e.get("note"), 300), E(e.get("timestamp"), 40)] for e in reversed(accepted)])
+                if accepted else para("None."))
+    body.append("<h3>Funds: the book's units and the owner's own (information only)</h3>")
+    t, h = guarded(lambda: funds_part(osx, env, name, entries), "holdings")
+    return times + t, "".join(body + [h])
+
+
+def shared_section(env: al.Env, ctx: Context) -> tuple[list, str]:
+    times, body = [], []
+    for name in shared_venue_names(env, ctx):
+        try:
+            got = shared_part(env, ctx, name)
+        except Exception as exc:
+            got = [], f"<h3>{E(name)}</h3>" + problem(exc, name)
+        if got is None:
+            continue
+        times += got[0]
+        body.append(got[1])
+    return times, "".join(body)
+
+
 SECTIONS = [("Strategies", "strategies", strategies_section), ("Paper account", "paper", paper_section),
-            ("Broker (paper)", "broker", broker_section), ("Forecasters", "forecasters", forecasters_section),
+            ("Broker (paper)", "broker", broker_section), ("Shared book", "shared", shared_section),
+            ("Forecasters", "forecasters", forecasters_section),
             ("Tax so far", "tax", tax_section), ("Limits and switches", "limits", limits_section),
             ("Research tests in progress", "research", research_section), ("Health", "health", health_section)]
 
@@ -654,6 +846,8 @@ def render(env: al.Env) -> str:
     parts = []
     for title, ident, fn in SECTIONS:
         times, body = guarded(lambda fn=fn: fn(env, ctx), "")
+        if ident == "shared" and not body:                # no venue has a shared book: no section, the page is as it was
+            continue
         parts.append(f'<section id="{ident}"><h2>{E(title)}</h2><p class="newest">Newest data: {E(newest_text(times))}</p>{body}</section>')
     return ("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"

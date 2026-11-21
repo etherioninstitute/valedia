@@ -25,6 +25,7 @@ import pytest
 from valedia_trader.core import alerts as al
 from valedia_trader.core import secrets as s
 from valedia_trader.data_and_fees import pick_lists as pl
+from valedia_trader.execution_and_risk import order_step as osx
 from valedia_trader.execution_and_risk.orders import OrderLedger
 from valedia_trader.research_loop import orderbook_loop as ol
 from valedia_trader.research_loop import owner_page as op
@@ -1229,3 +1230,202 @@ def test_t50_a3_a_trading_file_that_is_the_live_file_stops_the_page_before_it_is
         clean = T50_SECRET not in why
         assert clean and "webull-live.env" in why and not out.exists()
         assert not [p for p in opened if os.path.realpath(p) == os.path.realpath(live)]
+
+
+# ----------------------------------------------------------------------------------------------- T51c S4e: the shared book
+
+SHARED = "webull-shared"
+DAY1, DAY2 = "2026-11-12", "2026-11-13"
+T_ENTRY = [NOW - 5 * 86400, NOW - 4 * 86400, NOW - 3 * 86400, NOW - 2 * 86400]
+
+
+def add_shared_book(w, venue=SHARED, ledger=True, state=True, rows=True, surplus=True):
+    """The shared account's book as the trader's own code writes it: a state file (owner entries, hash-chained, and
+    book_nav rows), its order ledger (one filled purchase and a one-sided reconcile with the owner's surplus), the
+    journal's acceptance line and the watchdog's open alerts. Placeholder names only."""
+    mem = w.root / "memory"
+    if ledger:
+        path = mem / f"orders-{venue}.sqlite"
+        OrderLedger(path, clock=lambda: NOW).close()
+        db = sqlite3.connect(path)
+        db.execute("INSERT INTO orders (tag, symbol, units, reference_price, limit_price, state, created, updated, "
+                   "filled_units, fee, finished_at) VALUES ('os-20261112-100000-aaaaaa-SPY', 'SPY', 10, 500, 505, "
+                   "'filled', ?, ?, 10, 0.0, ?)", (NOW - 90000, NOW - 86000, NOW - 86000))
+        db.execute("INSERT INTO fills (tag, symbol, units, price, price_covers_units, fee, time, applied) VALUES "
+                   "('os-20261112-100000-aaaaaa-SPY', 'SPY', 10, 500.0, 10, 0.0, ?, 1)", (NOW - 86400,))
+        summary = {"owner_surplus": {"SPY": {"book": 10.0, "venue": 25.0, "unapplied": 0.0, "surplus": 15.0},
+                                     "OWN": {"book": 0.0, "venue": 4.0, "unapplied": 0.0, "surplus": 4.0}}} if surplus else {}
+        db.execute("INSERT INTO reconciles (time, clean, summary) VALUES (?, 1, ?)", (NOW - 600, json.dumps(summary)))
+        db.commit()
+        db.close()
+    if state:
+        st = osx.OrderStepState(mem / f"order_step-{venue}.sqlite", clock=lambda: NOW - 86400)
+        cash = {"kind": "cash_in", "units_before": "0", "units_after": "10000", "value_per_unit_before": None,
+                "value_per_unit_after": "1", "amount": "10000"}
+        st.add_owner_entry(cash, who="owner", note="first deposit", now=T_ENTRY[0])
+        st.add_owner_entry({**cash, "amount": "500", "units_before": "10000", "units_after": "10500"},
+                           who="owner", note="second deposit", now=T_ENTRY[1])
+        st.add_owner_entry({"kind": "mark", "symbol": "SPY", "mark": "505.0", "units_before": "10500", "units_after": "10500",
+                            "value_per_unit_before": "1.01", "value_per_unit_after": "1.01"},
+                           who=f"owner {HOSTILE}", note=f"took the real quote {SECRET} {HOSTILE}", now=T_ENTRY[2])
+        if rows:
+            for day, t, low, high in ((DAY1, NOW - 86400, "10500", "10520"), (DAY2, NOW - 3600, "10762.5", "10773.0")):
+                st.record_book_nav(day, f"b-{day}", {
+                    "units_outstanding": "10500", "value_per_unit": str(D(low) / D("10500")), "value_low": low,
+                    "value_high": high, "cash_bounded": 0, "marks": '{"SPY":"505.0"}', "marks_hash": "m", "entry_hash": "e"})
+        st.close()
+    w.journal.write(DAY1, {"type": "order_step", "event": "history_accepted", "venue": venue, "accepted_day": DAY1, "row_id": 1,
+                           "row_batch": "b-0", "value_per_unit": "1.0019", "value_per_unit_high": "1.0019",
+                           "journal_had": {"low": "1.0", "high": "1.0"}, "prev_hash": "", "who": "owner",
+                           "note": "accepted the lost summary's row", "hash": "h"})
+    lines = [{"time": iso(NOW - 500), "level": "critical", "key": f"step-stopped:{venue}", "title": "The order step stopped at stage marks",
+              "detail": f"{DAY2} {venue}: SPY quotes 700, and the book's last mark of it was 500"},
+             {"time": iso(NOW - 400), "level": "warning", "key": f"shared-shortfall:{venue}:{DAY2}",
+              "title": "The account holds less than the book counts as its own", "detail": f"{DAY2} {venue}: QQQ short"},
+             {"time": iso(NOW - 300), "level": "warning", "key": f"practice-stopped:propose:{DAY2}",
+              "title": "A propose run stopped at stage shortfall", "detail": f"{DAY2} {venue}: the account holds less"},
+             {"time": iso(NOW - 200), "level": "critical", "key": "step-stopped:webull-sandbox", "title": "Another venue stopped",
+              "detail": f"{DAY2} webull-sandbox: unrelated"}]
+    with (w.root / "artifacts" / "owner" / "alerts.jsonl").open("a") as fh:
+        fh.write("".join(json.dumps(x) + "\n" for x in lines))
+
+
+D = __import__("decimal").Decimal
+
+
+def shared_text(w):
+    page = w.page()
+    assert "Shared book" in page.sections, list(page.sections)
+    return page.sections["Shared book"]
+
+
+def test_no_shared_book_no_section_the_page_is_as_it_was(world):
+    assert "Shared book" not in world.page().sections
+    osx.OrderStepState(world.root / "memory" / "order_step-webull-sandbox.sqlite").close()          # a state file, no entry
+    assert "Shared book" not in world.page().sections
+
+
+def test_the_shared_book_shows_value_per_unit_units_the_day_stops_figure_and_the_peak(world):
+    add_shared_book(world)
+    page = world.page()
+    assert list(page.sections) == TITLES[:3] + ["Shared book"] + TITLES[3:]
+    text = shared_text(world)
+    assert SHARED in text and "Newest data:" in text
+    assert f"Value per unit, lower {D('10762.5') / D('10500'):.6f}" in text, text
+    assert f"Value per unit, upper {D('10773.0') / D('10500'):.6f}" in text, text
+    assert "Units outstanding 10,500.0000" in text, text
+    assert f"Previous value per unit (the day stop measures from it) {D('10520') / D('10500'):.6f}" in text, text
+    assert f"the last look of {DAY1}" in text, text
+    assert f"Peak value per unit {D('10773.0') / D('10500'):.6f}" in text, text
+
+
+def test_the_owner_entries_are_listed_latest_first_with_kind_figures_who_note_and_time(world):
+    add_shared_book(world)
+    text = shared_text(world)
+    first, second, third = (text.index(n) for n in ("first deposit", "second deposit", "took the real quote"))
+    assert third < second < first, text                                                   # latest first
+    for words in ("cash_in", "mark", "10000", "500", "SPY taken as the new mark at 505.0", "owner",
+                  op.when(T_ENTRY[2]), op.when(T_ENTRY[0])):
+        assert words in text, (words, text)
+
+
+def test_a_history_accepted_line_is_shown_with_its_day_figures_who_and_note(world):
+    add_shared_book(world)
+    text = shared_text(world)
+    for words in ("History accepted by the owner", DAY1, "1.0019", "accepted the lost summary's row"):
+        assert words in text, (words, text)
+
+
+def test_the_open_alerts_of_this_book_are_shown_and_another_venues_are_not(world):
+    add_shared_book(world)
+    text = shared_text(world)
+    for words in (f"step-stopped:{SHARED}", f"shared-shortfall:{SHARED}:{DAY2}", f"practice-stopped:propose:{DAY2}",
+                  "The order step stopped at stage marks"):
+        assert words in text, (words, text)
+    assert "webull-sandbox" not in text and "Another venue stopped" not in text
+
+
+def test_the_combined_holding_per_fund_shows_both_units_as_information_only(world):
+    add_shared_book(world)
+    text = shared_text(world)
+    for words in ("SPY 10.0000 15.0000 25.0000", "OWN 0.0000 4.0000 4.0000", "information only", "never a limit",
+                  "as of the last reconcile"):
+        assert words in text, (words, text)
+
+
+def test_a_held_fund_the_last_reconcile_lists_no_surplus_for_has_none_of_the_owners_own(world):
+    add_shared_book(world, surplus=True)
+    db = sqlite3.connect(world.root / "memory" / f"orders-{SHARED}.sqlite")
+    db.execute("UPDATE reconciles SET summary = ?", (json.dumps({"owner_surplus": {}}),))
+    db.commit()
+    db.close()
+    assert "SPY 10.0000 0.0000 10.0000" in shared_text(world)
+
+
+def test_a_last_reconcile_that_was_not_one_sided_says_the_owners_own_units_are_not_known(world):
+    add_shared_book(world, surplus=False)
+    text = shared_text(world)
+    assert "not known" in text and "SPY 10.0000" in text and "25.0000" not in text, text
+
+
+def test_the_page_only_reads_not_a_byte_of_the_state_file_the_ledger_or_the_journal_changes(world):
+    add_shared_book(world)
+    before = hashes(world.root)
+    world.html()
+    after = hashes(world.root)
+    assert after == before
+
+
+def test_a_locked_state_file_says_not_available_and_the_rest_of_the_page_is_built(world, monkeypatch):
+    add_shared_book(world)
+    monkeypatch.setattr(al, "WAIT_BUDGET_S", 0.2)
+    path = world.root / "memory" / f"order_step-{SHARED}.sqlite"
+    before = path.read_bytes()
+    holder = sqlite3.connect(path, isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        page = world.page()
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    text = page.sections["Shared book"]
+    assert "Unavailable" in text and SHARED in text and "busy" in text and "Traceback" not in text, text
+    assert list(page.sections)[:3] == TITLES[:3] and "Health" in page.sections
+    assert path.read_bytes() == before
+
+
+def test_a_missing_state_file_the_journal_still_knows_says_not_available_never_a_traceback(world):
+    w = world
+    add_shared_book(w, venue="webull-gone", state=False, ledger=False)
+    for n in range(2):
+        w.journal.write(DAY1, {"type": "owner_entry", "venue": "webull-gone", "id": n + 1, "kind": "cash_in", "hash": "h"})
+    text = shared_text(w)
+    assert "webull-gone" in text and "Not available" in text and "state file is not there" in text, text
+    assert "Traceback" not in text
+
+
+def test_an_entry_changed_after_it_was_written_is_said_in_words_not_shown(world):
+    add_shared_book(world)
+    db = sqlite3.connect(world.root / "memory" / f"order_step-{SHARED}.sqlite")
+    db.execute("DROP TRIGGER owner_entries_no_update")
+    db.execute("UPDATE owner_entries SET amount = '999999' WHERE id = 2")
+    db.commit()
+    db.close()
+    text = shared_text(world)
+    assert "Unavailable" in text and "changed after it was written" in text and "999999" not in text, text
+
+
+def test_a_missing_ledger_or_no_rows_each_say_so_and_the_rest_of_the_book_is_still_shown(world):
+    add_shared_book(world, ledger=False, rows=False)
+    text = shared_text(world)
+    assert "Not available" in text and "order ledger" in text and "no look" in text.lower(), text
+    assert "Units outstanding 10,500.0000" in text and "first deposit" in text
+
+
+def test_hostile_text_and_secrets_in_an_entry_are_cleaned_and_escaped(world):
+    add_shared_book(world)
+    html = world.html()
+    section = html[html.index('<section id="shared">'):]
+    section = section[:section.index("</section>")]
+    assert "<script>" not in section and "<img" not in section and SECRET not in section
+    assert "&lt;script&gt;" in section
