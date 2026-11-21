@@ -1039,6 +1039,109 @@ def untracked_tags(ledger_tags, *, venue: str, journal=(), tickets=(), sends=())
     return out
 
 
+# ---- T51c S4c: what a shared run judges on the book's value per unit (pure; every figure an exact decimal)
+
+@dataclass(frozen=True)
+class BookLoss:
+    """The day's loss and the drawdown, in percent, on the value per unit (R27). `previous` is the value per unit the
+    day's loss is measured from and `previous_from` says where it came from; `upper_open` is True when the previous
+    look's upper figure was not known and its lower one stood in; `peak` is the largest upper figure of every look."""
+    daily_loss_pct: Decimal
+    drawdown_pct: Decimal
+    previous: Decimal
+    previous_from: str
+    peak: Decimal
+    upper_open: bool
+
+
+def _nav_vpu(row: dict) -> tuple[Decimal | None, Decimal | None]:
+    """(lower, upper) value per unit of a `book_nav` row: its value bounds over its units outstanding, exact; None for
+    a bound the row does not have (the figures are stored as text, so they are compared only as decimals)."""
+    units = _opt_dec(row.get("units_outstanding"), "a book_nav row's units outstanding")
+    if units is None or units <= 0:
+        return None, None
+    low, high = (_opt_dec(row.get(k), f"a book_nav row's {k}") for k in ("value_low", "value_high"))
+    return (None if low is None else low / units), (None if high is None else high / units)
+
+
+def book_loss(rows, entries, day: str, *, low: Decimal, high: Decimal | None) -> BookLoss:
+    """T51c S4c (R27): the day's loss and the drawdown of the value per unit now (`low`: the lower figure, `high`: the
+    upper one, None when not known) against the book's own history. `rows` are the `book_nav` rows (dicts with their
+    figures as text: day, id, units_outstanding, value_low, value_high), `entries` the owner's entries (day, id,
+    value_per_unit_after), `day` today's New York day. The previous value per unit is the upper figure of the latest
+    row (by day, then id) of an earlier day (its lower figure when its upper is not known: `upper_open`), else the
+    value per unit after the latest owner entry of an earlier day, else the opening entry's (the book opened today).
+    The peak is the largest upper figure (the lower where the upper is not known) over every row and now, compared
+    as decimals. The day's loss is (previous - low) / previous and the drawdown (peak - low) / peak, each at least 0,
+    in percent. The owner's entries change no value per unit, so they are never a gain or a loss. Refused (BookError)
+    where no previous value per unit can be found, or a figure is not a finite decimal."""
+    with localcontext() as ctx:
+        ctx.prec = _BOOK_PREC
+        seen = []
+        for r in rows:
+            lo, hi = _nav_vpu(r)
+            if lo is not None or hi is not None:
+                seen.append((str(r["day"]), int(r["id"]), lo, hi))
+        earlier = [s for s in seen if s[0] < day]
+        open_ = False
+        if earlier:
+            d, _, lo, hi = max(earlier, key=lambda s: (s[0], s[1]))
+            previous, open_ = (hi, False) if hi is not None else (lo, True)
+            came = f"the last look of {d}"
+        else:
+            before = [e for e in entries if str(e["day"]) < day and e.get("value_per_unit_after") is not None]
+            if before:
+                e = max(before, key=lambda e: int(e["id"]))
+                previous, came = _dec(e["value_per_unit_after"], f"entry {e['id']}'s value per unit"), f"owner entry {e['id']}"
+            elif entries and entries[0].get("value_per_unit_after") is not None:
+                previous = _dec(entries[0]["value_per_unit_after"], "the opening entry's value per unit")
+                came = "the opening entry (the book was opened today)"
+            else:
+                raise BookError("there is no earlier value per unit to measure the day's loss from (no earlier look, no "
+                                "owner's entry with one); no figure is assumed")
+        now_high = low if high is None else high
+        peak = max([hi if hi is not None else lo for _, _, lo, hi in seen] + [now_high])
+        if previous <= 0 or peak <= 0:
+            raise BookError(f"the value per unit to measure from ({previous}) or the peak ({peak}) is not above nothing")
+        return BookLoss(daily_loss_pct=max(Decimal(0), (previous - low) / previous * 100),
+                        drawdown_pct=max(Decimal(0), (peak - low) / peak * 100), previous=previous, previous_from=came,
+                        peak=peak, upper_open=open_)
+
+
+def far_quotes(last_row: dict | None, entries, quotes: dict, held, limit_pct) -> list[dict]:
+    """T51c S4c (R28): the held funds whose quote is further from their last `book_nav` mark than `limit_pct` percent
+    (the owner's max_drawdown_pct). `last_row` is the latest row ({"time", "marks": {symbol: price text}}, None for
+    no row: nothing to judge), `entries` the owner's entries: a `split` of the symbol written after the row's time
+    moves the mark to what the split makes of it (the mark divided by its ratio), which is how the owner clears a real
+    split. A fund with no mark in the row or no quote is not judged here (a missing quote is the prices' own stop).
+    Exactly `limit_pct` away is not beyond. Each answer: {"symbol", "quote", "mark", "reference"}."""
+    if not last_row:
+        return []
+    marks, out = last_row.get("marks") or {}, []
+    with localcontext() as ctx:
+        ctx.prec = _BOOK_PREC
+        limit = _dec(limit_pct, "the drawdown limit")
+        for sym in sorted(held):
+            mark, quote = marks.get(sym), quotes.get(sym)
+            if mark is None or quote is None:
+                continue
+            ref = _dec(mark, f"the last mark of {_cut(sym)}")
+            for e in entries:
+                if e.get("kind") == "split" and e.get("symbol") == sym and float(e["time"]) > float(last_row["time"]):
+                    ref /= _dec(e["ratio"], f"entry {e.get('id')}'s ratio")
+            price = _dec(quote, f"the quote of {_cut(sym)}")
+            if ref > 0 and abs(price / ref - 1) * 100 > limit:
+                out.append({"symbol": sym, "quote": float(price), "mark": float(_dec(mark, "mark")), "reference": float(ref)})
+    return out
+
+
+def _shortfall_figures(shorts: dict) -> dict:
+    """A shared run's shortfalls as the summary says them: per plain symbol, the book's units, the account's, the
+    unapplied fills' and the units short, as numbers only."""
+    return {sym: {k: _number_or_none(d.get(k)) for k in ("book", "venue", "unapplied", "short")}
+            for sym, d in sorted(shorts.items(), key=lambda kv: str(kv[0])) if _plain(_SYMBOL, sym) and isinstance(d, dict)}
+
+
 _FIGURE = re.compile(r"[0-9]+(\.[0-9]+)?")       # the owner's figure as written: digits, an optional decimal part
 _OWNER_USES = {"cash_in": ("amount",), "cash_out": ("amount",), "units_out": ("symbol", "units"),
                "split": ("symbol", "ratio")}
@@ -1053,7 +1156,7 @@ _FIGURED_FILL_FIELDS = ("id", "tag", "symbol", "units", "price", "price_covers_u
 _FIGURED_ORDER_FIELDS = ("tag", "units", "order_type", "limit_price", "collar_price", "fee", "state", "finished_at",
                          "never_arrived_at")
 _RUN_FLAGS_WORDS = ("the owner's entry is written on its own, without --propose, --approve, --live, --check, "
-                    "--capital or --fractional; nothing was written")
+                    "--capital, --fractional or --shared; nothing was written")
 
 
 def _owner_figure(text, what: str) -> Decimal:
@@ -1319,7 +1422,7 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None, *
     confirm = getattr(args, "confirm", None)
     if (getattr(args, "propose", False) or getattr(args, "approve", None) is not None or getattr(args, "live", False)
             or getattr(args, "check", False) or getattr(args, "capital", None) is not None
-            or getattr(args, "fractional", False)):
+            or getattr(args, "fractional", False) or getattr(args, "shared", False)):
         return _owner_refuse(_RUN_FLAGS_WORDS)
     venue = getattr(args, "venue", None)
     if not isinstance(venue, str) or not venue or _safe_name(venue) != venue or venue.strip(".") == "":
@@ -2274,6 +2377,48 @@ class OrderStepState:
         with self._write():
             self._db.execute("UPDATE equity SET time = ?, equity = ? WHERE id = ?", (float(self.clock()), float(equity), int(row)))
 
+    # ---- T51c S4c (R27): the book's own value history, written by a shared run in place of `equity`
+
+    _NAV_COLUMNS = ("units_outstanding", "value_per_unit", "value_low", "value_high", "cash_bounded", "marks",
+                    "marks_hash", "entry_hash")
+
+    def book_nav_rows(self) -> list[dict]:
+        """Every `book_nav` row, oldest first, each a dict of its columns (the figures as the exact decimal text they
+        were written as); `marks` is parsed into {symbol: price text}. A row whose marks are not such an object is
+        refused in words (OrderStepError): a person must look."""
+        cols = ("id", "day", "time", "batch", *self._NAV_COLUMNS)
+        out = []
+        for raw in self._db.execute(f"SELECT {', '.join(cols)} FROM book_nav ORDER BY id").fetchall():
+            row = dict(zip(cols, raw))
+            try:
+                marks = json.loads(row["marks"])
+            except (ValueError, RecursionError):
+                marks = None
+            if not (isinstance(marks, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in marks.items())):
+                raise OrderStepError(f"book_nav row {row['id']} holds marks that are not a JSON object of price texts; "
+                                     "a person must look")
+            row["marks"] = marks
+            out.append(row)
+        return out
+
+    def record_book_nav(self, day: str, batch: str, nav: dict) -> int:
+        """Record a shared run's first look: one `book_nav` row, `nav` holding the figures as text (units_outstanding,
+        value_per_unit, value_low, value_high, cash_bounded, marks as canonical JSON text, marks_hash, entry_hash).
+        Returns the row's id (for reprice_book_nav). One write transaction."""
+        with self._write():
+            cur = self._db.execute(
+                f"INSERT INTO book_nav (day, time, batch, {', '.join(self._NAV_COLUMNS)}) VALUES (?, ?, ?, "
+                f"{', '.join('?' * len(self._NAV_COLUMNS))})",
+                (day, float(self.clock()), batch, *(nav[k] for k in self._NAV_COLUMNS)))
+        return int(cur.lastrowid)
+
+    def reprice_book_nav(self, row: int, nav: dict) -> None:
+        """Set the figures of this run's row again, when a quote in hand has changed (as reprice_equity does)."""
+        sets = ", ".join(f"{k} = ?" for k in self._NAV_COLUMNS)
+        with self._write():
+            self._db.execute(f"UPDATE book_nav SET time = ?, {sets} WHERE id = ?",
+                             (float(self.clock()), *(nav[k] for k in self._NAV_COLUMNS), int(row)))
+
     def sent_on(self, day: str) -> int:
         """Orders handed to the ledger for sending on `day` and not known to have stayed unsent. An order whose outcome
         was never written (a crash during the call) counts until settle_sends says otherwise."""
@@ -2561,10 +2706,32 @@ class TicketBook:
             return {}
         return mark if isinstance(mark, dict) else {}
 
-    def create(self, ticket: dict, lines: list[dict], live: dict | None = None, follow: dict | None = None) -> None:
+    def shared_mark(self, day: str, number: str) -> dict | None:
+        """T51c S4c: a ticket made by a SHARED run ({"mode": "shared"}: its capital is the book's value), or None for a
+        ticket of an ordinary run ({} when it cannot be read)."""
+        row = self._db.execute("SELECT value FROM meta WHERE key = ?", (f"shared:{day}:{number}",)).fetchone()
+        if row is None:
+            return None
+        try:
+            mark = json.loads(row[0])
+        except ValueError:
+            return {}
+        return mark if isinstance(mark, dict) else {}
+
+    def tagged_outcomes(self) -> list[tuple[str, str | None]]:
+        """T51c S4c: every tag a ticket line was given before its intend, with the line's latest outcome (None: no
+        outcome row yet), for `untracked_tags`. Reads only."""
+        rows = self._db.execute(
+            "SELECT t.tag, (SELECT o.outcome FROM outcomes o WHERE o.day = t.day AND o.number = t.number AND o.line = t.line "
+            "ORDER BY o.seq DESC LIMIT 1) FROM tags t ORDER BY t.rowid").fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def create(self, ticket: dict, lines: list[dict], live: dict | None = None, follow: dict | None = None,
+               shared: dict | None = None) -> None:
         """Write a ticket and its lines, and mark every earlier unused ticket of the same venue and account superseded,
         in one transaction: only the latest ticket is live. A live ticket also gets its mark (`live`) and the broker
-        book it follows (`follow`, T32) in the meta table, in the same transaction."""
+        book it follows (`follow`, T32) in the meta table, in the same transaction; so does a ticket of a shared run
+        (`shared`, T51c S4c)."""
         cols = ("day", "number", "created", "expires", "venue", "environment", "account", "capital", "fractional", "equity",
                 "cash", "settled_cash", "batch")
         with self._write():
@@ -2585,6 +2752,9 @@ class TicketBook:
             if follow is not None:
                 self._db.execute("INSERT INTO meta (key, value) VALUES (?, ?)",
                                  (f"broker_book:{ticket['day']}:{ticket['number']}", json.dumps(follow, sort_keys=True)))
+            if shared is not None:
+                self._db.execute("INSERT INTO meta (key, value) VALUES (?, ?)",
+                                 (f"shared:{ticket['day']}:{ticket['number']}", json.dumps(shared, sort_keys=True)))
 
     def mark_used(self, day: str, number: str, batch: str) -> None:
         """Mark the ticket used by `batch`; refused (OrderStepError) when it already has a fate."""
@@ -2793,7 +2963,7 @@ _ABSENT = object()
 def run_order_step(*, ledger: OrderLedger, venue, paper, quotes: Callable, journal, limits_file, state,
                    clock: Callable[[], float] = wall_clock, calendar=None, halt_file=risk_gate.HALT_FILE,
                    latch_file=None, capital: float | None = None, fractional: bool = False, propose: bool = False,
-                   approve: str | None = None, live=None, second_opinion=None, follow=None) -> dict:
+                   approve: str | None = None, live=None, second_opinion=None, follow=None, shared: bool = False) -> dict:
     """One order step (see the module notes). `paper` is PaperTargets or a callable giving them; `quotes(symbols)`
     gives {symbol: (price, time)}; `state` is an OrderStepState or the path of its file; `calendar` answers
     is_session, session_open and session_close (default: the XNYS calendar). Returns the summary, also journaled.
@@ -2804,10 +2974,12 @@ def run_order_step(*, ledger: OrderLedger, venue, paper, quotes: Callable, journ
     (default: second_quote.second_opinion), asked in live mode and, with `fractional` on, for each MARKET leg on
     practice (T51 ruling C; with `fractional` off practice asks none). `follow` (a Follow: config/broker_book.json as
     the command line reads it, T32) makes the broker book follow only the strategies it names; None follows the
-    whole book, except in live mode, which stops without one."""
+    whole book, except in live mode, which stops without one. `shared` (T51c S4c, practice only; live is S4d) is the
+    shared-account mode: the book is judged on its own figures (see the module notes, "The shared run")."""
     mode = "propose" if propose else ("approve" if approve is not None else None)
     run = _Run(ledger, venue, paper, quotes, journal, limits_file, state, clock, calendar, halt_file, latch_file,
                capital, fractional)
+    run.shared = bool(shared)
     if follow is not None:
         run.follow, run.follow_problem = follow, _follow_problem(follow)
         if run.follow_problem is None:
@@ -2916,6 +3088,18 @@ class _Run:
         self.second_load = None                          # T51 ruling C: practice, fractional: how to load the second source
         self.second_unloadable: str | None = None        # ... why it could not be loaded, once tried
         self.market_hours: tuple | None = None           # T51 R5 (B4): (start, end, why) of the MARKET legs' window
+        self.shared = False                              # T51c S4c: the shared-account mode (practice only)
+        self.last_fig: BookFigures | None = None        # ... the book's figures at the run's latest look
+        self.entries: list[dict] = []                    # ... the owner's entries, read once under the lock
+        self.journal_lines: list | None = None           # ... the journal as the scan read it (a shared run only)
+        self.nav_row: int | None = None                  # ... this run's book_nav row
+        self.nav_prior: list[dict] | None = None         # ... the book_nav rows written before this run's own
+        self.nav_sig: tuple | None = None                # ... what this run's row holds now
+        self.in_hand: dict[str, float] = {}              # ... the marks in hand at the run's last look
+        self.shared_info: dict = {}                      # ... what the summary says of the book
+        self.shortfalls: dict = {}                       # ... the shortfalls the run saw and did not set aside
+        self.journaled_units: dict[str, float] = {}      # ... the units of the fills this run journaled, per symbol
+        self.owner_surplus: set[str] = set()             # ... the latest reconcile's symbols the owner holds beyond the book
 
     # -- helpers
     def _follow_view(self) -> dict:
@@ -2987,6 +3171,9 @@ class _Run:
         self.batch = f"os-{stamp:%Y%m%d-%H%M%S}-{os.urandom(3).hex()}"
         if self.mode == "both":                          # before the lock: writes nothing anywhere
             return self._finish("stopped", "ticket", "propose and approve cannot be asked for in one run")
+        if self.live is not None and self.shared:        # T51c S4c: live mode is made shared by S4d, not by this slice
+            return self._finish("stopped", "live", "the shared mode is open on practice only for now: a live run is made "
+                                                   "shared by a later slice; nothing is read or sent")
         if self.live is not None:                        # live mode: only as a ticket run, a capital, whole shares
             why = ("live mode runs only with propose or approve" if self.mode is None else
                    "live mode needs the capital given (at most the confirmation's max_capital)" if self.capital is None else
@@ -3000,6 +3187,11 @@ class _Run:
             self._environment()                          # 1: the venue's name, environment and host only
         except _Stop as stop:
             return self._finish("stopped", stop.stage, stop.reason)
+        if self.shared and self.capital is not None:     # T51c S4c (R26): before the lock; the book's value is the capital
+            return self._finish("stopped", "targets",
+                                "--capital is refused in the shared mode: the capital is the book's own value (the cautious "
+                                "bound), one source of truth, so a stake is changed by the owner's entry and never by a "
+                                "figure typed to a run; nothing is read or sent")
         path = self.state_arg.path if isinstance(self.state_arg, OrderStepState) else str(self.state_arg)
         self.run_path = path
         lock = self.run_lock = _RunLock(path)
@@ -3050,6 +3242,14 @@ class _Run:
             why = self._lock_lost("nothing is sent")
             if why is not None:
                 return self._finish("stopped", "lock", why)
+        try:                                             # T51c S4c (R25): the latch, and a shared run's first refusals
+            self._latch()
+        except _Stop as stop:
+            return self._finish("stopped", stop.stage, stop.reason)
+        except (OrderError, OrderStepError, sqlite3.Error, OSError) as exc:
+            return self._finish("stopped", "state", f"the owner's entries, the journal or the ledger could not be checked: "
+                                                    f"{_local_error(exc)}; a person must look; nothing is read from the "
+                                                    "account and nothing is sent")
         if self.mode is not None:                        # the ticket's checks and the account, before any other venue call
             try:
                 self._ticket_first(now)
@@ -3063,10 +3263,14 @@ class _Run:
             baseline = self._baseline()                  # 3
             self._reconcile_and_cancel(baseline)         # 4
             paper = self.paper_read                      # 5
-            book = broker_book(self.ledger.fills())
+            book = self._shared_units() if self.shared else broker_book(self.ledger.fills())
             if any(abs(u) > MAX_UNITS for u in book.values()):
                 raise _Stop("reconcile", f"a position in the broker book is above {MAX_UNITS:,.0f} units in size; a person must look")
-            capital = paper.equity if self.capital is None else self.capital
+            if self.shared:                              # T51c S4c (R26): the prices come first; the capital is the book's value
+                prices, why_not = self._prices(self._shared_symbols(paper, book), now)
+                capital = self._shared_capital(book, prices)
+            else:
+                capital = paper.equity if self.capital is None else self.capital
             if not _finite(capital) or capital <= 0:
                 raise _Stop("targets", f"the capital must be a positive finite number, not {capital!r}")
             self.capital_used = float(capital)
@@ -3076,7 +3280,8 @@ class _Run:
                 min_value = paper.min_trade_pct * paper.share * float(capital) / paper.equity
             else:                                        # T32: the smallest trade at the followed strategies' scale
                 min_value = paper.min_trade_pct * paper.share * float(capital) / _book_capital(paper, self.follow_names)
-            prices, why_not = self._prices(sorted(set(self.target_units) | set(book) | set(baseline)), now)   # 6
+            if not self.shared:
+                prices, why_not = self._prices(sorted(set(self.target_units) | set(book) | set(baseline)), now)   # 6
             cash = self._cash()
         except _Stop as stop:
             return self._finish("stopped", stop.stage, stop.reason)
@@ -3094,7 +3299,7 @@ class _Run:
             final = self._reconcile(baseline, "after")  # 11
         except _Stop as stop:
             return self._finish("stopped", "after", stop.reason)
-        except (OrderError, sqlite3.Error, OSError) as exc:
+        except (OrderError, sqlite3.Error, OSError, BookError) as exc:
             return self._finish("stopped", "after", f"the last reconcile could not be completed: {_local_error(exc)}")
         self._judge_final(final)                         # T34b-2 (F1, F3): a failure here is the run's own (unexpected)
         if self.mode == "propose":
@@ -3104,7 +3309,254 @@ class _Run:
                 return self._finish("stopped", stop.stage, stop.reason)
             except (OrderStepError, sqlite3.Error, OSError) as exc:
                 return self._finish("stopped", "ticket", f"the ticket could not be written: {_local_error(exc)}")
+        if self.shared:
+            self._final_look()                           # T51c S4c: the run's row, at the book as the last reconcile left it
         return self._finish("done", None, None)
+
+    # -- T51c S4c: the shared run (practice): the book judged on its own figures
+    def _read_journal(self) -> list:
+        try:
+            return list(self.journal.read())
+        except Exception as exc:
+            raise _Stop("journal", f"the journal could not be read to compare the owner's entries: {_describe(exc)}") from None
+
+    def _ticket_pairs(self) -> list[tuple[str, str | None]]:
+        """Every tag a ticket line was given, with its line's outcome, from the ticket file (read only): the run's own
+        when it has one open, else the file beside the state file when there is one."""
+        book, own = self.tickets, False
+        if book is None:
+            path = ticket_path_for(self.run_path) if self.run_path is not None else ":memory:"
+            if str(path) == ":memory:" or not os.path.exists(path):
+                return []
+            try:
+                book, own = TicketBook(path, self.clock, create=False), True
+            except (OrderStepError, sqlite3.Error, OSError) as exc:
+                raise _Stop("ticket", f"the ticket file could not be read: {_local_error(exc)}; nothing is read from the "
+                                      "account and nothing is sent") from None
+        try:
+            return book.tagged_outcomes()
+        except sqlite3.Error as exc:
+            raise _Stop("ticket", f"the ticket file could not be read: {_local_error(exc)}; nothing is read from the "
+                                  "account and nothing is sent") from None
+        finally:
+            if own:
+                book.close()
+
+    def _latch(self) -> None:
+        """T51c S4c (R25, and study step 1), before anything is read from the account or sent. The state file latches:
+        one that holds an owner's entry refuses a run that is not shared (stage `state`), so the book_nav history is
+        never broken by a run that scales to the paper equity. A shared run, in this order: the state file's entries and
+        the journal's must agree (`state`: a person must look); every tag the journal, the send record or a ticket holds
+        must be in the ledger (`reconcile`: untracked_tags); and the book must have its opening entry (`targets`, a
+        skip: the owner opens it)."""
+        entries = self.state.owner_entries()             # the chain checked: a broken one is OrderStepError -> `state`
+        if not self.shared:
+            if entries:
+                raise _Stop("state", f"this state file holds {len(entries)} owner's "
+                                     f"entr{'y' if len(entries) == 1 else 'ies'}, so it is the shared account's book: a run "
+                                     "without --shared would scale to the paper equity, write the old equity table and "
+                                     "break the book's value history; run it with --shared; nothing is read from the "
+                                     "account and nothing is sent")
+            return
+        lines = self.journal_lines if self.journal_lines is not None else self._read_journal()
+        differences = owner_entry_differences(entries, lines, venue=self.name)
+        if differences:
+            raise _Stop("state", f"the state file and the journal differ on the owner's entries: "
+                                 f"{_cut('; '.join(differences), 600)}; a person must look; nothing is read from the "
+                                 "account and nothing is sent")
+        found = untracked_tags([o["tag"] for o in self.ledger.orders()], venue=self.name, journal=lines,
+                               tickets=self._ticket_pairs(), sends=self.state.send_tags())
+        if found:
+            raise _Stop("reconcile", f"{_cut('; '.join(f['reason'] for f in found[:3]), 600)}"
+                                     f"{f' (and {len(found) - 3} more)' if len(found) > 3 else ''}; nothing is read from the "
+                                     "account and nothing is sent")
+        if not entries or entries[0].get("kind") != "cash_in":
+            raise _Stop("targets", "the shared mode needs the book's opening entry (order-step --owner-entry cash_in "
+                                   "--venue NAME ...), written by the owner; nothing is read from the account and nothing "
+                                   "is sent")
+        self.entries = entries
+
+    def _shared_units(self, applied_only: bool = False) -> dict[str, float]:
+        """The book's units per symbol after the owner's entries (a units_out, a split), as book_figures reads them: of
+        every fill, or of the applied ones only (what the reconcile is given; it adds the unapplied itself)."""
+        fills = self.ledger.fills()
+        if applied_only:
+            fills = [f for f in fills if f["applied"]]
+        figures = book_figures(fills, self.ledger.orders(), self.entries, {}, self.day, now=self._now())
+        return {sym: float(u) for sym, u in figures.units.items() if u != 0}
+
+    def _shared_symbols(self, paper: PaperTargets, book: dict) -> list[str]:
+        """The symbols to quote: the paper book's funds (the same set at any capital) and every fund the book holds. The
+        baseline's holdings are never among them (R30)."""
+        scale_one, _ = targets(paper, _book_capital(paper, self.follow_names, self.follow_every), self.follow_names,
+                               self.follow_every)
+        return sorted(set(scale_one) | {sym for sym, u in book.items() if u != 0})
+
+    def _nav_rows(self) -> list[dict]:
+        if self.nav_prior is None:
+            self.nav_prior = self.state.book_nav_rows()     # before this run's own row is written
+        return self.nav_prior
+
+    def _shared_capital(self, book: dict, prices: dict) -> float:
+        """R26, R28, after the prices: the book's value at them is the capital (the lower bound, the cautious one). Not
+        known: stage `prices`; a held fund far from its last mark: stage `marks`; an approval whose book value moved
+        from its ticket's by more than TICKET_QUOTE_MOVE: stage `ticket`."""
+        figures = book_figures(self.ledger.fills(), self.ledger.orders(), self.entries, prices, self.day, now=self._now())
+        if figures.value is None:
+            raise _Stop("prices", f"the book's value is not known ({_value_unknown_why(figures)}); nothing is sent")
+        if figures.value_per_unit is None:
+            raise _Stop("targets", f"the book has {figures.units_outstanding} units outstanding, so it has no value per "
+                                   "unit; the owner's entry opens it; nothing is sent")
+        try:
+            limits = risk_gate.load_limits(self.limits_file)
+        except risk_gate.RiskConfigError:
+            limits = None                                # check_order then refuses every order with the file's own error
+        rows = self._nav_rows()
+        held = [sym for sym, u in figures.units.items() if u != 0]
+        if limits is not None:
+            for far in far_quotes(rows[-1] if rows else None, self.entries, prices, held, limits["max_drawdown_pct"]):
+                raise _Stop("marks", f"{far['symbol']} quotes {far['quote']:g}, and the book's last mark of it was "
+                                     f"{far['mark']:g}" + (f" ({far['reference']:g} after the owner's split entries)"
+                                                           if far["reference"] != far["mark"] else "") +
+                                     f", further than the owner's max_drawdown_pct of {float(limits['max_drawdown_pct']):g}% "
+                                     "away: a split, a rename or a bad quote; if it is a split, the owner writes a split "
+                                     "entry; a person must look; nothing is sent")
+        value = float(figures.value)
+        if self.mode == "approve" and self.ticket is not None:
+            made = float(self.ticket["capital"])
+            if not abs(value - made) <= TICKET_QUOTE_MOVE * made:
+                raise _Stop("ticket", f"that ticket was made at a book value of {made:,.2f}; it is now {value:,.2f}, more "
+                                      f"than {TICKET_QUOTE_MOVE:.1%} away; nothing is sent")
+        self.shared_info["capital"] = value
+        return value
+
+    def _book_look(self, marks: dict) -> BookFigures:
+        """The book's figures at the marks in hand, from the ledger as it is now; the value must be known."""
+        figures = book_figures(self.ledger.fills(), self.ledger.orders(), self.entries, marks, self.day, now=self._now())
+        if figures.value is None or figures.value_per_unit is None:
+            why = _value_unknown_why(figures) if figures.value is None else "no units outstanding"
+            raise _Stop("prices", f"the book's value is not known ({why}); nothing more is sent")
+        self.last_fig = figures
+        return figures
+
+    def _shared_look(self, marks: dict) -> tuple[BookFigures, BookLoss]:
+        """One look at the book: its figures at `marks`, the day's loss and the drawdown on the value per unit, and the
+        summary's account of them (said again at each look)."""
+        figures = self._book_look(marks)
+        with localcontext() as ctx:
+            ctx.prec = _BOOK_PREC
+            high = None if figures.value_high is None else figures.value_high / figures.units_outstanding
+        loss = book_loss(self._nav_rows(), self.entries, self.day, low=figures.value_per_unit, high=high)
+        self.shared_info.update(
+            book_value=float(figures.value), book_value_high=None if figures.value_high is None else float(figures.value_high),
+            value_per_unit=str(figures.value_per_unit), units_outstanding=str(figures.units_outstanding),
+            cash_bounded=figures.cash_bounded, fees_taken_as_none=figures.fees_taken_as_none,
+            fees_bounded={"count": len(figures.bounded_orders), "orders": sorted(_cut(t) for t in figures.bounded_orders)[:20]},
+            day_loss_pct=float(loss.daily_loss_pct), drawdown_pct=float(loss.drawdown_pct),
+            previous_value_per_unit=str(loss.previous), previous_from=loss.previous_from,
+            day_loss_upper_open=loss.upper_open)
+        return figures, loss
+
+    def _nav_sync(self, figures: BookFigures, marks: dict) -> None:
+        """This run's `book_nav` row at the figures: written at the first look, set again at a later one when it changed."""
+        held = {sym: str(_dec(marks[sym], f"the mark of {_cut(sym)}")) for sym, u in sorted(figures.units.items())
+                if u != 0 and sym in marks}
+        text = json.dumps(held, sort_keys=True, separators=(",", ":"))
+        nav = {"units_outstanding": str(figures.units_outstanding), "value_per_unit": str(figures.value_per_unit),
+               "value_low": str(figures.value), "value_high": None if figures.value_high is None else str(figures.value_high),
+               "cash_bounded": int(figures.cash_bounded), "marks": text,
+               "marks_hash": hashlib.sha256(text.encode()).hexdigest(), "entry_hash": self.entries[-1]["hash"]}
+        sig = tuple(nav.values())
+        if self.nav_row is None:
+            self.nav_row = self.state.record_book_nav(self.day, self.batch, nav)
+        elif sig != self.nav_sig:
+            self.state.reprice_book_nav(self.nav_row, nav)
+        self.nav_sig = sig
+
+    def _shared_account(self, marks: dict, opened: int) -> dict:
+        """The account the risk gate judges, in a shared run: the BOOK's value at the marks in hand (the lower bound) as
+        its equity, the day's loss and the drawdown on its value per unit, the funds it holds as the count (R27, R31)."""
+        figures, loss = self._shared_look(marks)
+        self._nav_sync(figures, marks)
+        self.broker_equity = float(figures.value)
+        return {"equity": float(figures.value), "daily_loss_pct": float(loss.daily_loss_pct),
+                "drawdown_pct": float(loss.drawdown_pct), "open_positions": opened}
+
+    def _final_look(self) -> None:
+        """After the last reconcile: the run's row (and the summary's figures) at the book as that reconcile left it, at
+        the marks in hand, so a fund bought in this run has its mark for the next run's check. The run is over: a look
+        that cannot be made leaves the row as the last judged look had it."""
+        if self.nav_row is None:
+            return
+        try:
+            self._shared_account(self.in_hand, 0)
+        except Exception:
+            pass
+
+    def _shortfall_stop(self, first, second, still: list[dict]) -> str | None:
+        """R24: the words of a stop at stage `shortfall`, or None. The ledger stands in the way only because the account
+        holds less than the book counts as its own: the second reconcile lists a shortfall (or, when its positions read
+        raised, the first one did), and nothing else is wrong in either (no unresolved order, anomaly, difference or
+        positions that could not be read except as said; no order still open, sent or unknown; no fill unapplied; no
+        blocking attention item). Anything else stays `reconcile`."""
+        try:
+            if still or not (isinstance(first, dict) and isinstance(second, dict)):
+                return None
+            shorts, from_first = second.get("position_shortfalls") or {}, False
+            if not shorts and second.get("positions_error_kind") == "positions_unread":
+                shorts, from_first = first.get("position_shortfalls") or {}, True
+            if not shorts or not isinstance(shorts, dict):
+                return None
+            for res in (first, second):
+                if res.get("unresolved") or res.get("anomalies") or res.get("position_differences"):
+                    return None
+            if first.get("positions_error") is not None or (second.get("positions_error") is not None and not from_first):
+                return None
+            if self.ledger.orders(("sent", "unknown")) or self.ledger.unapplied_fills():
+                return None
+            for item in self.ledger.attention(open_only=False):
+                if item.get("kind") in NOTICE_KINDS:
+                    continue
+                if item.get("closed_time") is None or int(item["id"]) > (self.attention_before or 0):
+                    return None
+            if any(why != "the latest reconcile was not clean" for why in self.ledger.blocked()):
+                return None
+            self.shortfalls = _shortfall_figures(shorts)
+            return self._shortfall_words(shorts) + ("; the second read of the account's positions failed" if from_first else "")
+        except Exception:
+            return None
+
+    def _shortfall_words(self, shorts: dict) -> str:
+        """The shortfalls in words (R2's sentence, from the ledger's own record: the symbol, both figures, the two
+        ordinary causes), for the stop and the ledger words; at most 2000 characters."""
+        parts = []
+        for sym in sorted(shorts, key=str):
+            d = shorts[sym]
+            if _plain(_SYMBOL, sym) and isinstance(d, dict) and isinstance(d.get("reason"), str):
+                parts.append(d["reason"])
+            else:
+                parts.append("the account holds less than the book counts as its own of a symbol that is not plain")
+        return _cut("the account holds less than the book counts as its own: " + "; ".join(parts) +
+                    "; nothing is sent; it clears when the shares are back or when the owner writes a units_out or a split "
+                    "entry", 2000)
+
+    def _short_within(self, sym, d) -> bool:
+        """R24: whether a shortfall `d` of `sym` is at most the units this run's own orders of it (open at the venue, or
+        of this batch) or the fills it journaled of it amount to."""
+        short = _as_float(d.get("short")) if isinstance(d, dict) else None
+        if short is None:
+            return False
+        orders = [o for o in self.ledger.orders() if o.get("symbol") == sym
+                  and (o.get("state") in OPEN_AT_VENUE or (self.batch and o.get("batch") == self.batch))]
+        cap = max(math.fsum(abs(float(o["units"])) for o in orders), self.journaled_units.get(sym, 0.0))
+        return short <= cap * (1.0 + 1e-9) + 1e-9
+
+    def _shared_summary(self) -> dict:
+        info = dict(self.shared_info)
+        info["owner_surplus"] = sorted(self.owner_surplus)
+        if self.shortfalls:
+            info["shortfalls"] = self.shortfalls
+        return info
 
     # -- live mode (go_live): the locks, the account, each order's caps and second price
     def _live_locks(self, path: str) -> str | None:
@@ -3254,13 +3706,21 @@ class _Run:
         unread = final.get("positions_error") is not None
         diffs = final.get("position_differences")
         diffs = diffs if isinstance(diffs, dict) else {}
-        if diffs:                                       # J2 (addendum 5): a symbol this run touched is set aside too
+        shorts = final.get("position_shortfalls")        # T51c S4c (R24): only a one-sided (shared) reconcile has them
+        shorts = shorts if isinstance(shorts, dict) else {}
+        if diffs or shorts:                             # J2 (addendum 5): a symbol this run touched is set aside too
             touched = {o["symbol"] for o in self.ledger.orders()
                        if o.get("state") in OPEN_AT_VENUE or (self.batch and o.get("batch") == self.batch)}
             working = touched | self.journaled_symbols
         else:
             working = set()
         aside = {sym for sym in diffs if sym in working}
+        # R24: a shortfall in a symbol this run's own orders touched, of at most their units, is set aside like a
+        # difference (the account's holding falls, or has not yet risen, before the order's status says so); any other
+        # shortfall is no fault either (an owner's sale is an ordinary day): it is said in the summary and the next
+        # run's first reconcile stops at stage `shortfall`
+        aside_short = {sym for sym, d in shorts.items() if sym in working and self._short_within(sym, d)}
+        self.shortfalls = _shortfall_figures({sym: d for sym, d in shorts.items() if sym not in aside_short})
         unresolved = final.get("unresolved")
         unresolved = unresolved if isinstance(unresolved, list) else ([] if not unresolved else [None])
         status_aside: dict[str, str] = {}               # G1 (addendum 4): judged by the order's state, never a reason
@@ -3273,11 +3733,12 @@ class _Run:
             else:
                 stuck = True
         other = (stuck or bool(final.get("anomalies")) or bool(set(diffs) - aside)
-                 or bool(self.ledger.orders(("sent", "unknown"))) or not (aside or unread or status_aside))
+                 or bool(self.ledger.orders(("sent", "unknown"))) or not (aside or unread or status_aside or shorts))
         if other:
             self.final_unclean = True
-        if aside or unread or status_aside:
-            self.reconcile_pending = {"symbols": sorted({self._cap_symbol(sym) for sym in (*aside, *status_aside.values())}),
+        if aside or aside_short or unread or status_aside:
+            self.reconcile_pending = {"symbols": sorted({self._cap_symbol(sym)
+                                                         for sym in (*aside, *aside_short, *status_aside.values())}),
                                       "positions_unread": unread, "status_unread": len(status_aside)}
 
     @staticmethod
@@ -3585,6 +4046,11 @@ class _Run:
         mark = book.live_mark(t["day"], t["number"])     # the ticket's mode: live tickets carry their locks' files
         if self.live is None and mark is not None:
             self._refuse_ticket("that ticket was made in live mode")
+        shared_mark = book.shared_mark(t["day"], t["number"])     # T51c S4c: a shared run's ticket has the book's value
+        if self.shared and shared_mark is None:                   # as its capital; an ordinary run's has the paper's
+            self._refuse_ticket("that ticket was not made in shared mode")
+        if not self.shared and shared_mark is not None:
+            self._refuse_ticket("that ticket was made in shared mode")
         if self.live is not None:
             if mark is None or mark.get("mode") != "live":
                 self._refuse_ticket("that ticket was not made in live mode")
@@ -3604,8 +4070,8 @@ class _Run:
         if now < t["created"]:
             self._refuse_ticket("that ticket was made after now on the clock")
         capital = self.paper_read.equity if self.capital is None else self.capital
-        if _as_float(capital) is None or float(capital) != t["capital"]:
-            self._refuse_ticket("that ticket was made for another capital")
+        if not self.shared and (_as_float(capital) is None or float(capital) != t["capital"]):
+            self._refuse_ticket("that ticket was made for another capital")   # (shared: judged after the prices, R26)
         if bool(t["fractional"]) != self.fractional:
             self._refuse_ticket("that ticket was made " + ("with" if t["fractional"] else "without") + " fractional units")
         lines = [{"line": int(ln["line"]), "fund": ln["symbol"], "side": ln["side"], "units": float(ln["units"]),
@@ -3658,7 +4124,7 @@ class _Run:
                   "settled_cash": self.settled_cash, "batch": self.batch}
         mark = None if self.live is None else {"mode": "live", "files": self.locks.digest}
         if self.live is None:
-            self.tickets.create(ticket, self.ticket_lines, live=mark)
+            self.tickets.create(ticket, self.ticket_lines, live=mark, shared={"mode": "shared"} if self.shared else None)
         else:                                            # T32: a live ticket is bound to the broker book it follows
             self.tickets.create(ticket, self.ticket_lines, live=mark,
                                 follow={"digest": self.follow.digest, **self._follow_view()})
@@ -3844,6 +4310,8 @@ class _Run:
             raise _Stop("journal", "the journal has a damaged line that is not the last line of the newest file ("
                                    + ", ".join(f"{name} line {n}" for name, n in bad[:5])
                                    + "); a person must look before the order step runs again")
+        if self.shared:                                  # T51c S4c: the owner's entries and the tags are compared with it
+            self.journal_lines = entries
         self._seen_fill_ids = {e.get("fill_id") for e in entries
                                if e.get("type") == "order_step" and e.get("event") == "fill" and e.get("venue") == self.name}
         self._scan_verdicts(entries)                     # T34b-3: every file, every run (no cut-off)
@@ -4010,7 +4478,12 @@ class _Run:
         return out
 
     def _reconcile(self, baseline: dict, when: str) -> dict:
-        result = self.ledger.reconcile(self.venue, self._applied_positions(baseline))
+        if self.shared:                                  # T51c S4c (R24, R30): one-sided, the book's own units after the
+            result = self.ledger.reconcile(self.venue, self._shared_units(applied_only=True), one_sided=True)   # entries
+            if isinstance(result, dict):
+                self.owner_surplus = {s for s in (result.get("owner_surplus") or {}) if _plain(_SYMBOL, s)}
+        else:
+            result = self.ledger.reconcile(self.venue, self._applied_positions(baseline))
         self._journal_fills()
         self._journal_notices()
         self._settle_unjudged()
@@ -4053,6 +4526,7 @@ class _Run:
                 self._seen_fill_ids.add(f["id"])
                 self.fills_journaled += 1
                 self.journaled_symbols.add(f["symbol"])
+                self.journaled_units[f["symbol"]] = self.journaled_units.get(f["symbol"], 0.0) + abs(float(f["units"]))
                 self._take_verdict(f"fill-{f['id']}", entry)
             self.ledger.mark_applied([f["id"]])
 
@@ -4174,6 +4648,10 @@ class _Run:
             unread = self._venue_unread(self.first_result, second, still)   # T34b-3 (G): a skipped day, or a fault
             if unread is not None:
                 raise _Stop("venue_read", unread)
+            if self.shared:                              # T51c S4c (R24): a shortfall alone is a hold, not a fault
+                held = self._shortfall_stop(self.first_result, second, still)
+                if held is not None:
+                    raise _Stop("shortfall", held)
             raise _Stop("reconcile", "; ".join(self._ledger_words(still, second))[:2000])
 
     def _venue_unread(self, first, second, still: list[dict]) -> str | None:
@@ -4197,8 +4675,8 @@ class _Run:
                 return None
             unread: set[str] = set()
             for res in (first, second):
-                if res.get("anomalies") or res.get("position_differences"):                      # (d)
-                    return None
+                if res.get("anomalies") or res.get("position_differences") or res.get("position_shortfalls"):   # (d)
+                    return None                        # T51c S4c (K4): a shortfall is never "the venue could not be read"
                 items = res.get("unresolved") or []
                 if not isinstance(items, list):
                     return None
@@ -4251,7 +4729,8 @@ class _Run:
                            "close_attention once a person has looked")
         last = self.ledger.last_reconcile()
         if last is None or not last.get("clean"):
-            counts = [f"{len(result.get(k) or [])} {k}" for k in ("unresolved", "anomalies") if result.get(k)]
+            counts = [f"{len(result.get(k) or [])} {k}" for k in ("unresolved", "anomalies", "position_shortfalls")
+                      if result.get(k)]
             if result.get("positions_error"):
                 counts.append("the venue's positions could not be read")
             reasons.append("the latest reconcile was not clean" + (f" ({', '.join(counts)})" if counts else ""))
@@ -4262,6 +4741,9 @@ class _Run:
             odd = len(diffs) - len(plain)
             reasons.append(f"positions differ from baseline plus broker book: {json.dumps(plain, sort_keys=True)}"
                            + (f" and {odd} more that are not plain symbols" if odd else ""))
+        shorts = result.get("position_shortfalls") or {}      # T51c S4c (K2): a shortfall's words are the ledger's own
+        if shorts:
+            reasons.append(self._shortfall_words(shorts))
         return reasons or ["the order ledger is blocked"]
 
     # -- 5
@@ -4458,7 +4940,10 @@ class _Run:
 
     # -- 8, 9, 10
     def _send(self, candidates, baseline, book, prices, cash) -> None:
-        held = {sym: math.fsum((baseline.get(sym, 0.0), book.get(sym, 0.0))) for sym in set(baseline) | set(book)}
+        if self.shared:                                  # T51c S4c (R30, R31): the baseline is never held, priced or counted
+            held = dict(book)
+        else:
+            held = {sym: math.fsum((baseline.get(sym, 0.0), book.get(sym, 0.0))) for sym in set(baseline) | set(book)}
         unpriced = [sym for sym, u in held.items() if u > UNITS_EPS and sym not in prices]
         if cash is None:                                 # unusable: stop before any order, record nothing
             raise _Stop("prices", f"the venue's cash is not a usable number ({_EQUITY_BOUNDS}); nothing is sent")
@@ -4474,15 +4959,23 @@ class _Run:
         if self.live is not None:                        # T22d-1 (A1): every held mark judged, before any equity, ticket
             self._judge_marks(held, prices, "nothing is sent")   # ... use or order
         in_hand = dict(prices)                           # every holding at its latest usable quote
-        equity = self._equity(cash, held, in_hand)
-        previous, prior_peak = self.state.previous_equity(self.day), self.state.peak()
-        row = self.state.record_equity(self.day, equity)
-        self.broker_equity = equity
-        opened = sum(1 for u in held.values() if u > UNITS_EPS)
+        if self.shared:                                  # T51c S4c (R27): the book_nav row, never the equity table
+            self.in_hand = in_hand
+            opened = sum(1 for u in held.values() if u > UNITS_EPS)
+            self._shared_account(in_hand, opened)        # the first look: the run's row is written here
+            previous = prior_peak = row = None
+        else:
+            equity = self._equity(cash, held, in_hand)
+            previous, prior_peak = self.state.previous_equity(self.day), self.state.peak()
+            row = self.state.record_equity(self.day, equity)
+            self.broker_equity = equity
+            opened = sum(1 for u in held.values() if u > UNITS_EPS)
 
         def account_now() -> dict:
             """The account at the quotes in hand now (a holding without a fresh quote at its last usable price). The
             day's row (and so the peak) is kept at the same prices."""
+            if self.shared:                              # the book at the quotes in hand: its value, loss and drawdown
+                return self._shared_account(in_hand, opened)
             now_equity = self._equity(cash, held, in_hand)
             if now_equity != self.broker_equity:
                 self.state.reprice_equity(row, now_equity)
@@ -4507,9 +5000,17 @@ class _Run:
         cash_budget = cash * (1.0 - CASH_KEPT) if cash > 0 else 0.0
         settled_budget = None if settled is None else (settled * (1.0 - CASH_KEPT) if settled > 0 else 0.0)
         budget = cash_budget if settled_budget is None else min(cash_budget, settled_budget)   # never unsettled money
+        book_budget = None                               # T51c S4c (step 5): the book's own usable cash is a third bound
+        if self.shared:
+            usable = self.last_fig.usable_cash
+            book_budget = float(usable) * (1.0 - CASH_KEPT) if usable is not None and usable > 0 else 0.0
+            budget = min(budget, book_budget)
         words = {"cash": f"the purchases would exceed the cash the venue reports less {CASH_KEPT:.0%} ({cash_budget:.2f})",
                  "settled": f"the purchases would exceed the settled cash the venue reports less {CASH_KEPT:.0%} "
                             f"({(settled_budget or 0.0):.2f})"}
+        if book_budget is not None:
+            words["book"] = (f"the purchases would exceed the book's usable cash less {CASH_KEPT:.0%} ({book_budget:.2f}): "
+                             "the account may hold more, but the book spends only its own")
         spent = 0.0
         purchases_stopped = None
 
@@ -4521,6 +5022,9 @@ class _Run:
             when it fits both."""
             cash_left = cash_budget - spent - self.purchases_left_unsettled
             settled_left = math.inf if settled_budget is None else settled_budget - spent
+            if book_budget is not None and cost > book_budget - spent:   # the book's own bound: the one with least left
+                lefts = {"cash": cash_left, "settled": settled_left, "book": book_budget - spent}
+                return min((k for k in lefts if cost > lefts[k]), key=lambda k: lefts[k])
             over_cash, over_settled = cost > cash_left, cost > settled_left
             if over_settled and not over_cash:
                 self.purchases_left_unsettled += cost
@@ -4601,8 +5105,13 @@ class _Run:
                     break
                 cost = units * limit if units > 0 else 0.0
                 if units > 0 and spent + cost > budget:
-                    purchases_stopped = money(cost) or ("cash" if settled_budget is None or cash_budget <= settled_budget
-                                                        else "settled")
+                    purchases_stopped = money(cost)
+                    if purchases_stopped is None:        # it fits what each has left; the smallest budget names it
+                        purchases_stopped = ("cash" if settled_budget is None or cash_budget <= settled_budget
+                                             else "settled")
+                        if book_budget is not None and book_budget < (cash_budget if purchases_stopped == "cash"
+                                                                       else settled_budget):
+                            purchases_stopped = "book"
                     self._leave(c, words[purchases_stopped], collar="value" if market else None)   # T51 R5 (B5)
                     break
                 self._check_environment()                # 3. the environment and host, read again
@@ -4899,6 +5408,11 @@ class _Run:
             mine = broker_book(f for f in self.ledger.fills() if self.batch and f["tag"].startswith(self.batch + "-"))
         except Exception:
             book, mine = {}, {}
+        if self.shared and self.entries:                 # T51c S4c: the book's units after the owner's entries
+            try:
+                book = self._shared_units()
+            except Exception:
+                pass
         gaps = {sym: {"broker_book": book.get(sym, 0.0), "target": t, "gap": t - book.get(sym, 0.0)}
                 for sym, t in sorted(self.target_units.items())}
         for sym in sorted(set(book) - set(self.target_units)):
@@ -4914,6 +5428,8 @@ class _Run:
             summary["residuals"] = [dict(r) for r in self.residuals]
         if self.follow_names is not None:                # T32: which strategies the broker book followed
             summary["follow"] = self._follow_view()
+        if self.shared:                                  # T51c S4c: the book's figures, its fees bounded, its shortfalls
+            summary["shared"] = self._shared_summary()
         corrections = []
         if self._locked:                                 # every used ticket mirrors the order ledger as it now is
             try:

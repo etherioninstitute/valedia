@@ -59,7 +59,7 @@ class Lag(T.Booked):
 
     def order_status(self, tag):
         out = super().order_status(tag)
-        if out is not None and self.lies:
+        if out is not None and self.lies and self.book[tag]["units"] < 0:       # a sale, seen late
             out.update(state="open", filled_units=0.0, avg_price=None)
         return out
 
@@ -273,7 +273,7 @@ def test_the_owners_deposits_and_withdrawals_are_never_a_profit_or_a_loss(mk):
     out = w.shared()
     assert out["status"] == "done" and out["refused"] == [] and sent_units(w) == {"SPY": 50.0}, out
     # the only fall is the purchase's own: 50 SPY bought at the limit 505 and marked at 500 (250 of 50,000)
-    assert out["shared"]["day_loss_pct"] == pytest.approx(0.5) and out["shared"]["previous_value_per_unit"] == "1"
+    assert out["shared"]["day_loss_pct"] == pytest.approx(0.5) and D(out["shared"]["previous_value_per_unit"]) == 1
 
 
 def test_the_peak_is_worked_out_in_decimal_not_as_text():
@@ -282,8 +282,8 @@ def test_the_peak_is_worked_out_in_decimal_not_as_text():
     entries = [{"id": 1, "day": "2026-11-10", "value_per_unit_after": "1"}]
     loss = osx.book_loss(rows, entries, "2026-11-13", low=D("9.9"), high=D("9.9"))
     assert loss.peak == D("10.5")                         # as SQL text, "9.5" is above "10.5"
-    assert loss.drawdown_pct == (D("10.5") - D("9.9")) / D("10.5") * 100
-    assert loss.previous == D("10.5") and loss.daily_loss_pct == (D("10.5") - D("9.9")) / D("10.5") * 100
+    assert loss.drawdown_pct.quantize(D("0.0000001")) == D("5.7142857") == loss.daily_loss_pct.quantize(D("0.0000001"))
+    assert loss.previous == D("10.5") and not loss.upper_open
 
 
 def test_the_previous_unit_value_is_the_latest_earlier_days_row_else_the_latest_earlier_entry_else_the_opening_one():
@@ -490,12 +490,12 @@ def test_a_shortfall_of_a_symbol_this_run_did_not_touch_is_no_fault_and_stops_th
     w.open_book()
     w.paper = T.paper({"a": {"SPY": 100.0, "QQQ": 100.0}})
     w.shared()
-    w.paper = T.paper({"a": {"SPY": 120.0, "QQQ": 100.0}})
+    w.paper = T.paper({"a": {"SPY": 110.0, "QQQ": 100.0}})        # it buys 9 SPY (the book has 9,100 of cash left)
     w.venue.lag_after_submit = {"QQQ": 0.0}               # the owner sells the book's QQQ while the run is going
     w.later()
     out = w.shared()
-    assert out["status"] == "done" and "faults" not in out, out
-    assert set(out["shared"]["shortfalls"]) == {"QQQ"}, out["shared"]
+    assert out["status"] == "done" and out["orders_sent"] == 1 and "faults" not in out, out
+    assert set(out["shared"]["shortfalls"]) == {"QQQ"} and "reconcile_pending" not in out, out
     w.later()
     out = w.shared()
     assert out["status"] == "stopped" and out["stage"] == "shortfall" and "QQQ" in out["reason"], out
@@ -520,6 +520,7 @@ def test_a_shortfall_is_never_classed_as_a_venue_that_could_not_be_read(mk):
     w.venue.held["SPY"] -= 30.0
     w.later()
     w.venue.reads, w.venue.positions_fail_from = 0, 2      # the first reconcile reads (a shortfall), the second cannot
+    w.venue.calls.clear()
     out = w.shared()
     assert out["status"] == "stopped" and out["stage"] == "shortfall" and "SPY" in out["reason"], out
     assert "submit" not in w.venue.names()
@@ -745,3 +746,33 @@ def test_a_second_run_on_one_day_at_the_same_quotes_gives_the_same_figures_and_t
     for key in ("book_value", "value_per_unit", "day_loss_pct", "drawdown_pct", "previous_value_per_unit"):
         assert one[key] == two[key], (key, one, two)
     assert len(w.nav()) == 3
+
+
+# ---- the command line's flag
+
+def test_the_command_lines_shared_flag_reaches_the_run_and_is_refused_where_it_cannot_go(tmp_path, monkeypatch, capsys):
+    import argparse
+    from valedia_trader.research_loop import risk_gate
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "risk.json").write_text(json.dumps(T.GENEROUS))
+    (tmp_path / "journal").mkdir()
+    (tmp_path / "journal" / "paper_state.json").write_text(json.dumps({
+        "starting_cash": 100_000.0, "cash": 98_000.0, "positions": {"a": {"SPY": {"units": 4.0, "cost": 500.0}}},
+        "pending": [], "history": [{"day": "2026-11-12", "equity": 100_000.0, "capital_per_strategy": 100_000.0}],
+        "peak_equity": 100_000.0, "last_day": "2026-11-12", "realized": {}, "panel_cases": []}))
+    venue, now = T.Booked(), T.ny("2026-11-13 10:00")
+    monkeypatch.setattr(cli, "_order_step_build", lambda: venue)
+    monkeypatch.setattr(osx, "wall_clock", lambda: now)
+    monkeypatch.setattr(osx, "minute_quotes", lambda symbols: {s: (500.0, now - 60) for s in symbols})
+    monkeypatch.setattr(risk_gate, "HALT_FILE", tmp_path / "no-halt.json")
+    assert cli.main(["--root", str(tmp_path), "order-step", "--shared", "--capital", "5000"]) == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["stage"] == "targets" and "--capital" in out["reason"] and venue.calls == [], out
+    assert cli.main(["--root", str(tmp_path), "order-step", "--shared"]) == 2          # no opening entry: a skip
+    out = json.loads(capsys.readouterr().out)
+    assert out["stage"] == "targets" and "opening entry" in out["reason"] and "shared" in out, out
+    asked = argparse.Namespace(live=True, check=False, shared=True, fractional=False, capital=1.0, propose=True, approve=None)
+    assert "--shared" in cli._live_args_refusal(asked)
+    assert cli.main(["--root", str(tmp_path), "order-step", "--owner-entry", "cash_in", "--venue", venue.name, "--amount",
+                     "1", "--who", "o", "--note", "n", "--shared"]) == 2               # the owner's entry takes no run flag
+    assert "--shared" in capsys.readouterr().err

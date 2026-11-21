@@ -731,14 +731,15 @@ def order_step_command(args, paths: LoopPaths, venue=None, ledger: HypothesisLed
             ledger=orders, venue=venue, paper=lambda: order_step.paper_targets(trader), quotes=order_step.minute_quotes,
             journal=trader.journal, limits_file=paths.risk_limits, state=order_step.state_path_for(ledger_path, venue.name),
             clock=order_step.wall_clock, halt_file=risk_gate.HALT_FILE, latch_file=trader.latch_file, capital=args.capital,
-            fractional=args.fractional, **ticket, **followed)
+            fractional=args.fractional, **ticket, **followed, **({"shared": True} if getattr(args, "shared", False) else {}))
     finally:
         orders.close()
     number = out.pop("ticket_number", None) if ticket else None
     print(json.dumps(out, indent=2, default=str))
     if number is not None:
         again = "".join([f" --capital {args.capital!r}" if args.capital is not None else "",
-                         " --fractional" if args.fractional else ""])
+                         " --fractional" if args.fractional else "",
+                         " --shared" if getattr(args, "shared", False) else ""])
         print(f"ticket number: {number} (approve within {order_step.TICKET_LIFE_SECONDS // 60} minutes with: "
               f"order-step --approve NUMBER{again})")
     return 0 if out["status"] == "done" else 2
@@ -757,6 +758,9 @@ def _live_args_refusal(args) -> str | None:
     live, check = getattr(args, "live", False), getattr(args, "check", False)
     if check and not live:
         return "--check is part of live mode: order-step --live --check"
+    if getattr(args, "shared", False) and (live or check):
+        return ("--shared is open on practice only for now (T51c S4c); live mode is made shared by a later slice, so a "
+                "live run is refused with it")
     if not live:
         return None
     if getattr(args, "fractional", False):
@@ -1090,6 +1094,9 @@ def main(argv=None) -> int:
     p.add_argument("--capital", type=float, default=None,
                    help="the broker capital the paper book is scaled to (default: the paper equity, a scale of 1)")
     p.add_argument("--fractional", action="store_true", help="fractional units (5 decimals) instead of whole shares")
+    p.add_argument("--shared", action="store_true",
+                   help="T51c S4c, practice: the account is shared with its owner and the fund book is judged on its own "
+                        "figures (its own value is the capital, so --capital is refused; needs the owner's opening entry)")
     ticket = p.add_mutually_exclusive_group()
     ticket.add_argument("--propose", action="store_true",
                         help="write a ticket of the orders instead of sending them; nothing is sent, the number is printed")

@@ -476,8 +476,8 @@ what settlement looks like.
 
 ## The shared account (being built)
 
-The owner also trades the account the fund book is to trade in (T51c). What exists after slices S1 to S3, and what is
-not wired yet (S4b wired the owner's command; see below):
+The owner also trades the account the fund book is to trade in (T51c). What exists after slices S1 to S3 and S4a to
+S4c (S4b wired the owner's command; S4c wired a PRACTICE run: "The shared run", below; live is S4d):
 
 - **The reconcile can compare one way** (`OrderLedger.reconcile(..., one_sided=True)`): what the account holds beyond
   the book and its unapplied fills is listed under `owner_surplus` and is no difference; an account holding LESS than
@@ -501,9 +501,10 @@ not wired yet (S4b wired the owner's command; see below):
   a change to those two in the journal alone is not found. A journal line that is not whole is skipped as a run
   skips it; if it was an owner's entry, that entry is then missing from the journal and the command refuses. An
   entry whose time is not later than the last entry's (a clock behind the record) is refused. Someone who rewrites BOTH to match, or puts both back from one older copy, is not caught by
-  this build; the nightly copies and the venue's own record are what would show it. A second new table, `book_nav`, will hold the book's own value
+  this build; the nightly copies and the venue's own record are what would show it. A second new table, `book_nav`, holds the book's own value
   per unit, its bounds, the marks it was valued at and the latest entry it includes, run by run, for the day's
-  loss and the drawdown of S4; nothing writes or reads it yet. The old `equity` table is kept as it was.
+  loss and the drawdown; a shared run writes and reads it (S4c). The old `equity` table is kept as it was: a shared
+  run neither reads nor writes it.
 - **A purchase the venue reports no fee for** (T51c S4a, addendum 7, R22). Seen on the practice account on
   2026-11-18: a filled purchase has no fee on the order or its fills (empty, not zero), while each sale reports its
   fee. The rule's source: Webull's pricing page, read 2026-11-18: no commission on stocks and funds, and a
@@ -521,17 +522,18 @@ not wired yet (S4b wired the owner's command; see below):
   stays as before: the lower bound open, so the value is not known and the owner's command refuses, naming the
   order. `book_figures` is handed the present time (`now`, the reading its New York day was taken from; a reading on
   another day, or in milliseconds, is refused) and reads no clock; the owner's command hands it its one clock
-  reading. Nothing in a run uses this yet. **KNOWN GAP:** a fee the venue charges later outside the order (a monthly
+  reading. A shared run uses it (S4c). **KNOWN GAP:** a fee the venue charges later outside the order (a monthly
   CAT charge, say), or reports only after the window has closed, is never seen by the book. Also: the ledger cannot
   tell a fee the venue left empty from fee entries the adapter could not read (both are stored empty), so a purchase
   whose fee entries could not be read is bounded by B too; and a fee of 0 reported only at a recheck is not stored by
   the ledger as built (no rise), so such an order stays bounded until its window closes.
 - **A local check** (`untracked_tags`): every tag the order step wrote to the journal, a ticket or its send record
-  must be in the ledger (a ledger put back from an older copy shows up here). Called by nothing yet.
+  must be in the ledger (a ledger put back from an older copy shows up here). A shared run makes it before anything
+  is read from the account.
 
-**Not wired** (slice S4, after the owner rules on the position limit's basis): no run reads the entries, the book's
-figures or the one-sided reconcile; limits, purchases and sales are still judged as before; `--capital` is unchanged.
-Still not seen by the book at all: a distribution paid on the book's shares, and any order the venue holds that the
+**Not wired** (S4d, S4e): live is not shared yet (`--shared` with `--live` is refused); the alerts on the owner's page
+and the combined holding per fund (his and hers, information only) are S4e. A run WITHOUT `--shared` is as it was,
+except that a state file holding an owner's entry refuses it (below). Still not seen by the book at all: a distribution paid on the book's shares, and any order the venue holds that the
 ledger never knew (the venue's order history is a later slice).
 
 **The owner's command** (T51c S3, wired by S4b, addendum 7 R29). The entry's own figure is the owner's; the command
@@ -609,8 +611,92 @@ written. It cannot make good an entry that was changed (the chain breaks, or the
 put in another order, a missing entry that is not the last, or an entry whose hash is not given; and, as before, an
 entry appended by hand with its hash recomputed and its hash typed is not told from the owner's own.
 
-*Not there yet*: live entries (S4d, with `--live`); shared mode in a run (S4c): no run reads the entries, the
-pending preview, the book's figures or the one-sided reconcile.
+*Not there yet*: live entries (S4d, with `--live`). (A run reads the entries and the book's figures only in the shared
+mode, below; no run ever reads the pending preview.)
+
+### The shared run, practice only (T51c S4c; `order-step --shared`)
+
+`order-step --shared` (the keyword `shared=True` of `run_order_step`) runs the order step against an account the owner
+also trades, judging the fund book on its OWN figures. It is open on the practice venue only: `--shared` with
+`--live` (or `--check`) is refused, and a live run is made shared by S4d. The scheduled practice job does not pass the
+flag yet; the lead moves the gate and the job together.
+
+**The stages of a shared run**, in order, each stop a `stage` the stake ladder knows (a skip counts the session as
+skipped; a fault is a fault):
+
+1. *Before the lock*: `--capital` is refused in words (stage `targets`, a skip), because the capital is the book's own
+   value (the cautious, lower bound), one source of truth; a stake changes by the owner's entry and never by a figure
+   typed to a run. (It replaces R6's "equal to the cent".)
+2. *After the lock and the journal scan, before anything is read from the account or sent* (`_latch`): (a) the
+   state file's owner entries and the journal's `owner_entry` lines must agree (stage `state`, a fault: a person must
+   look); (b) every tag the journal, the send record or a ticket holds must be in the ledger (`untracked_tags`; stage
+   `reconcile`, a fault: a ledger put back from an older copy); (c) the book must have its opening entry (`cash_in`
+   first; stage `targets`, a skip: the owner opens it). The order is (a) before (c), so a state file replaced by an
+   empty one is a fault (the journal holds entry 1), not a skip.
+3. *The latch (R25)*: a state file that holds an owner's entry REFUSES a run that is not shared (stage `state`, before
+   anything is read from the account): a run without the flag would scale to the paper equity, write the old
+   `equity` table and break the book's value history.
+4. *The reconcile is one-sided* (R24, R30): what the account holds beyond the book is `owner_surplus` (the owner's;
+   on the practice book that includes the whole baseline, which is never sold, priced or counted), what it holds LESS
+   than the book counts as its own is a shortfall. The book's units are the ledger's fills after the owner's entries
+   (a `units_out` lowers them, a `split` multiplies them); the baseline is read by nothing in a shared run.
+5. *A shortfall* stops the run at stage `shortfall`, a SKIPPED session for the stake ladder, never a fault: an
+   ordinary cause exists (the owner sold shares the book counts as its own). The stop and the summary carry the
+   ledger's words (the symbol, both figures, the two ordinary causes) and `shared.shortfalls` (the book's units, the
+   account's, the unapplied fills' and the units short); the ledger is blocked, which the alerts already show
+   (`orders:<ledger>`), and a stopped unattended run is `step-stopped`. It is cleared only by the shares coming back
+   or by the owner's `units_out` (the shares he took) or `split` entry. It is never taken as "the venue could not be
+   read" (`venue_read`): a shortfall in the first reconcile whose second positions read failed is still `shortfall`.
+   After the last reconcile of a run a shortfall in a symbol this run's own orders touched (open at the venue, or of
+   its batch, or of a fill it journaled), of at most those orders' units or the fills' units, is set aside as a
+   position difference is (the venue's positions lag its order status, seen on practice 2026-11-18: after a sale the
+   holding falls before the order says filled) and listed in `reconcile_pending`; any other shortfall found by that
+   last reconcile is no fault either (an owner's sale is an ordinary day): it is in `shared.shortfalls` and the next
+   run's first reconcile stops at `shortfall`.
+6. *The prices come before the capital*: one quote call for the paper book's funds and the funds the book holds
+   (never a baseline fund). The book's value at those quotes (lower bound) is the capital. A value not known (a fund
+   held with no usable quote, or a sale whose fee is empty: the lower bound stays open) stops at `prices`, a skip,
+   with the book's own words (R32). A purchase whose fee the venue left empty is bounded by the published CAT
+   fee (R22) and counted: `shared.fees_bounded` ({count, orders}) and `shared.fees_taken_as_none`, never a fault.
+7. *A held fund far from its last mark* (R28): a fund the book holds whose quote is further than the owner's
+   `max_drawdown_pct` (config/risk.json) from its mark in the latest `book_nav` row stops the run at stage `marks`
+   (a skip) before any order, because the one quote prices every order's limit and the whole book's value. A real
+   split is cleared by the owner's `split` entry: the mark is divided by the ratio of every split of that fund written
+   after the row. No earlier row, or a fund with no mark in it, is not judged. (When the limits file cannot be read the
+   check is not made: the risk gate then refuses every order with the file's own error.)
+8. *A ticket* (R26): a proposal stores the value it was made at (as its `capital`) and is marked as made by a shared run
+   (a ticket of an ordinary run is refused by a shared approval and the reverse: "not made in shared mode"); an
+   approval recomputes the value AFTER the prices and refuses (stage `ticket`, a skip; the ticket stays unused) when it
+   has moved by more than `TICKET_QUOTE_MOVE` (0.5%) from the ticket's. The exact-capital check is not made for a shared
+   ticket. Lock 1's `max_capital` binds a live run only; a live run is not shared yet (S4d).
+9. *Every limit is judged on the book alone* (R31, R27): the risk gate is given the book's value (lower bound) as the
+   equity, the book's units as what is held (so the position limit and the count of positions never see the owner's
+   holdings, the baseline included), and the day's loss and the drawdown on the VALUE PER UNIT, so the owner's deposits,
+   withdrawals and shares taken are never profit or loss: the previous value per unit is the upper figure of the
+   latest `book_nav` row of an earlier New York day (its lower figure when its upper is not known, said in
+   `shared.day_loss_upper_open`), else the value per unit after the latest owner entry of an earlier day, else the
+   opening entry's (1); the day's loss holds that upper figure against the present LOWER one; the peak is the largest
+   upper figure of every row and now, compared as decimals (the figures are stored as text: never an SQL MAX). A
+   width of the bounds (a cent a purchase at most, from R22) can hold the drawdown up by that width. `book_nav` gets one
+   row at a run's first look, set again at each later look when it changed (as the equity row is) and after the last
+   reconcile, so the next run has the marks of what this one bought.
+10. *Purchases* spend at most the smallest of the account's cash, its settled cash and the BOOK's own usable cash (its
+    cash less the proceeds of its sales that are unsettled today), each less the 1% kept; a purchase left over because
+    of the book's own bound says so ("the book's usable cash", `shared`; the account may hold more).
+    `broker_equity` in a shared summary is the book's value (lower bound), not the account's.
+
+The summary of a shared run carries `shared`: `capital`, `book_value` and `book_value_high` (at the latest look),
+`value_per_unit`, `units_outstanding`, `cash_bounded`, `fees_bounded`, `fees_taken_as_none`, `day_loss_pct`,
+`drawdown_pct`, `previous_value_per_unit` and where it came from, `owner_surplus`, and `shortfalls` when there are
+any.
+
+**What is NOT there yet.** Live is not shared (S4d: live always shared, live entries, lock 1 against the book's value);
+the alerts on the owner's page and the combined holding per fund (S4e); the fee a purchase's venue reports ABOVE the
+published bound writes no journal notice (R22 (c): the bounds simply follow the reported figure); a book value for a
+`units_outstanding` of nothing (every unit redeemed) stops at `targets` until the owner's entry opens it again. The
+go-live gate (`go_live.paper_record`) treats a run stopped at `shortfall` as it treats every stop but `session` and
+`ticket` (`targets`, `prices` and `marks` too): it counts as a stopped run for lock 2's days since a stopped run;
+making the owner's sale not count there is a change to that file, not made here.
 
 ## Not covered yet
 

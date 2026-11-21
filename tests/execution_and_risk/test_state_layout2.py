@@ -117,9 +117,10 @@ def test_a_new_state_file_is_layout_2_with_an_empty_entries_table(tmp_path):
     assert d["rows"]["owner_entries"] == [] and d["rows"]["book_nav"] == []
 
 
-def test_book_nav_holds_what_s4_needs_as_text_and_nothing_writes_it(tmp_path):
+def test_book_nav_holds_what_s4_needs_as_text_and_only_a_shared_run_writes_it(tmp_path):
     """Repair item 3: the book's value history, keyed like the equity table (an id, the New York day, the time), with
-    exact decimals as text; written and read by nothing in this build."""
+    exact decimals as text. T51c S4c: written and read only by OrderStepState's three methods for it, which only a
+    shared run calls."""
     osx.OrderStepState(tmp_path / "s.sqlite").close()
     con = sqlite3.connect(tmp_path / "s.sqlite")
     cols = {r[1]: (r[2], r[3]) for r in con.execute("PRAGMA table_info(book_nav)")}
@@ -130,8 +131,8 @@ def test_book_nav_holds_what_s4_needs_as_text_and_nothing_writes_it(tmp_path):
                     "marks_hash": ("TEXT", 1), "entry_hash": ("TEXT", 1)}
     src = Path(osx.__file__).read_text()
     assert "CREATE TABLE book_nav " in src
-    for verb in ("FROM book_nav", "INTO book_nav", "UPDATE book_nav", "JOIN book_nav"):
-        assert verb not in src, verb                                    # nothing in this build writes or reads it
+    for verb, times in (("FROM book_nav", 1), ("INTO book_nav", 1), ("UPDATE book_nav", 1), ("JOIN book_nav", 0)):
+        assert src.count(verb) == times, verb           # book_nav_rows, record_book_nav, reprice_book_nav; no join
     con = sqlite3.connect(tmp_path / "s.sqlite")
     row = ("2025-11-18", 1.0, "b1", "10", "1", "1", "1")
     for flag in (2, -1, "yes"):                                         # cash_bounded is 0 or 1, nothing else
@@ -756,9 +757,10 @@ def test_a_layout_1_file_is_read_as_no_entries_and_upgraded_only_by_an_entry_wri
     assert dump(state_of(tmp_path))["version"] == 2 and [ln["id"] for ln in journaled(tmp_path)] == [1]
 
 
-def test_only_the_command_calls_the_comparison_in_this_build():
+def test_only_the_command_and_a_shared_runs_latch_call_the_comparison():
     src = Path(osx.__file__).read_text()
-    assert src.count("owner_entry_differences(") == 3                   # its definition, the command's check, its repair's
+    assert src.count("owner_entry_differences(") == 4                   # its definition, the command's check, its repair's,
+                                                                        # and (T51c S4c) a shared run's latch
     assert "owner_entry_differences" not in Path(cli.__file__).read_text()
 
 

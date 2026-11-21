@@ -49,8 +49,10 @@ STOP_WINDOW = 25                     # over the last this many exact daily retur
 STOP_FLOOR_PCT = 1.0                 # and never under this (unless the owner's daily halt is lower)
 FAULT_STAGES = frozenset({"state", "reconcile", "send", "after", "journal", "baseline", "unexpected"})
 SKIP_STAGES = frozenset({"session", "ticket", "lock", "live", "clock", "environment", "targets", "follow", "prices",
-                         "marks", "venue_read"})    # D3's ordinary and data stops: a skipped session; T34b-3 (G):
-                                                    # venue_read, a venue that could not be read and nothing else
+                         "marks", "venue_read", "shortfall"})   # D3's ordinary and data stops: a skipped session; T34b-3
+                                                    # (G): venue_read, a venue that could not be read and nothing else;
+                                                    # T51c S4c (R24): shortfall, the account holds less than the shared
+                                                    # book counts as its own (the owner sold shares: an ordinary cause)
 DRIFT_ACTS = False                   # D10: a `drift` entry in a summary's faults does not make a fault while False
 DRIFT = "drift"
 MAX_DAY_ORDERS = 720                 # T34b-1 addendum 2, D-A: more possible orders on one day and a person must look
