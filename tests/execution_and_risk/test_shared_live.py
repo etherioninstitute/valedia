@@ -432,8 +432,8 @@ def test_only_the_latest_row_of_a_day_is_compared_and_a_day_without_a_figure_is_
     w = mkl()
     _three_days(w)
     w.seed_nav("2026-11-12", "1.05", None)               # a later run of the day wrote another row: the latest row is read
-    w.sql("UPDATE book_nav SET value_per_unit = '0.5' WHERE day = '2026-11-12' AND id = (SELECT MIN(id) FROM book_nav "
-          "WHERE day = '2026-11-12')")                   # ... and an earlier row of that day is not
+    w.sql("UPDATE book_nav SET value_per_unit = '0.5', value_low = '50000', value_high = '50000' WHERE day = '2026-11-12' "
+          "AND id = (SELECT MIN(id) FROM book_nav WHERE day = '2026-11-12')")      # ... and an earlier row of that day is not
     w.journal.write("2026-11-12", _look_line(None))      # a run that stopped before its first look: no figure to hold
     w.journal.write("2026-11-09", _look_line(None))      # a day with no figure at all: no row is required of it
     w.journal.write("2026-11-08", {"type": "order_step", "venue": VENUE, "event": "summary", "status": "stopped"})
@@ -878,11 +878,15 @@ def test_a_hand_edited_row_with_a_renamed_batch_and_a_lower_figure_is_refused(mk
           "WHERE day = '2026-11-12'")
     code, _, err = accept(w, "2026-11-12")
     assert code == 2 and "lower than the journal's figure for 2026-11-12" in err and w.journal_events("history_accepted") == []
-    w.sql("UPDATE book_nav SET value_per_unit = '1.07', value_low = '107000', value_high = '103000' "
-          "WHERE day = '2026-11-12'")                     # a higher lower figure but a lower upper one: still lower
-    code, _, err = accept(w, "2026-11-12")
-    assert code == 2 and "lower than the journal's figure" in err
     assert w.propose()["stage"] == "state"
+    other = mkl()                                         # a higher lower figure but a lower upper one: still lower
+    other.open_book("10000")
+    history(other, [("2026-11-10", "1.05", None)])
+    journal_look(other, "2026-11-12", "1.00", "1.20", batch="seen")
+    other.seed_nav("2026-11-12", "1.10", "1.15")
+    _row(other, batch="a-new-name")
+    code, _, err = accept(other, "2026-11-12")
+    assert code == 2 and "lower than the journal's figure" in err and other.journal_events("history_accepted") == []
 
 
 def test_a_lost_summarys_higher_row_is_accepted_and_the_day_stops_base_is_the_row(mkl):
@@ -963,3 +967,102 @@ def test_the_code_covers_every_difference_the_preview_lists_on_every_day(mkl):
     code, out, _ = accept(w, "2026-11-12")                # a fresh preview has a fresh code
     (fresh,) = re.findall(r"^code: ([0-9]{6})$", out, re.M)
     assert fresh != number
+
+
+# ---- T51c S4d repair round 4: one basis for every safety decision: value_low / units and value_high / units, as book_loss
+
+def _row(w, **columns):
+    """Edit the latest book_nav row (`value_high=None` sets NULL)."""
+    sets = ", ".join(f"{k} = ?" for k in columns)
+    w.sql(f"UPDATE book_nav SET {sets} WHERE id = (SELECT MAX(id) FROM book_nav)", tuple(columns.values()))
+
+
+def _probe(w, with_high=True):
+    """The checker's probe: days 11-10..11-12, the journal's last figure for 11-12 is 1.05; a new row for 11-12 whose text
+    column says 1.07 and whose value_low (what the day stop and the peak read) says 0.90 a unit, with no upper figure."""
+    w.open_book("10000")
+    history(w, [("2026-11-10", "1.05", None), ("2026-11-11", "1.00", None)])
+    w.seed_nav("2026-11-12", "1.05", None)
+    journal_look(w, "2026-11-12", "1.05", with_high=with_high)
+    w.seed_nav("2026-11-12", "1.07", None)
+    _row(w, value_low="90000", value_high=None, batch="probe")
+
+
+def test_the_checkers_probe_is_a_state_fault_with_and_without_an_acceptance_and_with_or_without_the_journals_upper(mkl):
+    for with_high in (True, False):
+        w = mkl()
+        _probe(w, with_high)
+        out = w.propose()
+        assert out["status"] == "stopped" and out["stage"] == "state", (with_high, out)
+        assert "2026-11-12" in out["reason"] and "value_low" in out["reason"] and "a person must look" in out["reason"], out
+        assert w.venue.calls == []
+        before = {p.name: p.read_bytes() for p in (w.tmp / "journal").glob("*.jsonl")}
+        code, out_text, err = accept(w, "2026-11-12")
+        assert code == 2 and out_text == "" and "value_low" in err and "nothing was written" in err, (with_high, err)
+        assert {p.name: p.read_bytes() for p in (w.tmp / "journal").glob("*.jsonl")} == before
+        assert w.journal_events("history_accepted") == []
+        assert w.propose()["stage"] == "state"
+
+
+def test_an_edited_upper_figure_is_judged_on_value_high_over_units_the_text_unchanged(mkl):
+    lower = mkl()                                         # the upper below the lower: a day stop base that fell
+    _three_days(lower)
+    _row(lower, value_high="50000")
+    out = lower.propose()
+    assert out["status"] == "stopped" and out["stage"] == "state" and "value_high" in out["reason"], out
+    old = mkl()                                           # a journal without upper figures: the lower is all it holds
+    old.open_book("10000")
+    history(old, [("2026-11-10", "1.05", None)])
+    old.seed_nav("2026-11-12", "1.05", None)
+    journal_look(old, "2026-11-12", "1.05", with_high=False)
+    _row(old, value_high="50000")                         # the day stop's base would be 0.50, the text still says 1.05
+    out = old.propose()
+    assert out["status"] == "stopped" and out["stage"] == "state", out
+    higher = mkl()                                        # a higher upper: tighter, so it may be accepted
+    _three_days(higher)
+    _row(higher, value_high="110000", batch="edited")
+    assert higher.propose()["stage"] == "state"
+    accepted(higher, "2026-11-12")
+    out = higher.propose()
+    assert out["status"] == "done" and D(out["shared"]["previous_value_per_unit"]) == D("1.10"), out
+
+
+def test_a_row_with_text_that_is_not_a_number_or_units_that_are_not_above_nothing_is_a_state_fault_in_words(mkl):
+    cases = (("value_per_unit", "NaN"), ("value_per_unit", "not a number"), ("units_outstanding", "0"),
+             ("units_outstanding", "-5"), ("units_outstanding", "NaN"), ("units_outstanding", "Infinity"),
+             ("value_low", "NaN"), ("value_low", None), ("value_high", "NaN"), ("value_per_unit", "1.0500001"))
+    for column, value in cases:
+        w = mkl()
+        _three_days(w)
+        _row(w, **{column: value})                        # the 11-12 row of a run, damaged
+        out = w.propose()
+        assert out["status"] == "stopped" and out["stage"] == "state", (column, value, out)
+        assert "2026-11-12" in out["reason"] and "a person must look" in out["reason"], (column, value, out["reason"])
+        assert w.venue.calls == []
+        code, _, err = accept(w, "2026-11-12")
+        assert code == 2 and "nothing was written" in err and "Traceback" not in err, (column, value, err)
+        assert w.journal_events("history_accepted") == []
+
+
+def test_a_hand_written_acceptance_below_the_journals_summary_is_ignored_when_the_run_reads_it(mkl):
+    w = mkl()
+    _three_days(w)
+    w.seed_nav("2026-11-12", "1.00", None)               # a lower row of the day (a copy, or a real fall), no summary of it
+    _row(w, batch="lost-x")
+    record = {"type": "order_step", "venue": VENUE, "event": "history_accepted", "accepted_day": "2026-11-12",
+              "row_id": 99, "row_batch": "lost-x", "value_per_unit": "1.00", "value_per_unit_high": "1.00",
+              "journal_had": {"value_per_unit": "1.05", "value_per_unit_high": "1.05"}, "prev_hash": "", "who": "o", "note": "n"}
+    record["hash"] = osx._accepted_hash(record)           # a whole, correctly chained line, but below the summary
+    w.journal.write("2026-11-13", record)
+    out = w.propose()
+    assert out["status"] == "stopped" and out["stage"] == "state", out
+    looks = osx._journal_shared_looks(w.journal.read(), VENUE)
+    assert [x for x in looks if x.get("accepted")] == []
+    ok = {**record, "value_per_unit": "1.06", "value_per_unit_high": "1.06"}     # at or above: it counts
+    ok["hash"] = osx._accepted_hash(ok)
+    other = mkl()
+    _three_days(other)
+    other.seed_nav("2026-11-12", "1.06", None)
+    _row(other, batch="lost-x")
+    other.journal.write("2026-11-13", ok)
+    assert other.propose()["status"] == "done"

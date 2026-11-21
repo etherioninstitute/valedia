@@ -1133,8 +1133,9 @@ def main(argv=None) -> int:
     owner.add_argument("--hash", default=None, help="with --owner-entry-rejournal: the entry's hash, as printed")
     owner.add_argument("--accept-history", default=None, metavar="DAY",
                        help="live repair (T51c S4d): accept the state file's latest book_nav row of DAY (YYYY-MM-DD) as the "
-                            "day's figure when its run's summary never reached the journal; with --live --venue --who "
-                            "--note, a preview first, then --confirm CODE")
+                            "day's figure when it differs from the journal's last figure of the day and is NOT BELOW it "
+                            "(it only tightens; a lower row has no route here); with --live --venue --who --note, a "
+                            "preview first, then --confirm CODE")
     p = sub.add_parser("critic")
     p.add_argument("--narrate", help="backend that puts the findings into words, e.g. hermes:valedia-trading-auditor")
     p.add_argument("--days", type=int, default=7)

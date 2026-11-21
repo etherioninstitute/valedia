@@ -1197,19 +1197,24 @@ def _scan_shared_looks(entries, venue: str) -> tuple[list[dict], str, set]:
     was journaled). A summary without a readable figure is not counted (a run that stopped before its first look has
     none); a ticket's `equity` never is (a later look may lower the row it was made at). An owner's acceptance of a day's
     figure (`history_accepted`: see accept_history_command) counts as a look of its `accepted_day` when its hash is its
-    own fields' and its `prev_hash` is the hash of the acceptance before it (a line that only looks like one is ignored).
+    own fields' and its `prev_hash` is the hash of the acceptance before it, AND its figures are not below the day's last
+    look before it (lower figure, and upper where known else lower): the tighten rule, read again (a line that only looks
+    like an acceptance, or one that would loosen, is ignored and does not move the chain).
     `batches`: every batch a summary of `venue` names, whatever it holds."""
     looks, last, batches = [], "", set()
     for e in entries:
         if not (isinstance(e, dict) and e.get("type") == "order_step" and e.get("venue") == venue):
             continue
         if e.get("event") == "history_accepted":
-            low = _decimal_or_none(e.get("value_per_unit"))
+            low, high = _decimal_or_none(e.get("value_per_unit")), _decimal_or_none(e.get("value_per_unit_high"))
             if (low is not None and e.get("prev_hash") == last and isinstance(e.get("hash"), str)
                     and e["hash"] == _accepted_hash(e) and isinstance(e.get("accepted_day"), str)):
-                last = e["hash"]
-                looks.append({"day": e["accepted_day"], "low": low, "high": _decimal_or_none(e.get("value_per_unit_high")),
-                              "has_high": True, "accepted": True})
+                before = [x for x in looks if x["day"] == e["accepted_day"]]      # the tighten rule, read again here:
+                if before and low >= before[-1]["low"] and (                       # an acceptance counts only when it is
+                        high if high is not None else low) >= (                   # not below the day's last figures
+                        before[-1]["high"] if before[-1]["high"] is not None else before[-1]["low"]):
+                    last = e["hash"]
+                    looks.append({"day": e["accepted_day"], "low": low, "high": high, "has_high": True, "accepted": True})
             continue
         if e.get("event") != "summary":
             continue
@@ -1231,6 +1236,46 @@ def _journal_shared_looks(entries, venue: str) -> list[dict]:
     return _scan_shared_looks(entries, venue)[0]
 
 
+def _row_figures(row: dict) -> tuple[Decimal, Decimal | None]:
+    """T51c S4d: a `book_nav` row's (lower, upper) value per unit as the day stop and the peak read them (`book_loss`, by
+    `_nav_vpu`): value_low and value_high over units_outstanding, exact decimals; the upper None when the row has none. The
+    one basis of every safety decision on a row (the history check, the accept judge, the confirm code, the preview): the
+    row's text `value_per_unit` is never one. A row that book_loss would read differently from what it says is refused in
+    words (OrderStepError: a state fault, a person must look): units outstanding, value_low, value_high or the text that are
+    not finite numbers (NaN, text), units that are not above nothing, a value_high below its value_low, and a `value_per_unit`
+    text that is not value_low over the units (the writer stores `value / units_outstanding` from the same division at
+    _BOOK_PREC digits, so the two are equal exactly, with no rounding allowed between them)."""
+    where = f"book_nav row {row.get('id')} of {row.get('day')}"
+
+    def need(key: str, optional: bool = False):
+        raw = row.get(key)
+        if raw is None or raw == "":
+            if optional:
+                return None
+            raise OrderStepError(f"{where} has no {key}; a person must look")
+        try:
+            figure = Decimal(str(raw))
+        except (InvalidOperation, ValueError):
+            figure = None
+        if figure is None or not figure.is_finite():
+            raise OrderStepError(f"{where} holds a {key} that is not a finite number ({_cut(repr(raw))}); a person must look")
+        return figure
+    units, value_low, value_high, text = (need("units_outstanding"), need("value_low"), need("value_high", True),
+                                          need("value_per_unit"))
+    if units <= 0:
+        raise OrderStepError(f"{where} holds units outstanding of {units}, which is not above nothing; a person must look")
+    with localcontext() as ctx:
+        ctx.prec = _BOOK_PREC
+        low, high = _nav_vpu(row)
+        if text != low:
+            raise OrderStepError(f"{where} reads a value per unit of {text} but its value_low over its units outstanding is "
+                                 f"{low}; the day stop and the peak read value_low, never the text; a person must look")
+        if value_high is not None and value_high < value_low:
+            raise OrderStepError(f"{where} holds a value_high ({value_high}) below its value_low ({value_low}); a person "
+                                 "must look")
+    return low, high
+
+
 def _nav_history(rows, looks) -> dict:
     """T51c S4d: the state file's `book_nav` rows against the journal's looks (see _live_nav_history): {"lacking": the
     days with a look and no row, "changed": per day the look and the day's latest row where they differ, "peak": the
@@ -1239,12 +1284,7 @@ def _nav_history(rows, looks) -> dict:
     with localcontext() as ctx:
         ctx.prec = _BOOK_PREC
         for row in rows:                                 # by id: a later row of a day replaces an earlier one
-            try:
-                low = Decimal(row["value_per_unit"])
-            except (InvalidOperation, TypeError, ValueError):
-                raise OrderStepError(f"book_nav row {row['id']} holds a value per unit that is not a number; a person "
-                                     "must look") from None
-            _, high = _nav_vpu(row)
+            low, high = _row_figures(row)                # the day stop's own basis, value_low and value_high over units
             basis = high if high is not None else low
             peak = basis if peak is None or basis > peak else peak
             latest[str(row["day"])] = {"low": low, "high": high, "row": row}
@@ -1926,16 +1966,21 @@ def _accept_code(venue: str, info: dict) -> str:
 
 def accept_history_command(args, paths, clock: Callable[[], float] | None = None) -> int:
     """T51c S4d (repair): `order-step --live --accept-history DAY --venue webull-production --who WHO --note NOTE`, and the
-    same with `--confirm CODE`: the owner's way out of a live run that stops at `state` because a run's `book_nav` row is in
-    the state file and its summary never reached the journal (the summary write raised, or the process died after the
-    run's first look). Run without --confirm it PRINTS what differs (the journal's last figures of the day, the state
-    file's latest row and its run, the other days that still differ) and a six-digit code, and writes nothing. Run again
-    with the code it writes ONE journal line (`history_accepted`: the day, the row, its figures, what the journal had, a
-    hash over them chained to the acceptance before it, who and why) and nothing else: the state file is never written,
-    and after it the history check takes the row as that day's figure and still stops on any other difference. It refuses
-    when nothing differs, for a day the journal holds no figure of, for a day with no row, and for a row of a run whose
-    summary the journal holds (an older state file put back: see _accept_judge). The venue must be a production venue's
-    name and `--live` must be given, as for the owner's entries. Exit 0: a preview printed or the line written; 2: refused."""
+    same with `--confirm CODE`: the owner's way past a live run that stops at `state` because the state file's latest
+    `book_nav` row of DAY differs from the journal's last figures of that day. The command does not tell WHY it differs
+    (a summary that never reached the journal, an older state file put back, a row changed) and does not claim to; it only
+    ever takes a row that TIGHTENS the day stop and the drawdown: the row's lower and upper figures, as `book_loss` reads
+    them (value_low and value_high over units_outstanding, never the text column), must both be at least the journal's
+    last figures of the day. Run without --confirm it PRINTS what differs (the journal's last figures of the day, the state
+    file's latest row and its run, every other day that still differs) and a six-digit code covering all of it, and writes
+    nothing. Run again with the code it writes ONE journal line (`history_accepted`: the day, the row, its figures, what the
+    journal had, who and why, and a hash over all of them chained to the acceptance before it) and nothing else: the state
+    file is never written, and after it the history check takes the row as that day's figure and still stops on any other
+    difference. It refuses, writing nothing, when nothing differs, for a day the journal holds no figure of, for a day with
+    no row, for a row lower on either figure (no command route: _accept_judge), for a row of a run whose summary the
+    journal holds, and for a state file whose rows cannot be read as `book_loss` reads them (_row_figures). The venue must
+    be a production venue's name and `--live` must be given, as for the owner's entries. Exit 0: a preview printed or the
+    line written; 2: refused."""
     import sys
     day, confirm = getattr(args, "accept_history", None), getattr(args, "confirm", None)
     venue = getattr(args, "venue", None)
@@ -4041,7 +4086,11 @@ class _Run:
         looks = self.journal_looks
         if not looks:
             return
-        found = _nav_history(self._nav_rows(), looks)
+        try:
+            found = _nav_history(self._nav_rows(), looks)
+        except OrderStepError as exc:
+            raise _Stop("state", f"the state file's book_nav rows cannot be read the way the day stop and the drawdown read "
+                                 f"them: {exc}; nothing is sent") from None
         if found["lacking"] or found["changed"]:
             said = ([f"no book_nav row for {', '.join(found['lacking'][:5])}"] if found["lacking"] else [])
             for day in list(found["changed"])[:5]:

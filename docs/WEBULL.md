@@ -731,7 +731,14 @@ shared run", above), under the four locks and every live rule, with these differ
   York day on which this venue's journal holds a shared summary with a value per unit must have a `book_nav` row of that
   day, and the day's LATEST row must read what the journal's LAST such summary of the day says: the lower value per unit
   (`shared.value_per_unit`) and the upper one (`shared.value_per_unit_high`, journaled from S4d; None when the upper value
-  was not known), exact decimals compared as decimals, never text. A day with no such summary (a run that stopped before its
+  was not known), exact decimals compared as decimals, never text. **The row's figures are read the way the day stop and
+  the peak read them** (`book_loss`): its lower figure is `value_low` over `units_outstanding` and its upper one
+  `value_high` over `units_outstanding` (the lower where the row has no upper), in one helper shared by the history check,
+  the accept command, its code and its preview; the row's text `value_per_unit` column is never the basis of a safety
+  decision. A row whose text disagrees with `value_low` over the units (the writer stores that very quotient, at 60
+  digits, so they are equal exactly, with no rounding between them), or whose units, `value_low`, `value_high` or text are
+  not finite numbers (NaN, words), or whose units are not above nothing, or whose `value_high` is below its `value_low`,
+  stops the run at `state`, a fault, in words, and the accept command refuses it, writing nothing. A day with no such summary (a run that stopped before its
   first look) is not required to have a row. So an older state file put back, or a row removed or changed, stops the run at
   `state`, a fault ("the state file lacks the book's value history the journal holds: a copy put back?"): without it, a
   removed later day would change the previous value per unit and the day stop would be missed. The peak is judged as well:
@@ -757,7 +764,9 @@ shared run", above), under the four locks and every live rule, with these differ
   after anything changed on ANY listed day is refused; the confirm needs the run lock. It also refuses, writing nothing:
   when nothing differs for the day, for a day the journal holds no figure of, for a day with no row, without `--live` or
   with a practice name, with any other flag, and (an extra refusal the safety does not depend on) for a row of a run
-  whose summary the journal holds. After an acceptance the check passes a day whose latest row reads the journal's last
+  whose summary the journal holds. At run time an acceptance line counts only if its figures are again not below the day's last figures before it (the same
+  tighten rule, read again, on the journal's lines); a hand-written line that would loosen is ignored, does not move the
+  chain, and the day stays stopped. After an acceptance the check passes a day whose latest row reads the journal's last
   look (the acceptance) OR the last summary before it, so the real state file put back after a copy's higher row was
   accepted passes by itself; the check still stops on every other difference (another day, the same row changed
   afterwards, the peak: an acceptance adds no peak of its own). Who and note are in the hash: an acceptance edited
