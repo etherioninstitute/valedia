@@ -212,6 +212,9 @@ def _judge_summary(e: dict) -> tuple[bool, list[str], list[str]]:
             faulty.append("a run stopped at a stage the ladder does not know (taken as a fault)")
     elif not done:
         faulty.append("a run ended with a status the ladder does not know (taken as a fault)")
+    elif _go_live._shortfall_seen(e):                    # T51c S4c-2 (R33): done, but the last reconcile found a shortfall
+        done = False                                     # not a clean session: a skipped one, no fault
+        notes.append("a run ended done with a shortfall at its last reconcile (a skipped session)")
     faults = e.get("faults")
     if "faults" in e and not isinstance(faults, list):                    # null included (addendum 3, F4)
         faulty.append("a run's faults list cannot be read (taken as a fault)")

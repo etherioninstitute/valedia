@@ -2,7 +2,9 @@
 a fault, and a run that ended `done` with a shortfall at its last reconcile is not a clean run."""
 from __future__ import annotations
 
+import json
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -31,6 +33,15 @@ def _run(j, day, batch, status, stage=None, fills=0, shared=None, **extra):
     j.write(day, entry)
 
 
+def _raw(folder, **entry):
+    """An entry whose `day` the journal reader keeps but `paper_record` cannot read (as the base test does)."""
+    j = Journal(folder)
+    j.write("2026-11-12", {"type": "order_step", "venue": gl.PAPER_VENUE, "batch": "z", "event": "fill"})   # makes the folder
+    with (Path(folder) / "2026-11-12.jsonl").open("a") as fh:
+        fh.write(json.dumps({"type": "order_step", "venue": gl.PAPER_VENUE, "batch": "u", "event": "summary", "day": "someday",
+                             **entry}) + "\n")
+
+
 def _record(folder):
     record, why = gl.paper_record(folder, gl.PAPER_VENUE, TODAY, CAL)
     assert why is None
@@ -55,11 +66,33 @@ def test_r32_a_shortfall_stop_leaves_an_earlier_stop_clock_as_it_was(tmp_path):
     assert record["skipped_shortfall_runs"] == ["2026-11-12"]
 
 
-def test_r32_a_shortfall_stop_without_a_shared_block_is_still_a_skip(tmp_path):
-    j = Journal(tmp_path / "j")
-    _run(j, "2026-11-12", "s1", "stopped", "shortfall")
+@pytest.mark.parametrize("shared", [None, "garbled", [], 0])
+def test_r32_a_shortfall_stop_without_a_well_formed_shared_block_is_a_stopped_run(tmp_path, shared):
+    j = Journal(tmp_path / "j")                      # the runner raises `shortfall` in shared mode only: this entry is corrupt
+    _run(j, "2026-11-12", "s1", "stopped", "shortfall", shared=shared)
     record = _record(tmp_path / "j")
-    assert record["last_stopped_run"] is None and record["skipped_shortfall_runs"] == ["2026-11-12"]
+    assert record["days_since_a_stopped_run"] == 1 and record["last_stopped_run"] == "2026-11-12"
+    assert "skipped_shortfall_runs" not in record
+
+
+@pytest.mark.parametrize("shared", [None, {}, {"shortfalls": SHORT}])
+def test_a_shortfall_stop_with_no_day_is_refused_as_base_refused_it(tmp_path, shared):
+    _raw(tmp_path / "j", status="stopped", stage="shortfall", **({} if shared is None else {"shared": shared}))
+    assert gl.paper_record(tmp_path / "j", gl.PAPER_VENUE, TODAY, CAL) == (
+        None, "a stopped paper run in the journal carries no date; a person must look")
+
+
+@pytest.mark.parametrize("stage", ["session", "ticket"])
+def test_a_session_or_ticket_stop_with_no_day_is_still_no_refusal(tmp_path, stage):
+    _raw(tmp_path / "j", status="stopped", stage=stage)
+    record, why = gl.paper_record(tmp_path / "j", gl.PAPER_VENUE, TODAY, CAL)
+    assert why is None and record["last_stopped_run"] is None
+
+
+def test_no_none_is_listed_among_the_skipped_or_unclean_days(tmp_path):
+    _raw(tmp_path / "j", status="done", shared={"shortfalls": SHORT})
+    record = _record(tmp_path / "j")
+    assert "unclean_shared_runs" not in record and "skipped_shortfall_runs" not in record   # no "None" day is listed
 
 
 def test_r33_a_done_shared_run_with_a_shortfall_is_not_clean(tmp_path):
