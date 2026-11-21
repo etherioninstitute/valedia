@@ -32,6 +32,14 @@ matched by keyword only, not read one by one. Item H-1 closes that.
    2026-11-30.
 2. His items in parallel: stake, live key file, the three files, a yes for one off-family review.
 3. Prediction markets: the forward copy test's wallet screen, so the 120-day clock starts; then T45-2.
+   **DONE 2026-11-21 1:57 AM PST: the test does not start.** Screen (T55a, main 9749743, blind check PASS) run on
+   the real store: cutoff end of 2026-10, W = 2025-11..2026-10, 189 wallets screened (3 not, page limit), **0
+   eligible** (fewer than 5 = the test does not start, by the locked rule). Most-failed lines: 9 of 12 counted
+   months (147), 20+ shares per dollar (87), both outcomes in over 10% (71), 100 closed (71). Report
+   `~/valedia-data/polymarket/forward-copy-screen/copy_screen_report.json` (sha256 d8b93f16…). The rule is locked:
+   no re-screen with looser lines. Copying wallets is closed as a route; the owner allowed more backtests.
+   Fund book: **S4c MERGED** (main 8908c4d, blind check PASS_WITH_NOTES); rulings R32 to R34 in
+   `.foreman/tickets/T51c-S4c2-go-live-counts-shortfall.md` (S4c-2 building; R34 goes to S4e).
 4. Hermes, Paperclip and Live-page work PARKED until 1 is done (each by name: elephant-code-mode follow-ups,
    Paperclip seats' daytime test VAL-19, the Mission tab's nightly refresh, the Engineer's key file wiring).
 
