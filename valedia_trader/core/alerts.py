@@ -31,7 +31,11 @@ with `level` "cleared" and the same key is written. An alert is open while the l
                                 day) decides, so a stop nothing has fixed stays open over a weekend, and a stop first seen after
                                 midnight is raised. It clears only when a later summary of the same venue and class is `done` with no
                                 shortfall, or stops at another stage (which opens that stage's key; a done run that found a shortfall
-                                is `shared-shortfall`); a run of the other class never clears it. Ordinary skips neither open nor
+                                is `shared-shortfall`); a run of the other class never clears it. Only POSITIVE evidence clears: when
+                                the 30 days read hold no relevant summary of that venue and class (the stop aged out, its day file is
+                                gone, the venue went quiet) the alert stays open untouched, with no `cleared` line, until a clean run of
+                                that venue and class; a retired venue's alert is ended that way (the file alone says what is open, and
+                                this module has no command that clears one). Ordinary skips neither open nor
                                 clear: a closed market (the unattended run), and stages ticket and session (propose and approve).
                                 A stop of a shared run no longer raises `step-stopped` or `practice-stopped` (those keys merged
                                 venues and stages, and a clean propose run could clear an unattended stop); an alert still open
@@ -982,6 +986,27 @@ def shared_states(env: Env) -> dict[tuple[str, str], tuple[str, dict]]:
     return states
 
 
+SHARED_CLASSES = ("unattended", "attended")
+
+
+def _hold_without_evidence(env: Env, out: CheckResult, prefix: str, tail: int, states: dict) -> None:
+    """T51c S4e (repair 3): an alert of `prefix` that is open in the alert file (the watch hands the check the open keys) is cleared
+    only on POSITIVE evidence: a later summary of its venue and class inside the journal window (which `states` holds). When the
+    window holds none (it aged out, the day file is gone, the venue went quiet) the key is HELD: left open as it is, no `cleared` line.
+    `tail` is how many `:`-parts at the end of the key are the class (and stage): 2 for `shared-stopped:<venue>:<class>:<stage>`, 1 for
+    `shared-shortfall:<venue>:<class>`. A key of an earlier form (a day in place of the class) is not held, and is cleared as before."""
+    known = {(_key_part(venue), cls) for venue, cls in states}
+    for key in sorted(env._cache.get("open_alert_keys") or ()):
+        if not key.startswith(prefix):
+            continue
+        parts = key[len(prefix):].split(":")
+        if len(parts) <= tail:
+            continue
+        cls, venue = parts[-tail], ":".join(parts[:-tail])
+        if cls in SHARED_CLASSES and (venue, cls) not in known:
+            out.held.append(key)
+
+
 SHORT_NAMES_CHARS = 64                                     # the names listed before "and K more" (the detail is cut at 300)
 
 
@@ -1023,7 +1048,9 @@ def check_shared_shortfall(env: Env) -> CheckResult:
     only, never an order's tag or an account; the count of short funds and the fund names come first (the alert's detail is cut at
     300 characters), the figures after."""
     out = CheckResult()
-    for (venue, cls), (state, e) in sorted(shared_states(env).items()):
+    states = shared_states(env)
+    _hold_without_evidence(env, out, "shared-shortfall:", 1, states)
+    for (venue, cls), (state, e) in sorted(states.items()):
         if state != "shortfall":
             continue
         day, shorts = str(e.get("day"))[:10], e["shared"]["shortfalls"]
@@ -1048,7 +1075,9 @@ def check_shared_stops(env: Env) -> CheckResult:
     unattended run: any stage but an ordinary closed market; propose, approve and the rest: any stage but ticket and session), and a
     shared summary is judged here whatever other keys it carries, so none falls between the checks."""
     out = CheckResult()
-    for (venue, cls), (state, e) in sorted(shared_states(env).items()):
+    states = shared_states(env)
+    _hold_without_evidence(env, out, "shared-stopped:", 2, states)
+    for (venue, cls), (state, e) in sorted(states.items()):
         if state != "stopped":
             continue
         stage, day = e.get("stage"), str(e.get("day"))[:10]
@@ -1385,6 +1414,10 @@ def watch(env: Env, senders=(), path=None) -> WatchResult:
     """Run every check once, write the new alerts and the cleared ones, then give each new alert to each sender."""
     path = Path(path) if path else alerts_file(env.root)
     register_trading_file(env)
+    try:                                                   # the keys open now: a check that needs positive evidence to clear reads them
+        env._cache["open_alert_keys"] = {a["key"] for a in read_alert_file(path)[0]}
+    except OSError:
+        env._cache["open_alert_keys"] = set()              # an unreadable file is the lock's own failure below
     produced, held, held_prefixes, failures = run_checks(env)
     now = iso(env.now)
     by_key = {}

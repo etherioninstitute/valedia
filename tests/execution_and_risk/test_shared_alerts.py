@@ -381,6 +381,92 @@ def test_the_stop_alerts_of_a_run_that_is_not_shared_are_unchanged_the_unattende
     assert step_alerts(w) == {}
 
 
+# ---- a key is cleared only on positive evidence (repair round 3): an aged-out or missing summary clears nothing
+
+def open_keys(path):
+    return {a["key"]: a["level"] for a in alerts.open_alerts(path)}
+
+
+def test_a_stop_older_than_the_journal_window_stays_open_critical_with_no_cleared_line(mk, tmp_path):
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    stop_line(w, "marks", WORDS["marks"], day=DAY)
+    key = sk(w.venue.name, "marks")
+    assert key in {a.key for a in alerts.watch(env_of(w), path=path).raised}
+    for days in (31, 60):                                          # the stop's day is outside the 30 days the journal read covers
+        w.clock.t = T.ny("2026-11-13 10:00") + days * 86400
+        res = alerts.watch(env_of(w), path=path)
+        assert res.cleared == [] and open_keys(path).get(key) == "critical", (days, [x.key for x in res.cleared])
+    assert not [x for x in map(json.loads, path.read_text().splitlines()) if x["level"] == "cleared"]
+
+
+def test_a_stop_whose_day_file_is_deleted_stays_open(mk, tmp_path):
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    stop_line(w, "marks", WORDS["marks"])
+    key = sk(w.venue.name, "marks")
+    alerts.watch(env_of(w), path=path)
+    for f in (w.tmp / "journal").glob("*.jsonl"):
+        f.unlink()
+    res = alerts.watch(env_of(w), path=path)
+    assert res.cleared == [] and key in open_keys(path)
+
+
+def test_a_clean_run_of_the_same_venue_and_class_after_the_stop_aged_out_clears_it_and_no_other_run_does(mk, tmp_path):
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    stop_line(w, "marks", WORDS["marks"], day=DAY)
+    stop_line(w, "marks", WORDS["marks"], day=DAY, mode="propose")
+    unattended, attended = sk(w.venue.name, "marks"), sk(w.venue.name, "marks", "attended")
+    alerts.watch(env_of(w), path=path)
+    w.clock.t = T.ny("2026-12-23 10:00")                            # day 40
+    stop_line(w, None, None, status="done", day="2026-12-23", venue="webull-elsewhere")          # another venue
+    stop_line(w, None, None, status="done", day="2026-12-23", mode="propose")                     # the other class
+    res = alerts.watch(env_of(w), path=path)
+    assert {a.key for a in res.cleared} == {attended} and unattended in open_keys(path), open_keys(path)
+    stop_line(w, None, None, status="done", day="2026-12-23")                                     # the same venue and class
+    res = alerts.watch(env_of(w), path=path)
+    assert {a.key for a in res.cleared} == {unattended} and open_keys(path).get(unattended) is None
+
+
+def test_a_stop_at_another_stage_after_the_old_one_aged_out_replaces_it(mk, tmp_path):
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    stop_line(w, "marks", WORDS["marks"], day=DAY)
+    alerts.watch(env_of(w), path=path)
+    w.clock.t = T.ny("2026-12-23 10:00")
+    stop_line(w, "state", WORDS["state"], day="2026-12-23")
+    res = alerts.watch(env_of(w), path=path)
+    assert {a.key for a in res.cleared} == {sk(w.venue.name, "marks")} and {a.key for a in res.raised} == {sk(w.venue.name, "state")}
+
+
+def test_a_shortfall_alert_follows_the_same_rule_aged_out_stays_clean_run_clears(mk, tmp_path):
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    bad = {"shortfalls": {"SPY": {"book": 1.0, "venue": 0.0, "short": 1.0}}}
+    stop_line(w, None, None, status="done", shared=bad, day=DAY)
+    key = "shared-shortfall:" + w.venue.name + ":unattended"
+    alerts.watch(env_of(w), path=path)
+    for days in (31, 60):
+        w.clock.t = T.ny("2026-11-13 10:00") + days * 86400
+        res = alerts.watch(env_of(w), path=path)
+        assert res.cleared == [] and key in open_keys(path), days
+    w.clock.t = T.ny("2026-12-23 10:00")
+    stop_line(w, None, None, status="done", day="2026-12-23")
+    assert key in {a.key for a in alerts.watch(env_of(w), path=path).cleared}
+
+
+def test_the_older_forms_of_the_keys_are_still_cleared_not_held(mk, tmp_path):
+    """A key of an earlier form (the day form of the stop, the day form of the shortfall) has no venue and class to hold it by."""
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    old = [f"shared-stopped:{w.venue.name}:marks:{DAY}", f"shared-shortfall:{w.venue.name}:{DAY}"]
+    path.write_text("".join(json.dumps({"time": "2026-11-13T14:00:00Z", "level": "warning", "key": k, "title": "old", "detail": "old"}) + "\n"
+                            for k in old))
+    res = alerts.watch(env_of(w), path=path)
+    assert {a.key for a in res.cleared} == set(old)
+
+
 def a_done_run_with_a_shortfall(w):
     """The book holds SPY and QQQ; the owner sells the book's QQQ while the run is going: the run is done and its last
     reconcile found the shortfall (test_shared_run's own scenario)."""

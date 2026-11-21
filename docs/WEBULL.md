@@ -847,7 +847,13 @@ a standing stop at New York midnight; a shared stop no longer raises either old 
 the day form of the new key) is cleared by the next watch IN WHICH THE SHARED CHECK RAN, and the stop is raised again under the new key
 (a watch where that check failed leaves the old keys open). A run that is NOT shared keeps both old keys and their rules (so two stages
 of one non-shared venue still merge there). The order ledger's own block (`orders:<ledger>`) stays as well. A stop is read from the
-last 30 days of the journal, so one with no summary after it for 30 days falls out of it.
+last 30 days of the journal (a whole-journal read on every watch would be heavy file work beside the collector), and that window is for
+RAISING. An open `shared-stopped` or `shared-shortfall` alert is cleared ONLY on positive evidence: a later summary of the same venue
+and class inside the window that is `done` with no shortfall, or a stop at another stage. When the window holds no relevant summary of
+that venue and class (the stop aged out, its day file was deleted, the venue went quiet) the alert stays open untouched, still critical
+or warning as it was, with no `cleared` line, and the owner's page keeps showing it. The accepted cost: the alert of a RETIRED venue
+never clears by itself. The plain way to end it is a clean run (`done`, no shortfall) of that venue and class; the alert file has no
+clearing command (the file alone says what is open, and this module adds none).
 *The one gap S4e closes*: a run that ENDS `done` whose last reconcile found a shortfall (its summary's `shared.shortfalls` not empty: the
 owner's sale of shares the book counts as its own, seen after the run's orders) raised nothing but that block. It now raises
 `shared-shortfall:<venue>:<class>` (a warning), under the same state rule: open while the latest relevant summary of that venue and

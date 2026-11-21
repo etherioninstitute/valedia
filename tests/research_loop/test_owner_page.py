@@ -1434,3 +1434,13 @@ def test_hostile_text_and_secrets_in_an_entry_are_cleaned_and_escaped(world):
     section = section[:section.index("</section>")]
     assert "<script>" not in section and "<img" not in section and SECRET not in section
     assert "&lt;script&gt;" in section
+
+
+def test_a_stop_alert_that_is_sixty_days_old_is_still_shown_under_its_book(world):
+    add_shared_book(world)
+    old = {"time": iso(NOW - 60 * 86400), "level": "critical", "key": f"shared-stopped:{SHARED}:unattended:marks",
+           "title": "The unattended shared run stopped at stage marks", "detail": f"2026-09-14 {SHARED}: SPY quotes 700"}
+    with (world.root / "artifacts" / "owner" / "alerts.jsonl").open("a") as fh:
+        fh.write(json.dumps(old) + "\n")
+    text = shared_text(world)
+    assert f"shared-stopped:{SHARED}:unattended:marks" in text and "2026-09-14" in text, text
