@@ -653,6 +653,7 @@ skipped; a fault is a fault):
    holding falls before the order says filled) and listed in `reconcile_pending`; any other shortfall found by that
    last reconcile is no fault either (an owner's sale is an ordinary day): it is in `shared.shortfalls` and the next
    run's first reconcile stops at `shortfall`.
+   The go-live gate reads it the same way (R32, R33): a paper run stopped at `shortfall` is a skipped session (not a stopped run; listed as `skipped_shortfall_runs`), and a run that ended `done` with `shared.shortfalls` not empty is not clean (its fills are not reconciled fills, it is no paper broker day, the stopped-run clock is untouched; listed as `unclean_shared_runs`).
 6. *The prices come before the capital*: one quote call for the paper book's funds and the funds the book holds
    (never a baseline fund). The book's value at those quotes (lower bound) is the capital. A value not known (a fund
    held with no usable quote, or a sale whose fee is empty: the lower bound stays open) stops at `prices`, a skip,

@@ -15,9 +15,15 @@ lock), and nothing else stands in for one: no environment variable, flag or argu
     - paper_broker_days: New York trading days on which a paper order step ended `done`;
     - reconciled_fills: fills journaled in paper runs that ended `done` (their reconciles were clean);
     - days_since_a_stopped_run: New York days since the last paper run (unattended or practice alike) that stopped
-      at any stage but `session` (outside hours or a holiday) and `ticket` (a refused approval: a wrong, expired, used
-      or superseded number is the owner's slip, not a failure of the order path); met when it is at least
+      at any stage but `session` (outside hours or a holiday), `ticket` (a refused approval: a wrong, expired, used
+      or superseded number is the owner's slip, not a failure of the order path) and `shortfall` (a shared run found
+      the account holding less than the book counts as its own: a skipped session, R24/R32); met when it is at least
       `min_days_since_a_stopped_run`, or when no paper run ever stopped: no stopped run within that many days;
+    A run that ended `done` but whose summary says its last reconcile found a shortfall (`shared.shortfalls` not empty,
+    or a `shared` block that is not a record: the safe side) is NOT clean (R33): its fills are not reconciled_fills and
+    it is not a paper_broker_day; it does not reset the stopped-run clock (the owner acted; nothing of hers failed). The
+    record then lists those runs' days as `unclean_shared_runs`, and the days of runs stopped at `shortfall` as
+    `skipped_shortfall_runs` (a key only when there are some).
     - fills_checked_by_hand at least min_fills_checked_by_hand (the owner's own statement).
 * Lock 3, the limits (`config/risk.json`): the risk gate's own file, which in live mode must hold
   `max_orders_per_day`, a whole number from 1 to 200 (the test environment's fallback of 40 does not apply), and
@@ -55,7 +61,8 @@ CHECKLIST_MAX = 100_000
 ORDERS_PER_DAY_MIN, ORDERS_PER_DAY_MAX = 1, 200
 SECOND_SOURCES = ("alpaca", "finnhub")
 SECOND_SOURCE_KEYS = ("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "FINNHUB_API_KEY")
-ORDINARY_STOP_STAGES = frozenset({"session", "ticket"})   # not stopped runs: outside hours or a holiday; a refused approval
+ORDINARY_STOP_STAGES = frozenset({"session", "ticket", "shortfall"})   # not stopped runs: outside hours or a holiday; a refused approval;
+                                                                       # a shared run that skipped (R24, R32: the account holds less than the book)
 LOCK_NAMES = {1: "the confirmation", 2: "the checklist", 3: "the limits", 4: "the ticket"}
 
 
@@ -152,13 +159,16 @@ def paper_record(journal_dir: str | Path, paper_venue: str, today: date, calenda
         cal = _calendar(calendar)
         mine = [e for e in entries if isinstance(e, dict) and e.get("type") == "order_step" and e.get("venue") == paper_venue]
         summaries = [e for e in mine if e.get("event") == "summary"]
-        done = {e.get("batch") for e in summaries if e.get("status") == "done" and type(e.get("batch")) is str}
+        unclean = [e for e in summaries if e.get("status") == "done" and _shortfall_seen(e)]
+        done = {e.get("batch") for e in summaries if e.get("status") == "done" and type(e.get("batch")) is str
+                and not _shortfall_seen(e)}
         days = set()
         for e in summaries:
             d = _day(e.get("day"))
-            if e.get("status") == "done" and d is not None and d <= today and bool(cal.is_session(d.isoformat())):
+            if e.get("status") == "done" and not _shortfall_seen(e) and d is not None and d <= today and bool(cal.is_session(d.isoformat())):
                 days.add(d)
         fills = sum(1 for e in mine if e.get("event") == "fill" and e.get("batch") in done)
+        skipped = [e for e in summaries if e.get("status") == "stopped" and e.get("stage") == "shortfall"]
         stops = [d for e in summaries if e.get("status") == "stopped" and e.get("stage") not in ORDINARY_STOP_STAGES
                  for d in [_day(e.get("day"))] if d is not None]
         undated = sum(1 for e in summaries if e.get("status") == "stopped" and e.get("stage") not in ORDINARY_STOP_STAGES
@@ -168,9 +178,25 @@ def paper_record(journal_dir: str | Path, paper_venue: str, today: date, calenda
     if undated:
         return None, "a stopped paper run in the journal carries no date; a person must look"
     last = max(stops) if stops else None
-    return {"paper_broker_days": len(days), "reconciled_fills": fills,
-            "days_since_a_stopped_run": None if last is None else (today - last).days,
-            "last_stopped_run": None if last is None else last.isoformat()}, None
+    record = {"paper_broker_days": len(days), "reconciled_fills": fills,
+              "days_since_a_stopped_run": None if last is None else (today - last).days,
+              "last_stopped_run": None if last is None else last.isoformat()}
+    for key, entries in (("unclean_shared_runs", unclean), ("skipped_shortfall_runs", skipped)):
+        if entries:                                      # said only when there are some: a non-shared record is as it was
+            record[key] = sorted(str(e.get("day")) for e in entries)
+    return record, None
+
+
+def _shortfall_seen(summary: dict) -> bool:
+    """R33: a summary whose shared block says the last reconcile found a shortfall. A summary with no `shared` block
+    is not shared; a `shared` block that is not a record (or whose `shortfalls` is neither empty nor absent) is read on
+    the safe side, as a shortfall."""
+    shared = summary.get("shared")
+    if shared is None:
+        return False
+    if not isinstance(shared, dict):
+        return True
+    return bool(shared.get("shortfalls"))
 
 
 def judge_checklist(data: Any, record: dict | None, record_why: str | None) -> dict:
