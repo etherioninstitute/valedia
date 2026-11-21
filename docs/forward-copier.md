@@ -301,3 +301,49 @@ later step"), not skips: nothing is written for those holdings.
 
 The final read (the mean result and its p-value); any schedule, loop, daemon or watch mode; any order, preview of an
 order, key or account; anything to Webull. Whether and when `step` runs is the owner's decision.
+
+## The wallet screen (T55a)
+
+`valedia_trader/research_loop/copy_screen.py` runs "The wallets (the screen), fixed once" of THE RULE, once, and writes
+the set as the file the record's door takes. It is its own command, beside `copy_leaders` and `leaders_monitor`
+(neither is changed; the screen reuses their trade and resolution readers, the average-cost realized-profit pass, the
+integrity check and the shared lock, and the record's own wallets-file reader):
+
+```
+python -m valedia_trader.research_loop.copy_screen run --store FILE --out-dir DIR [--run-day YYYY-MM-DD] \
+    [--cutoff-month YYYY-MM --cutoff-not-derived-from-the-run-day] [--max-memory-mb 1500]
+```
+
+- **Reads** the copy-leaders store through an SQLite `mode=ro` connection (also `query_only`), under the shared,
+  non-blocking `STORE.lock` and after `PRAGMA quick_check` (as `develop` does): while a pull holds the lock the run
+  refuses and the pull is never disturbed. It refuses a store whose oracle-shaped resolution rows are not read under the
+  fifth amendment, a store with an unfinished trade walk other than one ended at the page limit (those wallets are
+  named in the report as not screened), and a traded market with no resolution answer. Size and mtime are taken before
+  and after; a store that changed while it was read is refused with nothing written.
+- **Cutoff.** T47 is closed, so resolutions are read up to the end of the last complete calendar month before the run
+  day (UTC date, today unless `--run-day`), and W is the twelve complete months ending there; the run prints the cutoff
+  and the window. A resolution whose `resolved_ts` is before the cutoff is known (as the store's rows are read under
+  T47's document and its five amendments); a later one is not, and an unsold unresolved position stays at its cost.
+  Trades from the cutoff on are not read. Any other cutoff, or a run day that is not today, is refused unless
+  `--cutoff-not-derived-from-the-run-day` is given (name it in the run record); the report then says `override: true`.
+  An incomplete month is never a cutoff. The document's fallback for T47 still open on 2026-11-24 (nothing after
+  2026-06-30) would be `--cutoff-month 2026-06` with that flag.
+- **Per wallet:** realized profit by month in W, closed positions by month, counted months (5 or more closed), the four
+  eligibility lines as the document words them, the rank ratio and the point-4 margin; every wallet's every figure and
+  every failed line (all of them, not only the first) are in the report. The rank is the mean of the counted months'
+  profit over their POPULATION standard deviation (divisor n), compared exactly; ties by the larger margin, then the
+  wallet name. The readings taken where the document is silent are listed in the module's docstring and in the report's
+  `readings`.
+- **Writes** only into `--out-dir`: `copy_screen_report.json` and `copy_screen_set.txt` (one address a line in rank
+  order, no comment; the run checks it with `leaders_monitor.read_wallets_file` before writing), each with a
+  `.sha256` file; the report carries the set file's hash, the store's identity (size, mtime, id) and the rows read. Fewer
+  than 5 eligible: the test does not start, the report says so, and no set file is written.
+- **One run.** It refuses when the set file or the report already exists in the output folder (the report is written
+  first, so a run that stopped between the two is spent too).
+- **Exit codes:** 0 ran (also "the test does not start"); 2 refused, nothing written; 4 stopped by `--max-memory-mb`,
+  nothing written.
+- **Memory and time.** One wallet at a time; the wallet's trades are streamed twice through a cursor, so the state held
+  is that wallet's tokens and markets only. On a synthetic store of 3,456 trade rows the process peaked at 48.5 MB (44.4
+  MB of it the imports) and took about 11 microseconds a row a pass, integrity check included (an upper bound at that
+  size). The real store (about 35 million rows, two passes) is not measured here: expect the order of T47's development
+  run (the same two-pass plan), about 13 minutes of processor time plus two reads of the table and the integrity check.
