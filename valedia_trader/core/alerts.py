@@ -23,12 +23,19 @@ with `level` "cleared" and the same key is written. An alert is open while the l
     mode:unknown:<day>          a summary today whose `mode` is neither absent (the unattended run) nor exactly `propose` or
                                 `approve`: neither kind of run, never counted as one, one warning a day
     practice-stopped:<m>:<day>  a propose or approve run today stopped at a stage other than ticket or session: a warning of its own
+    shared-stopped:<venue>:<stage>:<day>  a SHARED run (T51c S4e; a summary with a `shared` block) of that venue today stopped at that
+                                stage, in any mode (the stages `step-stopped` and `practice-stopped` judge, with the same exceptions: an
+                                ordinary closed market; for propose and approve also stage ticket and session): critical when the
+                                unattended run stopped, else a warning. One alert for a venue, a stage and a day, however many runs repeat
+                                it; a practice stop and a live stop, or two stages, are separate alerts. It clears when a later shared
+                                summary of that venue the same day is `done` with no shortfall (any mode), and in any case when the day
+                                passes. A stop of a shared run no longer raises `step-stopped` or `practice-stopped` (those keys merged
+                                venues and stages); an alert open under one of them is cleared by the next watch, and the stop is raised
+                                again under this key. A run that is NOT shared keeps the two keys above, as before.
     shared-shortfall:<venue>:<day>  a SHARED run (T51c S4e) of that venue today ended `done` and its last reconcile found the account
                                 holding less than the book counts as its own (its summary's `shared.shortfalls` is not empty): a
                                 warning of its own, once for the venue and day; it clears when a later shared summary of that venue the
-                                same day is `done` with none. (A shared run that STOPS at stage shortfall, marks or state is already an
-                                alert of the two lines above: `step-stopped` for the unattended run, `practice-stopped` for propose and
-                                approve, live included; the order ledger's own block is `orders:<ledger>`.)
+                                same day is `done` with none. (The order ledger's own block is `orders:<ledger>`.)
     job:<label>                 a scheduled com.valedia.* job is not loaded, or its last exit code is not 0
     collector:heartbeat         the order-book collector's newest heartbeat is older than 10 minutes
     picks:no-end                the hourly pick-list log has no "end" line in the last 3 hours
@@ -851,6 +858,11 @@ def _has_mode_like_key(entry: dict) -> bool:
     return any(isinstance(k, str) and k != "mode" and k.strip().casefold() == "mode" for k in entry)
 
 
+def is_shared(entry: dict) -> bool:
+    """T51c S4e: a summary of a shared run (it carries a `shared` record): its stops are judged by `check_shared_stops`."""
+    return isinstance(entry.get("shared"), dict)
+
+
 def clears_a_stop(entry: dict) -> bool:
     """A summary that clears a stop of the unattended run: no `mode` key in any letter case, and a status that is exactly `done`."""
     return is_unattended(entry) and not _has_mode_like_key(entry) and isinstance(entry.get("status"), str) and entry["status"] == DONE
@@ -870,7 +882,7 @@ def check_order_step(env: Env) -> CheckResult:
         if not is_unattended(e):
             continue
         venue = str(e.get("venue"))
-        if e.get("status") == "stopped" and not is_outside_market_hours(e):
+        if e.get("status") == "stopped" and not is_outside_market_hours(e) and not is_shared(e):   # S4e: a shared stop has its own key
             stops[venue] = e
         elif clears_a_stop(e):
             stops.pop(venue, None)
@@ -914,7 +926,7 @@ def check_modes(env: Env) -> CheckResult:
                                 f"{today} {clean(unknown[-1].get('venue'), 60)}: mode {clean(repr(unknown[-1].get('mode')), 40)}"))
     for mode in PRACTICE_MODES:
         stops = [e for e in todays if e.get("mode") == mode and is_practice(e) and e.get("status") == "stopped"
-                 and e.get("stage") not in ("ticket", "session")]
+                 and e.get("stage") not in ("ticket", "session") and not is_shared(e)]
         if stops:
             e = stops[-1]
             out.alerts.append(Alert(f"practice-stopped:{mode}:{today}", "warning", f"A {mode} run stopped at stage {e.get('stage')}",
@@ -930,10 +942,19 @@ def _short_figure(x) -> str | None:
     return f"{x:g}" if isinstance(x, (int, float)) and not isinstance(x, bool) and x == x and abs(x) != float("inf") else None
 
 
+def _short_names(shorts: dict) -> str:
+    """The count of short funds and every fund's name, in order ("5 funds short: GLD, IWM, QQQ, SPY, TLT"); a name that is not a
+    plain symbol is counted and not named."""
+    names = [sym for sym in sorted(shorts, key=str) if isinstance(sym, str) and _SHORT_SYMBOL.fullmatch(sym)]
+    odd = len(shorts) - len(names)
+    word = f"{len(shorts)} fund{'' if len(shorts) == 1 else 's'} short"
+    return word + (": " + ", ".join(names) if names else "") + (f" (and {odd} whose name is not plain)" if odd and names
+                                                                  else f" ({odd} whose name is not plain)" if odd else "")
+
+
 def _short_words(shorts: dict) -> str:
-    """The shortfalls of a summary's `shared.shortfalls` in words: for each fund (at most SHORT_FUNDS_SHOWN, in order), what the
-    book counts, what the account holds and how much is short. Built from the figures only; a fund whose name is not a plain
-    symbol is not named, and a figure that is not a finite number is said as unknown."""
+    """The shortfalls of a summary's `shared.shortfalls`, figure by figure: for each fund (at most SHORT_FUNDS_SHOWN, in order), what
+    the book counts, what the account holds and how much is short. A figure that is not a finite number is said as unknown."""
     parts = []
     for sym in sorted(shorts, key=str):
         d = shorts[sym]
@@ -949,9 +970,9 @@ def check_shared_shortfall(env: Env) -> CheckResult:
     """T51c S4e (R24, R33): for today in New York, per venue, a SHARED run (a summary with a `shared` block) that ended `done` and
     whose last reconcile found a shortfall (`shared.shortfalls` a non-empty record) is a warning of its own, once for the venue
     and day: nothing else is raised for such a run (it is not a stop). A later shared summary of that venue the same day with the
-    status exactly `done` and no shortfall clears it. A stop of a shared run (any stage) neither raises nor clears it: a stop at
-    stage shortfall, marks or state is already `step-stopped` or `practice-stopped`. The words come from the summary's figures only
-    (the venue, the day, the funds and their units, the ordinary causes), never an order's tag or an account."""
+    status exactly `done` and no shortfall clears it. A stop of a shared run (any stage) neither raises nor clears it (see
+    `check_shared_stops`). The words come from the summary's figures only, never an order's tag or an account; the count of short
+    funds and every fund's name come first (the alert's detail is cut at 300 characters), the figures after."""
     out = CheckResult()
     found: dict[str, dict] = {}
     for e in todays_step_summaries(env):
@@ -966,11 +987,50 @@ def check_shared_shortfall(env: Env) -> CheckResult:
             found.pop(venue, None)
     for venue, e in sorted(found.items()):
         day = str(e.get("day"))[:10]
+        shorts = e["shared"]["shortfalls"]
         out.alerts.append(Alert(
             f"shared-shortfall:{_key_part(venue)}:{day}", "warning", "The account holds less than the book counts as its own",
-            f"{day} {clean(venue, 60)}: found by the run's last reconcile (stage after). The owner sold shares the book counts as its "
-            "own, or a split; the next run stops until the shares are back or the owner writes a units_out or split entry. "
-            f"{_short_words(e['shared']['shortfalls'])}."))
+            f"{day} {clean(venue, 60)}: found by the run's last reconcile (stage after). {_short_names(shorts)}. The owner sold shares "
+            "the book counts as its own, or a split; clear it with the shares or a units_out or split entry. "
+            f"{_short_words(shorts)}."))
+    return out
+
+
+def check_shared_stops(env: Env) -> CheckResult:
+    """T51c S4e repair 1: today in New York, a stop of a SHARED run (a summary with a `shared` block), in any mode, is one alert for
+    its venue, stage and day, so a practice stop never hides a live one and one stage never hides another. What counts as a stop is
+    what `step-stopped` (the unattended run: any stage but an ordinary closed market) and `practice-stopped` (propose and approve:
+    any stage but ticket and session) judge; a summary with another mode is neither (`mode:unknown` is its own warning). Critical when
+    the unattended run stopped, else a warning. A later shared summary of the venue the same day with the status exactly `done` and
+    no shortfall (any mode) clears every stop of that venue; a done run that found a shortfall does not. The key holds the day, so
+    nothing is carried to the next day."""
+    out = CheckResult()
+    open_: dict[tuple, dict] = {}
+    for e in todays_step_summaries(env):
+        shared = e.get("shared")
+        if not isinstance(shared, dict) or not isinstance(e.get("status"), str):
+            continue
+        venue = str(e.get("venue"))
+        unattended = is_unattended(e) and not _has_mode_like_key(e)
+        if not (unattended or is_practice(e)):
+            continue
+        if e["status"] == "stopped":
+            stage = e.get("stage")
+            if unattended and is_outside_market_hours(e):
+                continue
+            if not unattended and stage in ("ticket", "session"):
+                continue
+            was = open_.get((venue, str(stage)))
+            open_[(venue, str(stage))] = {"e": e, "critical": unattended or bool(was and was["critical"])}
+        elif e["status"] == DONE and not (isinstance(shared.get("shortfalls"), dict) and shared["shortfalls"]):
+            for key in [k for k in open_ if k[0] == venue]:
+                del open_[key]
+    for (venue, stage), item in sorted(open_.items()):
+        e = item["e"]
+        day = str(e.get("day"))[:10]
+        out.alerts.append(Alert(f"shared-stopped:{_key_part(venue)}:{_key_part(stage)}:{day}",
+                                "critical" if item["critical"] else "warning", f"A shared run stopped at stage {e.get('stage')}",
+                                f"{day} {clean(venue, 60)}: {e.get('reason') or 'no reason given'}"))
     return out
 
 
@@ -1142,6 +1202,7 @@ CHECKS: list[tuple[str, tuple[str, ...], Callable[[Env], CheckResult]]] = [
     ("approval", ("approval:",), check_approval_refused),
     ("order-step modes", ("mode:", "practice-stopped:"), check_modes),
     ("shared book", ("shared-shortfall:",), check_shared_shortfall),
+    ("shared stops", ("shared-stopped:",), check_shared_stops),
     ("scheduled jobs", ("job:",), check_jobs),
     ("order-book collector", ("collector:",), check_collector),
     ("pick-list log", ("picks:",), check_picks),

@@ -404,8 +404,8 @@ def test_a_shortfall_stops_the_run_at_its_own_stage_with_its_words_an_alert_and_
     env = alerts.Env(root=w.tmp_root, now=w.clock.t, halt_file=None, logs_dir=w.tmp / "logs",
                      launch_agents_dir=w.tmp / "la", launchctl=lambda: "", free_bytes=lambda p: 10 ** 12,
                      sessions=lambda: None)
-    keys = {a.key for a in alerts.check_order_step(env).alerts} | {a.key for a in alerts.check_orders(env).alerts}
-    assert any(k.startswith("step-stopped:") for k in keys) and any(k.startswith("orders:") for k in keys), keys
+    keys = {a.key for a in alerts.check_shared_stops(env).alerts} | {a.key for a in alerts.check_orders(env).alerts}
+    assert any(k.startswith("shared-stopped:") for k in keys) and any(k.startswith("orders:") for k in keys), keys
 
 
 def test_a_shortfall_clears_when_the_shares_come_back(mk):

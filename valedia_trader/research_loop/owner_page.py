@@ -686,10 +686,11 @@ def entry_figures(e: dict) -> str:
 
 
 def alert_is_of_venue(row: dict, venue: str, ledger_stem: str) -> bool:
-    """An open alert that is about this venue's book: the unattended run's stop and the shortfall of a done run (the venue is in
-    the key), the ledger's block (its file's name), the approval flow's stop (the venue is in its words)."""
+    """An open alert that is about this venue's book: a shared run's stop and the shortfall of a done run (the venue is in the
+    key), an older run's unattended stop (the venue is in its key), the ledger's block (its file's name), the approval flow's stop (the venue is in its words)."""
     key, kp = str(row.get("key")), al._key_part(venue)
-    if key == f"step-stopped:{kp}" or key.startswith(f"shared-shortfall:{kp}:") or key == f"orders:{al._key_part(ledger_stem)}":
+    if (key == f"step-stopped:{kp}" or key.startswith((f"shared-shortfall:{kp}:", f"shared-stopped:{kp}:"))
+            or key == f"orders:{al._key_part(ledger_stem)}"):
         return True
     return key.startswith("practice-stopped:") and f" {al.clean(venue, 60)}:" in str(row.get("detail"))
 
