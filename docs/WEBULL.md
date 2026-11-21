@@ -477,8 +477,9 @@ what settlement looks like.
 ## The shared account (being built)
 
 The owner also trades the account the fund book is to trade in (T51c). What exists after slices S1 to S3 and S4a to
-S4d (S4b wired the owner's command; S4c wired a PRACTICE run: "The shared run", below; S4d opened the LIVE venue: "A
-live shared run", below):
+S4e (S4b wired the owner's command; S4c wired a PRACTICE run: "The shared run", below; S4d opened the LIVE venue: "A
+live shared run", below; S4e added the alerts, the owner's page and the `mark` entry: "The alerts and the owner's page",
+below):
 
 - **The reconcile can compare one way** (`OrderLedger.reconcile(..., one_sided=True)`): what the account holds beyond
   the book and its unapplied fills is listed under `owner_surplus` and is no difference; an account holding LESS than
@@ -532,8 +533,7 @@ live shared run", below):
   must be in the ledger (a ledger put back from an older copy shows up here). A shared run makes it before anything
   is read from the account.
 
-**Not wired** (S4e, build B): the alerts on the owner's page and the combined holding per fund (his and hers,
-information only) are S4e; fractional live orders are build B (live trades whole shares only). A run WITHOUT `--shared` is as it was,
+**Not wired** (build B): fractional live orders (live trades whole shares only). A run WITHOUT `--shared` is as it was,
 except that a state file holding an owner's entry refuses it (below). Still not seen by the book at all: a distribution paid on the book's shares, and any order the venue holds that the
 ledger never knew (the venue's order history is a later slice).
 
@@ -541,7 +541,8 @@ ledger never knew (the venue's order history is a later slice).
 never proposes or defaults one, refuses a figure that is not a positive decimal written as digits, and needs `--who`
 and `--note`. The kinds: `cash_in` and `cash_out` (`--amount`), `units_out` (`--symbol`, `--units`: shares he took
 that the book counted as its own, which clears exactly that much of a shortfall), `split` (`--symbol`, `--ratio`: new
-units per old unit; the value stays, the units change).
+units per old unit; the value stays, the units change), `mark` (`--symbol` alone; S4e, R34: "this quote is real; take it as
+the new mark", below; no cash and no units change).
 
 *Marks are never typed* (`--mark` is refused in words). Every fund the book holds units of, and the entry's own symbol
 for a `units_out` or a `split`, is asked of the order step's OWN quote source (the function a run is handed: the last
@@ -671,7 +672,8 @@ skipped; a fault is a fault):
    `max_drawdown_pct` (config/risk.json) from its mark in the latest `book_nav` row stops the run at stage `marks`
    (a skip) before any order, because the one quote prices every order's limit and the whole book's value. A real
    split is cleared by the owner's `split` entry: the mark is divided by the ratio of every split of that fund written
-   after the row. No earlier row, or a fund with no mark in it, is not judged. (When the limits file cannot be read the
+   after the row; a real move of the quote is cleared by the owner's `mark` entry (S4e, R34, below): the fund's reference
+   becomes the mark that entry took. No earlier row, or a fund with no mark in it, is not judged. (When the limits file cannot be read the
    check is not made: the risk gate then refuses every order with the file's own error.)
 8. *A ticket* (R26): a proposal stores the value it was made at (as its `capital`) and is marked as made by a shared run
    (a ticket of an ordinary run is refused by a shared approval and the reverse: "not made in shared mode"); an
@@ -699,7 +701,7 @@ The summary of a shared run carries `shared`: `capital`, `book_value` and `book_
 `drawdown_pct`, `previous_value_per_unit` and where it came from, `owner_surplus`, and `shortfalls` when there are
 any.
 
-**What is NOT there yet.** The alerts on the owner's page and the combined holding per fund (S4e); the fee a purchase's venue reports ABOVE the
+**What is NOT there yet.** The fee a purchase's venue reports ABOVE the
 published bound writes no journal notice (R22 (c): the bounds simply follow the reported figure); a book value for a
 `units_outstanding` of nothing (every unit redeemed) stops at `targets` until the owner's entry opens it again. The
 go-live gate reads a shortfall as R32 and R33 say (above).
@@ -819,9 +821,68 @@ live without shared (unreachable from the command line; a live state file that h
 on the owner's entry names any folder (the entry's state file is that folder's `memory/`, unlike a live run, which reads
 the repository only).
 
-**What is still missing on live:** the alerts on the owner's page and the combined holding per fund (S4e); an owner entry
-kind `mark` for a real move beyond `max_drawdown_pct` (R34, S4e; the `marks` stop stays until a `split` entry or the
-quote comes back); fractional live orders (build B: live trades whole shares only).
+**What is still missing on live:** fractional live orders (build B: live trades whole shares only). The alerts, the
+owner's page and the `mark` entry (S4e) hold on live as on practice ("The alerts and the owner's page", below).
+
+### The alerts and the owner's page (T51c S4e)
+
+**The alerts** (`core/alerts.py`, the watchdog's own checks over the journal's summaries; no new way of delivery). Every stop
+of a shared run, practice or live, at stage `shortfall`, `marks` or `state` ALREADY raised an alert before S4e, and those
+checks are as they were: the unattended run's `step-stopped:<venue>` (critical; it clears when a later unattended summary of
+the day is `done`) and, for a propose or approve run (the live ones included), `practice-stopped:<mode>:<day>` (a warning). Each
+names the venue, the stage, the day and the run's own words (the stop's reason, R2) and never an order's id, a key or an
+account number (the watchdog's cleaning); a repeated stop of one cause on one day is ONE alert, not one a run (the keys are
+per venue, or per mode and day). The order ledger's own block (`orders:<ledger>`) stays as well. The one gap S4e closes: a run
+that ENDS `done` whose last reconcile found a shortfall (its summary's `shared.shortfalls` not empty: the owner's sale of
+shares the book counts as its own, seen after the run's orders) raised nothing but that block. It now raises
+`shared-shortfall:<venue>:<day>` (a warning): the venue, the day, the stage (the run's last reconcile), the two ordinary causes,
+what clears it, and the first two funds with the units the book counts, the account holds and the units short (from the
+summary's figures only). It is one alert for the venue and day however many runs repeat it, and it clears when a later shared
+summary of that venue the same day is `done` with no shortfall (otherwise when the day passes). Cause is read as the venue,
+the stage and the day.
+
+**The owner's page** (`research_loop/owner_page.py`) has a ninth section, "Shared book", when a venue has a shared book (its
+state file holds an owner's entry, or the journal holds one of that venue's; otherwise the page is as it was). For each such
+venue: the book's value per unit, lower and upper, and the latest look's day and time (from its latest `book_nav` row); the
+units outstanding (after the last entry); the value per unit the day stop measures from (the previous figure, and where it
+came from) and the peak value per unit (`book_loss`, as a run reads them); the open alerts of the watchdog about this venue's
+book; the owner's entries, latest first (number, kind, figures, units and value per unit after, who, note, time; the
+`mark` entry among them, "SPY taken as the new mark at 505.0"); any `history_accepted` lines of the venue (day, figures,
+who, note, when written); and one line per fund with the book's units, the owner's own units (what the account held beyond
+the book at the ledger's last reconcile, its time said) and the two together. The combined holding is INFORMATION ONLY (R31):
+nothing that judges an order imports or reads the page, and every limit stays on the book's own units. The page only reads:
+the state file is opened read-only on the page's own connection (waiting at most 5 seconds for a writer), the order ledger and
+the journal likewise. A state file that is missing (the journal still names the venue's entries), busy, of another layout or
+whose chain no longer checks, a ledger that is missing, and a last reconcile that was not one-sided each say so in plain words
+for that venue or that part ("Not available", "Unavailable"), never a traceback and never a write. A fund's owner's own units
+are "not known" when the last reconcile was not one-sided; a held fund the one-sided reconcile listed no surplus for shows 0.
+
+### The `mark` entry (T51c S4e, R34)
+
+A held fund whose quote is further from its last `book_nav` mark than `max_drawdown_pct` stops a shared run at stage `marks` (R28);
+until S4e only a `split` entry or the quote coming back cleared it. A REAL move (a fund up 40% overnight) needs the owner's yes:
+`order-step --owner-entry mark --venue VENUE --symbol SYMBOL --who WHO --note NOTE` (with `--live` for the production venue,
+as every live entry), then the same command with `--confirm CODE`. It is the owner's command of every other entry (R29): the
+preview prints first with a code and writes nothing; the mark is the order step's own quote (never typed: `--mark` is refused;
+`--amount`, `--units` and `--ratio` are refused for it), outside the session the last close, its time shown; the confirm asks
+the quote again and writes only if the mark has not moved by more than `TICKET_QUOTE_MOVE` and nothing else changed. The entry
+is hash-chained and journaled like the others (one `owner_entry` line; the repair of a lost line is the same). It names ONE fund
+(a book holding units of it; a mistyped or unheld symbol is refused, nothing written): to clear two funds the owner writes two
+entries. It changes no cash, no unit and no value per unit (the figures at its marks are the figures before). On the next run
+the fund's reference mark is the mark of the latest `mark` entry written after the last `book_nav` row (a later split of the
+fund divides it, a later `mark` replaces it), so a quote within `max_drawdown_pct` of that mark passes and one further away
+stops the run again; another fund's stop is not cleared.
+
+A `mark` entry is no stake change and no profit or loss, so it is never read as a base for a value per unit: `book_loss`'s
+fallback (the day stop's previous figure when no row of an earlier day exists) and the history check's base (`_entry_base`) skip
+it, and the peak is read from the `book_nav` rows alone. A mark taken at a LOWER value therefore cannot lower the day stop's
+base or the history check, and one at a higher value cannot raise it; tests show the figures equal with and without the entry.
+
+*Schema.* `owner_entries.kind` is a CHECK of the kinds. A new state file's statement names `mark`; a layout-2 file made before
+S4e is rebuilt in place by its FIRST `mark` entry, in the write transaction of that entry after its chain is checked (every row
+copied with its id, the table renamed, the two append-only triggers made again; all or none), with `user_version` still 2.
+An order step of an earlier build does not know the kind (its book figures raise "entry N is of kind 'mark', which is none of ..."),
+so going back to it needs the state file from before the first `mark` entry.
 
 ## Not covered yet
 
