@@ -42,7 +42,12 @@ matched by keyword only, not read one by one. Item H-1 closes that.
    `.foreman/tickets/T51c-S4c2-go-live-counts-shortfall.md` (R34 goes to S4e). **S4c-2 MERGED** (main e375fc3,
    two blind checks). **Practice gate moved** to e375fc3; the lead wrote the practice book's opening entry (R30:
    cash_in 1,001,229.06, book value 996,749.85 = Friday's paper equity); the practice job passes `--shared` from
-   **Mon 2026-11-23 6:55 AM PST**, the first shared practice run. S4d (live shared) building.
+   **Mon 2026-11-23 6:55 AM PST**, the first shared practice run. **S4d MERGED** (main 51d2641 + docs 733137c, 2026-11-21; seven repair
+   rounds, last blind check PASS_WITH_NOTES): live is always shared, lock 1 on the book's upper value, the
+   state file's value history is checked against the journal before any account read, and
+   `order-step --live --accept-history DAY` clears a lost summary only when the row tightens (a lower row is the
+   lead's by hand). **Practice gate moved** to 733137c (tested both ways). NEXT: S4e (alerts, the owner's page,
+   R34's `mark` entry), then T51 build B.
 4. Hermes, Paperclip and Live-page work PARKED until 1 is done (each by name: elephant-code-mode follow-ups,
    Paperclip seats' daytime test VAL-19, the Mission tab's nightly refresh, the Engineer's key file wiring).
 
