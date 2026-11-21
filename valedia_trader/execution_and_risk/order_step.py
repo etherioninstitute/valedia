@@ -171,7 +171,7 @@ Live mode (`live`, T22d-1) adds five checks to a ticket run; a practice run neve
    again;
  - the max_capital check works out this ledger's exposure afresh at each order, at the marks the gate has just used.
 
-The shared run (`shared`, T51c S4c; practice only, docs/WEBULL.md "The shared run"): the account is also the owner's,
+The shared run (`shared`, T51c S4c, and live since S4d; docs/WEBULL.md "The shared run"): the account is also the owner's,
 and the fund book is judged on its OWN figures (`book_figures`, from the ledger's fills and the owner's entries). Before
 anything is read from the account the state file latches (an owner's entry refuses a run that is not shared: stage
 `state`), its entries are compared with the journal (`state`), every tag with the ledger (`reconcile`) and the book
@@ -181,6 +181,10 @@ come first and the book's value at them is the capital (`--capital` is refused);
 `book_nav` mark stops at `marks`; the position limit, the count of positions, the day's loss and the drawdown are the
 book's (the loss and the drawdown on the value per unit, from `book_nav`; the old `equity` table is neither read nor
 written); purchases are bounded by the book's usable cash too; a ticket binds the book's value.
+In live mode (S4d: the command line takes `--live` only with `--shared`, and never a capital) the same run holds, with
+lock 1's `max_capital` binding the book's value at its UPPER bound (stage `lock`, before any order), the day stop
+judged on the loss of the value per unit, a live ticket marked shared as well, and the state file's counters read from
+the book's own `book_nav` rows and the journal's value per unit (Decimal), never the `equity` table.
 
 What the summary says for the stake ladder (T34b-2, docs/specs/2026-11-14-caps-ladder-design.md D4, D5, D6, D8):
  - `faults`, a list, only when not empty, on practice and live runs, done or stopped: `reconcile` when the final
@@ -269,7 +273,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, Decimal, localcontext
+from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Callable
 
@@ -1146,6 +1150,27 @@ def far_quotes(last_row: dict | None, entries, quotes: dict, held, limit_pct) ->
     return out
 
 
+def _journal_vpu_peak(entries, venue: str) -> Decimal | None:
+    """T51c S4d: the highest value per unit (exact decimal) the journal's summaries of `venue` recorded in their `shared`
+    block (the lower figure of a look, the text the run's `book_nav` row holds), or None. A figure that is not a finite
+    decimal is not counted; a ticket's `equity` never is (a later look may lower the row it was made at)."""
+    best = None
+    for e in entries:
+        if not (isinstance(e, dict) and e.get("type") == "order_step" and e.get("venue") == venue
+                and e.get("event") == "summary" and isinstance(e.get("shared"), dict)):
+            continue
+        text = e["shared"].get("value_per_unit")
+        if not isinstance(text, str):
+            continue
+        try:
+            figure = Decimal(text)
+        except (InvalidOperation, ValueError):
+            continue
+        if figure.is_finite() and (best is None or figure > best):
+            best = figure
+    return best
+
+
 def _shortfall_figures(shorts: dict) -> dict:
     """A shared run's shortfalls as the summary says them: per plain symbol, the book's units, the account's, the
     unapplied fills' and the units short, as numbers only."""
@@ -1166,8 +1191,9 @@ _PREVIEW_FIELDS = ("what", "venue", "code", "created", "expires", "marks", "argu
 _FIGURED_FILL_FIELDS = ("id", "tag", "symbol", "units", "price", "price_covers_units", "fee", "time")
 _FIGURED_ORDER_FIELDS = ("tag", "units", "order_type", "limit_price", "collar_price", "fee", "state", "finished_at",
                          "never_arrived_at")
-_RUN_FLAGS_WORDS = ("the owner's entry is written on its own, without --propose, --approve, --live, --check, "
-                    "--capital, --fractional or --shared; nothing was written")
+_RUN_FLAGS_WORDS = ("the owner's entry is written on its own, without --propose, --approve, --check, "
+                    "--capital, --fractional or --shared (and --live only for a production venue's book); nothing was "
+                    "written")
 
 
 def _owner_figure(text, what: str) -> Decimal:
@@ -1422,7 +1448,9 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None, *
     under the run lock, then journaled (one `owner_entry` line, by the journal's own writer, addendum 4 R12).
 
     `--owner-entry-rejournal N --hash H --who --note` (no kind, no figure) writes the missing journal line of entry N
-    (_owner_rejournal). A production venue's name is refused in every form before any quote is asked (R23).
+    (_owner_rejournal). A production venue's name is refused in every form, before any quote is asked, unless `--live`
+    is given with it (S4d: the live book's entries, with everything above holding there too); `--live` with any other
+    name is refused the same way (R23).
 
     Exit 0: a preview printed, an entry written and journaled, or a line rejournaled. Exit 2: refused in words on
     stderr, writing nothing to the state file, the journal or the ledger (R13: every refusal is decided before the
@@ -1431,17 +1459,24 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None, *
     import sys
     kind = getattr(args, "owner_entry", None)
     confirm = getattr(args, "confirm", None)
-    if (getattr(args, "propose", False) or getattr(args, "approve", None) is not None or getattr(args, "live", False)
+    if (getattr(args, "propose", False) or getattr(args, "approve", None) is not None
             or getattr(args, "check", False) or getattr(args, "capital", None) is not None
             or getattr(args, "fractional", False) or getattr(args, "shared", False)):
         return _owner_refuse(_RUN_FLAGS_WORDS)
+    live = bool(getattr(args, "live", False))
     venue = getattr(args, "venue", None)
     if not isinstance(venue, str) or not venue or _safe_name(venue) != venue or venue.strip(".") == "":
         return _owner_refuse("the owner's entry needs --venue, the plain name of the venue whose book it is (the name "
                              "in its state file's name); nothing was written")
-    if _production_venue_name(venue):                     # addendum 7 (R23): the live venue's state file, by name alone
-        return _owner_refuse(f"{_cut(repr(venue))} is a production venue's name: an owner's entry for a live venue is "
-                             "not open yet (it opens later, only together with --live); nothing was written")
+    # addendum 7 (R23, reversed for --live only by S4d): the live venue's state file is reached by its name alone, so a
+    # production venue's name is taken only together with --live, and --live takes only a production venue's name
+    if _production_venue_name(venue) != live:
+        return _owner_refuse(
+            f"{_cut(repr(venue))} is a production venue's name: an owner's entry for a live venue is written only "
+            "together with --live; nothing was written" if not live else
+            "the owner's entry is written on its own, without --propose, --approve, --check, --capital, --fractional or "
+            f"--shared; --live goes only with a production venue's name (it starts {_PRODUCTION_PREFIX!r}: the live "
+            f"venue's book), and {_cut(repr(venue))} is a practice name; nothing was written")
     if getattr(args, "mark", None) is not None:           # S4b (R29): marks are never typed
         return _owner_refuse("--mark is not taken: an owner's entry is valued at the order step's own quotes (the "
                              "quote source and age rule a run uses; outside the session the last session's close), "
@@ -2985,8 +3020,9 @@ def run_order_step(*, ledger: OrderLedger, venue, paper, quotes: Callable, journ
     (default: second_quote.second_opinion), asked in live mode and, with `fractional` on, for each MARKET leg on
     practice (T51 ruling C; with `fractional` off practice asks none). `follow` (a Follow: config/broker_book.json as
     the command line reads it, T32) makes the broker book follow only the strategies it names; None follows the
-    whole book, except in live mode, which stops without one. `shared` (T51c S4c, practice only; live is S4d) is the
-    shared-account mode: the book is judged on its own figures (see the module notes, "The shared run")."""
+    whole book, except in live mode, which stops without one. `shared` (T51c S4c; live mode takes it from S4d, and the
+    command line requires it there) is the shared-account mode: the book is judged on its own figures (see the module
+    notes, "The shared run")."""
     mode = "propose" if propose else ("approve" if approve is not None else None)
     run = _Run(ledger, venue, paper, quotes, journal, limits_file, state, clock, calendar, halt_file, latch_file,
                capital, fractional)
@@ -3063,6 +3099,7 @@ class _Run:
         self.live_marks: dict[str, float] = {}           # ... the exposure is worked out again at each order
         self.live_buys: list[float] = []                 # ... with the buys passed so far, in order
         self.journal_peak: float | None = None           # T22d-1 (A4): the highest equity the journal holds for this venue
+        self.journal_vpu_peak: Decimal | None = None     # T51c S4d (live, shared): the highest value per unit it holds
         self._ticket_expired_seen = False                # once a reading is past the ticket's expiry, it stays expired
         self.disagreements: list[dict] = []
         self.ticket: dict | None = None                  # approve: the ticket's row; propose: the ticket written
@@ -3182,12 +3219,10 @@ class _Run:
         self.batch = f"os-{stamp:%Y%m%d-%H%M%S}-{os.urandom(3).hex()}"
         if self.mode == "both":                          # before the lock: writes nothing anywhere
             return self._finish("stopped", "ticket", "propose and approve cannot be asked for in one run")
-        if self.live is not None and self.shared:        # T51c S4c: live mode is made shared by S4d, not by this slice
-            return self._finish("stopped", "live", "the shared mode is open on practice only for now: a live run is made "
-                                                   "shared by a later slice; nothing is read or sent")
-        if self.live is not None:                        # live mode: only as a ticket run, a capital, whole shares
-            why = ("live mode runs only with propose or approve" if self.mode is None else
-                   "live mode needs the capital given (at most the confirmation's max_capital)" if self.capital is None else
+        if self.live is not None:                        # live mode: only as a ticket run, whole shares, and a capital
+            why = ("live mode runs only with propose or approve" if self.mode is None else   # unless the book is shared:
+                   "live mode needs the capital given (at most the confirmation's max_capital)"   # then it is the book's
+                   if self.capital is None and not self.shared else                              # own value (T51c S4d, R26)
                    "live mode trades whole shares only" if self.fractional else None)
             if why is not None:
                 return self._finish("stopped", "live", why)
@@ -3433,6 +3468,8 @@ class _Run:
                                      "away: a split, a rename or a bad quote; if it is a split, the owner writes a split "
                                      "entry; a person must look; nothing is sent")
         value = float(figures.value)
+        if self.live is not None:                        # T51c S4d (R26): lock 1 against the BOOK's value, the upper bound
+            self._lock_one_book(figures)
         if self.mode == "approve" and self.ticket is not None:
             made = float(self.ticket["capital"])
             if not abs(value - made) <= TICKET_QUOTE_MOVE * made:
@@ -3440,6 +3477,26 @@ class _Run:
                                       f"than {TICKET_QUOTE_MOVE:.1%} away; nothing is sent")
         self.shared_info["capital"] = value
         return value
+
+    def _lock_one_book(self, figures: BookFigures) -> None:
+        """T51c S4d (R26): lock 1's `max_capital` stays binding in a live shared run, and the capital it binds is the
+        book's own value taken at its UPPER bound (the cautious side of a ceiling): a book above it, or one whose upper
+        value is not known, is refused before any order (stage `lock`, a skip; the confirmation's own words). The
+        figures are said in the summary (`shared.book_value`, `shared.book_value_high`, `ceiling`)."""
+        conf = self.locks.confirmation if self.locks is not None else None
+        if conf is None:
+            raise _Stop("lock", "lock 1 (the confirmation) is not in force; nothing is sent")
+        ceiling = Decimal(str(conf["max_capital"]))
+        high = figures.value_high
+        self.shared_info["book_value"] = float(figures.value)
+        self.shared_info["book_value_high"] = None if high is None else float(high)
+        if high is None:
+            raise _Stop("lock", f"lock 1 (the confirmation): the book's value has no upper bound known (the book's lower "
+                                f"value is {figures.value:,.2f}), so it cannot be shown to be at most max_capital "
+                                f"{ceiling:,.2f}; nothing is sent")
+        if not high <= ceiling:
+            raise _Stop("lock", f"lock 1 (the confirmation): the book's value (upper bound) {high:,.2f} is above "
+                                f"max_capital {ceiling:,.2f} (by {high - ceiling:,.2f}); nothing is sent")
 
     def _book_look(self, marks: dict) -> BookFigures:
         """The book's figures at the marks in hand, from the ledger as it is now; the value must be known."""
@@ -3484,12 +3541,15 @@ class _Run:
             self.state.reprice_book_nav(self.nav_row, nav)
         self.nav_sig = sig
 
-    def _shared_account(self, marks: dict, opened: int) -> dict:
+    def _shared_account(self, marks: dict, opened: int, look: bool = True) -> dict:
         """The account the risk gate judges, in a shared run: the BOOK's value at the marks in hand (the lower bound) as
-        its equity, the day's loss and the drawdown on its value per unit, the funds it holds as the count (R27, R31)."""
+        its equity, the day's loss and the drawdown on its value per unit, the funds it holds as the count (R27, R31).
+        In live mode every look but the run's last may trip the day stop, on the loss of the value per unit (S4d)."""
         figures, loss = self._shared_look(marks)
         self._nav_sync(figures, marks)
         self.broker_equity = float(figures.value)
+        if look and self.live is not None:               # T34b-2 (S2) as the ordinary account's look does it
+            self._look(float(loss.daily_loss_pct))
         return {"equity": float(figures.value), "daily_loss_pct": float(loss.daily_loss_pct),
                 "drawdown_pct": float(loss.drawdown_pct), "open_positions": opened}
 
@@ -3500,7 +3560,7 @@ class _Run:
         if self.nav_row is None:
             return
         try:
-            self._shared_account(self.in_hand, 0)
+            self._shared_account(self.in_hand, 0, look=False)
         except Exception:
             pass
 
@@ -3684,12 +3744,39 @@ class _Run:
                                  f"{self.day} and the order ledger holds {on_ledger} sent that day: the state file knows "
                                  "less than the ledger (an older copy put back?), so the day's cap cannot be judged; "
                                  "a person must look; nothing is sent")
+        if self.shared:                                  # T51c S4d (R27): the book's own figures, never the equity table
+            self._live_nav_peak()
+            return
         peak, seen = self.state.peak(), self.journal_peak
         if seen is not None and (peak is None or peak < seen):
             held = "no equity" if peak is None else f"an equity peak of {peak:,.2f}"
             raise _Stop("state", f"the order step's state file holds {held} and the journal recorded an equity of "
                                  f"{seen:,.2f} for {self.name}: the state file knows less than the journal (an older copy "
                                  "put back?), so the drawdown cannot be judged; a person must look; nothing is sent")
+
+    def _live_nav_peak(self) -> None:
+        """T51c S4d (A4 for the shared book, R27): the state file's `book_nav` rows must know at least the value per unit
+        the journal's summaries of this venue recorded (the lower figure each look wrote, the same text the row holds),
+        or an older state file put back would lower the peak the drawdown is judged against. Both are exact decimals,
+        compared as such: never an SQL MAX over text, in which "9.5" is above "10.5". The old `equity` table is not read."""
+        seen = self.journal_vpu_peak
+        if seen is None:
+            return
+        peak = None
+        for row in self._nav_rows():
+            try:
+                figure = Decimal(row["value_per_unit"])
+            except (InvalidOperation, TypeError, ValueError):
+                raise OrderStepError(f"book_nav row {row['id']} holds a value per unit that is not a number; a person "
+                                     "must look") from None
+            if figure.is_finite() and (peak is None or figure > peak):
+                peak = figure
+        if peak is None or peak < seen:
+            held = "no value per unit" if peak is None else f"a highest value per unit of {peak}"
+            raise _Stop("state", f"the order step's state file holds {held} in its book_nav rows and the journal recorded "
+                                 f"a value per unit of {seen} for {self.name}: the state file knows less than the journal "
+                                 "(an older copy put back?), so the drawdown cannot be judged; a person must look; nothing "
+                                 "is sent")
 
     # -- T34b-2: the faults the summary carries, and (live mode) the working stop and the day stop
     def _judge_final(self, final) -> None:
@@ -3860,7 +3947,7 @@ class _Run:
         named in `cap_unjudged`. (i), (ii) and (iii) are each fill's own verdict (`_fill_verdict`), written into its
         fill line by the run that journals it."""
         at_work = []
-        for sym, u in broker_book(self.ledger.fills()).items():
+        for sym, u in (self._shared_units() if self.shared else broker_book(self.ledger.fills())).items():
             if not u > UNITS_EPS:
                 continue
             q = self.live_marks.get(sym)
@@ -4135,8 +4222,9 @@ class _Run:
         if self.live is None:
             self.tickets.create(ticket, self.ticket_lines, live=mark, shared={"mode": "shared"} if self.shared else None)
         else:                                            # T32: a live ticket is bound to the broker book it follows
+            kept = {"shared": {"mode": "shared"}} if self.shared else {}   # T51c S4d: and, in a shared run, marked so
             self.tickets.create(ticket, self.ticket_lines, live=mark,
-                                follow={"digest": self.follow.digest, **self._follow_view()})
+                                follow={"digest": self.follow.digest, **self._follow_view()}, **kept)
         self.ticket, self.ticket_number_made = ticket, number
         self._write({"event": "ticket", **self._ticket_view()})
 
@@ -4326,11 +4414,14 @@ class _Run:
         self._scan_verdicts(entries)                     # T34b-3: every file, every run (no cut-off)
         self.torn_lines = [{"file": name, "line": n} for name, n, _ in torn]
         if self.live is not None:                        # T22d-1 (A4): the highest equity journaled for this venue
-            keys = {"summary": "broker_equity", "ticket": "equity"}
-            seen = [_as_float(e.get(keys[e.get("event")])) for e in entries if e.get("type") == "order_step"
-                    and e.get("venue") == self.name and type(e.get("event")) is str and e.get("event") in keys]
-            seen = [v for v in seen if v is not None]
-            self.journal_peak = max(seen) if seen else None
+            if self.shared:                              # T51c S4d (R27): the book's own, the value per unit, in Decimal
+                self.journal_vpu_peak = _journal_vpu_peak(entries, self.name)
+            else:
+                keys = {"summary": "broker_equity", "ticket": "equity"}
+                seen = [_as_float(e.get(keys[e.get("event")])) for e in entries if e.get("type") == "order_step"
+                        and e.get("venue") == self.name and type(e.get("event")) is str and e.get("event") in keys]
+                seen = [v for v in seen if v is not None]
+                self.journal_peak = max(seen) if seen else None
             self._carry_day_stop(entries)                # T34b-2 (S4): a day stop recorded earlier this New York day
         for name, n in new:
             self._write({"event": "torn_line", "file": name, "line": n,

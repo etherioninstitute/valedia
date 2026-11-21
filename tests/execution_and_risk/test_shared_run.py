@@ -772,7 +772,7 @@ def test_the_command_lines_shared_flag_reaches_the_run_and_is_refused_where_it_c
     out = json.loads(capsys.readouterr().out)
     assert out["stage"] == "targets" and "opening entry" in out["reason"] and "shared" in out, out
     asked = argparse.Namespace(live=True, check=False, shared=True, fractional=False, capital=1.0, propose=True, approve=None)
-    assert "--shared" in cli._live_args_refusal(asked)
+    assert "--capital" in cli._live_args_refusal(asked)   # S4d: live takes --shared (and never a capital)
     assert cli.main(["--root", str(tmp_path), "order-step", "--owner-entry", "cash_in", "--venue", venue.name, "--amount",
                      "1", "--who", "o", "--note", "n", "--shared"]) == 2               # the owner's entry takes no run flag
     assert "--shared" in capsys.readouterr().err

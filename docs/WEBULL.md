@@ -477,7 +477,8 @@ what settlement looks like.
 ## The shared account (being built)
 
 The owner also trades the account the fund book is to trade in (T51c). What exists after slices S1 to S3 and S4a to
-S4c (S4b wired the owner's command; S4c wired a PRACTICE run: "The shared run", below; live is S4d):
+S4d (S4b wired the owner's command; S4c wired a PRACTICE run: "The shared run", below; S4d opened the LIVE venue: "A
+live shared run", below):
 
 - **The reconcile can compare one way** (`OrderLedger.reconcile(..., one_sided=True)`): what the account holds beyond
   the book and its unapplied fills is listed under `owner_surplus` and is no difference; an account holding LESS than
@@ -531,8 +532,8 @@ S4c (S4b wired the owner's command; S4c wired a PRACTICE run: "The shared run", 
   must be in the ledger (a ledger put back from an older copy shows up here). A shared run makes it before anything
   is read from the account.
 
-**Not wired** (S4d, S4e): live is not shared yet (`--shared` with `--live` is refused); the alerts on the owner's page
-and the combined holding per fund (his and hers, information only) are S4e. A run WITHOUT `--shared` is as it was,
+**Not wired** (S4e, build B): the alerts on the owner's page and the combined holding per fund (his and hers,
+information only) are S4e; fractional live orders are build B (live trades whole shares only). A run WITHOUT `--shared` is as it was,
 except that a state file holding an owner's entry refuses it (below). Still not seen by the book at all: a distribution paid on the book's shares, and any order the venue holds that the
 ledger never knew (the venue's order history is a later slice).
 
@@ -595,8 +596,8 @@ confirm; it is not a secret. The shape, with figures that are AN EXAMPLE ONLY an
 `VENUE_NAME` is the name in the venue's state file, `memory/order_step-VENUE_NAME.sqlite` (under `--root` when one
 is given); the ledger beside it is only read, and the confirm is refused while a run holds that file's lock. A
 production venue's name (anything starting `webull-production`, compared without case and trailing dots) is refused
-in every form (preview, confirm, repair) before any quote is asked: live entries open later, only together with
-`--live`. A refusal writes nothing to the state file or the journal: no folder, lock file or upgrade of the state
+in every form (preview, confirm, repair) before any quote is asked unless `--live` is given with it (S4d, below); a
+practice name is never taken with `--live`. A refusal writes nothing to the state file or the journal: no folder, lock file or upgrade of the state
 file (it exits 2). An entry written whose journal line could not be written is said in words, with the entry's hash
 and the repair to run, and exits 3; the entry stays in the state file, and every later entry is refused until the
 line is written.
@@ -611,15 +612,22 @@ written. It cannot make good an entry that was changed (the chain breaks, or the
 put in another order, a missing entry that is not the last, or an entry whose hash is not given; and, as before, an
 entry appended by hand with its hash recomputed and its hash typed is not told from the owner's own.
 
-*Not there yet*: live entries (S4d, with `--live`). (A run reads the entries and the book's figures only in the shared
-mode, below; no run ever reads the pending preview.)
+*Live entries* (S4d, R23 reversed for `--live` only): `order-step --live --owner-entry KIND --venue webull-production
+...` (and `--confirm CODE`, and the repair `--live --venue webull-production --owner-entry-rejournal N --hash H ...`)
+takes the production venue's name, and everything above holds there unchanged: the preview is printed first with its
+code and writes nothing, the confirm re-asks the quotes (the order step's own quote path, never typed; outside the
+session the last close) and writes only if every mark is within `TICKET_QUOTE_MOVE`, the repair is for the last entry
+only. The two flags go together: a production venue's name without `--live` is refused ("written only together with
+--live"), and `--live` with any other name is refused ("a practice name"); `--live` with `--propose`, `--approve`,
+`--check`, `--capital`, `--fractional` or `--shared` is refused as every run flag is. (A run reads the entries and the
+book's figures only in the shared mode, below; no run ever reads the pending preview.)
 
-### The shared run, practice only (T51c S4c; `order-step --shared`)
+### The shared run (T51c S4c, practice; S4d, live; `order-step --shared`)
 
 `order-step --shared` (the keyword `shared=True` of `run_order_step`) runs the order step against an account the owner
-also trades, judging the fund book on its OWN figures. It is open on the practice venue only: `--shared` with
-`--live` (or `--check`) is refused, and a live run is made shared by S4d. The scheduled practice job does not pass the
-flag yet; the lead moves the gate and the job together.
+also trades, judging the fund book on its OWN figures. On the practice venue it is a flag; on the live venue it is
+required (S4d, "A live shared run", below); `--shared` with `--check` is refused. The scheduled practice job does not
+pass the flag yet; the lead moves the gate and the job together.
 
 **The stages of a shared run**, in order, each stop a `stage` the stake ladder knows (a skip counts the session as
 skipped; a fault is a fault):
@@ -669,7 +677,7 @@ skipped; a fault is a fault):
    (a ticket of an ordinary run is refused by a shared approval and the reverse: "not made in shared mode"); an
    approval recomputes the value AFTER the prices and refuses (stage `ticket`, a skip; the ticket stays unused) when it
    has moved by more than `TICKET_QUOTE_MOVE` (0.5%) from the ticket's. The exact-capital check is not made for a shared
-   ticket. Lock 1's `max_capital` binds a live run only; a live run is not shared yet (S4d).
+   ticket. Lock 1's `max_capital` binds a live run only, against the book's value at its upper bound (S4d).
 9. *Every limit is judged on the book alone* (R31, R27): the risk gate is given the book's value (lower bound) as the
    equity, the book's units as what is held (so the position limit and the count of positions never see the owner's
    holdings, the baseline included), and the day's loss and the drawdown on the VALUE PER UNIT, so the owner's deposits,
@@ -691,13 +699,51 @@ The summary of a shared run carries `shared`: `capital`, `book_value` and `book_
 `drawdown_pct`, `previous_value_per_unit` and where it came from, `owner_surplus`, and `shortfalls` when there are
 any.
 
-**What is NOT there yet.** Live is not shared (S4d: live always shared, live entries, lock 1 against the book's value);
-the alerts on the owner's page and the combined holding per fund (S4e); the fee a purchase's venue reports ABOVE the
+**What is NOT there yet.** The alerts on the owner's page and the combined holding per fund (S4e); the fee a purchase's venue reports ABOVE the
 published bound writes no journal notice (R22 (c): the bounds simply follow the reported figure); a book value for a
 `units_outstanding` of nothing (every unit redeemed) stops at `targets` until the owner's entry opens it again. The
-go-live gate (`go_live.paper_record`) treats a run stopped at `shortfall` as it treats every stop but `session` and
-`ticket` (`targets`, `prices` and `marks` too): it counts as a stopped run for lock 2's days since a stopped run;
-making the owner's sale not count there is a change to that file, not made here.
+go-live gate reads a shortfall as R32 and R33 say (above).
+
+### A live shared run (T51c S4d; `order-step --live --shared --propose`, then `--live --shared --approve NUMBER`)
+
+A live run is ALWAYS the shared account's book (the owner also trades that account). The command line refuses `--live`
+without `--shared`, in words, before anything is read, and it refuses `--capital` with it (R26: the capital is the
+book's own value, so a stake is changed by the owner's entry and never by a figure typed to a run). It does not imply
+`--shared`: the explicit flag keeps the printed command (`order-step --live --shared --approve NUMBER`, which the
+propose prints) saying what it runs, and an old habit (`--capital C`, no flag) is refused instead of changing the mode
+silently. `--live --check` is as it was. (`run_order_step` itself still accepts `live` without `shared`, for the
+tests that drive it; the command line is the gate, and a live state file that holds an owner's entry refuses such a run
+at stage `state` (R25).)
+
+The owner opens the live book first: `order-step --live --owner-entry cash_in --venue webull-production --amount ...`
+(preview, then `--confirm CODE`; "The owner's command", above). Without its opening entry a live shared run stops at
+`targets`, a skip. A live shared run is then the shared run of the practice venue, stage by stage ("The stages of a
+shared run", above), under the four locks and every live rule, with these differences:
+
+- *Lock 1 binds the book* (R26): after the prices and the marks check, a book whose value at its UPPER bound is above
+  the confirmation's `max_capital` stops the run at stage `lock` (a skip) before any order, in words (the figure, the
+  ceiling and the difference; `nothing is sent`) that reach the stop and the journaled summary, with
+  `shared.book_value`, `shared.book_value_high` and `ceiling`. A value exactly at the ceiling passes. A book whose
+  upper value is not known (no upper bound) is refused the same way: it cannot be shown to be at most the ceiling.
+  The per-order checks (`max_order_value`, the money at work against `max_capital`, the second price source on every
+  mark held and every order's quote) are as before; the money at work is the BOOK's holdings.
+- *The state file's counters* (T22d-1 A4) read the book's own figures: the `book_nav` rows must know at least the
+  highest value per unit the journal's summaries of this venue recorded (`shared.value_per_unit`, the lower figure each
+  look writes, the same text the row holds), both exact decimals compared as decimals (never an SQL MAX over text); a
+  state file that knows less (an older copy put back) stops the run at `state`. A ticket's `equity` is not counted in a
+  shared run (a later look may lower the row it was made at). The old `equity` table is neither read nor written.
+- *The day stop* (T34b-2) is judged on the loss of the value per unit at each look but the run's last, so the owner's
+  deposits and withdrawals are never a loss; a loss at or above the working stop refuses every purchase (stage of the
+  order: `day stop`), as on the ordinary live account.
+- *A live ticket* is marked shared as well as live (`shared:` and `live:` entries beside the ticket file's rows); an
+  approval of a ticket not made in shared mode, or of a shared ticket by a run that is not shared, is refused, and the
+  approval recomputes the book's value after the prices and refuses beyond `TICKET_QUOTE_MOVE` (R26).
+- *The shortfall (R24), the latch (R25), the marks (R28) and every limit on her book alone (R31)* hold as on practice; the
+  owner's own holdings of a fund (the baseline) are never priced or second-sourced.
+
+**What is still missing on live:** the alerts on the owner's page and the combined holding per fund (S4e); an owner entry
+kind `mark` for a real move beyond `max_drawdown_pct` (R34, S4e; the `marks` stop stays until a `split` entry or the
+quote comes back); fractional live orders (build B: live trades whole shares only).
 
 ## Not covered yet
 

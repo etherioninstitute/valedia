@@ -758,9 +758,9 @@ def _live_args_refusal(args) -> str | None:
     live, check = getattr(args, "live", False), getattr(args, "check", False)
     if check and not live:
         return "--check is part of live mode: order-step --live --check"
-    if getattr(args, "shared", False) and (live or check):
-        return ("--shared is open on practice only for now (T51c S4c); live mode is made shared by a later slice, so a "
-                "live run is refused with it")
+    shared = getattr(args, "shared", False)
+    if shared and check:
+        return "--check judges the locks and sends nothing: it takes no --shared (a live run is --live --shared --propose)"
     if not live:
         return None
     if getattr(args, "fractional", False):
@@ -769,12 +769,15 @@ def _live_args_refusal(args) -> str | None:
     if check:
         return None if capital is None or (math.isfinite(capital) and capital > 0) else "--capital must be a number above 0"
     if not getattr(args, "propose", False) and getattr(args, "approve", None) is None:
-        return ("live mode runs only as a ticket: order-step --live --propose --capital C, then order-step --live --approve "
-                "NUMBER --capital C (or order-step --live --check)")
-    if capital is None:
-        return "live mode needs --capital (at most the confirmation's max_capital)"
-    if not (math.isfinite(capital) and capital > 0):
-        return "--capital must be a number above 0"
+        return ("live mode runs only as a ticket: order-step --live --shared --propose, then order-step --live --shared "
+                "--approve NUMBER (or order-step --live --check)")
+    if not shared:                                      # T51c S4d (addendum 7): live is the shared account's book, always
+        return ("a live run is always the shared account's book (the owner also trades that account): add --shared, as in "
+                "order-step --live --shared --propose; it is not implied, so that the command says what it runs")
+    if capital is not None:                             # R26: the capital is the book's own value; lock 1 binds it
+        return ("--capital is refused in the shared mode: the capital is the book's own value (the cautious bound), so a "
+                "stake is changed by the owner's entry and never by a figure typed to a run; the confirmation's "
+                "max_capital still binds that value")
     return None
 
 
@@ -907,15 +910,15 @@ def _run_live(args, paths: LoopPaths, venue, files, second_opinion) -> int:
         out = order_step.run_order_step(
             ledger=orders, venue=venue, paper=lambda: order_step.paper_targets(trader), quotes=order_step.minute_quotes,
             journal=trader.journal, limits_file=paths.risk_limits, state=order_step.state_path_for(ledger_path, venue.name),
-            clock=order_step.wall_clock, halt_file=risk_gate.HALT_FILE, latch_file=trader.latch_file, capital=args.capital,
-            fractional=False, live=files, second_opinion=second_opinion, follow=follow, **ticket)
+            clock=order_step.wall_clock, halt_file=risk_gate.HALT_FILE, latch_file=trader.latch_file, capital=None,
+            fractional=False, live=files, second_opinion=second_opinion, follow=follow, shared=True, **ticket)
     finally:
         orders.close()
     number = out.pop("ticket_number", None)
     print(json.dumps(out, indent=2, default=str))
     if number is not None:
         print(f"ticket number: {number} (approve within {order_step.TICKET_LIFE_SECONDS // 60} minutes with: "
-              f"order-step --live --approve NUMBER --capital {args.capital!r})")
+              "order-step --live --shared --approve NUMBER)")
     return 0 if out["status"] == "done" else 2
 
 
@@ -1095,8 +1098,9 @@ def main(argv=None) -> int:
                    help="the broker capital the paper book is scaled to (default: the paper equity, a scale of 1)")
     p.add_argument("--fractional", action="store_true", help="fractional units (5 decimals) instead of whole shares")
     p.add_argument("--shared", action="store_true",
-                   help="T51c S4c, practice: the account is shared with its owner and the fund book is judged on its own "
-                        "figures (its own value is the capital, so --capital is refused; needs the owner's opening entry)")
+                   help="T51c S4c: the account is shared with its owner and the fund book is judged on its own "
+                        "figures (its own value is the capital, so --capital is refused; needs the owner's opening entry); "
+                        "required with --live (S4d: a live run is always the shared account's book)")
     ticket = p.add_mutually_exclusive_group()
     ticket.add_argument("--propose", action="store_true",
                         help="write a ticket of the orders instead of sending them; nothing is sent, the number is printed")
@@ -1105,8 +1109,10 @@ def main(argv=None) -> int:
     ticket.add_argument("--check", action="store_true",
                         help="with --live: print each lock of the go-live gate and, when locks 1 to 3 are met, the account")
     p.add_argument("--live", action="store_true",
-                   help="real money: only with --propose or --approve and --capital, under the go-live gate's four locks")
-    owner = p.add_argument_group("the owner's entry (T51c; nothing in a run reads it yet)")
+                   help="real money: only with --shared and --propose or --approve (never --capital: the book's own value "
+                        "is the capital, at most the confirmation's max_capital), under the go-live gate's four locks; "
+                        "with --owner-entry, the live venue's book (a production venue's name needs it)")
+    owner = p.add_argument_group("the owner's entry (T51c; a shared run reads it)")
     owner.add_argument("--owner-entry", choices=("cash_in", "cash_out", "units_out", "split"), default=None,
                        help="write one entry of the owner's into the venue's state file instead of running; every "
                             "figure is his own and none is defaulted")
