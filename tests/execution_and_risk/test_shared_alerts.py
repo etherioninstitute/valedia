@@ -72,7 +72,7 @@ def step_alerts(w):
     return out
 
 
-def stop_line(w, stage, reason, *, mode=None, venue=None, day=DAY, live=False, status="stopped", shared=True, **extra):
+def stop_line(w, stage, reason, *, mode=None, venue=None, day=DAY, live=False, status="stopped", shared=True, stamp=None, **extra):
     """An order-step summary line as a shared run journals it, written by the journal's own writer."""
     line = {"type": "order_step", "event": "summary", "day": day, "venue": venue or w.venue.name, "status": status,
             "stage": stage, "reason": reason, "orders_sent": 0, "batch": "b-1"}
@@ -85,6 +85,8 @@ def stop_line(w, stage, reason, *, mode=None, venue=None, day=DAY, live=False, s
     if live:
         line["live"] = True
     line.update(extra)
+    if stamp is not None:
+        line["timestamp"] = stamp                          # the journal's own stamp is the wall clock, to the second
     w.journal.write(day, line)
 
 
@@ -415,16 +417,16 @@ def test_a_stop_whose_day_file_is_deleted_stays_open(mk, tmp_path):
 def test_a_clean_run_of_the_same_venue_and_class_after_the_stop_aged_out_clears_it_and_no_other_run_does(mk, tmp_path):
     w = mk()
     path = tmp_path / "alerts.jsonl"
-    stop_line(w, "marks", WORDS["marks"], day=DAY)
-    stop_line(w, "marks", WORDS["marks"], day=DAY, mode="propose")
+    stop_line(w, "marks", WORDS["marks"], day=DAY, stamp=S(DAY, "10:00:00"))
+    stop_line(w, "marks", WORDS["marks"], day=DAY, mode="propose", stamp=S(DAY, "10:00:01"))
     unattended, attended = sk(w.venue.name, "marks"), sk(w.venue.name, "marks", "attended")
     alerts.watch(env_of(w), path=path)
     w.clock.t = T.ny("2026-12-23 10:00")                            # day 40
-    stop_line(w, None, None, status="done", day="2026-12-23", venue="webull-elsewhere")          # another venue
-    stop_line(w, None, None, status="done", day="2026-12-23", mode="propose")                     # the other class
+    stop_line(w, None, None, status="done", day="2026-12-23", venue="webull-elsewhere", stamp=S("2026-12-23", "10:00:00"))   # another venue
+    stop_line(w, None, None, status="done", day="2026-12-23", mode="propose", stamp=S("2026-12-23", "10:00:01"))           # the other class
     res = alerts.watch(env_of(w), path=path)
     assert {a.key for a in res.cleared} == {attended} and unattended in open_keys(path), open_keys(path)
-    stop_line(w, None, None, status="done", day="2026-12-23")                                     # the same venue and class
+    stop_line(w, None, None, status="done", day="2026-12-23", stamp=S("2026-12-23", "10:00:02"))  # the same venue and class
     res = alerts.watch(env_of(w), path=path)
     assert {a.key for a in res.cleared} == {unattended} and open_keys(path).get(unattended) is None
 
@@ -432,10 +434,10 @@ def test_a_clean_run_of_the_same_venue_and_class_after_the_stop_aged_out_clears_
 def test_a_stop_at_another_stage_after_the_old_one_aged_out_replaces_it(mk, tmp_path):
     w = mk()
     path = tmp_path / "alerts.jsonl"
-    stop_line(w, "marks", WORDS["marks"], day=DAY)
+    stop_line(w, "marks", WORDS["marks"], day=DAY, stamp=S(DAY))
     alerts.watch(env_of(w), path=path)
     w.clock.t = T.ny("2026-12-23 10:00")
-    stop_line(w, "state", WORDS["state"], day="2026-12-23")
+    stop_line(w, "state", WORDS["state"], day="2026-12-23", stamp=S("2026-12-23"))
     res = alerts.watch(env_of(w), path=path)
     assert {a.key for a in res.cleared} == {sk(w.venue.name, "marks")} and {a.key for a in res.raised} == {sk(w.venue.name, "state")}
 
@@ -444,7 +446,7 @@ def test_a_shortfall_alert_follows_the_same_rule_aged_out_stays_clean_run_clears
     w = mk()
     path = tmp_path / "alerts.jsonl"
     bad = {"shortfalls": {"SPY": {"book": 1.0, "venue": 0.0, "short": 1.0}}}
-    stop_line(w, None, None, status="done", shared=bad, day=DAY)
+    stop_line(w, None, None, status="done", shared=bad, day=DAY, stamp=S(DAY))
     key = "shared-shortfall:" + w.venue.name + ":unattended"
     alerts.watch(env_of(w), path=path)
     for days in (31, 60):
@@ -452,7 +454,7 @@ def test_a_shortfall_alert_follows_the_same_rule_aged_out_stays_clean_run_clears
         res = alerts.watch(env_of(w), path=path)
         assert res.cleared == [] and key in open_keys(path), days
     w.clock.t = T.ny("2026-12-23 10:00")
-    stop_line(w, None, None, status="done", day="2026-12-23")
+    stop_line(w, None, None, status="done", day="2026-12-23", stamp=S("2026-12-23"))
     assert key in {a.key for a in alerts.watch(env_of(w), path=path).cleared}
 
 
@@ -465,6 +467,126 @@ def test_the_older_forms_of_the_keys_are_still_cleared_not_held(mk, tmp_path):
                             for k in old))
     res = alerts.watch(env_of(w), path=path)
     assert {a.key for a in res.cleared} == set(old)
+
+
+# ---- evidence must be STRICTLY LATER than the stop that opened the key (repair round 4)
+
+def S(day, hh="10:00:00"):
+    return f"{day}T{hh}+00:00"
+
+
+def day_file(w, day):
+    return w.tmp / "journal" / f"{day}.jsonl"
+
+
+def state_of(path):
+    return {a["key"]: a for a in alerts.open_alerts(path)}
+
+
+def test_the_key_records_the_stamp_of_the_summary_that_raised_it(mk, tmp_path):
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    stop_line(w, "marks", WORDS["marks"], stamp=S(DAY))
+    alerts.watch(env_of(w), path=path)
+    assert state_of(path)[sk(w.venue.name, "marks")]["evidence"] == S(DAY) + "#0"
+
+
+@pytest.mark.parametrize("earlier", ["clean", "state stop"])
+def test_an_earlier_summary_is_no_evidence_when_the_stops_day_file_is_gone(mk, tmp_path, earlier):
+    """The checker's probes: a clean run (or a state stop) on 11-10, a marks stop on 11-13; the 11-13 file is deleted."""
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    if earlier == "clean":
+        stop_line(w, None, None, status="done", day="2026-11-10", stamp=S("2026-11-10"))
+    else:
+        stop_line(w, "state", WORDS["state"], day="2026-11-10", stamp=S("2026-11-10"))
+    stop_line(w, "marks", WORDS["marks"], stamp=S(DAY))
+    key = sk(w.venue.name, "marks")
+    res = alerts.watch(env_of(w), path=path)
+    assert key in {a.key for a in res.raised}
+    day_file(w, DAY).unlink()
+    res = alerts.watch(env_of(w), path=path)
+    assert res.cleared == [] and res.raised == [] and set(state_of(path)) >= {key}
+    assert sk(w.venue.name, "state") not in state_of(path), "an older stop must not open its stage's key over the held one"
+
+
+def test_an_earlier_summary_is_no_evidence_for_a_shortfall_key_either(mk, tmp_path):
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    bad = {"shortfalls": {"SPY": {"book": 1.0, "venue": 0.0, "short": 1.0}}}
+    stop_line(w, None, None, status="done", day="2026-11-10", stamp=S("2026-11-10"))
+    stop_line(w, None, None, status="done", shared=bad, stamp=S(DAY))
+    key = "shared-shortfall:" + w.venue.name + ":unattended"
+    assert key in {a.key for a in alerts.watch(env_of(w), path=path).raised}
+    day_file(w, DAY).unlink()
+    res = alerts.watch(env_of(w), path=path)
+    assert res.cleared == [] and key in state_of(path)
+
+
+def test_a_torn_latest_stop_line_holds_the_key_and_raises_no_stale_one(mk, tmp_path):
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    stop_line(w, "state", WORDS["state"], day="2026-11-10", stamp=S("2026-11-10"))
+    stop_line(w, "marks", WORDS["marks"], stamp=S(DAY))
+    key = sk(w.venue.name, "marks")
+    alerts.watch(env_of(w), path=path)
+    f = day_file(w, DAY)
+    f.write_text(f.read_text().rstrip("\n")[:-40])                # the last line is cut short, as a kill leaves it
+    res = alerts.watch(env_of(w), path=path)
+    assert res.cleared == [] and key in state_of(path) and sk(w.venue.name, "state") not in state_of(path)
+    assert alerts.check_journal_damage(env_of(w)).alerts, "journal:damaged is still raised"
+
+
+def test_only_a_strictly_later_summary_of_the_same_venue_and_class_clears_it(mk, tmp_path):
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    stop_line(w, "marks", WORDS["marks"], stamp=S(DAY, "10:00:00"))
+    key = sk(w.venue.name, "marks")
+    alerts.watch(env_of(w), path=path)
+    stop_line(w, None, None, status="done", day="2026-11-12", stamp=S(DAY, "10:00:00"))     # the same stamp: not strictly later
+    stop_line(w, None, None, status="done", day="2026-11-12", stamp=S(DAY, "09:00:00"))     # earlier
+    res = alerts.watch(env_of(w), path=path)
+    assert res.cleared == [] and key in state_of(path)
+    stop_line(w, None, None, status="done", stamp=S(DAY, "11:00:00"))
+    res = alerts.watch(env_of(w), path=path)
+    assert key in {a.key for a in res.cleared}
+
+
+def test_an_old_key_without_the_recorded_stamp_is_cleared_only_by_a_summary_later_than_its_own_time(mk, tmp_path):
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    key = sk(w.venue.name, "marks")
+    path.write_text(json.dumps({"time": "2026-11-13T14:00:00Z", "level": "critical", "key": key, "title": "old", "detail": "old"}) + "\n")
+    stop_line(w, None, None, status="done", stamp=S(DAY, "13:00:00"))                         # before the alert was raised
+    res = alerts.watch(env_of(w), path=path)
+    assert res.cleared == [] and key in state_of(path)
+    stop_line(w, None, None, status="done", stamp=S(DAY, "15:00:00"))                         # clearly later
+    res = alerts.watch(env_of(w), path=path)
+    assert key in {a.key for a in res.cleared}
+
+
+def test_the_open_keys_are_read_under_the_same_lock_as_the_write(mk, tmp_path, monkeypatch):
+    """No thread and no timing: the checks are given the open keys, and the alert file is locked, at the moment they run."""
+    import fcntl
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    key = sk(w.venue.name, "marks")
+    path.write_text(json.dumps({"time": "2026-11-13T14:00:00Z", "level": "critical", "key": key, "title": "t", "detail": "d"}) + "\n")
+    seen = {}
+    real = alerts.run_checks
+
+    def spy(env):
+        with open(path, "a+b") as other:
+            try:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                seen["locked"] = False
+            except BlockingIOError:
+                seen["locked"] = True
+        seen["open"] = set(env._cache.get("open_alerts") or {})
+        return real(env)
+    monkeypatch.setattr(alerts, "run_checks", spy)
+    alerts.watch(env_of(w), path=path)
+    assert seen == {"locked": True, "open": {key}}
 
 
 def a_done_run_with_a_shortfall(w):

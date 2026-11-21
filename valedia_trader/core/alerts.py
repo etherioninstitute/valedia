@@ -31,11 +31,16 @@ with `level` "cleared" and the same key is written. An alert is open while the l
                                 day) decides, so a stop nothing has fixed stays open over a weekend, and a stop first seen after
                                 midnight is raised. It clears only when a later summary of the same venue and class is `done` with no
                                 shortfall, or stops at another stage (which opens that stage's key; a done run that found a shortfall
-                                is `shared-shortfall`); a run of the other class never clears it. Only POSITIVE evidence clears: when
-                                the 30 days read hold no relevant summary of that venue and class (the stop aged out, its day file is
-                                gone, the venue went quiet) the alert stays open untouched, with no `cleared` line, until a clean run of
-                                that venue and class; a retired venue's alert is ended that way (the file alone says what is open, and
-                                this module has no command that clears one). Ordinary skips neither open nor
+                                is `shared-shortfall`); a run of the other class never clears it. Only POSITIVE evidence STRICTLY LATER than the
+                                stop that raised the alert clears it: the alert records the stamp of that summary (`evidence`, the
+                                journal's `timestamp` and its place among the lines of that timestamp), and an alert raised before
+                                that was recorded is read by its own `time` (clearly later than the stop it was raised for). A summary
+                                at or before that stamp (an earlier clean run, an earlier stop at another stage) never clears it and
+                                never raises a stale key over it. When no later summary of that venue and class is in the 30 days
+                                read (the stop aged out, its day file is gone, its line is torn, the venue went quiet) the alert
+                                stays open untouched, with no `cleared` line, until a clean run of that venue and class; a retired
+                                venue's alert is ended that way (the file alone says what is open, and this module has no command
+                                that clears one). Ordinary skips neither open nor
                                 clear: a closed market (the unattended run), and stages ticket and session (propose and approve).
                                 A stop of a shared run no longer raises `step-stopped` or `practice-stopped` (those keys merged
                                 venues and stages, and a clean propose run could clear an unattended stop); an alert still open
@@ -646,6 +651,7 @@ class Alert:
     level: str                        # "warning" or "critical"
     title: str
     detail: str
+    evidence: str = ""                # T51c S4e: the stamp (`<timestamp>#<n>`) of the journal summary that raised it, when it has one
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "key", _key_part(self.key))                   # a key is cleaned when it is made, always
@@ -962,48 +968,111 @@ def shared_class(entry: dict) -> str:
     return "attended" if "mode" in entry else "unattended"
 
 
-def shared_states(env: Env) -> dict[tuple[str, str], tuple[str, dict]]:
-    """The present state of each shared book, per (venue, class), from the journal's order-step summaries of the last 30 days that
-    carry a `shared` record (none dated after today in New York): ("stopped", the summary) when the latest relevant summary is a stop,
-    ("clean", ...) when it is `done` with no shortfall, ("shortfall", ...) when it is `done` with `shared.shortfalls` a non-empty
-    record. Ordinary skips are not relevant (the unattended run's closed market; stages ticket and session of an attended run), nor is
-    a status that is neither `stopped` nor `done`: they leave the state as it was."""
+SHARED_CLASSES = ("unattended", "attended")
+_NEVER = 10 ** 9                                           # an ordinal no summary reaches: "strictly later than this second"
+
+
+def _parse_stamp(text):
+    """An ISO time (the journal's `timestamp`, an alert's `time`) as an aware datetime, or None when it cannot be read."""
+    try:
+        d = datetime.fromisoformat(str(text).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d if d.tzinfo is not None else d.replace(tzinfo=timezone.utc)
+
+
+def _parse_evidence(text):
+    """The stamp an alert records for the summary that raised it, `<timestamp>#<n>` (n: that summary's place among the journal's lines
+    of the same timestamp, the journal stamps to the second), as (datetime, n); None when it is not one."""
+    ts, _, n = str(text or "").rpartition("#")
+    d = _parse_stamp(ts) if ts else None
+    return (d, int(n)) if d is not None and n.isdigit() else None
+
+
+def _open_key_parts(key: str):
+    """(prefix, venue part, class) of an open `shared-stopped:<venue>:<class>:<stage>` or `shared-shortfall:<venue>:<class>` key; None
+    for any other key and for an earlier form of these (a day where the class is), which is cleared as before."""
+    for prefix, tail in (("shared-stopped:", 2), ("shared-shortfall:", 1)):
+        if key.startswith(prefix):
+            parts = key[len(prefix):].split(":")
+            if len(parts) > tail and parts[-tail] in SHARED_CLASSES:
+                return prefix, ":".join(parts[:-tail]), parts[-tail]
+    return None
+
+
+def shared_view(env: Env):
+    """T51c S4e (repair 4): the present state of each shared book, per (venue key part, class), and the books that are HELD.
+
+    The journal's order-step summaries of the last 30 days that carry a `shared` record (none dated after today in New York) are read
+    in order; each is stamped (`timestamp`, then its place among the lines of that same timestamp). Ordinary skips (the unattended
+    run's closed market; stages ticket and session of an attended run) and statuses other than `stopped` and `done` are not relevant.
+    With no open alert for a book, its latest relevant summary decides: ("stopped", summary), ("clean", ..) when `done` with no
+    shortfall, ("shortfall", ..) when `done` with `shared.shortfalls` a non-empty record.
+
+    An OPEN alert (the watch hands the checks the open alerts) is cleared only by evidence STRICTLY LATER than the summary that raised
+    it: the stamp the alert records (`evidence`), or for an alert without one (raised before it was recorded) its own `time`, which is
+    clearly later than the stop it was raised for. Only summaries stamped later than that decide the state; a summary at or before it
+    (an earlier clean run, an earlier stop at another stage) is no evidence and raises no stale key. When none is later (it aged out of
+    the window, its day file is gone, its line is torn, the venue went quiet) the book is HELD: its keys are left open untouched.
+    Returns ({(venue key, class): (state, summary, its stamp text)}, held {(venue key, class)})."""
+    if "shared_view" in env._cache:
+        return env._cache["shared_view"]
     today = str(datetime.fromtimestamp(env.now, NEW_YORK).date())
-    states: dict[tuple[str, str], tuple[str, dict]] = {}
+    books: dict[tuple[str, str], list] = {}
+    seen: dict[str, int] = {}
     entries, _ = env.journal()
     for e in entries:
+        ts = e.get("timestamp") if isinstance(e, dict) else None
+        n = seen.get(ts, 0) if isinstance(ts, str) else 0
+        if isinstance(ts, str):
+            seen[ts] = n + 1
         if not (e.get("type") == "order_step" and e.get("event") == "summary" and isinstance(e.get("shared"), dict)
                 and isinstance(e.get("status"), str)) or str(e.get("day"))[:10] > today:
             continue
-        cls, venue = shared_class(e), str(e.get("venue"))
+        cls = shared_class(e)
         if e["status"] == "stopped":
             if (cls == "unattended" and is_outside_market_hours(e)) or (cls == "attended" and e.get("stage") in SHARED_STATE_STAGES_SKIPPED):
                 continue
-            states[(venue, cls)] = ("stopped", e)
+            state = "stopped"
         elif e["status"] == DONE:
             shorts = e["shared"].get("shortfalls")
-            states[(venue, cls)] = ("shortfall" if isinstance(shorts, dict) and shorts else "clean", e)
-    return states
-
-
-SHARED_CLASSES = ("unattended", "attended")
-
-
-def _hold_without_evidence(env: Env, out: CheckResult, prefix: str, tail: int, states: dict) -> None:
-    """T51c S4e (repair 3): an alert of `prefix` that is open in the alert file (the watch hands the check the open keys) is cleared
-    only on POSITIVE evidence: a later summary of its venue and class inside the journal window (which `states` holds). When the
-    window holds none (it aged out, the day file is gone, the venue went quiet) the key is HELD: left open as it is, no `cleared` line.
-    `tail` is how many `:`-parts at the end of the key are the class (and stage): 2 for `shared-stopped:<venue>:<class>:<stage>`, 1 for
-    `shared-shortfall:<venue>:<class>`. A key of an earlier form (a day in place of the class) is not held, and is cleared as before."""
-    known = {(_key_part(venue), cls) for venue, cls in states}
-    for key in sorted(env._cache.get("open_alert_keys") or ()):
-        if not key.startswith(prefix):
+            state = "shortfall" if isinstance(shorts, dict) and shorts else "clean"
+        else:
             continue
-        parts = key[len(prefix):].split(":")
-        if len(parts) <= tail:
+        d = _parse_stamp(ts) if isinstance(ts, str) else None
+        books.setdefault((_key_part(str(e.get("venue"))), cls), []).append(
+            (None if d is None else (d, n), state, e, f"{ts}#{n}" if d is not None else ""))
+    threshold: dict[tuple[str, str], tuple] = {}
+    for key, row in (env._cache.get("open_alerts") or {}).items():
+        parts = _open_key_parts(key)
+        if parts is None:
             continue
-        cls, venue = parts[-tail], ":".join(parts[:-tail])
-        if cls in SHARED_CLASSES and (venue, cls) not in known:
+        mark = _parse_evidence(row.get("evidence"))
+        if mark is None:
+            d = _parse_stamp(row.get("time"))
+            mark = (d, _NEVER) if d is not None else (datetime.max.replace(tzinfo=timezone.utc), _NEVER)   # unreadable: never cleared
+        book = (parts[1], parts[2])
+        threshold[book] = max(mark, threshold[book]) if book in threshold else mark
+    states, held = {}, set()
+    for book in threshold.keys() | books.keys():
+        items = books.get(book, [])
+        if book in threshold:
+            items = [it for it in items if it[0] is not None and it[0] > threshold[book]]
+            if not items:
+                held.add(book)
+                continue
+        if items:
+            _, state, e, text = items[-1]
+            states[book] = (state, e, text)
+    env._cache["shared_view"] = (states, held)
+    return states, held
+
+
+def _hold_open_keys(env: Env, out: CheckResult, prefix: str, held: set) -> None:
+    """Hand the watch the open keys of `prefix` whose book is held: left as they are, no `cleared` line."""
+    for key in sorted(env._cache.get("open_alerts") or ()):
+        parts = _open_key_parts(key)
+        if parts is not None and parts[0] == prefix and (parts[1], parts[2]) in held:
             out.held.append(key)
 
 
@@ -1041,18 +1110,19 @@ def _short_parts(shorts: dict) -> list[str]:
 
 
 def check_shared_shortfall(env: Env) -> CheckResult:
-    """T51c S4e (R24, R33): per venue and class (see `shared_states`), a SHARED run that ended `done` whose last reconcile found a
+    """T51c S4e (R24, R33): per venue and class (see `shared_view`), a SHARED run that ended `done` whose last reconcile found a
     shortfall (`shared.shortfalls` a non-empty record) is `shared-shortfall:<venue>:<class>` (a warning), open while that is the
     latest relevant summary of the venue and class, whatever the day: a later `done` with none, or a stop, closes it (a stop has its
     own alert, `shared-stopped`). It is no stop, so nothing else is raised for the run. The words come from the summary's figures
     only, never an order's tag or an account; the count of short funds and the fund names come first (the alert's detail is cut at
     300 characters), the figures after."""
     out = CheckResult()
-    states = shared_states(env)
-    _hold_without_evidence(env, out, "shared-shortfall:", 1, states)
-    for (venue, cls), (state, e) in sorted(states.items()):
+    states, held = shared_view(env)
+    _hold_open_keys(env, out, "shared-shortfall:", held)
+    for (venue, cls), (state, e, text) in sorted(states.items()):
         if state != "shortfall":
             continue
+        venue = str(e.get("venue"))
         day, shorts = str(e.get("day"))[:10], e["shared"]["shortfalls"]
         head = (f"{day} {clean(venue, 60)}: found by the last reconcile (stage after). {_short_names(shorts)}. The owner sold shares "
                 "the book counts as its own, or a split; clear it with the shares or a units_out or split entry.")
@@ -1062,12 +1132,12 @@ def check_shared_shortfall(env: Env) -> CheckResult:
                 break
             figures += ("; " if figures else " ") + part
         out.alerts.append(Alert(f"shared-shortfall:{_key_part(venue)}:{cls}", "warning",
-                                "The account holds less than the book counts as its own", head + figures))
+                                "The account holds less than the book counts as its own", head + figures, text))
     return out
 
 
 def check_shared_stops(env: Env) -> CheckResult:
-    """T51c S4e (repair 2): per venue and class (see `shared_states`), a SHARED run whose latest relevant summary is a stop is
+    """T51c S4e (repair 2): per venue and class (see `shared_view`), a SHARED run whose latest relevant summary is a stop is
     `shared-stopped:<venue>:<class>:<stage>`: critical for the unattended class, a warning for the attended one (propose, approve and
     any other `mode`). It is the book's present state, not the day's: a stop nothing has fixed stays open over days, a stop first
     seen after midnight is raised, a later `done` with no shortfall of the same venue and class (or a stop at another stage) closes
@@ -1075,16 +1145,17 @@ def check_shared_stops(env: Env) -> CheckResult:
     unattended run: any stage but an ordinary closed market; propose, approve and the rest: any stage but ticket and session), and a
     shared summary is judged here whatever other keys it carries, so none falls between the checks."""
     out = CheckResult()
-    states = shared_states(env)
-    _hold_without_evidence(env, out, "shared-stopped:", 2, states)
-    for (venue, cls), (state, e) in sorted(states.items()):
+    states, held = shared_view(env)
+    _hold_open_keys(env, out, "shared-stopped:", held)
+    for (venue, cls), (state, e, text) in sorted(states.items()):
         if state != "stopped":
             continue
+        venue = str(e.get("venue"))
         stage, day = e.get("stage"), str(e.get("day"))[:10]
         who = "The unattended shared run" if cls == "unattended" else "A propose or approve shared run"
         out.alerts.append(Alert(f"shared-stopped:{_key_part(venue)}:{cls}:{_key_part(str(stage))}",
                                 "critical" if cls == "unattended" else "warning", f"{who} stopped at stage {stage}",
-                                f"{day} {clean(venue, 60)}: {e.get('reason') or 'no reason given'}"))
+                                f"{day} {clean(venue, 60)}: {e.get('reason') or 'no reason given'}", text))
     return out
 
 
@@ -1411,19 +1482,12 @@ class WatchResult:
 
 
 def watch(env: Env, senders=(), path=None) -> WatchResult:
-    """Run every check once, write the new alerts and the cleared ones, then give each new alert to each sender."""
+    """Run every check once, write the new alerts and the cleared ones, then give each new alert to each sender. The alert file is
+    locked from the read of the open alerts to the write: the checks are given the alerts open at that moment (a check that clears
+    only on evidence later than the alert reads them), and no other watch can write between."""
     path = Path(path) if path else alerts_file(env.root)
     register_trading_file(env)
-    try:                                                   # the keys open now: a check that needs positive evidence to clear reads them
-        env._cache["open_alert_keys"] = {a["key"] for a in read_alert_file(path)[0]}
-    except OSError:
-        env._cache["open_alert_keys"] = set()              # an unreadable file is the lock's own failure below
-    produced, held, held_prefixes, failures = run_checks(env)
     now = iso(env.now)
-    by_key = {}
-    for a in produced:                                     # two checks, or two labels, that clean to one key are one alert
-        by_key.setdefault(a.key, a)
-    produced = list(by_key.values())
     path.parent.mkdir(parents=True, exist_ok=True)
     raised, cleared = [], []
     with path.open("a+b") as fh:
@@ -1431,13 +1495,20 @@ def watch(env: Env, senders=(), path=None) -> WatchResult:
         fh.seek(0)
         data = fh.read()
         open_map, _, withheld = _replay(data)
+        env._cache["open_alerts"] = dict(open_map)
+        produced, held, held_prefixes, failures = run_checks(env)
+        by_key = {}
+        for a in produced:                                 # two checks, or two labels, that clean to one key are one alert
+            by_key.setdefault(a.key, a)
+        produced = list(by_key.values())
         raised = [a for a in produced if a.key not in open_map]
         gone = [e for k, e in open_map.items()
                 if k not in by_key and k not in held and not any(k.startswith(p) for p in held_prefixes)
                 and any(k.startswith(p) for _, prefixes, _ in CHECKS for p in prefixes)]
         for e in gone:
             cleared.append(Alert(e["key"], CLEARED, "Cleared: " + str(e.get("title", "")), "The condition is no longer true."))
-        lines = [json.dumps({"time": now, "level": a.level, "key": a.key, "title": a.title, "detail": a.detail}) for a in raised]
+        lines = [json.dumps({"time": now, "level": a.level, "key": a.key, "title": a.title, "detail": a.detail,
+                             **({"evidence": a.evidence} if a.evidence else {})}) for a in raised]
         lines += [json.dumps({"time": now, "level": CLEARED, "key": a.key, "title": a.title, "detail": a.detail}) for a in cleared]
         if lines:
             text = ("\n" if data and not data.endswith(b"\n") else "") + "\n".join(lines) + "\n"
@@ -1446,7 +1517,8 @@ def watch(env: Env, senders=(), path=None) -> WatchResult:
         for a in cleared:
             open_map.pop(a.key, None)
         for a in raised:
-            open_map[a.key] = {"time": now, "level": a.level, "key": a.key, "title": a.title, "detail": a.detail}
+            open_map[a.key] = {"time": now, "level": a.level, "key": a.key, "title": a.title, "detail": a.detail,
+                               **({"evidence": a.evidence} if a.evidence else {})}
         shown = _notify(open_map, senders, notifications_file(env.root) if path == alerts_file(env.root) else path.with_name("notifications.jsonl"),
                         now, failures)
     return WatchResult(raised, cleared, list(open_map.values()), failures, shown, withheld)

@@ -848,12 +848,17 @@ the day form of the new key) is cleared by the next watch IN WHICH THE SHARED CH
 (a watch where that check failed leaves the old keys open). A run that is NOT shared keeps both old keys and their rules (so two stages
 of one non-shared venue still merge there). The order ledger's own block (`orders:<ledger>`) stays as well. A stop is read from the
 last 30 days of the journal (a whole-journal read on every watch would be heavy file work beside the collector), and that window is for
-RAISING. An open `shared-stopped` or `shared-shortfall` alert is cleared ONLY on positive evidence: a later summary of the same venue
-and class inside the window that is `done` with no shortfall, or a stop at another stage. When the window holds no relevant summary of
-that venue and class (the stop aged out, its day file was deleted, the venue went quiet) the alert stays open untouched, still critical
-or warning as it was, with no `cleared` line, and the owner's page keeps showing it. The accepted cost: the alert of a RETIRED venue
+RAISING. An open `shared-stopped` or `shared-shortfall` alert is cleared ONLY on positive evidence STRICTLY LATER than the summary that
+raised it: a same-venue, same-class summary stamped after it that is `done` with no shortfall, or a stop at another stage. The alert
+records the stamp of the summary that raised it (an `evidence` field on its line in the alert file: the journal's `timestamp`, to the
+second, and `#n`, the summary's place among the journal's lines of that same timestamp); an alert without the field (raised before it
+was recorded) is read by its own `time`, which is clearly later than the stop it was raised for. A summary at or before that stamp
+(an earlier clean run, an earlier stop at another stage) never clears it and never raises a stale key over it. When the window holds no
+later summary of that venue and class (the stop aged out, its day file was deleted, its line is torn, the venue went quiet) the alert
+stays open untouched, still critical or warning as it was, with no `cleared` line, and the owner's page keeps showing it (a torn line
+is still reported by `journal:damaged`). The accepted cost: the alert of a RETIRED venue
 never clears by itself. The plain way to end it is a clean run (`done`, no shortfall) of that venue and class; the alert file has no
-clearing command (the file alone says what is open, and this module adds none).
+clearing command (the file alone says what is open, and this module adds none). The watch reads the open alerts under the same lock as its write, so a second watch cannot clear a key the first never saw. (The journal stamps to the second; two summaries of one second are told apart by their place in the journal, which is read within the 30-day window.)
 *The one gap S4e closes*: a run that ENDS `done` whose last reconcile found a shortfall (its summary's `shared.shortfalls` not empty: the
 owner's sale of shares the book counts as its own, seen after the run's orders) raised nothing but that block. It now raises
 `shared-shortfall:<venue>:<class>` (a warning), under the same state rule: open while the latest relevant summary of that venue and
