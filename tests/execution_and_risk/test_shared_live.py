@@ -1326,3 +1326,86 @@ def test_the_preview_names_an_earlier_acceptance_as_the_base_when_it_is(mkl):
     code, out, err = accept(w, "2026-11-12")
     assert code == 0, err
     assert "the owner's acceptance of 2026-11-12" in out and "the journal's last summary of 2026-11-12 says" not in out, out
+
+
+# ---- T51c S4e (R34): the owner's `mark` entry on the live venue
+
+def test_a_live_mark_entry_is_taken_only_together_with_live_and_a_production_name(lw, capsys):
+    lw.open_book("10000")
+    lw.buy()
+    plain = ["--root", str(lw.tmp_root), "order-step", "--owner-entry", "mark", "--symbol", "SPY", "--who", "owner",
+             "--note", "test"]
+    before = lw.tree()
+    capsys.readouterr()
+    assert cli.main([*plain, "--venue", VENUE]) == 2 and "written only together with --live" in capsys.readouterr().err
+    assert cli.main([*plain, "--live", "--venue", "webull-sandbox"]) == 2
+    assert "a practice name" in capsys.readouterr().err
+    assert lw.tree() == before
+
+
+def test_a_live_mark_entry_prints_first_and_asks_the_order_steps_own_quote_never_a_typed_price(lw):
+    lw.open_book("10000")
+    lw.buy()
+    base = lw.owner_args("mark", "--symbol", "SPY")
+    before = lw.tree()
+    lw.capsys.readouterr()
+    assert cli.main(base) == 0
+    out = lw.capsys.readouterr().out
+    (code,) = re.findall(r"^code: ([0-9]{6})$", out, re.M)
+    assert "NOTHING was written" in out and "mark SPY: 500.0" in out and "no cash and no units change" in out, out
+    assert {k: v for k, v in lw.tree().items() if not k.endswith(".owner-preview.json")} == \
+        {k: v for k, v in before.items() if not k.endswith(".owner-preview.json")}
+    assert cli.main([*base, "--mark", "SPY=1"]) == 2 and "--mark is not taken" in lw.capsys.readouterr().err
+    lw.clock.t += 1.0
+    assert cli.main([*base, "--confirm", code]) == 0, lw.capsys.readouterr().err
+    assert lw.entries()[-1]["kind"] == "mark" and lw.entries()[-1]["mark"] == "500.0"
+    (line,) = [e for e in lw.journal.read() if e.get("type") == "owner_entry" and e.get("kind") == "mark"]
+    assert line["venue"] == VENUE and line["hash"] == lw.entries()[-1]["hash"]
+
+
+def test_a_live_mark_entry_outside_the_session_is_valued_at_the_last_close_and_shows_its_time(lw, monkeypatch):
+    lw.open_book("10000")
+    lw.buy()
+    close = T.ny("2026-11-13 16:00")
+    lw.clock.t = T.ny("2026-11-13 17:30")
+    monkeypatch.setattr(osx, "minute_quotes", lambda symbols: {s: (lw.prices[s], close - 60.0) for s in symbols})
+    lw.capsys.readouterr()
+    assert cli.main(lw.owner_args("mark", "--symbol", "SPY")) == 0
+    out = lw.capsys.readouterr().out
+    assert "outside the session" in out and "2026-11-13T16:00:00-05:00" in out, out
+
+
+def test_a_live_mark_entry_clears_the_marks_stop_and_the_history_check_is_neither_tripped_nor_loosened(mkl):
+    w = mkl(max_drawdown_pct=8.0)
+    w.open_book("10000")
+    w.buy()
+    w.prices["SPY"] = 700.0
+    w.later()
+    out = w.propose()
+    assert out["status"] == "stopped" and out["stage"] == "marks", out
+    w.owner("mark", "--symbol", "SPY")
+    w.later()
+    out = w.propose()
+    assert out["status"] == "done" and out["stage"] is None, out               # the history check passes (no `state` stop)
+    w2 = mkl(max_drawdown_pct=8.0)                                              # the same history, without the entry
+    w2.open_book("10000")
+    w2.buy()
+    w2.later()
+    base = w2.propose()
+    assert base["status"] == "done"
+    for key in ("previous_value_per_unit", "previous_from"):
+        assert out["shared"][key] == base["shared"][key], key
+
+
+def test_after_a_mark_entry_a_state_file_without_the_value_history_still_stops_the_live_run(lw):
+    lw.open_book("10000")
+    lw.buy()
+    lw.owner("mark", "--symbol", "SPY")
+    lw.sql("DELETE FROM book_nav")                        # an older state file put back: the entry does not excuse it
+    lw.later()
+    out = lw.propose()
+    assert out["status"] == "stopped" and out["stage"] == "state", out
+    assert "value history the journal holds" in out["reason"], out["reason"]
+    lw.later()
+    lowered = lw.sql("SELECT COUNT(*) AS n FROM owner_entries WHERE kind = 'mark'")
+    assert lowered == [{"n": 1}]

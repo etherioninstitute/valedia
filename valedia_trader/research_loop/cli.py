@@ -1113,12 +1113,14 @@ def main(argv=None) -> int:
                         "is the capital, at most the confirmation's max_capital), under the go-live gate's four locks; "
                         "with --owner-entry, the live venue's book (a production venue's name needs it)")
     owner = p.add_argument_group("the owner's entry (T51c; a shared run reads it)")
-    owner.add_argument("--owner-entry", choices=("cash_in", "cash_out", "units_out", "split"), default=None,
+    owner.add_argument("--owner-entry", choices=("cash_in", "cash_out", "units_out", "split", "mark"), default=None,
                        help="write one entry of the owner's into the venue's state file instead of running; every "
-                            "figure is his own and none is defaulted")
+                            "figure is his own and none is defaulted; `mark` (with --symbol alone) takes the fund's "
+                            "present quote, as the order step's own quote path gives it, as its new mark (no cash and "
+                            "no units change): it clears a stop at stage `marks` for that fund")
     owner.add_argument("--venue", default=None, help="the venue whose book it is, as in its state file's name")
     owner.add_argument("--amount", default=None, help="cash_in, cash_out: the amount, digits and a decimal part")
-    owner.add_argument("--symbol", default=None, help="units_out, split: the symbol")
+    owner.add_argument("--symbol", default=None, help="units_out, split, mark: the symbol")
     owner.add_argument("--units", default=None, help="units_out: the shares taken that the book counted as its own")
     owner.add_argument("--ratio", default=None, help="split: new units per old unit")
     owner.add_argument("--mark", action="append", default=None, metavar="SYMBOL=PRICE",

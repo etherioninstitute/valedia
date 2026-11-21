@@ -821,3 +821,256 @@ def test_a_shared_run_may_be_fractional_and_still_judges_the_book_alone(mk):
     assert out["status"] == "done" and out["refused"] == [] and "faults" not in out, out
     assert sorted(s["units"] for s in out["sent"]) == [0.4, 100.0], out["sent"]       # the whole leg and the remainder leg
     assert out["shared"]["owner_surplus"] == ["SPY"]
+
+
+# ---- T51c S4e (R34): the owner's `mark` entry ("this quote is real; take it as the new mark")
+
+def mark_command(w, *more, symbol="SPY"):
+    args = ["--root", str(w.tmp_root), "order-step", "--venue", w.venue.name, "--owner-entry", "mark"]
+    return [*args, *(["--symbol", symbol] if symbol else []), *more, "--who", "owner", "--note", "test"]
+
+
+def tree_of(w, skip=()):
+    return {str(p.relative_to(w.tmp)): p.read_bytes() for p in sorted(w.tmp.rglob("*"))
+            if p.is_file() and not p.name.endswith(skip)}
+
+
+def figures_of(w, marks=None, entries=None):
+    return osx.book_figures(w.fills(), w.orders(), w.entries() if entries is None else entries,
+                            marks or {"SPY": 500.0}, "2026-11-13", now=w.clock.t)
+
+
+def test_a_mark_entry_is_printed_first_then_written_by_the_confirm_and_changes_no_cash_or_units(mk, capsys):
+    w = mk(max_drawdown_pct=8.0)
+    w.open_book()
+    assert w.shared()["status"] == "done"
+    w.later()
+    base, before_fig, before = mark_command(w), figures_of(w), tree_of(w, (".owner-preview.json",))
+    capsys.readouterr()
+    assert cli.main(base) == 0
+    out = capsys.readouterr().out
+    (code,) = re.findall(r"^code: ([0-9]{6})$", out, re.M)
+    assert "NOTHING was written" in out and "mark SPY: 500.0" in out and "new mark" in out, out
+    assert "no cash and no units change" in out, out
+    assert tree_of(w, (".owner-preview.json",)) == before          # a preview writes no byte of state, journal or ledger
+    w.clock.t += 1.0
+    assert cli.main([*base, "--confirm", code]) == 0, capsys.readouterr().err
+    e = w.entries()[-1]
+    assert e["kind"] == "mark" and e["symbol"] == "SPY" and e["mark"] == "500.0"
+    assert (e["amount"], e["units"], e["ratio"]) == (None, None, None)
+    assert e["units_before"] == e["units_after"] and e["value_per_unit_before"] == e["value_per_unit_after"]
+    after = figures_of(w)
+    for field in ("units", "cash_low", "cash_high", "usable_cash", "value", "value_high", "units_outstanding",
+                  "value_per_unit"):
+        assert getattr(after, field) == getattr(before_fig, field), field
+    lines = [x for x in w.journal.read() if x.get("type") == "owner_entry"]
+    assert lines[-1]["kind"] == "mark" and lines[-1]["hash"] == e["hash"]
+    assert osx.owner_entry_differences(w.entries(), w.journal.read(), venue=w.venue.name) == []
+    assert osx._checked_entries(sqlite3.connect(w.state_path))[-1]["hash"] == e["hash"]        # chained like the others
+
+
+def test_a_mark_entry_takes_a_symbol_only_never_a_typed_price_and_a_fund_the_book_does_not_hold_is_refused(mk, capsys):
+    w = mk()
+    w.open_book()
+    w.shared()
+    w.later()
+    before = tree_of(w)
+    cases = [(mark_command(w, "--mark", "SPY=700"), "--mark is not taken"),
+             (mark_command(w, "--amount", "5"), "takes no --amount"),
+             (mark_command(w, "--units", "1"), "takes no --units"),
+             (mark_command(w, "--ratio", "2"), "takes no --ratio"),
+             (mark_command(w, symbol=None), "needs --symbol"),
+             (mark_command(w, symbol="a b"), "plain symbol"),
+             (mark_command(w, symbol="QQQ"), "the book holds no QQQ")]
+    for argv, words in cases:
+        capsys.readouterr()
+        assert cli.main(argv) == 2, argv
+        assert words in capsys.readouterr().err, (argv, words)
+    assert tree_of(w) == before
+
+
+def test_a_mark_entry_without_a_usable_quote_is_refused_and_writes_nothing(mk, capsys):
+    w = mk()
+    w.open_book()
+    w.shared()
+    w.later()
+    before = tree_of(w)
+    del w.prices["SPY"]
+    capsys.readouterr()
+    assert cli.main(mark_command(w)) == 2 and "SPY" in capsys.readouterr().err
+    assert tree_of(w) == before
+
+
+def test_a_mark_entry_clears_the_marks_stop_of_that_fund_on_the_next_run_and_only_that_fund(mk):
+    w = mk(max_drawdown_pct=8.0)
+    w.open_book()
+    w.paper = T.paper({"a": {"SPY": 100.0, "QQQ": 100.0}})
+    assert w.shared()["status"] == "done"
+    w.prices["SPY"], w.prices["QQQ"] = 700.0, 560.0         # both +40% overnight: a rename, a bad quote, or a real move
+    w.later()
+    out = w.shared()
+    assert out["stage"] == "marks" and "QQQ quotes" in out["reason"], out          # the first fund, in symbol order
+    w.owner("mark", "--symbol", "QQQ")
+    w.later()
+    out = w.shared()
+    assert out["stage"] == "marks" and "SPY quotes" in out["reason"] and "QQQ quotes" not in out["reason"], out
+    assert out["orders_sent"] == 0 and len(w.nav()) == 1
+    w.owner("mark", "--symbol", "SPY")
+    w.later()
+    out = w.shared()
+    assert out["status"] == "done" and out["stage"] is None, out
+    assert [e["kind"] for e in w.entries()][-2:] == ["mark", "mark"] and len(w.nav()) == 2
+
+
+def test_the_confirmed_mark_is_the_reference_not_a_licence_a_quote_far_from_it_stops_the_run_again(mk):
+    w = mk(max_drawdown_pct=8.0)
+    w.open_book()
+    w.shared()
+    w.prices["SPY"] = 700.0
+    w.later()
+    assert w.shared()["stage"] == "marks"
+    w.owner("mark", "--symbol", "SPY")                      # the owner took 700 as the new mark ...
+    w.prices["SPY"] = 800.0                                 # ... and it moved 14% more before the next run
+    w.later()
+    out = w.shared()
+    assert out["status"] == "stopped" and out["stage"] == "marks" and "700" in out["reason"], out
+    assert "mark entries" in out["reason"], out["reason"]
+    w.prices["SPY"] = 740.0                                 # within 8% of the owner's mark
+    w.later()
+    assert w.shared()["status"] == "done"
+
+
+def test_far_quotes_takes_the_latest_mark_entry_after_the_row_as_the_reference_and_a_later_split_divides_it():
+    row = {"time": 100.0, "marks": {"SPY": "500"}}
+    mark = {"id": 2, "kind": "mark", "symbol": "SPY", "mark": "700", "time": 150.0}
+
+    def far(entries, quote, limit=8.0):
+        return [f["symbol"] for f in osx.far_quotes(row, entries, {"SPY": quote}, ["SPY"], limit)]
+    assert far([mark], 700.0) == [] and far([mark], 755.9) == [] and far([mark], 756.1) == ["SPY"]
+    assert far([{**mark, "time": 50.0}], 700.0) == ["SPY"]                   # written before the row: the row has it
+    assert far([{**mark, "symbol": "QQQ"}], 700.0) == ["SPY"]                # another fund's mark clears nothing here
+    assert far([mark, {**mark, "id": 3, "mark": "800", "time": 160.0}], 800.0) == []         # the latest mark wins
+    assert far([mark, {**mark, "id": 3, "mark": "800", "time": 160.0}], 700.0) == ["SPY"]
+    assert far([mark, {"id": 3, "kind": "split", "symbol": "SPY", "ratio": "2", "time": 160.0}], 350.0) == []
+    assert far([{"id": 2, "kind": "split", "symbol": "SPY", "ratio": "2", "time": 120.0}, {**mark, "id": 3}], 700.0) == []
+
+
+def test_a_mark_entry_changes_no_value_per_unit_the_day_stop_or_the_history_base_reads():
+    """A mark entry is no stake change and no profit or loss: the fallbacks that read an owner entry's value per unit (the
+    day stop's previous figure when no earlier row exists, the history check's base) skip it, so a mark taken at a
+    LOWER value can never become the base that loosens them; the peak is read from the rows only."""
+    def entry(i, day, vpu, kind="cash_in"):
+        return {"id": i, "day": day, "kind": kind, "value_per_unit_after": vpu, "symbol": None if kind != "mark" else "SPY"}
+    plain = [entry(1, "2026-11-10", "1"), entry(2, "2026-11-11", "1.2", "cash_in")]
+    marked = [*plain, entry(3, "2026-11-12", "0.5", "mark")]            # a real fall, taken as the new mark
+    low, high = D("1.1"), D("1.15")
+    for rows in ([], [{"day": "2026-11-09", "id": 1, "units_outstanding": "10", "value_low": "9", "value_high": "9.5"}]):
+        a = osx.book_loss(rows, plain, "2026-11-13", low=low, high=high)
+        b = osx.book_loss(rows, marked, "2026-11-13", low=low, high=high)
+        assert a == b, (a, b)
+    assert osx.book_loss([], marked, "2026-11-13", low=low, high=high).previous == D("1.2")
+    assert osx._entry_base(marked, "2026-11-13") == osx._entry_base(plain, "2026-11-13")
+    assert osx._entry_base([plain[0], entry(2, "2026-11-12", "0.5", "mark")], "2026-11-13") == \
+        osx._entry_base([plain[0]], "2026-11-13")
+    rows = [{"day": "2026-11-12", "id": 1, "units_outstanding": "10", "value_per_unit": "1.05", "value_low": "10.5",
+             "value_high": "10.5"}]
+    looks = [{"day": "2026-11-12", "low": D("1.05"), "high": D("1.05"), "has_high": True}]
+    assert osx._nav_history(rows, looks, "2026-11-13", marked) == osx._nav_history(rows, looks, "2026-11-13", plain)
+    assert osx._nav_history([], [], "2026-11-13", marked) == osx._nav_history([], [], "2026-11-13", plain)
+
+
+def test_a_mark_entry_in_a_run_leaves_the_previous_figure_the_peak_and_the_drawdown_as_the_rows_give_them(mk):
+    def figures(with_mark):
+        w = mk(max_drawdown_pct=50.0)
+        w.open_book()
+        w.shared()
+        w.later()
+        w.seed_nav("2026-11-12", "1.10", "1.12")
+        if with_mark:
+            w.owner("mark", "--symbol", "SPY")
+        w.later()
+        w.next_day()
+        out = w.shared()
+        assert out["status"] == "done", out
+        s = out["shared"]
+        return {k: s[k] for k in ("previous_value_per_unit", "previous_from", "day_loss_pct", "drawdown_pct")}
+    assert figures(True) == figures(False)
+
+
+def test_a_layout_2_file_made_before_the_mark_kind_is_rebuilt_in_place_by_its_first_mark_entry(tmp_path):
+    path = tmp_path / "s.sqlite"
+    old = [s.replace(", 'mark'", "") for s in osx._STATE_UPGRADE_1_TO_2]
+    assert "'mark'" in osx._STATE_UPGRADE_1_TO_2[0] and "'mark'" not in old[0]
+    con = sqlite3.connect(path)
+    for statement in (*osx.STATE_SCHEMA, *old):
+        con.execute(statement)
+    con.execute("PRAGMA user_version = 2")
+    con.commit()
+    con.close()
+    clock = iter(range(1_763_478_000, 1_763_479_000, 7))
+    st = osx.OrderStepState(path, clock=lambda: float(next(clock)))
+    opening = {"kind": "cash_in", "amount": "100", "units_before": "0", "units_after": "100",
+               "value_per_unit_before": None, "value_per_unit_after": "1"}
+    first = st.add_owner_entry(opening, who="o", note="n")
+    fields = {"kind": "mark", "symbol": "SPY", "mark": "500.0", "units_before": "100", "units_after": "100",
+              "value_per_unit_before": "1", "value_per_unit_after": "1"}
+    raw = sqlite3.connect(path)
+    with pytest.raises(sqlite3.IntegrityError):                       # the old CHECK refuses the kind ...
+        raw.execute("INSERT INTO owner_entries (time, day, kind, symbol, mark, units_before, units_after, who, note, "
+                    "prev_hash, hash) VALUES (1, '2026-11-13', 'mark', 'SPY', '1', '1', '1', 'o', 'n', 'p', 'h')")
+    raw.close()
+    second = st.add_owner_entry(fields, who="o", note="n")             # ... until the first mark entry rebuilds the table
+    third = st.add_owner_entry(opening | {"units_before": "100", "units_after": "200"}, who="o", note="n")
+    assert [e["id"] for e in st.owner_entries()] == [1, 2, 3]          # the chain checks, ids 1 to 3, none missing
+    assert st.owner_entries()[0]["hash"] == first["hash"] and st.owner_entries()[1]["hash"] == second["hash"]
+    assert third["prev_hash"] == second["hash"]
+    st.close()
+    raw = sqlite3.connect(path)
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert raw.execute("SELECT seq FROM sqlite_sequence WHERE name = 'owner_entries'").fetchone()[0] == 3
+    assert "'mark'" in raw.execute("SELECT sql FROM sqlite_master WHERE name = 'owner_entries'").fetchone()[0]
+    assert {r[0] for r in raw.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")} >= \
+        {"owner_entries_no_update", "owner_entries_no_delete"}
+    for statement in ("UPDATE owner_entries SET note = 'x'", "DELETE FROM owner_entries"):
+        with pytest.raises(sqlite3.DatabaseError, match="append-only"):
+            raw.execute(statement)
+    raw.close()
+
+
+def test_a_broken_chain_is_found_before_the_rebuild_and_the_file_is_left_as_it_was(tmp_path):
+    path = tmp_path / "s.sqlite"
+    old = [s.replace(", 'mark'", "") for s in osx._STATE_UPGRADE_1_TO_2]
+    con = sqlite3.connect(path)
+    for statement in (*osx.STATE_SCHEMA, *old):
+        con.execute(statement)
+    con.execute("PRAGMA user_version = 2")
+    con.commit()
+    con.close()
+    st = osx.OrderStepState(path, clock=lambda: 1_763_478_000.0)
+    opening = {"kind": "cash_in", "amount": "100", "units_before": "0", "units_after": "100",
+               "value_per_unit_before": None, "value_per_unit_after": "1"}
+    st.add_owner_entry(opening, who="o", note="n")
+    st.close()
+    raw = sqlite3.connect(path)
+    raw.execute("DROP TRIGGER owner_entries_no_update")
+    raw.execute("UPDATE owner_entries SET amount = '999'")              # an entry changed after it was written
+    raw.commit()
+    before = raw.execute("SELECT sql FROM sqlite_master ORDER BY name").fetchall()
+    raw.close()
+    st = osx.OrderStepState(path, clock=lambda: 1_763_478_100.0)
+    with pytest.raises(osx.OrderStepError, match="was changed after it was written"):
+        st.add_owner_entry({"kind": "mark", "symbol": "SPY", "mark": "500.0", "units_before": "100", "units_after": "100",
+                            "value_per_unit_before": "1", "value_per_unit_after": "1"}, who="o", note="n")
+    st.close()
+    raw = sqlite3.connect(path)
+    assert raw.execute("SELECT sql FROM sqlite_master ORDER BY name").fetchall() == before
+    raw.close()
+
+
+def test_the_owners_page_is_no_input_to_any_limit_nothing_that_judges_an_order_reads_it():
+    """R31: the combined holding per fund is information on the page only; nothing in the order step, the risk gate or
+    the stake ladder imports or names the page."""
+    import inspect
+    from valedia_trader.research_loop import risk_gate
+    for module in (osx, stake_ladder, risk_gate):
+        assert "owner_page" not in inspect.getsource(module), module.__name__

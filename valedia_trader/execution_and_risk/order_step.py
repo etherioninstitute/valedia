@@ -674,7 +674,7 @@ def broker_book(fills) -> dict[str, float]:
 
 # ---- T51c S2: the fund book's own figures in an account the owner also trades (pure; called by nothing yet)
 
-ENTRY_KINDS = ("cash_in", "cash_out", "units_out", "split")   # R5: the owner's entries
+ENTRY_KINDS = ("cash_in", "cash_out", "units_out", "split", "mark")   # R5: the owner's entries; T51c S4e (R34): `mark`
 _BOOK_PREC = 60                                   # decimal digits: every sum and product of ledger figures is exact
 
 
@@ -919,6 +919,8 @@ def book_figures(fills, orders, entries, marks, day: str, *, now: float) -> Book
                 units[x["symbol"]] = units.get(x["symbol"], Decimal(0)) - _dec(x["units"], f"entry {x['id']}'s units")
             elif kind == "split":
                 units[x["symbol"]] = units.get(x["symbol"], Decimal(0)) * _dec(x["ratio"], f"entry {x['id']}'s ratio")
+            elif kind == "mark":                      # T51c S4e (R34): the owner took a quote as a fund's new mark: it
+                pass                                  # changes no cash and no unit (it is read by far_quotes only)
             else:
                 raise BookError(f"entry {x['id']} is of kind {_cut(repr(kind))}, which is none of {', '.join(ENTRY_KINDS)}")
         low = None if low is None else low + flows
@@ -966,7 +968,9 @@ def next_entry(figures: BookFigures, kind: str, *, amount: Decimal | None = None
     defaulted. A stake change issues or redeems units at the value per unit (R4), so it is never profit or loss: a
     `cash_in` issues amount / value per unit (the first, with none outstanding, issues one unit per unit of the book's
     value after it, a value per unit of 1); a `cash_out` (at most the book's cash, lower bound) and a `units_out` (at
-    most the book's units of that symbol, valued at `mark`) redeem at it; a `split` changes no unit outstanding.
+    most the book's units of that symbol, valued at `mark`) redeem at it; a `split` changes no unit outstanding. T51c S4e
+    (R34): a `mark` (a fund's quote the owner took as its new mark: `symbol` and `mark`, the book holding units of that
+    symbol) changes no cash, no unit and no value per unit (the figures are valued at the marks given, as a split's are).
     Refused (BookError) in words: another kind, a figure that is not a positive decimal, more than the book holds, or
     a book whose value is not known."""
     if kind not in ENTRY_KINDS:
@@ -982,6 +986,11 @@ def next_entry(figures: BookFigures, kind: str, *, amount: Decimal | None = None
             out["symbol"] = symbol
             if kind == "units_out":
                 out["units"], out["mark"] = str(_positive(units, "the units")), str(_positive(mark, "the mark"))
+            elif kind == "mark":                          # T51c S4e (R34): the owner's yes to a quote; nothing else moves
+                out["mark"] = str(_positive(mark, "the mark"))
+                if figures.units.get(symbol, Decimal(0)) == 0:
+                    raise BookError(f"the book holds no {symbol}, so a mark of it changes nothing and is not recorded; "
+                                    "nothing was written")
             else:
                 out["ratio"] = str(_positive(ratio, "the ratio"))
                 if figures.units.get(symbol, Decimal(0)) == 0:   # addendum 6 (R21): a mistyped symbol records nothing
@@ -1079,6 +1088,14 @@ def _nav_vpu(row: dict) -> tuple[Decimal | None, Decimal | None]:
     return (None if low is None else low / units), (None if high is None else high / units)
 
 
+def _stake_entries(entries) -> list:
+    """T51c S4e (R34): the owner's entries that can be a base for the value per unit: every kind but `mark`. A mark entry
+    moves no cash and no unit; it records a fund's new mark and is read by far_quotes alone, so the value per unit it
+    carries (a real fall, taken as the new mark, is a LOWER one) must never become the previous figure the day stop
+    measures from when no earlier row gives one, nor the history check's base: that would loosen both."""
+    return [e for e in entries or () if e.get("kind") != "mark"]
+
+
 def book_loss(rows, entries, day: str, *, low: Decimal, high: Decimal | None) -> BookLoss:
     """T51c S4c (R27): the day's loss and the drawdown of the value per unit now (`low`: the lower figure, `high`: the
     upper one, None when not known) against the book's own history. `rows` are the `book_nav` rows (dicts with their
@@ -1104,6 +1121,7 @@ def book_loss(rows, entries, day: str, *, low: Decimal, high: Decimal | None) ->
             previous, open_ = (hi, False) if hi is not None else (lo, True)
             came = f"the last look of {d}"
         else:
+            entries = _stake_entries(entries)             # T51c S4e (R34): a `mark` entry is never a base for the loss
             before = [e for e in entries if str(e["day"]) < day and e.get("value_per_unit_after") is not None]
             if before:
                 e = max(before, key=lambda e: int(e["id"]))
@@ -1126,9 +1144,11 @@ def book_loss(rows, entries, day: str, *, low: Decimal, high: Decimal | None) ->
 def far_quotes(last_row: dict | None, entries, quotes: dict, held, limit_pct) -> list[dict]:
     """T51c S4c (R28): the held funds whose quote is further from their last `book_nav` mark than `limit_pct` percent
     (the owner's max_drawdown_pct). `last_row` is the latest row ({"time", "marks": {symbol: price text}}, None for
-    no row: nothing to judge), `entries` the owner's entries: a `split` of the symbol written after the row's time
-    moves the mark to what the split makes of it (the mark divided by its ratio), which is how the owner clears a real
-    split. A fund with no mark in the row or no quote is not judged here (a missing quote is the prices' own stop).
+    no row: nothing to judge), `entries` the owner's entries, read in the order written: a `split` of the symbol
+    written after the row's time moves the mark to what the split makes of it (the mark divided by its ratio), which is
+    how the owner clears a real split; a `mark` entry of the symbol written after the row's time (T51c S4e, R34) sets
+    the reference to the mark the owner took (a real move, said with that entry), and a split written after it divides
+    that. A fund with no mark in the row or no quote is not judged here (a missing quote is the prices' own stop).
     Exactly `limit_pct` away is not beyond. Each answer: {"symbol", "quote", "mark", "reference"}."""
     if not last_row:
         return []
@@ -1141,9 +1161,12 @@ def far_quotes(last_row: dict | None, entries, quotes: dict, held, limit_pct) ->
             if mark is None or quote is None:
                 continue
             ref = _dec(mark, f"the last mark of {_cut(sym)}")
-            for e in entries:
-                if e.get("kind") == "split" and e.get("symbol") == sym and float(e["time"]) > float(last_row["time"]):
-                    ref /= _dec(e["ratio"], f"entry {e.get('id')}'s ratio")
+            for e in entries:                              # in the order written: a mark entry sets the reference, a split divides it
+                if e.get("symbol") == sym and float(e["time"]) > float(last_row["time"]):
+                    if e.get("kind") == "split":
+                        ref /= _dec(e["ratio"], f"entry {e.get('id')}'s ratio")
+                    elif e.get("kind") == "mark":         # T51c S4e (R34): the owner took this quote as the new mark
+                        ref = _dec(e["mark"], f"entry {e.get('id')}'s mark")
             price = _dec(quote, f"the quote of {_cut(sym)}")
             if ref > 0 and abs(price / ref - 1) * 100 > limit:
                 out.append({"symbol": sym, "quote": float(price), "mark": float(_dec(mark, "mark")), "reference": float(ref)})
@@ -1322,7 +1345,8 @@ def _entry_base(entries, today: str):
     """The value per unit `book_loss` falls back to when no row of an earlier day gives one: the value per unit after the
     latest owner entry of an earlier day, else after the opening (first) entry, as {"low", "high", "has_high", "entry"} (the
     one figure for both bounds), or None when there is none. The same choice as book_loss's, in the same order."""
-    before = [e for e in entries or () if str(e["day"]) < today and e.get("value_per_unit_after") is not None]
+    entries = _stake_entries(entries)                     # T51c S4e (R34): never a `mark` entry
+    before = [e for e in entries if str(e["day"]) < today and e.get("value_per_unit_after") is not None]
     if before:
         e, what = max(before, key=lambda e: int(e["id"])), "the latest earlier owner entry"
     elif entries and entries[0].get("value_per_unit_after") is not None:
@@ -1391,7 +1415,7 @@ def _shortfall_figures(shorts: dict) -> dict:
 
 _FIGURE = re.compile(r"[0-9]+(\.[0-9]+)?")       # the owner's figure as written: digits, an optional decimal part
 _OWNER_USES = {"cash_in": ("amount",), "cash_out": ("amount",), "units_out": ("symbol", "units"),
-               "split": ("symbol", "ratio")}
+               "split": ("symbol", "ratio"), "mark": ("symbol",)}
 _OWNER_ARGUMENTS = ("amount", "units", "ratio", "symbol")
 _ENTRY_HASH = re.compile(r"[0-9a-f]{64}")
 _ENTRY_NUMBER = re.compile(r"[1-9][0-9]*")
@@ -1581,6 +1605,8 @@ def _figure_text(kind: str, arguments: dict) -> str:
         return arguments["amount"]
     if kind == "units_out":
         return f"{arguments['units']} {arguments['symbol']}"
+    if kind == "mark":                                    # T51c S4e (R34): the figure is the quote, shown in the marks
+        return f"{arguments['symbol']}, its quote taken as the fund's new mark"
     return f"{arguments['symbol']} at {arguments['ratio']} new units per old"
 
 
@@ -1641,7 +1667,10 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None, *
                         calendar=None) -> int:
     """T51c S3 (R5), wired by S4b (R29): `order-step --owner-entry KIND --venue NAME --who WHO --note NOTE` and the
     figures of that kind, which the OWNER runs: `cash_in`/`cash_out` take --amount; `units_out` takes --symbol and
-    --units (shares he took that the book counted as its own); `split` takes --symbol and --ratio (new units per old).
+    --units (shares he took that the book counted as its own); `split` takes --symbol and --ratio (new units per old);
+    `mark` (T51c S4e, R34: "this quote is real; take it as the new mark") takes --symbol alone and moves no cash and
+    no unit: it records the quote the order step's own quote path gave as that fund's new mark, so the marks stop (R28)
+    clears for it on the next run.
 
     Marks are never typed (`--mark` is refused): every fund the book holds units of, and the entry's own symbol for a
     units_out or a split, is quoted by the order step's own quote source (`quotes`; minute_quotes, the function a run
@@ -1777,7 +1806,7 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None, *
                                  f"{_cut('; '.join(differences), 600)}; a person must look; nothing was written",
                                  pending)
         held = sorted(book_figures(fills, orders, entries, {}, day, now=now).unmarked)   # every fund it holds units of
-        asked = sorted(set(held) | ({symbol} if kind in ("units_out", "split") else set()))
+        asked = sorted(set(held) | ({symbol} if kind in ("units_out", "split", "mark") else set()))
         marks, close, why = _owner_marks(asked, quotes, calendar, now)
         if why is not None:
             return _owner_refuse(why, pending)
@@ -1788,7 +1817,7 @@ def owner_entry_command(args, paths, clock: Callable[[], float] | None = None, *
             valued = entries + [{"id": len(entries) + 1, "time": now, "kind": "split", "symbol": symbol,
                                  "ratio": str(figs["ratio"]), "units_before": last, "units_after": last}]
         figures = book_figures(fills, orders, valued, prices, day, now=now)
-        mark = _dec(prices[symbol], f"the mark of {symbol}") if kind == "units_out" else None
+        mark = _dec(prices[symbol], f"the mark of {symbol}") if kind in ("units_out", "mark") else None
         fields = next_entry(figures, kind, amount=figs.get("amount"), symbol=symbol, units=figs.get("units"),
                             ratio=figs.get("ratio"), mark=mark)
         head = entries[-1]["hash"] if entries else _GENESIS
@@ -1868,6 +1897,9 @@ def _owner_preview(venue: str, path: Path, now: float, life: float, now_record: 
     high = "no upper bound" if figures.value_high is None else str(figures.value_high)
     print(f"  the book's value: {figures.value} (from {figures.value} to {high}"
           + (f"; bounded by: {_cut('; '.join(figures.bounded_by), 300)}" if figures.bounded_by else "") + ")")
+    if kind == "mark":                                    # T51c S4e (R34): said plainly, beside the mark it records
+        print(f"  this takes the quote above as {a['symbol']}'s new mark, so the marks stop clears for it on the next run "
+              "(a quote then further than max_drawdown_pct from it stops the run again); no cash and no units change")
     print(f"  units outstanding: {fields['units_before']} before, {fields['units_after']} after")
     print(f"  value per unit: {fields['value_per_unit_before'] or 'none (no units outstanding)'} before, "
           f"{fields['value_per_unit_after'] or 'none'} after")
@@ -2539,7 +2571,7 @@ _LAYOUT1_TABLES = frozenset({"meta", "baseline", "equity", "sends"})
 # so a new file and an upgraded one have the same schema. The old `equity` table is kept as it is.
 _STATE_UPGRADE_1_TO_2 = [
     "CREATE TABLE owner_entries (id INTEGER PRIMARY KEY AUTOINCREMENT, time REAL NOT NULL, day TEXT NOT NULL, "
-    "kind TEXT NOT NULL CHECK (kind IN ('cash_in', 'cash_out', 'units_out', 'split')), symbol TEXT, amount TEXT, "
+    "kind TEXT NOT NULL CHECK (kind IN ('cash_in', 'cash_out', 'units_out', 'split', 'mark')), symbol TEXT, amount TEXT, "
     "units TEXT, ratio TEXT, mark TEXT, units_before TEXT NOT NULL, units_after TEXT NOT NULL, "
     "value_per_unit_before TEXT, value_per_unit_after TEXT, who TEXT NOT NULL CHECK (length(trim(who)) > 0), "
     "note TEXT NOT NULL CHECK (length(trim(note)) > 0), prev_hash TEXT NOT NULL, hash TEXT NOT NULL UNIQUE)",
@@ -2632,19 +2664,26 @@ def _owner_entries_read_only(path: Path) -> list[dict]:
         return []
     db = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=30.0)
     try:
-        version = db.execute("PRAGMA user_version").fetchone()[0]
-        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        tables.discard("sqlite_sequence")
-        if not tables and version == 0:
-            return []
-        if version == 1 and tables <= _LAYOUT1_TABLES:
-            return []
-        if not (version == STATE_LAYOUT and _LAYOUT2_NEW <= tables <= _LAYOUT2_TABLES):
-            raise OrderStepError(f"{path} is not an order-step state file of layout 1 or {STATE_LAYOUT}; it is not "
-                                 "opened")
-        return _checked_entries(db)
+        return owner_entries_of(db, path)
     finally:
         db.close()
+
+
+def owner_entries_of(db, path) -> list[dict]:
+    """The owner's entries of the state file open on `db` (any read-only connection), after the chain is checked: none for
+    an empty file or a layout-1 file, else _checked_entries. Anything that is not a state file of layout 1 or 2 is refused
+    in words (OrderStepError). Reads only. T51c S4e: the owner's page reads through it on its own connection."""
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    tables.discard("sqlite_sequence")
+    if not tables and version == 0:
+        return []
+    if version == 1 and tables <= _LAYOUT1_TABLES:
+        return []
+    if not (version == STATE_LAYOUT and _LAYOUT2_NEW <= tables <= _LAYOUT2_TABLES):
+        raise OrderStepError(f"{path} is not an order-step state file of layout 1 or {STATE_LAYOUT}; it is not "
+                             "opened")
+    return _checked_entries(db)
 
 
 _JOURNALED_ENTRY = ("id", "kind", "symbol", "amount", "units", "ratio", "mark", "units_before", "units_after",
@@ -2776,6 +2815,8 @@ class OrderStepState:
             if after is not None and (rows[-1]["hash"] if rows else _GENESIS) != after:
                 raise OrderStepError("the owner's entries changed while this entry was being worked out (another "
                                      "owner's entry was written meanwhile); nothing was written")
+            if figures.get("kind") == "mark":
+                self._allow_mark_kind(len(rows))              # the chain is checked above; this is in the same transaction
             row = {k: figures.get(k) for k in _ENTRY_FIELDS if k not in ("id", "time", "day", "who", "note", "prev_hash")}
             row.update(id=len(rows) + 1, time=now, day=day, who=who, note=note,
                        prev_hash=rows[-1]["hash"] if rows else _GENESIS)
@@ -2784,6 +2825,27 @@ class OrderStepState:
             self._db.execute(f"INSERT INTO owner_entries ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
                              tuple(row[k] for k in cols))
         return {k: row[k] for k in (*_ENTRY_FIELDS, "hash")}
+
+    def _allow_mark_kind(self, count: int) -> None:
+        """T51c S4e (R34): a layout-2 file made before the `mark` kind has a CHECK on `owner_entries.kind` that refuses it,
+        and a CHECK cannot be altered in place. In the write transaction of the first `mark` entry (the chain already
+        checked, so no entry is missing or changed), the table is made again from the module's own statement, every row
+        copied with its id, then the table renamed and its two append-only triggers made again; `user_version` stays 2. A
+        file whose table already names the kind (a new one) is left as it is. All of it or none: the caller's transaction
+        rolls back on any failure, and a copy that does not hold the same number of rows is one."""
+        have = self._db.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'owner_entries'").fetchone()
+        if have is not None and "'mark'" in have[0]:
+            return
+        cols = ", ".join((*_ENTRY_FIELDS, "hash"))
+        self._db.execute(_STATE_UPGRADE_1_TO_2[0].replace("CREATE TABLE owner_entries", "CREATE TABLE owner_entries_new", 1))
+        self._db.execute(f"INSERT INTO owner_entries_new ({cols}) SELECT {cols} FROM owner_entries ORDER BY id")
+        if self._db.execute("SELECT COUNT(*) FROM owner_entries_new").fetchone()[0] != count:
+            raise OrderStepError("the owner's entries could not be copied whole into the table that names the mark kind; "
+                                 "nothing was written")
+        self._db.execute("DROP TABLE owner_entries")
+        self._db.execute("ALTER TABLE owner_entries_new RENAME TO owner_entries")
+        for statement in _STATE_UPGRADE_1_TO_2[1:3]:          # the append-only triggers (they went with the old table)
+            self._db.execute(statement)
 
     def send_tags(self) -> set[str]:
         """R3: every tag the send record holds."""
@@ -3875,11 +3937,11 @@ class _Run:
         if limits is not None:
             for far in far_quotes(rows[-1] if rows else None, self.entries, prices, held, limits["max_drawdown_pct"]):
                 raise _Stop("marks", f"{far['symbol']} quotes {far['quote']:g}, and the book's last mark of it was "
-                                     f"{far['mark']:g}" + (f" ({far['reference']:g} after the owner's split entries)"
+                                     f"{far['mark']:g}" + (f" ({far['reference']:g} after the owner's split and mark entries)"
                                                            if far["reference"] != far["mark"] else "") +
                                      f", further than the owner's max_drawdown_pct of {float(limits['max_drawdown_pct']):g}% "
                                      "away: a split, a rename or a bad quote; if it is a split, the owner writes a split "
-                                     "entry; a person must look; nothing is sent")
+                                     "entry, and if the quote is real a mark entry; a person must look; nothing is sent")
         value = float(figures.value)
         if self.live is not None:                        # T51c S4d (R26): lock 1 against the BOOK's value, the upper bound
             self._lock_one_book(figures)
