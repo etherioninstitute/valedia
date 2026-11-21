@@ -25,6 +25,18 @@ matched by keyword only, not read one by one. Item H-1 closes that.
 
 ---
 
+## 0. Priority set by the owner (2026-11-21, "Yes, start")
+
+1. The fund book's live path, section 2 (S4c, S4d, S4e, T51 build B, the stricter go-live gate), then the
+   practice sightings in market hours from Mon 2026-11-23. Earliest first attended real order: the week of
+   2026-11-30.
+2. His items in parallel: stake, live key file, the three files, a yes for one off-family review.
+3. Prediction markets: the forward copy test's wallet screen, so the 120-day clock starts; then T45-2.
+4. Hermes, Paperclip and Live-page work PARKED until 1 is done (each by name: elephant-code-mode follow-ups,
+   Paperclip seats' daytime test VAL-19, the Mission tab's nightly refresh, the Engineer's key file wiring).
+
+No prediction-market strategy has passed; no real event order until one does.
+
 ## 1. In flight today (2026-11-17)
 
 - **DONE 2026-11-17 20:30 PST** T51 fractional orders, build A (practice path only; live fractions stay
