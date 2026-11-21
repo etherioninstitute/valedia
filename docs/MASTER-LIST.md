@@ -46,8 +46,13 @@ matched by keyword only, not read one by one. Item H-1 closes that.
    rounds, last blind check PASS_WITH_NOTES): live is always shared, lock 1 on the book's upper value, the
    state file's value history is checked against the journal before any account read, and
    `order-step --live --accept-history DAY` clears a lost summary only when the row tightens (a lower row is the
-   lead's by hand). **Practice gate moved** to 733137c (tested both ways). NEXT: S4e (alerts, the owner's page,
-   R34's `mark` entry), then T51 build B.
+   lead's by hand). **S4e MERGED** (main 169d4d8..75a51f5, 2026-11-21; four repair rounds, last blind check
+   PASS_WITH_NOTES): shared stop and shortfall alerts per venue and class (unattended critical), cleared only by a
+   strictly later clean run; the owner's page "Shared book" section; R34's `mark` entry. **Practice gate moved** to
+   75a51f5 (backup `.before-s4e`, tested both ways). OWNER: try a `mark` entry on a COPY of the practice state file
+   first (the first one rebuilds a layout-2 file in place). NEXT: a small ticket (re-pin
+   test_fractional_off_against_base, which fails on main since S4c-2; drop alerts.py's cached shared view when the
+   open alerts are set), then T51 build B, then the stricter go-live gate.
 4. Hermes, Paperclip and Live-page work PARKED until 1 is done (each by name: elephant-code-mode follow-ups,
    Paperclip seats' daytime test VAL-19, the Mission tab's nightly refresh, the Engineer's key file wiring).
 
