@@ -556,7 +556,7 @@ def _followed_book(root):
 
 
 @pytest.fixture
-def live_project(order_step_project, monkeypatch):
+def live_project(order_step_project, monkeypatch, capsys):
     from datetime import date
 
     from valedia_trader.data_and_fees import second_quote
@@ -588,18 +588,38 @@ def live_project(order_step_project, monkeypatch):
     monkeypatch.setattr(second_quote, "second_opinion",
                         lambda price, symbol, **kw: asked.append(symbol) or {"verdict": "agree"})
     monkeypatch.setattr(webull, "ny_date", lambda t=None: date(2026, 11, 13))
+    _open_live_book(root, capsys)                           # T51c S4d: a live run is the shared book's: the owner opens it
     return root, venue, built, asked
+
+
+def _open_live_book(root, capsys, amount="100000"):
+    """T51c S4d: the owner's opening entry of the live venue's book, through the command line as the owner writes it
+    (`--live`, a preview and its code, then `--confirm CODE`); an empty book asks for no quote."""
+    import re
+    base = ["--root", str(root), "order-step", "--live", "--venue", "webull-production", "--owner-entry", "cash_in",
+            "--amount", amount, "--who", "owner", "--note", "opening"]
+    capsys.readouterr()
+    assert cli.main(base) == 0
+    (code,) = re.findall(r"^code: ([0-9]{6})$", capsys.readouterr().out, re.M)
+    assert cli.main([*base, "--confirm", code]) == 0
+    capsys.readouterr()
 
 
 def _tree(root):
     return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
 
 
-@pytest.mark.parametrize("argv", [["--live"], ["--live", "--propose"], ["--live", "--approve", "123456"],
-                                  ["--live", "--propose", "--capital", "100000", "--fractional"],
-                                  ["--live", "--approve", "123456", "--capital", "100000", "--fractional"],
-                                  ["--live", "--propose", "--capital", "nan"], ["--live", "--propose", "--capital", "-5"],
-                                  ["--check"], ["--check", "--capital", "5"]])
+@pytest.mark.parametrize("argv", [["--live"], ["--live", "--shared"], ["--live", "--propose"],
+                                  ["--live", "--approve", "123456"],     # T51c S4d: a live run is always shared: no --shared
+                                  ["--live", "--propose", "--capital", "100000"],          # ... and the old form: a capital
+                                  ["--live", "--approve", "123456", "--capital", "100000"],
+                                  ["--live", "--shared", "--propose", "--capital", "100000"],   # no capital with --shared
+                                  ["--live", "--shared", "--approve", "123456", "--capital", "100000"],
+                                  ["--live", "--shared", "--propose", "--fractional"],
+                                  ["--live", "--shared", "--approve", "123456", "--fractional"],
+                                  ["--live", "--shared", "--propose", "--capital", "nan"],
+                                  ["--live", "--shared", "--propose", "--capital", "-5"],
+                                  ["--check"], ["--check", "--capital", "5"], ["--live", "--check", "--shared"]])
 def test_live_flags_that_cannot_run_are_refused_before_anything_is_read(live_project, monkeypatch, capsys, argv):
     root, venue, built, asked = live_project
     monkeypatch.setattr(cli, "_live_environ", lambda: pytest.fail("the environment was loaded"))
@@ -612,21 +632,71 @@ def test_live_flags_that_cannot_run_are_refused_before_anything_is_read(live_pro
 
 def test_live_propose_and_approve_on_the_command_line(live_project, capsys):
     root, venue, built, asked = live_project
-    assert cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"]) == 0
+    assert cli.main(["--root", str(root), "order-step", "--live", "--shared", "--propose"]) == 0
     captured = capsys.readouterr()
     out, number_lines = _ticket_out(captured.out)
     assert out["status"] == "done" and out["live"] is True and out["mode"] == "propose" and "submit" not in venue.calls
     assert [(o["fund"], o["side"], o["units"]) for o in out["ticket"]["orders"]] == [("SPY", "buy", 5.0)]
     (line,) = number_lines
     number = line.split()[2]
-    assert "order-step --live --approve NUMBER --capital 100000.0" in line and asked == ["SPY"]
+    assert "order-step --live --shared --approve NUMBER" in line and "--capital" not in line \
+        and asked == ["SPY"]
     assert len(built) == 1 and built[0].confirmation == root / "config" / "webull_live.json"
     assert built[0].checklist == root / "config" / "go_live.json" and built[0].limits == root / "config" / "risk.json"
-    assert cli.main(["--root", str(root), "order-step", "--live", "--approve", number, "--capital", "100000"]) == 0
+    assert cli.main(["--root", str(root), "order-step", "--live", "--shared", "--approve", number]) == 0
     out, number_lines = _ticket_out(capsys.readouterr().out)
     assert number_lines == [] and out["orders_sent"] == 1 and venue.calls.count("submit") == 1 and asked == ["SPY", "SPY"]
     text = captured.out + captured.err + "".join(p.read_text() for p in (root / "journal").glob("*.jsonl"))
     assert LIVE_ACCOUNT[:-4] not in text
+
+
+def test_the_help_says_a_live_run_is_always_shared_and_takes_no_capital(capsys):
+    """T51c S4d: the command line's own help names the rule (the words are the parser's, not the refusal's)."""
+    with pytest.raises(SystemExit) as stop:
+        cli.main(["order-step", "--help"])
+    assert stop.value.code == 0
+    text = " ".join(capsys.readouterr().out.split()).replace("- ", "-")        # the help wraps after a hyphen
+    assert "real money: only with --shared and --propose or --approve (never --capital" in text, text
+    assert "with --owner-entry, the live venue's book (a production venue's name needs it)" in text, text
+    assert "required with --live (S4d: a live run is always the shared account's book)" in text, text
+
+
+def _sqlite_rows(path, sql):
+    con = sqlite3.connect(path)
+    try:
+        return con.execute(sql).fetchall()
+    finally:
+        con.close()
+
+
+def test_live_order_step_command_end_to_end_is_the_shared_book_with_no_capital(live_project, capsys):
+    """T51c S4d: the live command itself (flags, locks, venue builder, follow list, the real order step on the stand-in
+    production venue): a propose, then an approve of its number, both shared; the book's own value is the capital; the
+    state file's old equity table is untouched; and the same command without --shared builds nothing."""
+    from datetime import date
+    root, venue, built, asked = live_project
+    paths = cli.LoopPaths(root)
+    flags = dict(live=True, check=False, propose=False, approve=None, capital=None, shared=False, fractional=False)
+    run = lambda **kw: cli.live_order_step_command(argparse.Namespace(**{**flags, **kw}), paths, environ=dict(LIVE_KEYS),
+                                                   build_venue=lambda files, environ: built.append(files) or venue,
+                                                   today=date(2026, 11, 13), attended=True)
+    assert run(propose=True) == 2                                         # not shared: refused, nothing built or read
+    assert "always the shared account's book" in capsys.readouterr().err and built == [] and venue.calls == []
+    assert run(propose=True, shared=True, capital=1000.0) == 2            # a capital with --shared: refused
+    assert "--capital is refused" in capsys.readouterr().err and built == [] and venue.calls == []
+    assert run(propose=True, shared=True) == 0
+    out, (line,) = _ticket_out(capsys.readouterr().out)
+    number = line.split()[2]
+    assert out["live"] is True and out["mode"] == "propose" and out["shared"]["capital"] == pytest.approx(100_000.0), out
+    assert [(o["fund"], o["side"], o["units"]) for o in out["ticket"]["orders"]] == [("SPY", "buy", 5.0)]
+    assert "order-step --live --shared --approve NUMBER" in line and "--capital" not in line and len(built) == 1
+    assert run(approve=number, shared=True) == 0
+    out, _ = _ticket_out(capsys.readouterr().out)
+    assert out["status"] == "done" and out["orders_sent"] == 1 and venue.calls.count("submit") == 1, out
+    assert out["shared"]["book_value"] == pytest.approx(out["broker_equity"]) and out["ceiling"] == 100000.0
+    state = root / "memory" / "order_step-webull-production.sqlite"
+    assert _sqlite_rows(state, "SELECT COUNT(*) FROM equity") == [(0,)]       # never the old equity table
+    assert _sqlite_rows(state, "SELECT COUNT(*) FROM book_nav")[0][0] >= 1
 
 
 def test_live_check_prints_each_lock_and_the_account_only_when_locks_one_to_three_are_met(live_project, capsys):
@@ -664,7 +734,7 @@ def test_a_live_propose_with_a_lock_unmet_says_which_builds_nothing_and_creates_
     root, venue, built, asked = live_project
     (root / "config" / missing).unlink()
     before = _tree(root)
-    assert cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"]) == 2
+    assert cli.main(["--root", str(root), "order-step", "--live", "--shared", "--propose"]) == 2
     err = capsys.readouterr().err
     assert err.startswith("refused: lock ") and "is missing" in err and "nothing was read from the account" in err
     assert built == [] and venue.calls == [] and asked == [] and _tree(root) == before
@@ -681,21 +751,21 @@ def _verdicts(root):
 
 def test_a_live_approve_after_a_lock_stops_being_met_is_refused_and_marked_without_any_account_read(live_project, capsys):
     root, venue, built, asked = live_project
-    assert cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"]) == 0
+    assert cli.main(["--root", str(root), "order-step", "--live", "--shared", "--propose"]) == 0
     _, (line,) = _ticket_out(capsys.readouterr().out)
     number = line.split()[2]
     conf = (root / "config" / "webull_live.json").read_text()
     (root / "config" / "webull_live.json").unlink()                 # the confirmation removed: lock 1 unmet
     calls_before = list(venue.calls)
     built.clear()
-    assert cli.main(["--root", str(root), "order-step", "--live", "--approve", number, "--capital", "100000"]) == 2
+    assert cli.main(["--root", str(root), "order-step", "--live", "--shared", "--approve", number]) == 2
     captured = capsys.readouterr()
     assert captured.err.startswith("refused: lock 1 (the confirmation)") and venue.calls == calls_before and built == []
     out = json.loads(captured.out)
     assert out["stage"] == "lock" and out["live"] is True and _verdicts(root) == ["refused"]
     (root / "config" / "webull_live.json").write_text(json.dumps({**json.loads(conf), "max_order_value": 2900}))
     (root / "config" / "webull_live.json").chmod(0o644)             # back, with a smaller cap: every lock met again
-    assert cli.main(["--root", str(root), "order-step", "--live", "--approve", number, "--capital", "100000"]) == 2
+    assert cli.main(["--root", str(root), "order-step", "--live", "--shared", "--approve", number]) == 2
     out = json.loads(capsys.readouterr().out)
     assert out["stage"] == "ticket" and "changed since that ticket was made" in out["reason"]
     assert "submit" not in venue.calls and _verdicts(root) == ["refused", "refused"]
@@ -745,8 +815,8 @@ def _no_reads(monkeypatch):
     monkeypatch.setattr(cli, "_order_step_live_venue", lambda *a, **k: pytest.fail("a venue was built"))
 
 
-@pytest.mark.parametrize("argv", [["--live", "--propose", "--capital", "100000"], ["--live", "--approve", "123456",
-                                  "--capital", "100000"], ["--live", "--check"], ["--live", "--check", "--capital", "5"]])
+@pytest.mark.parametrize("argv", [["--live", "--shared", "--propose"], ["--live", "--shared", "--approve", "123456"],
+                                  ["--live", "--check"], ["--live", "--check", "--capital", "5"]])
 def test_a_live_run_whose_root_is_another_folder_is_refused_at_the_flags_step(live_project, monkeypatch, capsys, argv,
                                                                                  tmp_path_factory):
     from valedia_trader.venues import webull
@@ -823,12 +893,12 @@ def test_nothing_a_caller_passes_opens_live_mode_with_every_owner_file_met_in_an
             raise AssertionError(f"the client was used: {name}")
 
     # the command line: --root the other folder, every flag, every environment variable
-    for argv in (["--live", "--propose", "--capital", "100000"], ["--live", "--approve", "123456", "--capital", "100000"],
+    for argv in (["--live", "--shared", "--propose"], ["--live", "--shared", "--approve", "123456"],
                  ["--live", "--check"]):
         assert cli.main(["--root", str(other), "order-step", *argv]) == 2
         assert "runs only from the repository itself" in capsys.readouterr().err
     # the command line without --root: the repository's files, none written, so nothing opens
-    assert cli.main(["order-step", "--live", "--propose", "--capital", "100000"]) == 2
+    assert cli.main(["order-step", "--live", "--shared", "--propose"]) == 2
     err = capsys.readouterr().err
     assert "lock 1 (the confirmation): config/webull_live.json is missing" in err and "lock 2 (" in err
     assert cli.main(["order-step", "--live", "--check"]) == 2
@@ -836,7 +906,7 @@ def test_nothing_a_caller_passes_opens_live_mode_with_every_owner_file_met_in_an
     assert [lock["met"] for lock in report["locks"]][:2] == [False, False] and report["all_met"] is False
     assert "is missing" in report["locks"][0]["reason"] and "is missing" in report["locks"][1]["reason"]
     # the command function given the other folder's paths, the environment and a venue builder
-    args = ap.Namespace(live=True, check=False, propose=True, approve=None, capital=100000.0, fractional=False)
+    args = ap.Namespace(live=True, check=False, propose=True, approve=None, capital=None, shared=True, fractional=False)
     assert cli.live_order_step_command(args, cli.LoopPaths(other), environ=env,
                                        build_venue=lambda *a: pytest.fail("a venue was built"),
                                        second_opinion=lambda *a, **k: pytest.fail("a second source was asked")) == 2
@@ -909,7 +979,7 @@ def test_live_mode_runs_with_the_repositorys_own_folders_whatever_paths_it_is_gi
     link = tmp_path_factory.mktemp("links") / "repo"
     link.symlink_to(root, target_is_directory=True)
     seen = _capture_run_live(monkeypatch)
-    args = argparse.Namespace(live=True, check=False, propose=True, approve=None, capital=100000.0, fractional=False)
+    args = argparse.Namespace(live=True, check=False, propose=True, approve=None, capital=None, shared=True, fractional=False)
     for given in (Pointing(root), cli.LoopPaths(link), cli.LoopPaths(Path(str(root) + "/."))):
         assert cli.live_order_step_command(args, given, environ=dict(LIVE_KEYS)) == 0, given
         capsys.readouterr()
@@ -1115,7 +1185,7 @@ def test_t32_a_live_run_without_a_usable_broker_book_file_is_refused_before_any_
     elif how == "a link":
         path.symlink_to(_owner_file(tmp_path_factory.mktemp("elsewhere") / "b.json", {"follow": [1]}))
     before = _tree(root)
-    assert cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"]) == 2
+    assert cli.main(["--root", str(root), "order-step", "--live", "--shared", "--propose"]) == 2
     captured = capsys.readouterr()
     assert captured.err.startswith("refused: config/broker_book.json ") and len(captured.err.strip().splitlines()) == 1
     assert {"missing": "never follows the whole book", "empty list": "at least one id", "unknown id": "hypothesis 7",
@@ -1126,7 +1196,7 @@ def test_t32_a_live_run_without_a_usable_broker_book_file_is_refused_before_any_
 
 def test_t32_a_live_proposal_shows_what_it_follows(live_project, capsys):
     root, venue, built, asked = live_project
-    assert cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"]) == 0
+    assert cli.main(["--root", str(root), "order-step", "--live", "--shared", "--propose"]) == 0
     out, _ = _ticket_out(capsys.readouterr().out)
     assert out["follow"] == {"ids": [1], "names": ["mom_paper"]} and out["ticket"]["follow"] == out["follow"]
     journal = [json.loads(ln) for ln in (root / "journal" / "2026-11-13.jsonl").read_text().splitlines()]
@@ -1137,7 +1207,7 @@ def test_t32_a_live_proposal_shows_what_it_follows(live_project, capsys):
 @pytest.mark.parametrize("change", ["removed", "another key", "refused"])
 def test_t32_a_live_approve_after_the_broker_book_file_changed_is_refused_and_marked(live_project, capsys, change):
     root, venue, built, asked = live_project
-    assert cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"]) == 0
+    assert cli.main(["--root", str(root), "order-step", "--live", "--shared", "--propose"]) == 0
     _, (line,) = _ticket_out(capsys.readouterr().out)
     number = line.split()[2]
     path = root / "config" / "broker_book.json"
@@ -1149,7 +1219,7 @@ def test_t32_a_live_approve_after_the_broker_book_file_changed_is_refused_and_ma
         _book_file(root, {"follow": [1, 1]})
     calls_before = list(venue.calls)
     built.clear()
-    assert cli.main(["--root", str(root), "order-step", "--live", "--approve", number, "--capital", "100000"]) == 2
+    assert cli.main(["--root", str(root), "order-step", "--live", "--shared", "--approve", number]) == 2
     captured = capsys.readouterr()
     out = json.loads(captured.out)
     if change == "another key":                                    # still a usable file: the ticket's check refuses it
@@ -1241,7 +1311,7 @@ def test_t32_rev2_a_live_follow_refusal_comes_before_the_venue_is_built(live_pro
     root, venue, built, asked = live_project
     number = None
     if mode == "approve":
-        assert cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"]) == 0
+        assert cli.main(["--root", str(root), "order-step", "--live", "--shared", "--propose"]) == 0
         _, (line,) = _ticket_out(capsys.readouterr().out)
         number = line.split()[2]
     seen = _secrets_watch(monkeypatch)
@@ -1257,8 +1327,8 @@ def test_t32_rev2_a_live_follow_refusal_comes_before_the_venue_is_built(live_pro
         _set_status(root, 1, how)
     else:
         _book_file(root, {"follow": [1, 99]})
-    argv = ["--live", "--propose"] if mode == "propose" else ["--live", "--approve", number]
-    assert cli.main(["--root", str(root), "order-step", *argv, "--capital", "100000"]) == 2
+    argv = ["--live", "--shared", "--propose"] if mode == "propose" else ["--live", "--shared", "--approve", number]
+    assert cli.main(["--root", str(root), "order-step", *argv]) == 2
     err = capsys.readouterr().err
     assert err.startswith("refused: ") and "nothing was read from the account" in err, err
     words = {"not in the latest day": "not among the strategies of the paper book's latest day",
@@ -1277,7 +1347,7 @@ def test_t32_rev2_a_live_approve_after_a_followed_strategy_was_renamed_to_anothe
                                                                                                      capsys):
     root, venue, built, asked = live_project
     _second_book(root)                                             # mom_two is in the latest day, not followed
-    assert cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"]) == 0
+    assert cli.main(["--root", str(root), "order-step", "--live", "--shared", "--propose"]) == 0
     out, (line,) = _ticket_out(capsys.readouterr().out)
     assert out["follow"] == {"ids": [1], "names": ["mom_paper"]}
     number = line.split()[2]
@@ -1285,7 +1355,7 @@ def test_t32_rev2_a_live_approve_after_a_followed_strategy_was_renamed_to_anothe
     spec = json.loads(spec_path.read_text())
     spec_path.write_text(json.dumps({**spec, "name": "mom_two", "market": ["QQQ"]}))   # the same file, the same ids
     calls_before = len([c for c in venue.calls if c[0] == "submit"])
-    assert cli.main(["--root", str(root), "order-step", "--live", "--approve", number, "--capital", "100000"]) == 2
+    assert cli.main(["--root", str(root), "order-step", "--live", "--shared", "--approve", number]) == 2
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "stopped" and "broker book's follow list" in out["reason"] and "changed" in out["reason"], out
     assert len([c for c in venue.calls if c[0] == "submit"]) == calls_before
@@ -2411,7 +2481,7 @@ T50_KEY, T50_SECRET = "ZqLiveKey7Rt4Kw9PmXv2Bn", "ZqLiveSecret3LbNHs4GdYp8"
 T50_NAMES = ("WEBULL_LIVE_APP_KEY", "WEBULL_LIVE_APP_SECRET")
 REAL_LIVE_ENVIRON = cli._live_environ                                  # before live_project replaces it
 REAL_ATTENDED = getattr(cli, "_attended", lambda: pytest.fail("no _attended"))
-LIVE_RUNS = (["--live", "--propose", "--capital", "100000"], ["--live", "--approve", "123456", "--capital", "100000"],
+LIVE_RUNS = (["--live", "--shared", "--propose"], ["--live", "--shared", "--approve", "123456"],
              ["--live", "--check"])
 
 
@@ -2580,7 +2650,7 @@ def test_t50_a_live_value_never_reaches_stdout_stderr_the_journal_an_exception_o
 
     monkeypatch.setattr(cli, "_order_step_live_venue", build)
     codes = [cli.main(["--root", str(root), "order-step", "--live", "--check"]),
-             cli.main(["--root", str(root), "order-step", "--live", "--propose", "--capital", "100000"])]
+             cli.main(["--root", str(root), "order-step", "--live", "--shared", "--propose"])]
     captured = capsys.readouterr()
     stored = b"".join(p.read_bytes() for p in root.rglob("*") if p.is_file())
     printed_clean = _t50_clean(captured.out + captured.err)
