@@ -39,7 +39,10 @@ matched by keyword only, not read one by one. Item H-1 closes that.
    `~/valedia-data/polymarket/forward-copy-screen/copy_screen_report.json` (sha256 d8b93f16…). The rule is locked:
    no re-screen with looser lines. Copying wallets is closed as a route; the owner allowed more backtests.
    Fund book: **S4c MERGED** (main 8908c4d, blind check PASS_WITH_NOTES); rulings R32 to R34 in
-   `.foreman/tickets/T51c-S4c2-go-live-counts-shortfall.md` (S4c-2 building; R34 goes to S4e).
+   `.foreman/tickets/T51c-S4c2-go-live-counts-shortfall.md` (R34 goes to S4e). **S4c-2 MERGED** (main e375fc3,
+   two blind checks). **Practice gate moved** to e375fc3; the lead wrote the practice book's opening entry (R30:
+   cash_in 1,001,229.06, book value 996,749.85 = Friday's paper equity); the practice job passes `--shared` from
+   **Mon 2026-11-23 6:55 AM PST**, the first shared practice run. S4d (live shared) building.
 4. Hermes, Paperclip and Live-page work PARKED until 1 is done (each by name: elephant-code-mode follow-ups,
    Paperclip seats' daytime test VAL-19, the Mission tab's nightly refresh, the Engineer's key file wiring).
 
