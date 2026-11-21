@@ -3507,9 +3507,9 @@ class _Run:
     def _shortfall_stop(self, first, second, still: list[dict]) -> str | None:
         """R24: the words of a stop at stage `shortfall`, or None. The ledger stands in the way only because the account
         holds less than the book counts as its own: the second reconcile lists a shortfall (or, when its positions read
-        raised, the first one did), and nothing else is wrong in either (no unresolved order, anomaly, difference or
-        positions that could not be read except as said; no order still open, sent or unknown; no fill unapplied; no
-        blocking attention item). Anything else stays `reconcile`."""
+        raised, the first one did: it is never taken as "the venue could not be read"), and nothing else is wrong in
+        either (no unresolved order, anomaly or difference; no order still open, sent or unknown; no fill unapplied; no
+        blocking attention item). Anything else stays `reconcile`, with the shortfall in its words."""
         try:
             if still or not (isinstance(first, dict) and isinstance(second, dict)):
                 return None
@@ -3521,8 +3521,6 @@ class _Run:
             for res in (first, second):
                 if res.get("unresolved") or res.get("anomalies") or res.get("position_differences"):
                     return None
-            if first.get("positions_error") is not None or (second.get("positions_error") is not None and not from_first):
-                return None
             if self.ledger.orders(("sent", "unknown")) or self.ledger.unapplied_fills():
                 return None
             for item in self.ledger.attention(open_only=False):

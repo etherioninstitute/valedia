@@ -776,3 +776,48 @@ def test_the_command_lines_shared_flag_reaches_the_run_and_is_refused_where_it_c
     assert cli.main(["--root", str(tmp_path), "order-step", "--owner-entry", "cash_in", "--venue", venue.name, "--amount",
                      "1", "--who", "o", "--note", "n", "--shared"]) == 2               # the owner's entry takes no run flag
     assert "--shared" in capsys.readouterr().err
+
+
+def test_a_shortfall_beside_something_else_wrong_is_a_reconcile_stop_that_keeps_the_shortfalls_words(mk):
+    w = mk()
+    w.open_book()
+    w.shared()
+    w.paper = T.paper({"a": {"SPY": 100.0, "QQQ": 20.0}})
+    w.venue.fill_at_once = 0.0                            # the QQQ order stays open at the venue ...
+    w.later()
+    assert w.shared()["status"] == "done"
+    w.venue.cancel_answer = "not yet"                     # ... and its cancel does not take
+    w.venue.held["SPY"] -= 30.0                           # ... while the owner sells 30 of the book's SPY
+    w.later()
+    w.venue.calls.clear()
+    out = w.shared()
+    assert out["status"] == "stopped" and out["stage"] == "reconcile", out
+    for words in ("still open at the broker", "SPY", "70.0", "100.0", "the owner sold shares the book counts as its own"):
+        assert words in out["reason"], (words, out["reason"])
+    assert "submit" not in w.venue.names()
+
+
+def test_an_approval_of_a_shared_ticket_is_not_judged_on_an_exact_capital(mk):
+    w = mk()
+    w.open_book("40000")                                  # a book of 40,000 against a paper equity of 100,000
+    number = w.shared(propose=True)["ticket_number"]
+    (row,) = w.sql("SELECT * FROM tickets", path=osx.ticket_path_for(w.state_path))
+    assert row["capital"] == pytest.approx(40_000.0)
+    w.later(1)
+    out = w.shared(approve=number)
+    assert out["status"] == "done" and out["orders_sent"] == 1 and sent_units(w) == {"SPY": 40.0}, out
+
+
+
+
+# ---- the other options a practice run has
+
+def test_a_shared_run_may_be_fractional_and_still_judges_the_book_alone(mk):
+    w = mk(max_position_pct=1.0)
+    w.venue.held = {"SPY": 7.0}                           # the owner's own shares: never part of the book's position
+    w.open_book()
+    w.paper = T.paper({"a": {"SPY": 100.4}})
+    out = w.shared(fractional=True)
+    assert out["status"] == "done" and out["refused"] == [] and "faults" not in out, out
+    assert sorted(s["units"] for s in out["sent"]) == [0.4, 100.0], out["sent"]       # the whole leg and the remainder leg
+    assert out["shared"]["owner_surplus"] == ["SPY"]
