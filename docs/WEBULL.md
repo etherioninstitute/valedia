@@ -303,12 +303,15 @@ usual):
 - `clock`: only from 30 minutes after the open to 30 minutes before the close (`MARKET_AFTER_OPEN`,
   `MARKET_BEFORE_CLOSE`; a half-day's close as the calendar has it), judged again at the moment of sending;
 - `quote_age`: its quote at most 120 seconds old at the moment of sending (`MARKET_QUOTE_MAX_AGE_SECONDS`; LIMIT legs keep
-  their 20 minutes), judged again at the moment of sending. When the quote in hand has passed 120 seconds at the moment
-  the collar is about to judge it (and a later whole clock second has begun since the leg last asked for it), the order step asks its own
-  quote path ONCE more, right before the collar, and takes the answer only when it is usable and newer; the leg is then
-  judged again from the top on that quote (its collar price, value, the gate, the budget, live's caps and second source),
-  once. A source with nothing newer leaves the leg to the collar's own `quote_age` hold-back, which is no fault. This holds
-  on practice and live alike (an approval; a proposal has no collar);
+  their 20 minutes), judged again at the moment of sending. In one judgment of a MARKET leg there is at most ONE ask of its
+  quote beyond the quote in hand when the judgment starts, and that count includes the ask the judgment's own refresh
+  makes when the quote in hand is already older than 120 seconds. So: if the refresh asked, nothing asks again; if it did
+  not (the quote was fresh when judging began) and the quote has passed 120 seconds by the moment the collar is about to
+  judge it (a later whole clock second, and not asked for in this one), the order step asks its own quote path ONCE more,
+  right before the collar, and takes the answer only when it is usable and newer. The leg is then judged again from the
+  top on that quote (its collar price, value, the gate, the budget, live's caps and second source), once, without any
+  further ask. A source with nothing newer leaves the leg to the collar's own `quote_age` hold-back, which is no fault. This holds on
+  practice and live alike (an approval; a proposal has no collar);
 - `quote_move`: the quote within 0.5% (`TICKET_QUOTE_MOVE`) of the quote the leg was decided at. This name appears on an
   ordinary run only. On an approval the ticket check runs before the collar and compares the fresh quote with the
   ticket's: a quote more than 0.5% away DROPS the leg there (a `dropped` entry with the reason in words, not named
@@ -414,9 +417,11 @@ system ever sends without a limit price, and it is sent only behind four locks, 
 NOT stop and does NOT turn fractional: it is, in what it reads, decides and writes, the same live run as without
 `--fractional` (no split, no zero rule, no five-decimal units or minimum, no residual, the ticket not marked
 fractional), because a stop, or a half-fractional run, would change the whole-share path. The one addition is the
-`live_fractions` block on its summary, which says why: `open` (false), `consent`, the practice reading (`practice`:
-purchases and sales found, and why if it could not be read) and `why` (what is missing, in words). When the opening is
-open the block also carries `first_contact` and the live reading (`live_clean`). A live run that stops before the opening
+`live_fractions` block on its summary, which says why. Its fields: `open` (false); `consent` (true or false: whether the
+confirmation holds the owner's line as JSON true); `practice`, when the practice record was read (`purchases` and `sales`:
+how many clean MARKET remainder fills were found of each side, and `unreadable`, in words, only when the record could not
+be read); and `why` (what is missing, in words). When the opening is open the block carries `open` true, `consent`,
+`practice`, `first_contact` and the live reading (`live_clean`: `purchases` and `sales` of the live record). A live run that stops before the opening
 is judged (a lapsed or absent confirmation, an unmet lock, a flag combination refused) is also exactly the stop of the
 run without `--fractional`, its summary carrying only a `live_fractions` block that says it stopped before the opening
 was judged. A ticket made with an open opening is marked fractional and a ticket made with a shut one is marked as
@@ -427,8 +432,8 @@ appeared or vanished, so that the opening opened or shut, the ticket's fractiona
 fractional units" (a shut ticket, an approval now open) or "that ticket was made with fractional units" (an open
 ticket, an approval now shut). The command line prints the approve hint with `--fractional` only when the opening was
 open; when it was shut, or the run stopped before it was judged, it prints exactly what the run without the flag prints.
-`--live --check --fractional` is refused in words, as `--live --check --shared` is (a check judges the locks and sends
-nothing). The first MARKET order on live is therefore your own decision twice over: the practice proof
+`--live --check --fractional` is refused with the words it was refused with before this build ("live mode trades whole
+shares only (no --fractional)"), as `--live --check --shared` is: a check judges the locks and sends nothing. The first MARKET order on live is therefore your own decision twice over: the practice proof
 you ran, and the line you wrote.
 
 **The quote re-ask** (B5, see the collar's `quote_age`) applies to a live remainder leg as to a practice one.

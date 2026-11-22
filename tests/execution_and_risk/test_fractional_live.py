@@ -954,6 +954,8 @@ def _shut_pair(mkl, spec):
             if p.get("ticket_number"):
                 rows.append(lw.approve(p["ticket_number"], fractional=flag))
             lw.later(30)
+        if not flag:
+            assert "live_fractions" not in json.dumps(lw.journal_events()), "a run without the flag wrote the block"
         journal = [e for e in lw.journal_events() if e.get("event") in ("order", "left_over", "refused", "dropped", "fill",
                                                                           "summary", "unknown", "ticket", "no_quote")]
         led = lw.ledger()
@@ -1103,6 +1105,8 @@ def test_r2_1_every_live_stop_with_the_flag_is_the_live_stop_without_it_and_no_f
                 assert key not in out, (how, flag, key)
             for e in lw.journal_events("summary"):
                 assert "residuals" not in e or e["batch"] != out["batch"], (how, "a journaled summary holds `residuals`", e)
+            if not flag:                                   # UNMASKED: a run without the flag never has the block, anywhere
+                assert "live_fractions" not in out and "live_fractions" not in json.dumps(lw.journal_events()), (how, out)
             got.append((_everything(lw, out), out))
             stopped += 1
         assert got[0][0] == got[1][0], how
@@ -1170,3 +1174,55 @@ def test_r2_4_a_ticket_made_with_an_open_opening_is_refused_by_its_mark_when_the
     osx.ledger_path_for(lw.tmp / "memory", "webull-sandbox").unlink()   # the practice ledger is gone: no proof
     refused = lw.approve(out["ticket_number"], fractional=True)
     assert refused["status"] == "stopped" and "made with fractional units" in refused["reason"], refused
+
+
+# ---- T51 B repair3 (1): at most ONE ask beyond the quote in hand per judgment of a leg, the refresh's ask counted
+
+def test_r3_1_a_leg_the_refresh_already_asked_for_is_not_asked_again_by_the_re_ask_when_a_new_second_begins(tmp_path, monkeypatch):
+    w = collar_world(tmp_path / "w")
+    w.quote_age["SPY"] = 130.0                                         # old at the start: the refresh asks (build A's ask)
+    age_the_market_leg_after_its_checks(w, monkeypatch, 1.0)           # and a whole second passes in the gate
+    asks = []
+    real = w.quotes
+    w.quotes = lambda symbols: (asks.append(list(symbols)), real(symbols))[1]
+    out = w.run(fractional=True)
+    (left,) = held_back(out)
+    assert left["collar"] == "quote_age" and "faults" not in out, (left, out)
+    assert asks == [["SPY"], ["SPY"]], asks                            # the run's first ask and the refresh's: no third
+
+
+def test_r3_1_the_same_in_a_live_run_with_the_clock_moving_in_the_second_source(mkl):
+    def asks_in_the_approval(old):
+        lw = frac_world(mkl, target=0.5)
+        out = lw.propose(fractional=True)
+        lw.later(1)
+        if old:
+            lw.quote_age["SPY"] = 130.0
+        state = {"slow": True}
+
+        class Second(type(lw.second)):
+            def __call__(self, first_price, symbol, **kw):
+                if state["slow"]:
+                    state["slow"] = False
+                    lw.clock.t += 1.0                                  # a whole second in the second source
+                return super().__call__(first_price, symbol, **kw)
+        lw.second = Second()
+        before = len(lw.quote_calls)
+        lw.approve(out["ticket_number"], fractional=True)
+        return [c for c in lw.quote_calls[before:] if c == ["SPY"]]
+    assert len(asks_in_the_approval(old=True)) == 2                    # the first ask and the refresh's; the re-ask adds none
+
+
+# ---- T51 B repair3 (3): on an approval the first-contact leg is the fund of the ticket's remainder line
+
+def test_r3_3_an_approval_picks_the_ticket_remainder_funds_leg_even_when_a_move_reorders_the_least_value(mkl):
+    lw = frac_world(mkl)
+    lw.prices["IWM"] = 200.4                                           # IWM 0.1 x 200.4 = 20.04; GLD 0.08 x 250 = 20.00
+    lw.paper = paper({"a": {"GLD": 0.8, "IWM": 1.0}})
+    out = lw.propose(fractional=True)
+    assert [(e["fund"], e["leg"]) for e in out["ticket"]["orders"]] == [("GLD", "remainder")], out["ticket"]["orders"]
+    lw.prices["GLD"] = 251.0                                           # +0.4%, inside the band: GLD 20.08 now above IWM 20.04
+    lw.later(1)
+    done = lw.approve(out["ticket_number"], fractional=True)
+    assert done["status"] == "done" and done["orders_sent"] == 1, done
+    assert [s["symbol"] for s in lw.venue.limitless()] == ["GLD"], lw.venue.limitless()

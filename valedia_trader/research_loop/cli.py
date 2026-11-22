@@ -762,8 +762,7 @@ def _live_args_refusal(args) -> str | None:
     if shared and check:
         return "--check judges the locks and sends nothing: it takes no --shared (a live run is --live --shared --propose)"
     if check and getattr(args, "fractional", False) and live:
-        return ("--check judges the locks and sends nothing: it takes no --fractional (a live fractional run is "
-                "--live --shared --fractional --propose)")
+        return "live mode trades whole shares only (no --fractional)"      # 4db3192's own words, for a check
     if not live:
         return None
     capital = getattr(args, "capital", None)

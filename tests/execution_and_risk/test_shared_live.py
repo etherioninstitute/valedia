@@ -164,7 +164,7 @@ def test_check_takes_no_fractional_as_before_t51_b():
     """4db3192 refused `--live --check --fractional`; the flag is not silently ignored."""
     for kw in ({}, {"capital": 1000.0}):
         why = cli._live_args_refusal(ns(live=True, check=True, fractional=True, **kw))
-        assert why and "--check" in why and "--fractional" in why, why
+        assert why == "live mode trades whole shares only (no --fractional)", why      # 4db3192's own words
     assert cli._live_args_refusal(ns(live=True, check=True)) is None
 
 

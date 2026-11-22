@@ -3708,6 +3708,7 @@ class _Run:
         self.journaled_symbols: set = set()              # T34b-2 J2: the symbols of the fills this run journaled
         self.quote_times: dict[str, float] = {}
         self.asked: dict[str, float] = {}               # when each symbol was last asked of the quote function
+        self.ask_counts: dict[str, int] = {}             # T51 B repair3: how many times each symbol has been asked, in all
         self.torn_lines: list[dict] = []
         self.paper_read: PaperTargets | None = None
         self._line_ended = False
@@ -5621,6 +5622,7 @@ class _Run:
         if ask:
             for s in ask:
                 self.asked[s] = now
+                self.ask_counts[s] = self.ask_counts.get(s, 0) + 1
             try:
                 raw = dict(self.quotes(ask) or {})
             except Exception as exc:
@@ -5656,6 +5658,7 @@ class _Run:
         is usable and newer than the quote in hand; True when taken (it goes into `in_hand` with its time). A failure to
         ask or an answer that is not usable or newer leaves everything as it was: the collar then judges the old quote."""
         self.asked[sym] = self._now()
+        self.ask_counts[sym] = self.ask_counts.get(sym, 0) + 1
         try:
             raw = dict(self.quotes([sym]) or {})
         except Exception:
@@ -5950,6 +5953,7 @@ class _Run:
                 self._leave(c, f"the order is above {MAX_UNITS:,.0f} units in size")
                 continue
             quote, judged = in_hand.get(sym, c["quote"]), None   # the latest quote in hand (a holding's may be newer)
+            c.setdefault("asks_at_start", self.ask_counts.get(sym, 0))   # T51 B repair3: asks of this leg's symbol so far
             for round_ in (1, 2):
                 quote, stale, unpriced = self._refresh(sym, quote, held, in_hand, market and not c.get("reasked"))   # 1. one ask
                                                          # (T51 B5: a leg put back after its re-ask asks no more)
@@ -6010,6 +6014,7 @@ class _Run:
                     continue
             if market and self.mode != "propose":        # T51 R5: the collar, before its intend (a line is not an order)
                 if (not c.get("reasked") and not self._quote_fresh(sym, MARKET_QUOTE_MAX_AGE_SECONDS)
+                        and self.ask_counts.get(sym, 0) == c["asks_at_start"]       # T51 B repair3: the refresh has not asked
                         and not self._asked_this_second(sym)):
                     c["reasked"] = True                  # T51 B5: past 120 s at the moment of judging, and not asked for in
                     if self._ask_again(sym, in_hand):    # this very second: ask once more, right before the collar; a newer
