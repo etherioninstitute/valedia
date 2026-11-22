@@ -3983,3 +3983,131 @@ def test_r33a_old_against_new_with_the_key_the_same_tables_plus_exactly_the_rule
         opened += len(mine)
         closed += sum(1 for m in mine if m[2] is not None)
     assert opened > 30 and closed > 10, (opened, closed)
+
+
+# ---- T51 B6 (2): a file that SAYS layout 4 has its whole schema checked, by both the write-open and the read-only open
+
+def _layout4_file(tmp_path: Path, name: str = "four.sqlite") -> Path:
+    path = tmp_path / name
+    led = ledger(path)
+    intend(led, tag="w-1", units=3.0, limit_price=91.0)
+    intend(led, tag="m-1", units=0.5, order_type="MARKET", collar_price=90.9)
+    led.close()
+    return path
+
+
+def _damage(path: Path, how: str) -> None:
+    """One change to a layout-4 file that keeps `PRAGMA user_version` at 4: the file still says layout 4."""
+    raw = sqlite3.connect(str(path))
+    raw.isolation_level = None
+    try:
+        if how == "trigger orders_type_fixed gone":
+            raw.execute("DROP TRIGGER orders_type_fixed")
+        elif how == "trigger events_no_update gone":
+            raw.execute("DROP TRIGGER events_no_update")
+        elif how == "trigger fills_no_delete gone":
+            raw.execute("DROP TRIGGER fills_no_delete")
+        elif how == "index attention_one_open gone":
+            raw.execute("DROP INDEX attention_one_open")
+        elif how == "an extra table":
+            raw.execute("CREATE TABLE notes (x TEXT)")
+        elif how == "an extra column":
+            raw.execute("ALTER TABLE orders ADD COLUMN extra TEXT")
+        elif how == "an extra trigger":
+            raw.execute("CREATE TRIGGER extra BEFORE DELETE ON orders BEGIN SELECT 1; END")
+        elif how == "the type's trigger weakened":
+            raw.execute("DROP TRIGGER orders_type_fixed")
+            raw.execute("CREATE TRIGGER orders_type_fixed BEFORE UPDATE OF order_type ON orders "
+                        "WHEN NEW.order_type IS NOT OLD.order_type BEGIN SELECT RAISE(ABORT, 'x'); END")
+        elif how == "a table dropped":
+            raw.execute("DROP TABLE reconciles")
+        elif how == "the orders table rebuilt without the columns' checks":
+            rows = raw.execute("SELECT * FROM orders").fetchall()
+            raw.execute("DROP TRIGGER orders_type_fixed")
+            raw.execute("ALTER TABLE orders RENAME TO old_orders")
+            raw.execute("CREATE TABLE orders (tag TEXT PRIMARY KEY, symbol TEXT NOT NULL, units REAL NOT NULL, "
+                        "reference_price REAL NOT NULL, limit_price REAL, batch TEXT, parts TEXT, state TEXT NOT NULL, "
+                        "created REAL NOT NULL, sent_at REAL, updated REAL NOT NULL, venue TEXT, venue_order_id TEXT, "
+                        "filled_units REAL NOT NULL DEFAULT 0, avg_price REAL, fee REAL, raw_status TEXT, note TEXT, "
+                        "priced_units REAL NOT NULL DEFAULT 0, priced_avg REAL, never_arrived_at REAL, finished_at REAL, "
+                        "amount_unconfirmed INTEGER NOT NULL DEFAULT 0, order_type TEXT NOT NULL DEFAULT 'LIMIT', "
+                        "collar_price REAL)")
+            raw.execute("DROP TABLE old_orders")
+            assert rows
+        elif how == "layout 3 numbered 4":                     # a layout-3 file (no new columns) whose number was raised
+            raw.execute("DROP TRIGGER orders_type_fixed")
+            raw.execute("ALTER TABLE orders DROP COLUMN collar_price")
+            raw.execute("ALTER TABLE orders DROP COLUMN order_type")
+        else:
+            raise AssertionError(how)
+    finally:
+        raw.close()
+    version = sqlite3.connect(str(path))
+    try:
+        assert version.execute("PRAGMA user_version").fetchone()[0] == 4, how
+    finally:
+        version.close()
+
+
+DAMAGES = ["trigger orders_type_fixed gone", "trigger events_no_update gone", "trigger fills_no_delete gone",
+           "index attention_one_open gone", "an extra table", "an extra column", "an extra trigger",
+           "the type's trigger weakened", "a table dropped", "the orders table rebuilt without the columns' checks",
+           "layout 3 numbered 4"]
+
+
+@pytest.mark.parametrize("how", DAMAGES)
+def test_b6_a_file_that_says_layout4_with_another_schema_is_refused_in_words_by_both_opens_and_not_changed(tmp_path, how):
+    path = _layout4_file(tmp_path)
+    _damage(path, how)
+    before = path.read_bytes()
+    with pytest.raises(OrderError, match=r"says layout 4, but its tables are not"):
+        ledger(path)
+    with pytest.raises(OrderError, match=r"says layout 4, but its tables are not"):
+        orders.open_read_only(path)
+    assert path.read_bytes() == before, "a refused open changed the file"
+
+
+def test_b6_the_write_open_checks_the_schema_before_it_writes_anything(tmp_path):
+    path = _layout4_file(tmp_path)
+    _damage(path, "trigger orders_type_fixed gone")
+    raw = sqlite3.connect(str(path))
+    raw.execute("UPDATE orders SET order_type = 'LIMIT' WHERE tag = 'w-1'")      # changeable now: the trigger is gone
+    raw.commit()
+    raw.close()
+    stamp = os.stat(path).st_mtime_ns
+    with pytest.raises(OrderError, match="layout 4"):
+        ledger(path)
+    assert os.stat(path).st_mtime_ns == stamp
+
+
+def test_b6_a_new_file_an_upgraded_file_and_a_reopened_file_all_pass_the_check(tmp_path, old_orders):
+    fresh = _layout4_file(tmp_path)
+    ledger(fresh).close()                                        # reopened for writing
+    orders.open_read_only(fresh).close()
+    old = _old_ledger_file(old_orders, tmp_path / "up.sqlite")
+    ledger(old).close()                                          # upgraded 3 -> 4 by the write-open
+    assert _look(old)["version"] == 4 and _look(old)["master"] == _look(fresh)["master"]
+    ledger(old).close()                                          # and then opened again as a layout-4 file
+    orders.open_read_only(old).close()
+
+
+def test_b6_over_seeded_damages_every_one_is_refused_and_no_undamaged_file_is(tmp_path):
+    refused = passed = 0
+    for seed in range(40):
+        rng = random.Random(81_000 + seed)
+        path = _layout4_file(tmp_path, f"s{seed}.sqlite")
+        how = rng.choice([None] + DAMAGES)
+        if how is not None:
+            _damage(path, how)
+        before = path.read_bytes()
+        for opener in (lambda p: ledger(p).close(), lambda p: orders.open_read_only(p).close()):
+            if how is None:
+                opener(path)
+                passed += 1
+            else:
+                with pytest.raises(OrderError, match="layout 4"):
+                    opener(path)
+                refused += 1
+        if how is not None:
+            assert path.read_bytes() == before, (seed, how)
+    assert refused > 20 and passed > 4, (refused, passed)

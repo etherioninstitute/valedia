@@ -299,9 +299,19 @@ def _master(db: sqlite3.Connection) -> list:
 
 def _layout3_master() -> list:
     """The schema a layout-3 file has, as sqlite records it (built from the layout-3 statements in memory)."""
+    return _master_of(_LAYOUT3_SCHEMA)
+
+
+def _layout4_master() -> list:
+    """T51 B6 (2): the schema a layout-4 file has, as sqlite records it: every table, column, index and trigger, built
+    from the statements a new file runs (an upgraded layout-3 file reads the same, which a test holds)."""
+    return _master_of(SCHEMA)
+
+
+def _master_of(statements) -> list:
     db = sqlite3.connect(":memory:")
     try:
-        for statement in _LAYOUT3_SCHEMA:
+        for statement in statements:
             db.execute(statement)
         return _master(db)
     finally:
@@ -318,12 +328,19 @@ def unreadable_layout(db: sqlite3.Connection) -> str | None:
         return f"it has layout {version}, and this code reads layouts {' and '.join(map(str, READABLE_LAYOUTS))} only"
     if version == 3 and _master(db) != _layout3_master():
         return "it says layout 3, but its tables are not layout 3's"
+    if version == 4 and _master(db) != _layout4_master():     # T51 B6 (2): the whole schema, not only the number
+        return "it says layout 4, but its tables are not layout 4's"
     return None
 
 
 def _not_layout3(path) -> OrderError:
     return OrderError(f"the ledger file {_one_line(path)} says layout 3, but its tables are not the layout 3 this module "
                       "upgrades; it is not opened, and nothing in it was changed")
+
+
+def _not_layout4(path) -> OrderError:
+    return OrderError(f"the ledger file {_one_line(path)} says layout 4, but its tables are not the layout 4 this module "
+                      "writes (a table, column, index or trigger differs); it is not opened, and nothing in it was changed")
 
 
 class OrderLedger:
@@ -338,7 +355,8 @@ class OrderLedger:
     at layout 3 whose schema is exactly layout 3's is upgraded to layout 4 inside the open's own write transaction
     (T51 R7: `order_type` and `collar_price` added, every existing order a LIMIT order with no collar price), so it is
     either upgraded completely or left as it was, and of several openers exactly one upgrades it. A file written with
-    any other layout, or at layout 3 with another schema, is refused, never repaired. `open_read_only` reads a file
+    any other layout, or at layout 3 or 4 with another schema (T51 B6: the whole schema of a file that says layout 4 is
+    checked, tables, columns, indexes and triggers), is refused, never repaired. `open_read_only` reads a file
     at layout 3 or 4 and never writes it. `not_sent` lists exception classes that
     guarantee nothing was transmitted; any other failure of a submit leaves the order `unknown`. `clock` gives
     the time in seconds.
@@ -392,6 +410,8 @@ class OrderLedger:
                 elif ours and version != LAYOUT_VERSION:
                     raise OrderError(f"the ledger file {path} was written by a different version of this module "
                                      f"(layout {version}, this module writes layout {LAYOUT_VERSION}); it is not opened")
+                elif ours and _master(self._db) != _layout4_master():   # T51 B6 (2): says layout 4: the whole schema holds
+                    raise _not_layout4(path)
                 if not ours and (anything or version != 0):   # only a new or empty database becomes a ledger
                     raise OrderError(f"the file {path} is a database but not an order ledger (it has other tables or "
                                      f"user_version {version}); it is not opened")
