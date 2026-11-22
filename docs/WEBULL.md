@@ -304,7 +304,7 @@ usual):
   `MARKET_BEFORE_CLOSE`; a half-day's close as the calendar has it), judged again at the moment of sending;
 - `quote_age`: its quote at most 120 seconds old at the moment of sending (`MARKET_QUOTE_MAX_AGE_SECONDS`; LIMIT legs keep
   their 20 minutes), judged again at the moment of sending. When the quote in hand has passed 120 seconds at the moment
-  the collar is about to judge it (and the clock has moved since the leg last asked for it), the order step asks its own
+  the collar is about to judge it (and a later whole clock second has begun since the leg last asked for it), the order step asks its own
   quote path ONCE more, right before the collar, and takes the answer only when it is usable and newer; the leg is then
   judged again from the top on that quote (its collar price, value, the gate, the budget, live's caps and second source),
   once. A source with nothing newer leaves the leg to the collar's own `quote_age` hold-back, which is no fault. This holds

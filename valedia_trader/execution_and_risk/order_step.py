@@ -5641,6 +5641,12 @@ class _Run:
         in_hand[sym] = quote
         return quote, None, sorted(s for s, u in held.items() if u > UNITS_EPS and not self._quote_fresh(s))
 
+    def _asked_this_second(self, sym: str) -> bool:
+        """T51 B repair F6: whether `sym` was last asked for in the same WHOLE clock second as now (the clock's floor),
+        so a fraction of a second never counts as time for a quote to have moved on. Never asked: False."""
+        asked = self.asked.get(sym)
+        return asked is not None and math.floor(asked) == math.floor(self._now())
+
     def _ask_again(self, sym: str, in_hand: dict) -> bool:
         """T51 B5: ask the order step's own quote path ONCE more for `sym` (nothing else), and take the answer only when it
         is usable and newer than the quote in hand; True when taken (it goes into `in_hand` with its time). A failure to
@@ -5999,7 +6005,7 @@ class _Run:
                     continue
             if market and self.mode != "propose":        # T51 R5: the collar, before its intend (a line is not an order)
                 if (not c.get("reasked") and not self._quote_fresh(sym, MARKET_QUOTE_MAX_AGE_SECONDS)
-                        and self.asked.get(sym) != self._now()):
+                        and not self._asked_this_second(sym)):
                     c["reasked"] = True                  # T51 B5: past 120 s at the moment of judging, and not asked for in
                     if self._ask_again(sym, in_hand):    # this very second: ask once more, right before the collar; a newer
                         if self.live is not None and units > 0 and self.live_buys:   # usable quote is taken, and the leg is

@@ -992,3 +992,52 @@ def test_f1_the_repro_cases_one_share_held_and_a_target_under_the_minimum_or_a_d
         flagged, plain = _shut_pair(mkl, {"shut": "no proof", "prelude": prelude, "wanted": wanted, "min_trade_pct": mtp})
         assert _plain(flagged[0]) == _plain(plain[0]) and flagged[2] == plain[2], (wanted, mtp)
         assert plain[0][0].get("ticket", {}).get("orders", []) == [], (wanted, plain[0][0])   # without the flag: no order
+
+
+# ---- T51 B repair F6: "asked in this very second" is judged on whole clock seconds, not on float equality
+
+def test_f6_a_fraction_of_a_second_since_the_last_ask_is_the_same_second_and_no_re_ask(tmp_path, monkeypatch):
+    w = collar_world(tmp_path / "w")
+    w.clock.t += 0.2
+    w.quote_age["SPY"] = 130.0                                         # old at every ask: the collar must hold it back
+    age_the_market_leg_after_its_checks(w, monkeypatch, 0.3)           # the clock moves 0.3 s while the leg is judged
+    asks = []
+    real = w.quotes
+    w.quotes = lambda symbols: (asks.append(list(symbols)), real(symbols))[1]
+    out = w.run(fractional=True)
+    (left,) = held_back(out)
+    assert left["collar"] == "quote_age" and asks == [["SPY"], ["SPY"]], (asks, left)
+
+
+def test_f6_a_second_or_more_since_the_last_ask_and_a_quote_past_120_seconds_is_asked_again(tmp_path, monkeypatch):
+    w = collar_world(tmp_path / "w")
+    w.clock.t += 0.2                                                   # asked at x.2; the quote is 60 s old
+    age_the_market_leg_after_its_checks(w, monkeypatch, 61.0)          # 61 s later (another second): 121 s old
+    asks = []
+    real = w.quotes
+    w.quotes = lambda symbols: (asks.append(list(symbols)), real(symbols))[1]
+    out = w.run(fractional=True)
+    assert out["status"] == "done" and asks == [["SPY"], ["SPY"]], (asks, out)
+
+
+# ---- T51 B repair F4: a leg put back for its re-ask is not counted twice against max_capital
+
+def test_f4_a_live_buy_judged_again_after_its_re_ask_counts_once_against_max_capital(mkl, monkeypatch):
+    """The book holds 19 SPY (9,500 at its marks) under a max_capital of 10,000. A remainder purchase of 0.5 (252.50 at its
+    collar price) fits once (9,752.50) and not twice (10,005.00). A minute passes while the leg is judged, so it is asked
+    for again and judged again: the buy of its first judging must be taken back, or the second judging refuses it."""
+    lw = frac_world(mkl, target=19.0, conf={CONSENT: True, "max_capital": 10_000, "max_order_value": 10_000})
+    out = lw.propose(fractional=True)
+    lw.later(1)
+    assert lw.approve(out["ticket_number"], fractional=True)["orders_sent"] == 1          # 19 SPY, whole shares
+    lw.later(30)
+    lw.paper = paper({"a": {"SPY": 195.0}})                                               # 19.5: a remainder of 0.5
+    out = lw.propose(fractional=True)
+    assert [(ln["units"], ln["leg"]) for ln in out["ticket"]["orders"]] == [(0.5, "remainder")], out
+    lw.later(1)
+    age_the_market_leg_after_its_checks(lw, monkeypatch, 61.0)           # a minute passes while the 0.5 leg is judged
+    before = len(lw.quote_calls)
+    done = lw.approve(out["ticket_number"], fractional=True)
+    assert [c for c in lw.quote_calls[before:] if c == ["SPY"]] == [["SPY"], ["SPY"]], "the leg was not asked for again"
+    assert done["status"] == "done" and done["orders_sent"] == 1 and done["dropped"] == [], done
+    assert [s["fractional_live"] for s in lw.venue.limitless()] == [True]
