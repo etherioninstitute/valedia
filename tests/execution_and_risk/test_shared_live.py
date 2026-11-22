@@ -155,7 +155,9 @@ def test_live_without_shared_is_refused_in_words_and_a_capital_with_it(lw):
         why = cli._live_args_refusal(ns(live=True, shared=True, capital=1000.0, **ticket))
         assert why and "--capital" in why and "book" in why, why
     assert "--shared" in cli._live_args_refusal(ns(live=True))                       # neither a ticket flag nor --shared
-    assert "whole shares" in cli._live_args_refusal(ns(live=True, shared=True, fractional=True, propose=True))
+    assert cli._live_args_refusal(ns(live=True, shared=True, fractional=True, propose=True)) is None    # T51 B3: lifted
+    assert cli._live_args_refusal(ns(live=True, shared=True, fractional=True, approve="123456")) is None
+    assert "--shared" in cli._live_args_refusal(ns(live=True, fractional=True, propose=True))             # the others stay
 
 
 def test_check_is_as_it_was_and_shared_with_check_is_refused():
@@ -186,6 +188,12 @@ def test_the_live_command_hands_the_run_shared_and_no_capital_and_prints_a_share
     assert seen["shared"] is True and seen["capital"] is None and seen["live"] == "FILES" and seen["fractional"] is False
     printed = capsys.readouterr().out
     assert "--live --shared --approve NUMBER" in printed and "--capital" not in printed, printed
+    assert seen["practice_ledger"] == osx.ledger_path_for(paths.memory, gl.PAPER_VENUE)     # T51 B1: where the proof is read
+    seen.clear()                                                                               # T51 B3: --fractional goes through
+    assert cli._run_live(ns(live=True, shared=True, propose=True, fractional=True), paths, T.LiveVenue(), "FILES", None) == 0
+    assert seen["fractional"] is True and seen["shared"] is True and seen["capital"] is None
+    printed = capsys.readouterr().out
+    assert "--live --shared --fractional --approve NUMBER" in printed and "--capital" not in printed, printed
 
 
 def test_a_live_shared_run_given_a_capital_is_refused_before_the_lock(lw):

@@ -3575,14 +3575,15 @@ class _SubmitWatch:
     """The venue as handed to ledger.submit_once: it remembers the call's exception or answer, so that what the run
     writes about the outcome comes from the order step's own words, not from the venue's text in the ledger's note."""
 
-    def __init__(self, venue) -> None:
+    def __init__(self, venue, extra: dict | None = None) -> None:
         self._venue = venue
+        self._extra = dict(extra or {})                  # T51 B3: arguments added to every submit (the live remainder's flag)
         self.called, self.error, self.answer = False, None, None
 
     def submit(self, *args, **kwargs):
         self.called = True
         try:
-            self.answer = self._venue.submit(*args, **kwargs)
+            self.answer = self._venue.submit(*args, **{**kwargs, **self._extra})
         except BaseException as exc:
             self.error = exc
             raise
@@ -3614,7 +3615,8 @@ _ABSENT = object()
 def run_order_step(*, ledger: OrderLedger, venue, paper, quotes: Callable, journal, limits_file, state,
                    clock: Callable[[], float] = wall_clock, calendar=None, halt_file=risk_gate.HALT_FILE,
                    latch_file=None, capital: float | None = None, fractional: bool = False, propose: bool = False,
-                   approve: str | None = None, live=None, second_opinion=None, follow=None, shared: bool = False) -> dict:
+                   approve: str | None = None, live=None, second_opinion=None, follow=None, shared: bool = False,
+                   practice_ledger=None) -> dict:
     """One order step (see the module notes). `paper` is PaperTargets or a callable giving them; `quotes(symbols)`
     gives {symbol: (price, time)}; `state` is an OrderStepState or the path of its file; `calendar` answers
     is_session, session_open and session_close (default: the XNYS calendar). Returns the summary, also journaled.
@@ -3627,11 +3629,13 @@ def run_order_step(*, ledger: OrderLedger, venue, paper, quotes: Callable, journ
     the command line reads it, T32) makes the broker book follow only the strategies it names; None follows the
     whole book, except in live mode, which stops without one. `shared` (T51c S4c; live mode takes it from S4d, and the
     command line requires it there) is the shared-account mode: the book is judged on its own figures (see the module
-    notes, "The shared run")."""
+    notes, "The shared run"). `practice_ledger` (T51 B1; a live fractional run only): the PRACTICE order ledger's path, read
+    read-only for the proof reading; None: the practice ledger beside this run's own ledger file."""
     mode = "propose" if propose else ("approve" if approve is not None else None)
     run = _Run(ledger, venue, paper, quotes, journal, limits_file, state, clock, calendar, halt_file, latch_file,
                capital, fractional)
     run.shared = bool(shared)
+    run.practice_ledger = practice_ledger
     if follow is not None:
         run.follow, run.follow_problem = follow, _follow_problem(follow)
         if run.follow_problem is None:
@@ -3740,6 +3744,10 @@ class _Run:
         self.second_load = None                          # T51 ruling C: practice, fractional: how to load the second source
         self.second_unloadable: str | None = None        # ... why it could not be loaded, once tried
         self.market_hours: tuple | None = None           # T51 R5 (B4): (start, end, why) of the MARKET legs' window
+        self.practice_ledger = None                      # T51 B1: where the practice proof is read (None: beside the ledger)
+        self.live_fractions: dict | None = None          # T51 B1-B4 (live, fractional): the opening as judged at the start
+        self.live_open = False                           # ... remainder legs may go: B1, B2 and the shared book all hold
+        self.first_contact = False                       # ... B4: no live remainder fill has reconciled cleanly yet
         self.shared = False                              # T51c S4c: the shared-account mode (practice only)
         self.last_fig: BookFigures | None = None        # ... the book's figures at the run's latest look
         self.entries: list[dict] = []                    # ... the owner's entries, read once under the lock
@@ -3826,8 +3834,7 @@ class _Run:
         if self.live is not None:                        # live mode: only as a ticket run, whole shares, and a capital
             why = ("live mode runs only with propose or approve" if self.mode is None else   # unless the book is shared:
                    "live mode needs the capital given (at most the confirmation's max_capital)"   # then it is the book's
-                   if self.capital is None and not self.shared else                              # own value (T51c S4d, R26)
-                   "live mode trades whole shares only" if self.fractional else None)
+                   if self.capital is None and not self.shared else None)                        # own value (T51c S4d, R26)
             if why is not None:
                 return self._finish("stopped", "live", why)
             why = self._live_place()                     # before the lock: nothing read, nothing written
@@ -3853,6 +3860,8 @@ class _Run:
                 why = self._live_locks(path)
                 if why is not None:
                     return self._finish("stopped", "lock", why)
+                if self.fractional:                      # T51 B1 to B4: read at the start, read-only; a hold, never a stop
+                    self._live_fractions()
             try:
                 self._scan_journal()                     # before anything is asked of the venue
                 self._session(now)                       # 2
@@ -4263,6 +4272,63 @@ class _Run:
         finally:
             book.close()
         return why
+
+    def _practice_ledger_path(self):
+        """T51 B1: the practice ledger the proof is read from: the one given, else the practice venue's ledger file beside
+        this run's own (the configured layout: one ledger per venue name in the memory folder). None when neither."""
+        if self.practice_ledger is not None:
+            return self.practice_ledger
+        mine = getattr(self.ledger, "path", None)
+        if type(mine) is not str or mine in (":memory:", ""):
+            return None
+        return ledger_path_for(Path(mine).parent, PRACTICE_VENUE)
+
+    def _journal_folder(self):
+        folder = getattr(self.journal, "dir", None)
+        return None if folder is None else folder
+
+    def _live_fractions(self) -> None:
+        """T51 B1 to B4, once, at the start of a live fractional run (the locks are met, nothing is read from the account):
+        whether the remainder legs may go on the live account, by three locks, each read without writing anything:
+          - the shared book (live is always shared, S4d);
+          - B2, the owner's consent: the confirmation the locks judged holds `fractional_live_consent` as JSON true;
+          - B1, the practice proof: `practice_proof` on the practice ledger and journal, a clean MARKET remainder
+            purchase and a clean MARKET remainder sale.
+        When any is missing the run HOLDS its remainder legs back (each a residual with reason `live_fractions`, never
+        a fault) and sends its whole-share LIMIT legs as without --fractional, saying what is missing in words on the
+        summary (`live_fractions`). A hold, not a stop: the whole-share path is what it was, and a stop would take it
+        down with the fractions. When all hold, B4 is read from the LIVE record by the same definition: until one live
+        remainder leg has filled and reconciled cleanly, at most ONE remainder leg goes in a run (`first_contact`)."""
+        missing = []
+        if not self.shared:
+            missing.append("the live book is always the shared account's (the run was not shared)")
+        conf = self.locks.confirmation if self.locks is not None else None
+        if not (isinstance(conf, dict) and conf.get("fractional_live_consent") is True):
+            missing.append("the owner's consent is not given: config/webull_live.json does not hold "
+                           "\"fractional_live_consent\": true (absent, false, text or anything but JSON true is no consent)")
+        proof = None
+        folder = self._journal_folder()
+        mine = self._practice_ledger_path()
+        if mine is None or folder is None:
+            missing.append("the practice record cannot be found (no practice ledger or journal folder to read it from)")
+        else:
+            proof = practice_proof(mine, folder)
+            if not proof.ok:
+                missing.append("the practice proof is not there: " + proof.words())
+        info = {"open": not missing, "consent": bool(isinstance(conf, dict) and conf.get("fractional_live_consent") is True)}
+        if proof is not None:
+            info["practice"] = {"purchases": proof.purchases, "sales": proof.sales}
+            if proof.unreadable is not None:
+                info["practice"]["unreadable"] = proof.unreadable
+        if missing:
+            info["why"] = "; ".join(missing)
+        else:
+            live = clean_remainder_fills(self.ledger.path, folder, self.name) if getattr(self.ledger, "path", None) else None
+            cleared = live is not None and live.unreadable is None and (live.purchases + live.sales) >= 1
+            self.first_contact = not cleared             # unreadable: the safe side, one leg at most
+            info["first_contact"] = self.first_contact
+            info["live_clean"] = {"purchases": 0 if live is None else live.purchases, "sales": 0 if live is None else live.sales}
+        self.live_fractions, self.live_open = info, not missing
 
     def _live_account(self, account: str) -> str | None:
         """Live mode, at the first account read: the account the venue will trade is the confirmation's (its class,
@@ -5555,6 +5621,21 @@ class _Run:
         in_hand[sym] = quote
         return quote, None, sorted(s for s, u in held.items() if u > UNITS_EPS and not self._quote_fresh(s))
 
+    def _ask_again(self, sym: str, in_hand: dict) -> bool:
+        """T51 B5: ask the order step's own quote path ONCE more for `sym` (nothing else), and take the answer only when it
+        is usable and newer than the quote in hand; True when taken (it goes into `in_hand` with its time). A failure to
+        ask or an answer that is not usable or newer leaves everything as it was: the collar then judges the old quote."""
+        self.asked[sym] = self._now()
+        try:
+            raw = dict(self.quotes([sym]) or {})
+        except Exception:
+            return False
+        price, t, _ = _read_quote(raw.get(sym), self._now())
+        if price is None or not t > self.quote_times.get(sym, -math.inf):
+            return False
+        self.quote_times[sym], in_hand[sym] = t, price
+        return True
+
     def _cash(self) -> float | None:
         try:
             answer = self.venue.cash()
@@ -5663,9 +5744,41 @@ class _Run:
                 c = {"symbol": sym, "units": u, "quote": quote, "value": abs(u) * quote, "parts": parts, "owned": owned,
                      "leg": leg.leg, "order_type": leg.order_type}
                 if leg.leg == "remainder":
+                    if self.live is not None and not self.live_open:   # T51 B1 to B3: a live remainder goes only when open
+                        self._hold_live(c, "live_fractions", "its remainder leg is held back: " +
+                                        str((self.live_fractions or {}).get("why", "live fractions are not open")))
+                        continue
                     c["after_whole"] = whole             # sent only after this fund's LIMIT leg of this run passed
                 out.append(c)
+        if self.live is not None and self.live_open and self.first_contact:   # T51 B4: one live remainder leg, at most
+            remainders = [c for c in out if c.get("leg") == "remainder"]
+            keep = self._first_contact_pick(remainders)
+            for c in remainders:
+                if c is not keep:
+                    out.remove(c)
+                    self._hold_live(c, "first_contact", "first contact: no live remainder fill has reconciled cleanly yet, "
+                                                        "so at most one live MARKET remainder leg goes in a run; this one "
+                                                        "waits for a later run")
         return out
+
+    def _hold_live(self, c: dict, reason: str, words: str) -> None:
+        """T51 B3, B4: a live remainder leg that is not a candidate is a residual of its fund, with the reason's name;
+        never a fault, an attention item or drift."""
+        self.residuals.append({"symbol": c["symbol"], "units": c["units"], "quote": c["quote"], "value": c["value"],
+                               "why": words, "reason": reason})
+
+    def _first_contact_pick(self, remainders: list[dict]) -> dict | None:
+        """T51 B4: the one remainder leg a first-contact run may send: on an approval the fund of the ticket's remainder
+        line (the leg the owner saw proposed), else the smallest by value at its quote (the least real money first),
+        the fund's name deciding a tie. None when there is none."""
+        if not remainders:
+            return None
+        if self.mode == "approve":
+            named = {ln["fund"] for ln in self.ticket_lines if ln.get("leg") == "remainder"}
+            for c in remainders:
+                if c["symbol"] in named:
+                    return c
+        return min(remainders, key=lambda c: (c["value"], c["symbol"]))
 
     # -- 8, 9, 10
     def _send(self, candidates, baseline, book, prices, cash) -> None:
@@ -5779,13 +5892,19 @@ class _Run:
         sales = sorted((c for c in candidates if c["units"] < 0), key=order_key)
         buys = sorted((c for c in candidates if c["units"] > 0), key=order_key)
         queue = sales + buys
-        for i, c in enumerate(queue):
+        todo = list(enumerate(queue))                    # T51 B5: a MARKET leg may be put back at the front, once
+        while todo:
+            i, c = todo.pop(0)
             sym, units = c["symbol"], c["units"]
             market = c.get("order_type") == "MARKET"     # T51 R4: the remainder leg, by quantity, behind its collar
             owned_here = held.get(sym, 0.0)
             if c.get("leg") == "remainder":              # T51 R4: judged on top of its fund's LIMIT leg of this run
                 owned_here = math.fsum((owned_here, self.whole_passed.get(sym, 0.0)))
             reduces = units < 0 and owned_here > 0 and abs(owned_here + units) < abs(owned_here)
+            if market and self.live is not None and not self.live_open:   # T51 B3: never a live MARKET leg unopened
+                self._refuse(c, "order step", "a live MARKET leg is sent only when the practice proof, the owner's consent "
+                                              "and the shared book all hold; this run's opening is shut")
+                continue
             if c.get("leg") == "remainder" and c["after_whole"] and sym not in self.whole_passed:
                 self._leave(c, self._gate_words(sym))     # T51 R4, R9, A3 (a): by the LIMIT leg's state, named
                 continue
@@ -5863,12 +5982,20 @@ class _Run:
                     self._drop(c, why)
                     continue
             if market and self.mode != "propose":        # T51 R5: the collar, before its intend (a line is not an order)
+                if (not c.get("reasked") and not self._quote_fresh(sym, MARKET_QUOTE_MAX_AGE_SECONDS)
+                        and self.asked.get(sym) != self._now()):
+                    c["reasked"] = True                  # T51 B5: past 120 s at the moment of judging, and not asked for in
+                    if self._ask_again(sym, in_hand):    # this very second: ask once more, right before the collar; a newer
+                        if self.live is not None and units > 0 and self.live_buys:   # usable quote is taken, and the leg is
+                            self.live_buys.pop()         # judged again from the top on it (its collar price, its value, the
+                        todo.insert(0, (i, c))           # gate, the budget, the caps and the second source), once
+                        continue
                 held_back = self._collar(c, units, quote)
                 if held_back is not None:
                     self._leave(c, held_back[1], collar=held_back[0])
                     continue
             tag = f"{self.batch}-{sym}" + (".r" if c.get("leg") == "remainder" else "")
-            watch = _SubmitWatch(self.venue)
+            watch = _SubmitWatch(self.venue, {"fractional_live": True} if market and self.live is not None else None)
             if self.mode == "approve":                   # the line's tag, on file before its intend
                 self.tickets.note_tag(self.ticket["day"], self.ticket["number"], c["line"], tag, self.batch)
                 c["tag_noted"] = tag
@@ -6155,6 +6282,8 @@ class _Run:
                    "purchases_left_unsettled": self.purchases_left_unsettled}
         if self.fractional:                              # T51 R1: each fund's residual (ruling A: fractional runs only)
             summary["residuals"] = [dict(r) for r in self.residuals]
+            if self.live_fractions is not None:          # T51 B1 to B4: a live fractional run says how the opening stood
+                summary["live_fractions"] = dict(self.live_fractions)
         if self.follow_names is not None:                # T32: which strategies the broker book followed
             summary["follow"] = self._follow_view()
         if self.shared:                                  # T51c S4c: the book's figures, its fees bounded, its shortfalls

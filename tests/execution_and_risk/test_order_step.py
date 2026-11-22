@@ -4912,9 +4912,9 @@ def test_a_live_approve_sends_the_tickets_orders_and_asks_the_second_source_agai
 @pytest.mark.parametrize("kw, words", [({}, "only with propose or approve"),
                                        ({"propose": True}, "needs the capital"),
                                        ({"approve": "123456"}, "needs the capital"),
-                                       ({"propose": True, "capital": 1000.0, "fractional": True}, "whole shares only"),
-                                       ({"approve": "123456", "capital": 1000.0, "fractional": True}, "whole shares only")])
-def test_live_without_a_ticket_mode_a_capital_or_in_fractions_reads_nothing_and_writes_nothing(tmp_path, kw, words):
+                                       ({"fractional": True}, "only with propose or approve"),
+                                       ({"propose": True, "fractional": True}, "needs the capital")])
+def test_live_without_a_ticket_mode_or_a_capital_reads_nothing_and_writes_nothing(tmp_path, kw, words):
     w = live_world(tmp_path / "w")
     w.ledger().close()                                             # the ledger file is the harness's, made before
     before = sorted(str(p) for p in w.tmp.rglob("*"))

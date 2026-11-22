@@ -615,8 +615,8 @@ def _tree(root):
                                   ["--live", "--approve", "123456", "--capital", "100000"],
                                   ["--live", "--shared", "--propose", "--capital", "100000"],   # no capital with --shared
                                   ["--live", "--shared", "--approve", "123456", "--capital", "100000"],
-                                  ["--live", "--shared", "--propose", "--fractional"],
-                                  ["--live", "--shared", "--approve", "123456", "--fractional"],
+                                  ["--live", "--propose", "--fractional"],     # T51 B3: --fractional itself is no longer refused on
+                                  ["--live", "--approve", "123456", "--fractional"],    # live, but the other live rules still bind it
                                   ["--live", "--shared", "--propose", "--capital", "nan"],
                                   ["--live", "--shared", "--propose", "--capital", "-5"],
                                   ["--check"], ["--check", "--capital", "5"], ["--live", "--check", "--shared"]])

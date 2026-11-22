@@ -485,7 +485,8 @@ def test_with_fractional_off_no_line_carries_a_new_field_no_tag_a_suffix_and_eve
     assert runs > 60 and orders > 40, (runs, orders)
 
 
-# ---- live stays refused for fractions, before anything is read or written
+# ---- live fractions (T51 build B lifted the refusal of `fractional` on live; see test_fractional_live.py): the OTHER
+# ---- live refusals still stop a fractional run before anything is read or written
 
 class _Untouchable:
     """Anything the run must not look at: every attribute read or call is recorded."""
@@ -514,9 +515,11 @@ class _Watched:
         return getattr(self._ledger, attr)
 
 
-def test_a_live_run_with_fractional_on_stops_before_anything_is_read_or_written_over_seeded_worlds(tmp_path):
-    """Propose and approve alike: no venue, quote, paper book, live file, second source or journal is touched, no file
-    changes; the summary reads the ledger's fills only (as every run stopped before the lock does today)."""
+def test_a_live_run_with_fractional_on_still_stops_before_anything_is_read_or_written_when_it_lacks_a_ticket_mode_or_a_capital(tmp_path):
+    """T51 B3 lifted the refusal of `fractional` itself on live. The other live refusals hold for a fractional run as they do
+    for any: no propose or approve, and (unshared) no capital. No venue, quote, paper book, live file, second source or
+    journal is touched, no file changes; the summary reads the ledger's fills only (as every run stopped before the lock
+    does today)."""
     for k in range(30):
         rng = random.Random(56_000 + k)
         w = live_world(tmp_path / f"w{k}")
@@ -525,11 +528,12 @@ def test_a_live_run_with_fractional_on_stops_before_anything_is_read_or_written_
             w.journal.write("2026-11-13", {"type": "note"})
         before = {str(p): (p.read_bytes() if p.is_file() else None) for p in sorted(w.tmp.rglob("*"))}
         seen = []
-        kw = {"capital": rng.choice([100.0, 1000.0, 5000.0]), "fractional": True}
         if rng.random() < 0.5:
-            kw["propose"] = True
+            kw, words = {"fractional": True, "capital": rng.choice([100.0, 1000.0, 5000.0])}, "only with propose or approve"
         else:
-            kw["approve"] = f"{rng.randrange(1_000_000):06d}"
+            kw, words = {"fractional": True, rng.choice(["propose", "approve"]): True}, "needs the capital"
+            if "approve" in kw:
+                kw["approve"] = f"{rng.randrange(1_000_000):06d}"
         led = w.ledger()
         try:
             out = osx.run_order_step(ledger=_Watched(led, seen), venue=_Untouchable(seen, "venue"),
@@ -540,7 +544,7 @@ def test_a_live_run_with_fractional_on_stops_before_anything_is_read_or_written_
                                      second_opinion=_Untouchable(seen, "second"), **kw)
         finally:
             led.close()
-        assert out["status"] == "stopped" and out["stage"] == "live" and "whole shares only" in out["reason"], out
+        assert out["status"] == "stopped" and out["stage"] == "live" and words in out["reason"], out
         assert seen == [("ledger", "fills"), ("ledger", "fills")], seen
         after = {str(p): (p.read_bytes() if p.is_file() else None) for p in sorted(w.tmp.rglob("*"))}
         assert after == before

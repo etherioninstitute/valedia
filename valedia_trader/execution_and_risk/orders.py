@@ -423,6 +423,11 @@ class OrderLedger:
             self._close_quietly()
             raise
 
+    @property
+    def path(self) -> str:
+        """The ledger file's path as it was opened (":memory:" for a private one)."""
+        return self._path
+
     def _check_file(self, must_exist: bool) -> tuple | None:
         """Refuse the ledger's path, in one line naming it, when it is a symbolic link or a regular file group or
         others may write, and with `must_exist` when no regular file is there. Returns the file's (device, inode),

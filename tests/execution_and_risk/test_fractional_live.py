@@ -52,17 +52,19 @@ def proof(w, **kw):
 
 def buy_then_sell(w, buy=True, sell=True, settle=True):
     """Run on practice with fractions: a purchase with a MARKET remainder (2.5 SPY: a LIMIT of 2 and a MARKET of 0.5), a
-    run that sells a remainder (2.5 down to 2.1: a MARKET sale of 0.4), and a run with nothing to do whose reconcile is
-    the NEXT one after both fills."""
+    run that sells a remainder (2.5 down to 2.1: a MARKET sale of 0.4; with no purchase run before it, 3 whole shares are
+    bought first and 2.6 is the target), and a run with nothing to do whose reconcile is the NEXT one after both fills."""
     outs = []
     if buy:
         w.paper = paper({"a": {"SPY": 2.5}})
         outs.append(w.run(fractional=True))
         w.later(30)
     if sell:
-        w.paper = paper({"a": {"SPY": 2.1 if buy else 0.0}})
         if not buy:
-            w.venue.held = {"SPY": 2.5}
+            w.paper = paper({"a": {"SPY": 3.0}})
+            outs.append(w.run(fractional=True))
+            w.later(30)
+        w.paper = paper({"a": {"SPY": 2.1 if buy else 2.6}})
         outs.append(w.run(fractional=True))
         w.later(30)
     if settle:
@@ -83,7 +85,10 @@ def test_b1_the_reading_is_the_two_items_and_nothing_less(tmp_path):
     p = proof(w)
     assert (p.purchases, p.sales, p.ok) == (1, 0, False)
     assert p.missing == ["a MARKET remainder SALE that filled and reconciled cleanly"]
-    outs = buy_then_sell(w, buy=False)
+    w.paper = paper({"a": {"SPY": 2.1}})                  # the book holds 2.5: a MARKET sale of 0.4, then a reconcile
+    outs = [w.run(fractional=True)]
+    w.later(30)
+    outs.append(w.run(fractional=True))
     p = proof(w)
     assert (p.purchases, p.sales, p.ok) == (1, 1, True) and p.missing == [] and p.unreadable is None
     assert "both" in p.words() and "purchase" in p.words() and "sale" in p.words()
@@ -283,3 +288,572 @@ def oracle_counts(w):
 
 def test_the_practice_venue_name_is_the_go_live_gates_own():
     assert osx.PRACTICE_VENUE == gl.PAPER_VENUE == "webull-sandbox"
+
+
+# ---- B2, B3: the live opening, through the real order step on a stand-in live venue
+
+import test_order_step as T
+import test_shared_live as SL
+from test_fractional_legs import LegVenue
+
+CONSENT = "fractional_live_consent"
+
+
+class FracVenue(T.LiveVenue):
+    """The live stand-in. It records every submit with the arguments the order step gave it, and applies NO adapter rule
+    of its own: whatever the order step lets through to the venue is what these tests judge. (The adapter's own rules are
+    held by tests/venues/test_webull.py.)"""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.sent = []
+
+    def submit(self, symbol, units, tag, price=None, limit_price=None, session="CORE", fractional_live=False):
+        self.sent.append({"symbol": symbol, "units": units, "tag": tag, "price": price, "limit_price": limit_price,
+                          "session": session, "fractional_live": fractional_live})
+        return super().submit(symbol, units, tag, price, None, session)   # every order fills at the quote it was judged on
+
+    def limitless(self):
+        return [s for s in self.sent if s["limit_price"] is None]
+
+
+@pytest.fixture
+def mkl(tmp_path, monkeypatch, capsys):
+    count = []
+
+    def make(conf=None, venue=None, **limits):
+        count.append(1)
+        return SL.LW(tmp_path / f"w{len(count)}", monkeypatch, capsys, venue if venue is not None else FracVenue(),
+                     conf, **limits)
+    return make
+
+
+def practice_record(lw, buy=True, sell=True, venue_name="webull-sandbox"):
+    """A practice record for a live world: practice runs (fractions on, every order filled at once) in the same memory and
+    journal folders, under the practice venue's name, ending with the reconcile that follows the last fill."""
+    pw = leg_world(lw.tmp, fill=1.0)
+    pw.venue.name = venue_name
+    pw.ledger_path = osx.ledger_path_for(lw.tmp / "memory", venue_name)
+    pw.state_path = osx.state_path_for(pw.ledger_path, venue_name)
+    pw.clock = lw.clock
+    outs = buy_then_sell(pw, buy=buy, sell=sell)
+    assert all(o["status"] == "done" and "faults" not in o for o in outs), outs
+    lw.later(30)
+    return pw
+
+
+def live_proposal(lw, **kw):
+    kw.setdefault("fractional", True)
+    out = lw.propose(**kw)
+    return out
+
+
+def frac_world(mkl, consent=True, proof=(True, True), target=12.5, conf=None):
+    """A live shared world with a book of 10,000 open (a tenth of the paper book's 100,000), the paper book wanting
+    `target` x 10 SPY, so the book's target is `target` SPY (a LIMIT leg and a MARKET remainder), the owner's consent as
+    given and the practice record as given (a purchase, a sale)."""
+    over = dict(conf or {})
+    if consent is not None:
+        over[CONSENT] = consent
+    lw = mkl(conf=over)
+    lw.open_book("10000")
+    if any(proof):
+        practice_record(lw, buy=proof[0], sell=proof[1])
+    lw.paper = paper({"a": {"SPY": target * 10}})
+    return lw
+
+
+def test_b3_with_every_lock_a_live_run_sends_the_limit_leg_and_the_remainder_as_a_market_order_by_quantity(mkl):
+    lw = frac_world(mkl)
+    out = lw.propose(fractional=True)
+    assert out["status"] == "done" and out["live_fractions"]["open"] is True, out
+    assert [(ln["units"], ln["leg"]) for ln in out["ticket"]["orders"]] == [(12.0, "whole"), (0.5, "remainder")], out
+    assert lw.venue.sent == []
+    lw.later(1)
+    done = lw.approve(out["ticket_number"], fractional=True)
+    assert done["status"] == "done" and "faults" not in done, done
+    a, b = lw.venue.sent
+    assert (a["units"], a["limit_price"], a["fractional_live"]) == (12.0, 505.0, False)
+    assert (b["units"], b["limit_price"], b["fractional_live"], b["session"]) == (0.5, None, True, "CORE")
+    assert b["tag"].endswith("-SPY.r") and 0 < abs(b["units"]) < 1
+    recs = {o["tag"]: o for o in lw.orders()}
+    assert recs[b["tag"]]["order_type"] == "MARKET" and recs[b["tag"]]["collar_price"] == 505.0
+
+
+def whole_only(lw, out):
+    """The run held every remainder back and left the whole-share path as it was: the ticket (or the sends) hold LIMIT
+    legs only, nothing is a fault, an attention item or a left-over, and the remainders are residuals with a reason."""
+    assert out["status"] == "done" and "faults" not in out and out["left_over"] == [] and out["refused"] == [], out
+    assert all(ln.get("leg", "whole") == "whole" for ln in out.get("ticket", {}).get("orders", [])), out
+    held = [r for r in out["residuals"] if r.get("reason") == "live_fractions"]
+    assert held and all(0 < abs(r["units"]) < 1 for r in held), out["residuals"]
+    assert out["live_fractions"]["open"] is False and out["live_fractions"]["why"], out
+    return held
+
+
+@pytest.mark.parametrize("value", [False, "true", "yes", 1, 0, None, [True], {"a": True}, 1.0, "", None.__class__])
+def test_b2_a_consent_that_is_not_json_true_holds_the_remainder_in_words_and_the_whole_leg_goes_as_before(mkl, value):
+    lw = frac_world(mkl, consent=None, conf={CONSENT: None} if value is None.__class__ else {CONSENT: value})
+    if value is None.__class__:                           # the line absent altogether
+        lw.write_conf()
+    out = lw.propose(fractional=True)
+    held = whole_only(lw, out)
+    assert CONSENT in out["live_fractions"]["why"] and "no consent" in out["live_fractions"]["why"]
+    assert out["live_fractions"]["consent"] is False and "practice" in out["live_fractions"]
+    assert [(ln["units"], ln["leg"]) for ln in out["ticket"]["orders"]] == [(12.0, "whole")]
+    assert held[0]["units"] == 0.5 and "the owner's consent" in held[0]["why"]
+    lw.later(1)
+    done = lw.approve(out["ticket_number"], fractional=True)
+    assert done["status"] == "done" and done["orders_sent"] == 1 and lw.venue.limitless() == [], done
+
+
+@pytest.mark.parametrize("proof, missing", [((False, False), ("PURCHASE", "SALE")), ((True, False), ("SALE",)),
+                                            ((False, True), ("PURCHASE",))])
+def test_b1_a_practice_record_missing_a_side_holds_the_remainder_and_says_what_is_missing(mkl, proof, missing):
+    lw = frac_world(mkl, proof=proof)
+    if proof == (False, False):
+        pw = leg_world(lw.tmp, fill=1.0)                  # a practice ledger with nothing in it
+        pw.venue.name = "webull-sandbox"
+        osx.open_ledger(osx.ledger_path_for(lw.tmp / "memory", "webull-sandbox")).close()
+    out = lw.propose(fractional=True)
+    whole_only(lw, out)
+    why = out["live_fractions"]["why"]
+    assert "practice proof" in why and all(m in why for m in missing), why
+    assert not [m for m in ("PURCHASE", "SALE") if m not in missing and m in why], why
+    assert out["live_fractions"]["consent"] is True
+    lw.later(1)
+    assert lw.approve(out["ticket_number"], fractional=True)["orders_sent"] == 1 and lw.venue.limitless() == []
+
+
+def test_b1_no_practice_ledger_at_all_holds_the_remainder_and_creates_nothing(mkl):
+    lw = frac_world(mkl, proof=(False, False))
+    practice = osx.ledger_path_for(lw.tmp / "memory", "webull-sandbox")
+    assert not practice.exists()
+    out = lw.propose(fractional=True)
+    whole_only(lw, out)
+    assert "practice" in out["live_fractions"]["why"] and "cannot be" in out["live_fractions"]["why"]
+    assert not practice.exists()
+
+
+def test_b1_a_practice_record_of_layout3_orders_never_counts_through_a_live_run(mkl):
+    lw = frac_world(mkl, proof=(False, False))
+    path = osx.ledger_path_for(lw.tmp / "memory", "webull-sandbox")
+    raw = sqlite3.connect(str(path))
+    for statement in orders._LAYOUT3_SCHEMA:
+        raw.execute(statement)
+    raw.execute("PRAGMA user_version = 3")
+    raw.commit()
+    raw.close()
+    before = path.read_bytes()
+    out = lw.propose(fractional=True)
+    whole_only(lw, out)
+    assert path.read_bytes() == before                    # reading it did not upgrade it
+
+
+def test_a_live_run_with_fractions_off_is_what_it_was_and_says_nothing_of_them(mkl):
+    lw = frac_world(mkl)
+    out = lw.propose(fractional=False)
+    assert out["status"] == "done" and "live_fractions" not in out and "residuals" not in out, out
+    assert [ln["units"] for ln in out["ticket"]["orders"]] == [12.0] and not any("leg" in ln for ln in out["ticket"]["orders"])
+
+
+def test_the_live_summary_is_journaled_with_the_openings_words(mkl):
+    lw = frac_world(mkl, consent=False)
+    out = lw.propose(fractional=True)
+    (summary,) = [e for e in lw.journal_events("summary") if e["batch"] == out["batch"]]
+    assert summary["live_fractions"] == out["live_fractions"] and summary["live_fractions"]["open"] is False
+
+
+def test_b3_the_ticket_made_with_fractions_is_refused_by_an_approval_without_them_and_the_reverse(mkl):
+    lw = frac_world(mkl)
+    out = lw.propose(fractional=True)
+    lw.later(1)
+    refused = lw.approve(out["ticket_number"], fractional=False)
+    assert refused["status"] == "stopped" and "fractional" in refused["reason"] and lw.venue.sent == [], refused
+
+
+def test_b2_taking_the_consent_back_between_propose_and_approve_refuses_the_approval_and_sends_nothing(mkl):
+    lw = frac_world(mkl)
+    out = lw.propose(fractional=True)
+    lw.later(1)
+    lw.write_conf(**{CONSENT: False})                     # the owner takes it back: the files changed since the ticket
+    refused = lw.approve(out["ticket_number"], fractional=True)
+    assert refused["status"] == "stopped" and lw.venue.sent == [], refused
+    assert "changed" in refused["reason"] or "owner's files" in refused["reason"], refused
+
+
+def test_b3_a_live_remainder_is_judged_by_the_confirmations_caps_like_a_whole_leg(mkl):
+    lw = frac_world(mkl, target=0.5, conf={CONSENT: True, "max_order_value": 200})
+    out = lw.propose(fractional=True)
+    assert out["status"] == "done" and out["ticket"]["orders"] == [] and out["live_fractions"]["open"] is True, out
+    assert [d["leg"] for d in out["dropped"]] == ["remainder"] and "max_order_value" in out["dropped"][0]["reason"], out
+    lw2 = frac_world(mkl, target=0.5, conf={CONSENT: True, "max_order_value": 300})
+    out = lw2.propose(fractional=True)
+    assert [(ln["units"], ln["leg"]) for ln in out["ticket"]["orders"]] == [(0.5, "remainder")], out
+    lw2.later(1)
+    done = lw2.approve(out["ticket_number"], fractional=True)
+    assert done["orders_sent"] == 1 and [s["fractional_live"] for s in lw2.venue.limitless()] == [True], done
+
+
+# ---- B4: the first-contact rule
+
+MANY = {"SPY": 62.5, "QQQ": 37.0, "IWM": 31.0, "TLT": 23.0}       # a tenth of the book: 6.25, 3.7, 3.1, 2.3 units
+
+
+def remainders(out):
+    return [e for e in out.get("ticket", {}).get("orders", []) if e.get("leg") == "remainder"]
+
+
+def test_b4_a_first_live_run_sends_one_market_remainder_and_holds_the_others_as_first_contact_residuals(mkl):
+    lw = frac_world(mkl)
+    lw.paper = paper({"a": MANY})
+    out = lw.propose(fractional=True)
+    assert out["status"] == "done" and out["live_fractions"]["first_contact"] is True, out
+    assert [(e["fund"], e["units"]) for e in remainders(out)] == [("IWM", 0.1)], out["ticket"]["orders"]   # the least money
+    held = sorted((r["symbol"], r["units"]) for r in out["residuals"] if r.get("reason") == "first_contact")
+    assert held == [("QQQ", 0.7), ("SPY", 0.25), ("TLT", 0.3)], out["residuals"]
+    assert all("first contact" in r["why"] for r in out["residuals"] if r.get("reason") == "first_contact")
+    assert "faults" not in out and out["left_over"] == [] and out["refused"] == [] and out["dropped"] == [], out
+    assert len([e for e in out["ticket"]["orders"] if e["leg"] == "whole"]) == 4
+    lw.later(1)
+    done = lw.approve(out["ticket_number"], fractional=True)
+    assert done["status"] == "done" and "faults" not in done and done["orders_sent"] == 5, done
+    assert [(s["symbol"], s["fractional_live"]) for s in lw.venue.limitless()] == [("IWM", True)]
+    led = lw.ledger()
+    try:
+        assert led.attention() == []
+    finally:
+        led.close()
+
+
+def test_b4_the_rule_ends_after_a_live_remainder_has_filled_and_reconciled_cleanly_in_the_live_record(mkl):
+    lw = frac_world(mkl)
+    lw.paper = paper({"a": MANY})
+    out = lw.propose(fractional=True)
+    lw.later(1)
+    lw.approve(out["ticket_number"], fractional=True)                 # run A: the first live remainder, filled at once
+    assert len(lw.venue.limitless()) == 1
+    lw.later(30)
+    b = lw.propose(fractional=True)                                   # run B: its first reconcile is the one after the fill
+    assert b["live_fractions"]["first_contact"] is True and b["live_fractions"]["live_clean"] == {"purchases": 0, "sales": 0}
+    assert [e["fund"] for e in remainders(b)] == ["TLT"], b["ticket"]["orders"]   # the rule still binds: one leg, the least
+    lw.later(30)
+    c = lw.propose(fractional=True)                                   # run C: the live record now holds it
+    assert c["live_fractions"]["first_contact"] is False and c["live_fractions"]["live_clean"]["purchases"] == 1, c
+    assert sorted(e["fund"] for e in remainders(c)) == ["QQQ", "SPY", "TLT"], c["ticket"]["orders"]
+    assert not [r for r in c.get("residuals", []) if r.get("reason") == "first_contact"]
+    lw.later(1)
+    done = lw.approve(c["ticket_number"], fractional=True)
+    assert done["orders_sent"] == 3 and "faults" not in done, done
+    assert sorted(s["symbol"] for s in lw.venue.limitless()) == ["IWM", "QQQ", "SPY", "TLT"]    # the first one, then these
+
+
+def test_b4_a_live_remainder_that_did_not_reconcile_cleanly_does_not_end_the_rule(mkl):
+    lw = frac_world(mkl)
+    lw.paper = paper({"a": MANY})
+    out = lw.propose(fractional=True)
+    lw.later(1)
+    lw.approve(out["ticket_number"], fractional=True)
+    lw.later(30)
+    lw.venue.held["IWM"] -= 0.02                                      # the account holds less than the book: a shortfall
+    stopped = lw.propose(fractional=True)                             # ... at the reconcile right after the fill
+    assert stopped["status"] == "stopped", stopped
+    lw.venue.held["IWM"] += 0.02
+    for _ in range(2):
+        lw.later(30)
+        lw.propose(fractional=True)
+    last = lw.propose(fractional=True)
+    assert last["status"] == "done" and last["live_fractions"]["first_contact"] is True, last
+    assert last["live_fractions"]["live_clean"] == {"purchases": 0, "sales": 0}
+
+
+def test_b4_practice_is_not_limited_by_the_rule(tmp_path):
+    w = leg_world(tmp_path / "w", fill=1.0)
+    w.paper = paper({"a": {"SPY": 2.5, "QQQ": 3.7, "IWM": 4.3, "TLT": 1.4}})
+    out = w.run(fractional=True)
+    assert out["status"] == "done" and "live_fractions" not in out, out
+    assert sorted(e["symbol"] for e in out["sent"] if e["leg"] == "remainder") == ["IWM", "QQQ", "SPY", "TLT"]
+    assert not [r for r in out["residuals"] if r.get("reason")]
+
+
+def test_b4_a_first_contact_approval_whose_quotes_moved_keeps_to_the_ticket_and_never_sends_two(mkl):
+    lw = frac_world(mkl)
+    lw.paper = paper({"a": MANY})
+    out = lw.propose(fractional=True)
+    lw.prices["TLT"] = 0.01                                           # the fresh values reorder: IWM no longer the least
+    lw.prices["IWM"] = 400.0
+    lw.later(1)
+    done = lw.approve(out["ticket_number"], fractional=True)
+    assert len(lw.venue.limitless()) <= 1, lw.venue.limitless()
+
+
+# ---- B5: a remainder leg asks again for its quote when it is past 120 seconds at the moment of judging
+
+from test_fractional_collar import collar_world, held_back
+
+
+def age_the_market_leg_after_its_checks(w, monkeypatch, seconds):
+    """The stand-in clock moves on while the MARKET leg is being judged (in the risk gate's check of an order under
+    300 dollars: the 0.5 SPY leg, never the 2 SPY LIMIT leg), so its quote has aged by the time its collar looks."""
+    real = osx.risk_gate.check_order
+    seen = []
+
+    def check(order, *a, **k):
+        if order["value"] < 300 and not seen:
+            seen.append(1)
+            w.clock.t += seconds
+        return real(order, *a, **k)
+    monkeypatch.setattr(osx.risk_gate, "check_order", check)
+
+
+def test_b5_a_quote_that_passed_120_seconds_while_the_leg_was_judged_is_asked_for_once_more_and_taken_when_newer(tmp_path, monkeypatch):
+    w = collar_world(tmp_path / "w")                                  # the quote is 60 s old whenever it is asked
+    age_the_market_leg_after_its_checks(w, monkeypatch, 61.0)         # 121 s old at the collar
+    real = w.quotes
+    asks = []
+
+    def quotes(symbols):
+        asks.append(list(symbols))
+        if len(asks) > 1:
+            w.prices["SPY"] = 502.0                                   # the venue's quote has moved on, by 0.4%
+        return real(symbols)
+    w.quotes = quotes
+    out = w.run(fractional=True)
+    b = out["batch"]
+    assert out["status"] == "done" and "faults" not in out, out
+    assert [a["tag"] for a in w.venue.args] == [f"{b}-SPY", f"{b}-SPY.r"], out
+    o = {x["tag"]: x for x in w.orders()}
+    assert o[f"{b}-SPY.r"]["reference_price"] == 502.0                 # the collar judged the newer quote
+    assert o[f"{b}-SPY.r"]["collar_price"] == osx.limit_price(0.5, 502.0) == 507.02   # ... and its price comes from it
+    assert asks == [["SPY"], ["SPY"]], asks                            # the first ask of the run, and one once more
+
+
+def test_b5_the_newer_quote_is_judged_again_by_everything_the_old_one_was_not_only_the_collar(tmp_path, monkeypatch):
+    """The new quote 502 is within the band of the decided quote 500 but the second source disagrees on it: held back."""
+    w = collar_world(tmp_path / "w")
+    age_the_market_leg_after_its_checks(w, monkeypatch, 61.0)
+    real = w.quotes
+    n = [0]
+
+    def quotes(symbols):
+        n[0] += 1
+        if n[0] > 1:
+            w.prices["SPY"] = 502.0
+        return real(symbols)
+    w.quotes = quotes
+    w.second.by_price[("SPY", 502.0)] = "disagree"
+    out = w.run(fractional=True)
+    (left,) = held_back(out)
+    assert left["collar"] == "second_source" and "faults" not in out, out
+
+
+def test_b5_a_source_that_gives_nothing_newer_leaves_the_leg_held_back_by_the_collar_and_it_is_no_fault(tmp_path, monkeypatch):
+    w = collar_world(tmp_path / "w")
+    age_the_market_leg_after_its_checks(w, monkeypatch, 61.0)
+    asks, first = [], {}
+    real = w.quotes
+
+    def quotes(symbols):
+        asks.append(list(symbols))
+        got = real(symbols)
+        first.setdefault("quote", got)                                # every later ask gives the first answer again
+        return first["quote"]
+    w.quotes = quotes
+    out = w.run(fractional=True)
+    b = out["batch"]
+    assert out["status"] == "done" and "faults" not in out and "cap_unjudged" not in out, out
+    assert [a["tag"] for a in w.venue.args] == [f"{b}-SPY"]            # its LIMIT leg went
+    (left,) = held_back(out)
+    assert left["collar"] == "quote_age" and f"{osx.MARKET_QUOTE_MAX_AGE_SECONDS} seconds" in left["reason"], left
+    assert asks == [["SPY"], ["SPY"]], asks                            # one once more, not a third
+    led = w.ledger()
+    try:
+        assert led.attention() == []
+    finally:
+        led.close()
+
+
+@pytest.mark.parametrize("age, extra_asks", [(119.0, 0), (120.0, 0), (121.0, 1)])
+def test_b5_the_limit_stays_120_seconds_a_quote_at_the_limit_is_not_asked_for_again(tmp_path, monkeypatch, age, extra_asks):
+    w = collar_world(tmp_path / "w")
+    w.quote_age["SPY"] = age - 60.0                                    # the age at the start; 60 s more pass while it is judged
+    age_the_market_leg_after_its_checks(w, monkeypatch, 60.0)
+    asks = []
+    real = w.quotes
+    w.quotes = lambda symbols: (asks.append(list(symbols)), real(symbols))[1]
+    out = w.run(fractional=True)
+    assert out["status"] == "done" and "faults" not in out, out
+    assert len(asks) == 1 + extra_asks, (age, asks)
+
+
+def test_b5_a_leg_whose_quote_was_just_asked_for_in_the_same_second_is_not_asked_again(tmp_path):
+    w = collar_world(tmp_path / "w")
+    w.quote_age["SPY"] = 130.0                                         # old at the start; the clock never moves
+    asks = []
+    real = w.quotes
+    w.quotes = lambda symbols: (asks.append(list(symbols)), real(symbols))[1]
+    out = w.run(fractional=True)
+    (left,) = held_back(out)
+    assert left["collar"] == "quote_age" and asks == [["SPY"], ["SPY"]], (asks, left)   # the start, and the leg's own refresh
+
+
+def test_b5_it_applies_to_a_live_remainder_leg_too(mkl):
+    def asks_of_spy(slow):
+        lw = frac_world(mkl, target=0.5)
+        state = {"slow": False}
+
+        class Second(type(lw.second)):
+            def __call__(self, first_price, symbol, **kw):
+                if state["slow"]:
+                    state["slow"] = False
+                    lw.clock.t += 61.0                                # the second source takes a minute the first time
+                return super().__call__(first_price, symbol, **kw)
+        lw.second = Second()
+        out = lw.propose(fractional=True)                             # a proposal has no collar: nothing to ask again
+        assert [(e["units"], e["leg"]) for e in out["ticket"]["orders"]] == [(0.5, "remainder")], out
+        lw.later(1)
+        before = len(lw.quote_calls)
+        state["slow"] = slow
+        done = lw.approve(out["ticket_number"], fractional=True)
+        assert done["status"] == "done" and done["orders_sent"] == 1 and "faults" not in done, (slow, done["left_over"], done["dropped"], done["refused"])
+        assert [s["fractional_live"] for s in lw.venue.limitless()] == [True]
+        return [c for c in lw.quote_calls[before:] if c == ["SPY"]]
+    assert len(asks_of_spy(slow=True)) == len(asks_of_spy(slow=False)) + 1
+
+
+# ---- the safety property, over seeded worlds: no order without a limit reaches a production venue unless every lock holds
+
+PROOFS = ("both",) * 6 + ("purchase only", "sale only", "none", "layout 3 only", "damaged journal")
+CONSENTS = (True,) * 6 + (False, "true", 1, "absent")
+
+
+def seeded_world(mkl, rng):
+    consent = rng.choice(CONSENTS)
+    proof = rng.choice(PROOFS)
+    fractional = rng.random() < 0.85
+    lw = mkl(conf=None if consent == "absent" else {CONSENT: consent})
+    lw.open_book("10000")
+    practice = osx.ledger_path_for(lw.tmp / "memory", "webull-sandbox")
+    if proof in ("both", "purchase only", "sale only"):
+        practice_record(lw, buy=proof != "sale only", sell=proof != "purchase only")
+    elif proof == "layout 3 only":
+        practice.parent.mkdir(parents=True, exist_ok=True)
+        raw = sqlite3.connect(str(practice))
+        for statement in orders._LAYOUT3_SCHEMA:
+            raw.execute(statement)
+        raw.execute("PRAGMA user_version = 3")
+        raw.commit()
+        raw.close()
+    elif proof == "damaged journal":
+        practice_record(lw)
+        day = sorted(Path(lw.journal.dir).glob("*.jsonl"))[0]
+        day.write_text(day.read_text() + "{torn\n")
+    lw.paper = paper({"a": {sym: rng.choice([0.0, 12.5, 37.0, 62.5, 31.0, 23.0, 3.0, 7.0, 4.0]) for sym in
+                            rng.sample(("SPY", "QQQ", "IWM", "TLT"), rng.randint(1, 4))}})
+    holds = consent is True and proof == "both"                       # B1 and B2, by construction
+    return lw, {"consent": consent, "proof": proof, "fractional": fractional, "open": holds and fractional}
+
+
+def test_the_safety_property_over_seeded_live_worlds_no_order_without_a_limit_unless_every_lock_holds(mkl):
+    limitless = whole = worlds_open = worlds_shut = 0
+    for k in range(48):
+        rng = random.Random(62_000 + k)
+        lw, world = seeded_world(mkl, rng)
+        for step in range(rng.randint(1, 3)):
+            out = lw.propose(fractional=world["fractional"])
+            if out.get("status") != "done" or not out.get("ticket_number"):
+                lw.later(30)
+                continue
+            lw.later(1)
+            if rng.random() < 0.2:                                    # the owner takes his consent back before the approval
+                lw.write_conf(**{CONSENT: False})
+                world["open"] = False
+            sent_before = len(lw.venue.sent)
+            led = lw.ledger()
+            try:
+                cleared = any(o["order_type"] == "MARKET" and o["state"] == "filled" for o in led.orders())
+            finally:
+                led.close()
+            done = lw.approve(out["ticket_number"], fractional=world["fractional"])
+            mine = lw.venue.sent[sent_before:]
+            market = [s for s in mine if s["limit_price"] is None]
+            if not world["open"]:
+                assert market == [], (k, world, [s["tag"] for s in market])
+            for s in market:                                          # every B3 condition, for every one that went
+                assert s["fractional_live"] is True and s["session"] == "CORE", (k, s)
+                assert 0 < abs(s["units"]) < 1 and s["tag"].endswith(".r") and s["price"] and s["price"] > 0, (k, s)
+            for s in mine:
+                if s["limit_price"] is not None:
+                    assert s["fractional_live"] is False and s["units"] == int(s["units"]), (k, s)
+            if world["open"] and not cleared and done["status"] == "done":
+                assert len(market) <= 1, (k, "first contact: at most one live MARKET leg per run", market)   # B4
+            limitless += len(market)
+            whole += len(mine) - len(market)
+            lw.later(30)
+        worlds_open += world["open"]
+        worlds_shut += not world["open"]
+    assert limitless > 8 and whole > 20 and worlds_open > 6 and worlds_shut > 8, (limitless, whole, worlds_open, worlds_shut)
+
+
+# ---- B3: the shared book's figures, the reconcile and the day stop handle units with five decimals
+
+def test_b3_a_five_decimal_live_purchase_and_sale_are_exact_in_the_book_the_reconcile_and_the_nav(mkl):
+    lw = frac_world(mkl, target=0.43859)
+    out = lw.propose(fractional=True)
+    assert [(e["units"], e["leg"]) for e in out["ticket"]["orders"]] == [(0.43859, "remainder")], out
+    lw.later(1)
+    a = lw.approve(out["ticket_number"], fractional=True)
+    assert a["status"] == "done" and a["orders_sent"] == 1 and "faults" not in a, a
+    assert lw.venue.held == {"SPY": 0.43859}                                   # the venue's holding: the five decimals sent
+    led = lw.ledger()
+    try:
+        figures = osx.book_figures(led.fills(), led.orders(), lw.entries(), {"SPY": 450.0}, "2026-11-13", now=lw.clock.t)
+        assert figures.units["SPY"] == osx.Decimal("0.43859")                  # exact, not a float's neighbour
+        assert figures.value == osx.Decimal("10000") - osx.Decimal("0.43859") * 50     # 9978.0705, to the last digit
+        assert osx.broker_book(led.fills()) == {"SPY": 0.43859}
+    finally:
+        led.close()
+    lw.later(30)
+    lw.prices["SPY"] = 450.0
+    b = lw.propose(fractional=True)                                            # its reconcile: the book against the venue
+    assert b["status"] == "done" and "faults" not in b and not b["shared"].get("shortfalls"), b
+    assert b["shared"]["book_value"] == 9978.0705 and b["shared"]["day_loss_pct"] == 0.219295, b["shared"]
+    assert lw.nav()[-1]["value_low"] == "9978.070500" and lw.nav()[-1]["value_per_unit"] == "0.99780705"
+    # a MARKET sale of the remainder: target 0.12764, so about 0.31095 is sold (the split rounds toward zero)
+    lw.prices["SPY"] = 500.0
+    lw.paper = paper({"a": {"SPY": 1.2764}})
+    lw.later(30)
+    s = lw.propose(fractional=True)
+    ((line,),) = [[e for e in s["ticket"]["orders"]]]
+    sold = -line["units"]
+    assert (line["leg"], line["side"]) == ("remainder", "sell") and sold in (0.31094, 0.31095), s
+    lw.later(1)
+    d = lw.approve(s["ticket_number"], fractional=True)
+    assert d["status"] == "done" and d["orders_sent"] == 1 and "faults" not in d, d
+    assert lw.venue.held["SPY"] == pytest.approx(0.43859 - sold, abs=1e-12)
+    lw.later(30)
+    nxt = lw.propose(fractional=True)
+    assert nxt["status"] == "done" and "faults" not in nxt and not nxt["shared"].get("shortfalls"), nxt   # a clean reconcile
+    led = lw.ledger()
+    try:
+        left = sum((osx.Decimal(repr(f["units"])) for f in led.fills()), osx.Decimal(0))
+        assert left == osx.Decimal("0.43859") - osx.Decimal(repr(sold))                # exact in Decimal
+        assert [f["units"] for f in led.fills()] == [0.43859, -sold]
+    finally:
+        led.close()
+
+
+def test_b3_the_day_stop_reads_the_loss_of_a_five_decimal_holding_to_the_last_digit(mkl):
+    lw = frac_world(mkl, target=0.43859)
+    out = lw.propose(fractional=True)
+    lw.later(1)
+    assert lw.approve(out["ticket_number"], fractional=True)["orders_sent"] == 1
+    lw.later(30)
+    lw.prices["SPY"] = 100.0                                                   # the holding loses 0.43859 x 400 = 175.436
+    lw.paper = paper({"a": {"SPY": 10.0, "QQQ": 8.0}})                         # more purchases are wanted
+    b = lw.propose(fractional=True)
+    assert b["status"] == "done", b
+    assert b["shared"]["day_loss_pct"] == pytest.approx(1.75436, abs=1e-9), b["shared"]
+    assert b["day_stop"] is not None, b                                         # past the working stop of 1.00%
+    assert all(r["by"] == "day stop" for r in b["refused"]) and b["refused"], b   # no purchase goes; nothing is a fault
+    assert "faults" not in b

@@ -763,8 +763,6 @@ def _live_args_refusal(args) -> str | None:
         return "--check judges the locks and sends nothing: it takes no --shared (a live run is --live --shared --propose)"
     if not live:
         return None
-    if getattr(args, "fractional", False):
-        return "live mode trades whole shares only (no --fractional)"
     capital = getattr(args, "capital", None)
     if check:
         return None if capital is None or (math.isfinite(capital) and capital > 0) else "--capital must be a number above 0"
@@ -900,7 +898,7 @@ def _live_account_report(venue, confirmation) -> tuple[dict | str, bool]:
 
 
 def _run_live(args, paths: LoopPaths, venue, files, second_opinion) -> int:
-    from valedia_trader.execution_and_risk import order_step
+    from valedia_trader.execution_and_risk import go_live, order_step
     ticket = {"propose": True} if args.propose else {"approve": args.approve}
     trader = PaperTrader(paths.journal, paths.risk_limits)
     follow = broker_book_follow(paths, live=True, trader=trader)   # T32: read again for this run, with its paper book
@@ -911,14 +909,16 @@ def _run_live(args, paths: LoopPaths, venue, files, second_opinion) -> int:
             ledger=orders, venue=venue, paper=lambda: order_step.paper_targets(trader), quotes=order_step.minute_quotes,
             journal=trader.journal, limits_file=paths.risk_limits, state=order_step.state_path_for(ledger_path, venue.name),
             clock=order_step.wall_clock, halt_file=risk_gate.HALT_FILE, latch_file=trader.latch_file, capital=None,
-            fractional=False, live=files, second_opinion=second_opinion, follow=follow, shared=True, **ticket)
+            fractional=bool(getattr(args, "fractional", False)), live=files, second_opinion=second_opinion, follow=follow,
+            shared=True, practice_ledger=order_step.ledger_path_for(paths.memory, go_live.PAPER_VENUE), **ticket)
     finally:
         orders.close()
     number = out.pop("ticket_number", None)
     print(json.dumps(out, indent=2, default=str))
     if number is not None:
+        again = " --fractional" if getattr(args, "fractional", False) else ""
         print(f"ticket number: {number} (approve within {order_step.TICKET_LIFE_SECONDS // 60} minutes with: "
-              "order-step --live --shared --approve NUMBER)")
+              f"order-step --live --shared{again} --approve NUMBER)")
     return 0 if out["status"] == "done" else 2
 
 
@@ -1096,7 +1096,10 @@ def main(argv=None) -> int:
                        allow_abbrev=False)   # T50: --liv, --li, --l and every other prefix are errors, not --live
     p.add_argument("--capital", type=float, default=None,
                    help="the broker capital the paper book is scaled to (default: the paper equity, a scale of 1)")
-    p.add_argument("--fractional", action="store_true", help="fractional units (5 decimals) instead of whole shares")
+    p.add_argument("--fractional", action="store_true",
+                   help="fractional units (5 decimals) instead of whole shares; with --live only the remainder legs under "
+                        "one share go, and only behind the practice proof, the owner's consent and the first-contact "
+                        "rule (docs/WEBULL.md, Fractions on live); otherwise they are held back and whole shares go as before")
     p.add_argument("--shared", action="store_true",
                    help="T51c S4c: the account is shared with its owner and the fund book is judged on its own "
                         "figures (its own value is the capital, so --capital is refused; needs the owner's opening entry); "

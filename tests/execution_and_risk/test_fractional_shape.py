@@ -280,8 +280,13 @@ def drive(w, rng, kind, counts):
         _new_day(w, rng)
         w.paper = _draw_paper(rng, funds=("IWM", "TLT"), equity=5000.0) if live else _draw_paper(rng)
         if live:
-            out = lpropose(w, fractional=True)                            # live still refuses --fractional
-            assert out["status"] == "stopped" and not w.venue.args and "submit" not in w.venue.names(), out
+            out = lpropose(w, fractional=True)                            # T51 B3: live no longer refuses --fractional; with no
+            assert not w.venue.args and "submit" not in w.venue.names(), out   # practice proof and no consent every remainder is held
+            if out["status"] == "done":
+                assert out["live_fractions"]["open"] is False and all(ln.get("leg", "whole") == "whole" for ln in
+                                                                      out.get("ticket", {}).get("orders", [])), out
+                assert all(0 < abs(r["units"]) < 1 and r["reason"] == "live_fractions" for r in out["residuals"]
+                           if r.get("reason")), out
             counts.add("live refused")
             return
 
