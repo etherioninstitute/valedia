@@ -427,6 +427,9 @@ dominance Stage 0 from 2026-12-04, (8) Candidate C. The live path (stricter go-l
   z-scoring over the whole context (544-547): context 128 vs 512 chosen on 2024-H2 only; target = centered
   cross-path variance (path-averaged Rogers-Satchell logged). Sampling T=1.0, top_p=1.0, top_k=0 (the worker
   passes 0.9 today). Pass amount = volume x OHLC/4 (missing today, filled with zeros).
+  Round 11: device check = exactness at near-greedy temperature (within 1e-4, batch vs single and MPS vs CPU)
+  plus distribution at T=1.0, M=256 (KS p > 0.10), then one device and seed scheme pinned. One closed-form
+  QLIKE scale per (model, horizon) on 2024-H2 for every competitor; 3%-a-year variance floor for all models.
 - **QUEUED** Stage A news-window steam test (sports; 1.18's near-start moneyline already failed). Owner's yes
   2026-11-22 for about 8,100 Odds API credits. Heavy slate-days chosen by game count only; a free Kalshi
   liquidity check at T_open - 5 min; 18 snapshots every 5 min in 90-min news windows (NHL 11:00-12:30 ET, MLB
@@ -449,7 +452,9 @@ dominance Stage 0 from 2026-12-04, (8) Candidate C. The live path (stricter go-l
 - **QUEUED** Candidate B second, narrowed round 7: headline CPI only (KXCPI/CPI, KXCPIYOY/CPIYOY), quadratic
   series; "strictly above k" on the 1-decimal print; day d's nowcast usable from 14:00 ET; error scale fitted
   2013-07..2021-12. Stage 0 first (no fill code): paired cluster Brier, Cleveland Fed p vs Kalshi's 14:00 mid at
-  T-5 and T-2, about 36 releases 2022-2024, one-sided Wilcoxon p < 0.05; fail = closed. Check first: legacy
+  T-5 and T-2, about 36 releases 2022-2024, one-sided Wilcoxon p < 0.05; fail = closed. Round 11: event
+  suffixes use the BLS reference month; the 36 releases are -21DEC (2022-01-12) to -24NOV (2024-12-11); -24DEC
+  (released 2025-01-15) is sealed; Carbon's date table still owed (its reply was cut off). Check first: legacy
   tickers reachable in our history client; the nowcast download is as first published (two fetches compared);
   October 2025 CPI cancelled.
 - **BLOCKED** Candidate A (option-implied index brackets): needs option-chain history.
