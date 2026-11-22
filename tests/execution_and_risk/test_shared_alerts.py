@@ -589,6 +589,41 @@ def test_the_open_keys_are_read_under_the_same_lock_as_the_write(mk, tmp_path, m
     assert seen == {"locked": True, "open": {key}}
 
 
+def test_a_check_run_on_an_env_before_the_watch_does_not_leave_the_watch_a_view_built_without_the_open_alerts(mk, tmp_path):
+    """The S4e verifier's finding: `shared_view` is cached on the Env. A check that runs first (here check_shared_stops) builds
+    it with no open alerts; the watch on the same Env then set the open alerts but reused that view. With the stop's day file
+    deleted the book is not seen as held, and a `cleared` line was written for a key that must stay open."""
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    stop_line(w, "marks", WORDS["marks"], stamp=S(DAY))
+    key = sk(w.venue.name, "marks")
+    assert key in {a.key for a in alerts.watch(env_of(w), path=path).raised}
+    day_file(w, DAY).unlink()
+    env = env_of(w)                                                # one Env: the check first, then the watch
+    assert alerts.check_shared_stops(env).alerts == []
+    res = alerts.watch(env, path=path)
+    assert res.cleared == [] and not [a for a in res.raised if a.key.startswith("shared-")] and key in state_of(path)
+    assert not [x for x in map(json.loads, path.read_text().splitlines()) if x["level"] == "cleared"]
+
+
+def test_two_watches_on_one_env_each_judge_with_the_alerts_open_at_their_own_start(mk, tmp_path):
+    """The second watch of an Env must not reuse the view the first built under an older set of open alerts: here an earlier
+    clean run is no evidence for a stop whose alert another process opened between the two watches (its day file is gone)."""
+    w = mk()
+    path = tmp_path / "alerts.jsonl"
+    stop_line(w, None, None, status="done", day="2026-11-10", stamp=S("2026-11-10"))
+    key = sk(w.venue.name, "marks")
+    env = env_of(w)
+    first = alerts.watch(env, path=path)                           # builds the view: the book is clean, nothing is open
+    assert not [a for a in first.raised if a.key.startswith("shared-")]
+    with path.open("a") as fh:                                     # another watch opened the key for a stop that is not in the journal
+        fh.write(json.dumps({"time": "2026-11-13T14:00:00Z", "level": "critical", "key": key, "title": "t", "detail": "d",
+                             "evidence": S(DAY) + "#0"}) + "\n")
+    res = alerts.watch(env, path=path)
+    assert res.cleared == [] and not [a for a in res.raised if a.key.startswith("shared-")] and key in state_of(path)
+    assert not [x for x in map(json.loads, path.read_text().splitlines()) if x["level"] == "cleared"]
+
+
 def a_done_run_with_a_shortfall(w):
     """The book holds SPY and QQQ; the owner sells the book's QQQ while the run is going: the run is done and its last
     reconcile found the shortfall (test_shared_run's own scenario)."""

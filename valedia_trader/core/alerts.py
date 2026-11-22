@@ -1496,6 +1496,7 @@ def watch(env: Env, senders=(), path=None) -> WatchResult:
         data = fh.read()
         open_map, _, withheld = _replay(data)
         env._cache["open_alerts"] = dict(open_map)
+        env._cache.pop("shared_view", None)                # a view cached by an earlier check or watch was built without these open alerts
         produced, held, held_prefixes, failures = run_checks(env)
         by_key = {}
         for a in produced:                                 # two checks, or two labels, that clean to one key are one alert
