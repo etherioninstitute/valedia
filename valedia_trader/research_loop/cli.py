@@ -1097,9 +1097,10 @@ def main(argv=None) -> int:
     p.add_argument("--capital", type=float, default=None,
                    help="the broker capital the paper book is scaled to (default: the paper equity, a scale of 1)")
     p.add_argument("--fractional", action="store_true",
-                   help="fractional units (5 decimals) instead of whole shares; with --live only the remainder legs under "
-                        "one share go, and only behind the practice proof, the owner's consent and the first-contact "
-                        "rule (docs/WEBULL.md, Fractions on live); otherwise they are held back and whole shares go as before")
+                   help="fractional units (5 decimals) instead of whole shares; with --live only when the practice proof, "
+                        "the owner's consent and the shared book all hold (then the whole legs follow the split and the "
+                        "remainders under one share go as MARKET orders, one per run until the first has reconciled; "
+                        "docs/WEBULL.md, Fractions on live); otherwise the run is exactly the live run without --fractional")
     p.add_argument("--shared", action="store_true",
                    help="T51c S4c: the account is shared with its owner and the fund book is judged on its own "
                         "figures (its own value is the capital, so --capital is refused; needs the owner's opening entry); "

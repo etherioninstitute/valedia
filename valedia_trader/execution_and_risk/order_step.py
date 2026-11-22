@@ -165,9 +165,9 @@ no update, no delete, no replacement; the state file's layout is unchanged.
 Fractions on live (T51 build B; docs/WEBULL.md, "Fractions on live"): with `fractional` on in live mode the run reads, once
 at its start and read-only, the three things its remainder legs need: the shared book, the owner's consent in the
 confirmation the locks judged (`fractional_live_consent`, JSON true only), and the practice proof (`practice_proof`: a
-clean MARKET remainder purchase and sale in the practice ledger and journal). Missing any, the run HOLDS its remainder legs
-(residuals with reason `live_fractions`, never a fault) and sends its whole-share LIMIT legs as without `fractional`; all
-present, a remainder leg is a MARKET order by quantity handed to the venue with `fractional_live=True`, and until one live
+clean MARKET remainder purchase and sale in the practice ledger and journal). Missing any, the opening is shut and the run
+is exactly the live run without `fractional` (no split, no zero rule, no five-decimal units; only the words are added to
+the summary); all present, the whole legs follow the split as on practice and a remainder leg is a MARKET order by quantity handed to the venue with `fractional_live=True`, and until one live
 remainder leg has filled and reconciled cleanly in the live record at most ONE goes per run (reason `first_contact`).
 The adapter takes a production order with no limit price only for such a leg and judges it again at its place_order call.
 A MARKET leg whose quote has passed MARKET_QUOTE_MAX_AGE_SECONDS at the moment its collar is about to judge it is asked
@@ -4310,10 +4310,11 @@ class _Run:
           - B2, the owner's consent: the confirmation the locks judged holds `fractional_live_consent` as JSON true;
           - B1, the practice proof: `practice_proof` on the practice ledger and journal, a clean MARKET remainder
             purchase and a clean MARKET remainder sale.
-        When any is missing the run HOLDS its remainder legs back (each a residual with reason `live_fractions`, never
-        a fault) and sends its whole-share LIMIT legs as without --fractional, saying what is missing in words on the
-        summary (`live_fractions`). A hold, not a stop: the whole-share path is what it was, and a stop would take it
-        down with the fractions. When all hold, B4 is read from the LIVE record by the same definition: until one live
+        When any is missing the opening is SHUT and the run is, in everything it reads, decides and writes, the same live
+        run as without `--fractional` (T51 B repair F1: `self.fractional` is switched off, so no split, no zero rule, no
+        five-decimal units or minimum, no residual and no `fractional` mark on the ticket), saying what is missing in words
+        on the summary (`live_fractions`), the only addition. A hold, not a stop: the whole-share path is exactly what it
+        was, and a stop would take it down with the fractions. When all hold, B4 is read from the LIVE record by the same definition: until one live
         remainder leg has filled and reconciled cleanly, at most ONE remainder leg goes in a run (`first_contact`)."""
         missing = []
         if not self.shared:
@@ -4345,6 +4346,9 @@ class _Run:
             info["first_contact"] = self.first_contact
             info["live_clean"] = {"purchases": 0 if live is None else live.purchases, "sales": 0 if live is None else live.sales}
         self.live_fractions, self.live_open = info, not missing
+        if missing:                                      # T51 B repair F1: a shut opening is no fractional run at all:
+            self.fractional = False                      # no split, no zero rule, no 5-decimal units, no residual, the
+                                                         # ticket flag as without --fractional; only the words are added
 
     def _live_account(self, account: str) -> str | None:
         """Live mode, at the first account read: the account the venue will trade is the confirmation's (its class,
@@ -5760,10 +5764,6 @@ class _Run:
                 c = {"symbol": sym, "units": u, "quote": quote, "value": abs(u) * quote, "parts": parts, "owned": owned,
                      "leg": leg.leg, "order_type": leg.order_type}
                 if leg.leg == "remainder":
-                    if self.live is not None and not self.live_open:   # T51 B1 to B3: a live remainder goes only when open
-                        self._hold_live(c, "live_fractions", "its remainder leg is held back: " +
-                                        str((self.live_fractions or {}).get("why", "live fractions are not open")))
-                        continue
                     c["after_whole"] = whole             # sent only after this fund's LIMIT leg of this run passed
                 out.append(c)
         if self.live is not None and self.live_open and self.first_contact:   # T51 B4: one live remainder leg, at most
@@ -6298,8 +6298,8 @@ class _Run:
                    "purchases_left_unsettled": self.purchases_left_unsettled}
         if self.fractional:                              # T51 R1: each fund's residual (ruling A: fractional runs only)
             summary["residuals"] = [dict(r) for r in self.residuals]
-            if self.live_fractions is not None:          # T51 B1 to B4: a live fractional run says how the opening stood
-                summary["live_fractions"] = dict(self.live_fractions)
+        if self.live_fractions is not None:              # T51 B1 to B4: a live fractional run says how the opening stood
+            summary["live_fractions"] = dict(self.live_fractions)   # (the only addition when it is shut: the words)
         if self.follow_names is not None:                # T32: which strategies the broker book followed
             summary["follow"] = self._follow_view()
         if self.shared:                                  # T51c S4c: the book's figures, its fees bounded, its shortfalls

@@ -185,7 +185,7 @@ connects to `api.webull.com` with the live pair (Webull may ask for a one-time a
 key is used) and asks for the account list, to print the class and last 4 characters of the account the venue would
 trade. It places, changes or cancels no order. `--propose` writes a ticket and sends no order; `--approve NUMBER` sends
 only that ticket's orders, each after fresh checks. Whole shares only, unless `--fractional` is given and every lock of
-"Fractions on live" (below) holds: then the remainder legs under one share go too. The command line
+"Fractions on live" (below) holds: then the remainder legs under one share go too, and the whole legs follow the split. The command line
 takes no abbreviation of any flag: `--liv`, `--li`, `--l` and every other prefix are errors, never `--live`.
 
 **The live key pair** lives in a file of its own, `~/.hermes/secrets/webull-live.env`, beside `trading.env`. The code
@@ -331,8 +331,8 @@ units filled than asked is judged as before. A MARKET leg's fill is never left u
 the part the zero rule changed: when a target of less than one share worth less than 5 dollars is taken as zero, the
 residual is the difference between what the rounded difference was and what the legs send, so the legs and the
 residual always add up to the fund's whole difference. It is written per fund on the run's summary under `residuals`
-(units, quote, value and why) and is never a fault, never an attention item and never drift. On live a remainder held
-back by a lock, or by first contact, is a residual too, with a `reason` (below).
+(units, quote, value and why) and is never a fault, never an attention item and never drift. On live, a remainder held
+back by first contact is a residual too, with `reason: first_contact` (see "Fractions on live", further down).
 
 **What `--fractional` now sends on practice.** Whole-share LIMIT orders and MARKET orders of under one share, nothing
 else. Before this build `--fractional` sent one LIMIT order with decimals per fund (1.5 shares, say), which the test
@@ -342,8 +342,12 @@ file is upgraded once, the first time it is opened for writing, every earlier ro
 no collar; the code before this build refuses a layout-4 file in words.
 
 **Live and `--fractional`.** Build B opened the live path for remainder legs, behind four locks and nothing else
-changed; see "Fractions on live" below. Without every lock `--fractional` on live holds the remainder legs back and the
-whole shares go as without it.
+changed; see "Fractions on live" below. Without every lock the opening is SHUT and a live `--fractional` run is exactly the
+live run without `--fractional`: the same orders, residuals (none) and journal lines, the split, the zero rule and the
+five-decimal units not applied at all; the only addition is the words saying why fractions are refused. With every
+lock the opening is OPEN and the whole legs, too, follow the split exactly as on practice (so a whole leg can differ
+from the run without the flag: a target under one share worth under 5 dollars is taken as zero, and the minimum is
+judged on the five-decimal units).
 
 **The practice proof (the lead runs it, in core hours, on the practice account).** Each item with what the design
 does if the answer is the unwelcome one:
@@ -382,7 +386,7 @@ system ever sends without a limit price, and it is sent only behind four locks, 
        "fractional_live_consent": true
 
    It counts only when its value is JSON `true`. Absent, `false`, the text `"true"`, `1`, `null` or anything else is no
-   consent: the run says so in words (`live_fractions.why`) and the remainder legs are held back. The key never makes the
+   consent: the run says so in words (`live_fractions.why`) and the opening is shut. The key never makes the
    confirmation itself fail, so whole-share runs go on as before. The adapter reads the file again at every order, so
    taking the line out (or setting it to anything but `true`) stops the next order at once; and because a ticket is bound to
    the digest of your files, an approval of a ticket proposed before you changed the file is refused. Nothing in this
@@ -406,14 +410,17 @@ system ever sends without a limit price, and it is sent only behind four locks, 
    held back as residuals with `reason: first_contact`: never a fault and never an attention item. Practice is not limited
    by this rule.
 
-**A hold, not a stop.** When lock 1 or 2 (or the shared book) is missing, the run does NOT stop: it holds its remainder
-legs back (each a residual with `reason: live_fractions` and the words) and sends its whole-share LIMIT legs as without
-`--fractional`, because a stop would take the whole-share path down with the fractions. The summary of every live
-`--fractional` run carries `live_fractions`: `open`, `consent`, the practice reading (`practice`: purchases and sales found,
-and why if it could not be read), `why` (what is missing, in words) and, when open, `first_contact` and the live reading
-(`live_clean`). A ticket made with `--fractional` is approved only with `--fractional` (and the reverse), and the command
-line prints the approve line with it. The first MARKET order on live is therefore your own decision twice over: the
-practice proof you ran, and the line you wrote.
+**A shut opening is not a stop and not a different run.** When lock 1 or 2 (or the shared book) is missing, the run does
+NOT stop and does NOT turn fractional: it is, in what it reads, decides and writes, the same live run as without
+`--fractional` (no split, no zero rule, no five-decimal units or minimum, no residual, the ticket not marked
+fractional), because a stop, or a half-fractional run, would change the whole-share path. The one addition is the
+`live_fractions` block on its summary, which says why: `open` (false), `consent`, the practice reading (`practice`:
+purchases and sales found, and why if it could not be read) and `why` (what is missing, in words). When the opening is
+open the block also carries `first_contact` and the live reading (`live_clean`). A ticket made with an open opening is
+approved only with `--fractional` (and a ticket made with a shut one is marked as without; if the opening opens
+before the approval the approval is refused, as the owner's files then differ), and the command line prints the approve
+line with `--fractional`. The first MARKET order on live is therefore your own decision twice over: the practice proof
+you ran, and the line you wrote.
 
 **The quote re-ask** (B5, see the collar's `quote_age`) applies to a live remainder leg as to a practice one.
 
@@ -614,7 +621,7 @@ below):
   must be in the ledger (a ledger put back from an older copy shows up here). A shared run makes it before anything
   is read from the account.
 
-**Not wired:** nothing of build B (fractional live orders are wired: "Fractions on live", below). A run WITHOUT `--shared` is as it was,
+**Not wired:** nothing of build B (fractional live orders are wired: "Fractions on live", above). A run WITHOUT `--shared` is as it was,
 except that a state file holding an owner's entry refuses it (below). Still not seen by the book at all: a distribution paid on the book's shares, and any order the venue holds that the
 ledger never knew (the venue's order history is a later slice).
 
@@ -902,7 +909,7 @@ live without shared (unreachable from the command line; a live state file that h
 on the owner's entry names any folder (the entry's state file is that folder's `memory/`, unlike a live run, which reads
 the repository only).
 
-**What is still missing on live:** nothing of the book's own (fractional live orders: "Fractions on live", below). The alerts, the
+**What is still missing on live:** nothing of the book's own (fractional live orders: "Fractions on live", above). The alerts, the
 owner's page and the `mark` entry (S4e) hold on live as on practice ("The alerts and the owner's page", below).
 
 ### The alerts and the owner's page (T51c S4e)

@@ -381,14 +381,12 @@ def test_b3_with_every_lock_a_live_run_sends_the_limit_leg_and_the_remainder_as_
 
 
 def whole_only(lw, out):
-    """The run held every remainder back and left the whole-share path as it was: the ticket (or the sends) hold LIMIT
-    legs only, nothing is a fault, an attention item or a left-over, and the remainders are residuals with a reason."""
+    """The opening is shut (T51 B repair F1): the run is the live run without --fractional: whole-share LIMIT lines only,
+    no leg mark, no residual, nothing a fault, an attention item or a left-over; only the words say why."""
     assert out["status"] == "done" and "faults" not in out and out["left_over"] == [] and out["refused"] == [], out
-    assert all(ln.get("leg", "whole") == "whole" for ln in out.get("ticket", {}).get("orders", [])), out
-    held = [r for r in out["residuals"] if r.get("reason") == "live_fractions"]
-    assert held and all(0 < abs(r["units"]) < 1 for r in held), out["residuals"]
+    assert all("leg" not in ln for ln in out.get("ticket", {}).get("orders", [])), out
+    assert "residuals" not in out, out
     assert out["live_fractions"]["open"] is False and out["live_fractions"]["why"], out
-    return held
 
 
 @pytest.mark.parametrize("value", [False, "true", "yes", 1, 0, None, [True], {"a": True}, 1.0, "", None.__class__])
@@ -397,11 +395,10 @@ def test_b2_a_consent_that_is_not_json_true_holds_the_remainder_in_words_and_the
     if value is None.__class__:                           # the line absent altogether
         lw.write_conf()
     out = lw.propose(fractional=True)
-    held = whole_only(lw, out)
+    whole_only(lw, out)
     assert CONSENT in out["live_fractions"]["why"] and "no consent" in out["live_fractions"]["why"]
     assert out["live_fractions"]["consent"] is False and "practice" in out["live_fractions"]
-    assert [(ln["units"], ln["leg"]) for ln in out["ticket"]["orders"]] == [(12.0, "whole")]
-    assert held[0]["units"] == 0.5 and "the owner's consent" in held[0]["why"]
+    assert [ln["units"] for ln in out["ticket"]["orders"]] == [12.0]
     lw.later(1)
     done = lw.approve(out["ticket_number"], fractional=True)
     assert done["status"] == "done" and done["orders_sent"] == 1 and lw.venue.limitless() == [], done
@@ -885,7 +882,7 @@ def test_b3_a_live_run_that_is_not_the_shared_book_holds_its_remainders_though_c
     out = lw.run(**lw.live_kw({"propose": True, "capital": 5000.0, "fractional": True}))
     assert out["status"] == "done" and out["live_fractions"]["open"] is False, out
     assert "shared" in out["live_fractions"]["why"] and out["live_fractions"]["consent"] is True
-    assert all(ln.get("leg") == "whole" for ln in out["ticket"]["orders"]) and out["residuals"][0]["reason"] == "live_fractions"
+    assert all("leg" not in ln for ln in out["ticket"]["orders"]) and "residuals" not in out
 
 
 def test_b3_even_a_forged_live_market_candidate_is_refused_by_the_order_step_when_the_opening_is_shut(mkl, monkeypatch):
@@ -896,14 +893,102 @@ def test_b3_even_a_forged_live_market_candidate_is_refused_by_the_order_step_whe
 
     def forged(self, *a, **k):
         out = real(self, *a, **k)
-        whole = next(c for c in out if c["leg"] == "whole")
+        whole = out[0]
         return out + [{**whole, "units": 0.5, "value": 0.5 * whole["quote"], "leg": "remainder", "order_type": "MARKET",
                        "after_whole": False}]
     monkeypatch.setattr(osx._Run, "_differences", forged)
     out = lw.propose(fractional=True)
     assert [(r["leg"], r["by"]) for r in out["refused"]] == [("remainder", "order step")], out
     assert "opening is shut" in out["refused"][0]["reason"] and "faults" not in out
-    assert all(ln["leg"] == "whole" for ln in out["ticket"]["orders"])
+    assert all("leg" not in ln for ln in out["ticket"]["orders"])
     lw.later(1)
     lw.approve(out["ticket_number"], fractional=True)
     assert lw.venue.limitless() == []
+
+
+# ---- T51 B repair F1: a SHUT opening changes nothing: the run is the same live run as without --fractional
+
+import re as _re
+
+_BATCH = _re.compile(r"os-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}")
+
+
+def _plain(x):
+    """A value as one comparable text: batch ids made equal, the opening's words and the random ticket number left out."""
+    drop = {"timestamp", "live_fractions", "ticket_number", "number_ends"}
+
+    def clean(v):
+        if isinstance(v, dict):
+            return {k: clean(w) for k, w in v.items() if k not in drop}
+        if isinstance(v, (list, tuple)):
+            return [clean(w) for w in v]
+        return v
+    return _BATCH.sub("B", json.dumps(clean(x), sort_keys=True, default=str))
+
+
+def _shut_pair(mkl, spec):
+    """Two identical live worlds, one run with --fractional and one without, each given the same days; the opening is
+    shut in both by `spec["shut"]`. Returns the two lists of (what a run returned, the journal's lines, the ledger's rows)."""
+    seen = []
+    for flag in (True, False):
+        consent, proof = {"consent": (False, (True, True)), "absent": ("absent", (True, True)),
+                          "no proof": (True, (False, False)), "purchase only": (True, (True, False)),
+                          "sale only": (True, (False, True))}[spec["shut"]]
+        conf = None if consent == "absent" else {CONSENT: consent}
+        lw = mkl(conf=conf)
+        lw.open_book("10000")
+        if any(proof):
+            practice_record(lw, buy=proof[0], sell=proof[1])
+        lw.prices["GLD"] = 40.0
+        lw.paper = paper({"a": spec["prelude"]})
+        out = lw.propose()                                   # the prelude: whole shares, the same in both
+        lw.later(1)
+        lw.approve(out["ticket_number"])
+        lw.later(30)
+        rows = []
+        lw.paper = paper({"a": spec["wanted"]}, min_trade_pct=spec["min_trade_pct"])
+        for step in range(2):
+            p = lw.propose(fractional=flag)
+            rows.append(p)
+            lw.later(1)
+            if p.get("ticket_number"):
+                rows.append(lw.approve(p["ticket_number"], fractional=flag))
+            lw.later(30)
+        journal = [e for e in lw.journal_events() if e.get("event") in ("order", "left_over", "refused", "dropped", "fill",
+                                                                          "summary", "unknown", "ticket", "no_quote")]
+        led = lw.ledger()
+        try:
+            book = [(o["symbol"], o["units"], o["limit_price"], o["order_type"], o["state"]) for o in led.orders()]
+        finally:
+            led.close()
+        seen.append((rows, journal, book))
+    return seen
+
+
+def test_f1_with_the_opening_shut_a_live_fractional_run_is_the_live_run_without_the_flag_over_seeded_worlds(mkl):
+    differing = 0
+    for k in range(24):
+        rng = random.Random(63_000 + k)
+        spec = {"shut": rng.choice(["consent", "no proof", "purchase only", "sale only", "absent"]),
+                "prelude": {"SPY": 10.0, "GLD": 10.0, "QQQ": rng.choice([0.0, 20.0])},
+                "wanted": {"SPY": rng.choice([0.08, 0.04, 5.0, 10.0, 15.0, 27.0, 0.0]),
+                           "GLD": rng.choice([25.0, 15.0, 10.0, 37.0]), "QQQ": rng.choice([0.0, 20.0, 31.0, 5.0])},
+                "min_trade_pct": rng.choice([0.0, 0.005])}
+        spec["prelude"] = {s: u for s, u in spec["prelude"].items() if u}
+        flagged, plain = _shut_pair(mkl, spec)
+        for a, b in zip(flagged[0], plain[0]):
+            assert a["live_fractions"]["open"] is False and "live_fractions" not in b, (k, spec)
+            assert "residuals" not in a, (k, spec, a.get("residuals"))
+        assert _plain(flagged[0]) == _plain(plain[0]), (k, spec)       # what the runs returned
+        assert _plain([e for e in flagged[1]]) == _plain([e for e in plain[1]]), (k, spec)   # the journal's lines
+        assert flagged[2] == plain[2], (k, spec)                       # the ledger's orders
+        differing += 1
+    assert differing == 24
+
+
+def test_f1_the_repro_cases_one_share_held_and_a_target_under_the_minimum_or_a_difference_of_one_and_a_half(mkl):
+    for wanted, prelude, mtp, _ in (({"SPY": 0.08}, {"SPY": 10.0}, 0.0, "SPY"), ({"SPY": 0.04}, {"SPY": 10.0}, 0.0, "SPY"),
+                                      ({"GLD": 25.0}, {"GLD": 10.0}, 0.005, "GLD")):
+        flagged, plain = _shut_pair(mkl, {"shut": "no proof", "prelude": prelude, "wanted": wanted, "min_trade_pct": mtp})
+        assert _plain(flagged[0]) == _plain(plain[0]) and flagged[2] == plain[2], (wanted, mtp)
+        assert plain[0][0].get("ticket", {}).get("orders", []) == [], (wanted, plain[0][0])   # without the flag: no order
