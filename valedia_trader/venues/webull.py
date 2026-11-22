@@ -236,6 +236,11 @@ LIVE_REPO = REPO
 LIVE_ACCOUNT_CLASS = "INDIVIDUAL_CASH"
 LIVE_KEYS = ("account_class", "account_ends", "confirmed_by", "max_order_value", "max_capital", "valid_until",
              "i_understand_this_trades_real_money")
+# T51 B2: the one optional key of a confirmation, the owner's own line for fractional remainder legs. It counts only
+# when its value is JSON true; absent, false, a string or anything else is no consent, and never makes the confirmation
+# itself fail (whole shares go on as they were). It is read where the confirmation is read, at every order.
+LIVE_CONSENT_KEY = "fractional_live_consent"
+LIVE_OPTIONAL_KEYS = (LIVE_CONSENT_KEY,)
 LIVE_DAYS_AHEAD_MAX = 31                          # valid_until at most this many days after today (New York date)
 LIVE_MONEY_MAX = 1e9                              # a cap above this is not a number this trader would ever be given
 OWNER_FILE_MAX_BYTES = 65536
@@ -654,6 +659,38 @@ def _require_live_limit(limit_price: Any) -> None:
                              "market orders from this adapter")
 
 
+def _live_remainder_exemption(fractional_live: Any, crypto: bool, amount: Any, session: Any, tag: Any,
+                              confirmation: Any) -> bool:
+    """T51 B3: whether a production order with NO limit price may go anyway. Only a remainder leg: `fractional_live` is
+    exactly True (the run vouches that its practice proof, B1, and the owner's consent, B2, held when it started), the
+    order is a stock or fund's (not crypto) of more than 0 and less than 1 unit in size, in the CORE session, its tag
+    is a remainder leg's (ends in ".r"), and the confirmation read for THIS order holds the owner's consent as JSON
+    true. (A MARKET order here is by quantity: entrust_type QTY is the only kind order_payload builds.) Everything
+    else, whatever the flag says, is a production order that needs a limit (_require_live_limit)."""
+    return bool(fractional_live is True and crypto is False and type(amount) is float and 0 < abs(amount) < 1
+                and type(session) is str and session == "CORE" and isinstance(tag, str) and tag.endswith(".r")
+                and isinstance(confirmation, dict) and confirmation.get(LIVE_CONSENT_KEY) is True)
+
+
+def _production_payload_ok(order: Any, market_ok: bool) -> bool:
+    """T51 B3, the second lock, at the single place_order call: a production payload is a LIMIT order with a limit price,
+    or (only when submit vouched for it with `market_ok`) the one MARKET order B3 allows, judged again on the payload
+    itself: a stock or fund, by quantity, in the CORE session, no limit price, a quantity above 0 and below 1."""
+    try:
+        if not isinstance(order, dict):
+            return False
+        if order.get("order_type") == "LIMIT":
+            return isinstance(order.get("limit_price"), str) and bool(order["limit_price"])
+        if order.get("order_type") != "MARKET" or market_ok is not True or "limit_price" in order:
+            return False
+        quantity = Decimal(order["quantity"])
+        return bool(order.get("entrust_type") == "QTY" and order.get("instrument_type") == "EQUITY"
+                    and order.get("support_trading_session") == "CORE" and order.get("market") == "US"
+                    and quantity.is_finite() and 0 < quantity < 1)
+    except Exception:
+        return False
+
+
 def _money(value: Any) -> float | None:
     """A finite number above 0 and at most LIVE_MONEY_MAX (an int or a float, never a bool), or None."""
     if type(value) not in (int, float):
@@ -694,7 +731,7 @@ def judge_live_confirmation(data: Any, today: date, floor: date | None = None) -
     if "account_id" in data:
         return None, ("is in the old form (a whole account id), which is no longer accepted: name the account by "
                       "account_class and account_ends")
-    unknown = [k for k in data if k not in LIVE_KEYS]
+    unknown = [k for k in data if k not in LIVE_KEYS and k not in LIVE_OPTIONAL_KEYS]
     if unknown:
         return None, f"has keys that are not part of a confirmation: {_key_list(unknown)}"
     missing = [k for k in LIVE_KEYS if k not in data]
@@ -731,9 +768,12 @@ def judge_live_confirmation(data: Any, today: date, floor: date | None = None) -
         return None, f"valid_until is more than {LIVE_DAYS_AHEAD_MAX} days ahead of today ({today.isoformat()})"
     if data["i_understand_this_trades_real_money"] is not True:
         return None, "i_understand_this_trades_real_money must be true"
-    return {"account_class": LIVE_ACCOUNT_CLASS, "account_ends": data["account_ends"], "confirmed_by": data["confirmed_by"],
-            "max_order_value": per_order, "max_capital": capital, "valid_until": day.isoformat(),
-            "i_understand_this_trades_real_money": True}, None
+    judged = {"account_class": LIVE_ACCOUNT_CLASS, "account_ends": data["account_ends"], "confirmed_by": data["confirmed_by"],
+              "max_order_value": per_order, "max_capital": capital, "valid_until": day.isoformat(),
+              "i_understand_this_trades_real_money": True}
+    if data.get(LIVE_CONSENT_KEY) is True:             # T51 B2: present in the judged form only when exactly JSON true
+        judged[LIVE_CONSENT_KEY] = True
+    return judged, None
 
 
 def own_confirmation() -> Path:
@@ -2282,10 +2322,18 @@ class WebullVenue:
 
     @_public
     def submit(self, symbol: str, units: float, tag: str, price: float | None = None, limit_price: float | None = None,
-               session: str = "CORE") -> dict:
+               session: str = "CORE", fractional_live: bool = False) -> dict:
         """Place one order. `price` is the last known price, used only to value the order for the live cap. `session`:
         CORE (regular hours, the default), ALL or NIGHT, sent as support_trading_session; NIGHT takes limit orders
         only, crypto takes none (see _session).
+
+        T51 B3: in production an order needs a limit price, with ONE exception: `fractional_live` exactly True (the order
+        step's own vouching that this run passed the practice proof and the owner's consent when it began) lets a
+        remainder leg go with none, when it is also a stock or fund order of more than 0 and less than 1 unit, in the
+        CORE session, with a tag ending ".r", and the confirmation read for this very order holds
+        `fractional_live_consent: true`. Every other production order without a limit is NotTransmitted, as before; the
+        per-order cap and the account checks apply to it like any other. The single place_order call judges the
+        payload once more (_production_payload_ok). The test environment ignores the flag.
 
         Everything that can refuse (choosing the account, the order fitting the account's class, the session, the
         long-only check, the live guard, building the payload) runs before the single place_order call, and any
@@ -2348,7 +2396,9 @@ class WebullVenue:
             # in production the price is judged before any call (a real number only: _live_order_value); in the test
             # environment where the base judged it
             confirmation = self._guard_live(*_live_order_value(amount, reference)) if live else None
-            if live:
+            market_ok = bool(live and limit_price is None
+                             and _live_remainder_exemption(fractional_live, crypto, amount, session, tag, confirmation))
+            if live and not market_ok:
                 _require_live_limit(limit_price)                          # T22d-2 B2: before any call or request is built
             account = self.account_id
             self._fits(crypto)
@@ -2367,7 +2417,7 @@ class WebullVenue:
             raise NotTransmitted(f"not sent: {_plain(exc)}") from None    # built here from gated parts
         except Exception as exc:                                          # a local fault, e.g. an unreadable price
             raise NotTransmitted(f"not sent: {_class_name(exc, secrets)}: {_gate(exc, secrets)}") from None
-        return self._place(account, order, secrets)
+        return self._place(account, order, secrets, market_ok=market_ok)
 
     def _submit_event(self, symbol: Any, units: Any, tag: str, limit_price: Any) -> dict:
         """submit in an Events venue. Everything that can refuse runs before the single place_order call and raises
@@ -2445,9 +2495,16 @@ class WebullVenue:
         raise NotTransmitted(f"the holdings could not be read within {SALE_READ_MAX_AGE:g} seconds of the order call after "
                              f"{SALE_REREADS} re-reads; not sent")
 
-    def _place(self, account: str, order: dict, secrets: _Secrets, expected: str | None = None) -> dict:
+    def _place(self, account: str, order: dict, secrets: _Secrets, expected: str | None = None,
+               market_ok: bool = False) -> dict:
         """The single place_order call and what follows it (see submit). `expected`: the event name sent, for the
-        detail read after a refusal (None for stocks and crypto)."""
+        detail read after a refusal (None for stocks and crypto). `market_ok` (T51 B3): submit vouched for a production
+        remainder leg with no limit price; in production anything else without a limit is refused here, whatever
+        submit did."""
+        if self._to_production() and not _production_payload_ok(order, market_ok):
+            raise NotTransmitted("a real-money order needs a limit price (a finite number above zero); production takes no "
+                                 "market orders from this adapter but the one fractional remainder leg of a run that passed "
+                                 "its locks")
         detail, refused = None, None
         cid = order["client_order_id"]
         if order["side"] == "SELL":                                       # T22d-2 B3: counted until seen settled

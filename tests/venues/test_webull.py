@@ -1,5 +1,6 @@
 import io
 import json
+import random
 import logging
 import sys
 import types
@@ -4174,3 +4175,207 @@ def test_r33a_old_against_new_the_answer_is_the_old_one_plus_the_key(tmp_path, b
         if unread:
             assert old["fee"] is None, (i, fields)
     assert seen[True] > 50 and seen[False] > 50, seen
+
+
+# ==== T51 B2, B3: the owner's consent line, and the one production order that may carry no limit price
+
+CONSENT = "fractional_live_consent"
+
+
+def _consent_conf(tmp_path, **over):
+    return _conf_file(tmp_path, _live(**over))
+
+
+def _market_args(**over):
+    """A production remainder leg as the order step hands it to the adapter: a MARKET order (no limit) of under one
+    share, a price to value it by, session CORE, the remainder tag, and the run's flag."""
+    args = dict(symbol="SPY", units=0.5, tag="os-1-SPY.r", price=100.0, limit_price=None, session="CORE", fractional_live=True)
+    args.update(over)
+    return args
+
+
+def _prod_submit(v, **args):
+    return v.submit(args.pop("symbol"), args.pop("units"), args.pop("tag"), **args)
+
+
+@pytest.mark.parametrize("value", [True, False, "true", "yes", 1, 0, None, [True], {"a": 1}, 1.0, ""])
+def test_b2_the_consent_line_is_judged_only_as_json_true_and_never_makes_the_confirmation_itself_fail(tmp_path, value):
+    today = wb.ny_date()
+    data = json.loads(_live(**{CONSENT: value}))
+    got, why = wb.judge_live_confirmation(data, today)
+    assert why is None and got is not None, why                    # the whole-share path continues whatever it holds
+    assert (got.get(CONSENT) is True) == (value is True), (value, got)
+    assert (CONSENT in got) == (value is True)                      # present only when exactly JSON true
+    absent, _ = wb.judge_live_confirmation(json.loads(_live()), today)
+    assert CONSENT not in absent
+    assert {k: v for k, v in got.items() if k != CONSENT} == absent  # nothing else about the confirmation changed
+
+
+def test_b2_an_unknown_key_is_still_refused_and_the_consent_name_is_the_only_one_added():
+    today = wb.ny_date()
+    data = json.loads(_live())
+    data["fractional_live_consent_please"] = True
+    got, why = wb.judge_live_confirmation(data, today)
+    assert got is None and "not part of a confirmation" in why
+    assert wb.LIVE_OPTIONAL_KEYS == (CONSENT,) and set(wb.LIVE_KEYS).isdisjoint(wb.LIVE_OPTIONAL_KEYS)
+
+
+def test_b3_a_production_remainder_leg_with_every_condition_is_sent_as_a_market_order_by_quantity(tmp_path):
+    v, client = venue(tmp_path, env="production")
+    _consent_conf(tmp_path, **{CONSENT: True})
+    out = _prod_submit(v, **_market_args(units=0.43859))
+    assert out["status"] == "accepted" and out["environment"] == "production"
+    (placed,) = client.placed()
+    order = placed[2][0]
+    assert order["order_type"] == "MARKET" and "limit_price" not in order and order["entrust_type"] == "QTY"
+    assert order["support_trading_session"] == "CORE" and order["quantity"] == "0.43859" and order["side"] == "BUY"
+
+
+def test_b3_a_production_remainder_sale_is_sent_the_same_way(tmp_path):
+    v, client = venue(tmp_path, env="production", positions=[{"symbol": "SPY", "quantity": "2.5", "instrument_type": "EQUITY"}])
+    _consent_conf(tmp_path, **{CONSENT: True})
+    out = _prod_submit(v, **_market_args(units=-0.31095))
+    assert out["status"] == "accepted"
+    (placed,) = client.placed()
+    assert placed[2][0]["side"] == "SELL" and placed[2][0]["order_type"] == "MARKET" and placed[2][0]["quantity"] == "0.31095"
+
+
+CONSENT_VALUES = [False, "true", "yes", 1, 0, None, [True], {"a": 1}, 1.0, "", DROP]
+
+
+@pytest.mark.parametrize("value", CONSENT_VALUES)
+def test_b2_a_consent_that_is_not_json_true_refuses_the_market_order_before_any_call(tmp_path, value):
+    v, client = venue(tmp_path, env="production")
+    _consent_conf(tmp_path, **{CONSENT: value})
+    with pytest.raises(wb.NotTransmitted, match="limit price"):
+        _prod_submit(v, **_market_args())
+    assert client.calls == []
+    out = v.submit("SPY", 1.0, "ok-1", price=100.0, limit_price=100.0)       # a limit order is as it was
+    assert out["status"] == "accepted" and len(client.placed()) == 1
+
+
+@pytest.mark.parametrize("change", [
+    {"fractional_live": False}, {"fractional_live": None}, {"fractional_live": 1}, {"fractional_live": "yes"},
+    {"units": 1.0}, {"units": -1.0}, {"units": 1.5}, {"units": 2.0}, {"units": 1.00001}, {"units": 0.0},
+    {"session": "ALL"}, {"session": "NIGHT"}, {"session": "core"}, {"session": None},
+    {"tag": "os-1-SPY"}, {"tag": "os-1-SPY.r2"}, {"tag": "r"}, {"symbol": "BTC-USD"}, {"price": None}, {"price": 0.0},
+    {"price": True}, {"price": "100"}, {"units": True}, {"units": "0.5"}])
+def test_b3_each_condition_alone_failing_refuses_the_order_without_a_limit_before_any_call(tmp_path, change):
+    v, client = venue(tmp_path, env="production")
+    _consent_conf(tmp_path, **{CONSENT: True})
+    with pytest.raises(wb.NotTransmitted):
+        _prod_submit(v, **_market_args(**change))
+    assert client.placed() == []
+
+
+def test_b3_the_per_order_cap_still_binds_a_market_remainder_and_so_does_the_confirmations_account(tmp_path):
+    v, client = venue(tmp_path, env="production")
+    _consent_conf(tmp_path, **{CONSENT: True, "max_order_value": 40})
+    with pytest.raises(wb.LiveTradingNotConfirmed, match="above the confirmed cap"):
+        _prod_submit(v, **_market_args(units=0.5, price=100.0))              # 50 above 40
+    _consent_conf(tmp_path, **{CONSENT: True, "account_ends": "9999"})
+    with pytest.raises(wb.LiveTradingNotConfirmed, match="different account"):
+        _prod_submit(v, **_market_args())
+    _consent_conf(tmp_path, **{CONSENT: True, "valid_until": "2020-01-01"})
+    with pytest.raises(wb.LiveTradingNotConfirmed, match="lapsed"):
+        _prod_submit(v, **_market_args())
+    assert client.placed() == []
+
+
+def test_b3_the_consent_is_read_again_at_every_order_so_taking_it_back_stops_the_next_one(tmp_path):
+    v, client = venue(tmp_path, env="production")
+    _consent_conf(tmp_path, **{CONSENT: True})
+    assert _prod_submit(v, **_market_args(tag="a-1.r"))["status"] == "accepted"
+    _consent_conf(tmp_path, **{CONSENT: False})
+    with pytest.raises(wb.NotTransmitted, match="limit price"):
+        _prod_submit(v, **_market_args(tag="a-2.r"))
+    assert len(client.placed()) == 1
+
+
+def test_b3_the_test_environment_is_as_it_was_whatever_the_flag_says(tmp_path):
+    v, client = venue(tmp_path)
+    for flag in (True, False):
+        v.submit("SPY", 0.5, f"t-{flag}", price=100.0, fractional_live=flag)
+    assert [c[2][0]["order_type"] for c in client.placed()] == ["MARKET", "MARKET"]
+
+
+def test_b3_the_place_call_itself_refuses_a_production_order_with_no_limit_unless_the_run_vouched_for_it(tmp_path, monkeypatch):
+    """Two locks in series: with the first (the limit rule in submit) gone, the single place_order call still refuses."""
+    v, client = venue(tmp_path, env="production")
+    _consent_conf(tmp_path, **{CONSENT: True})
+    monkeypatch.setattr(wb, "_require_live_limit", lambda limit: None)         # a broken first lock
+    for change in ({"fractional_live": False}, {"units": 1.5}, {"session": "ALL"}, {"tag": "os-1-SPY"}):
+        with pytest.raises(wb.NotTransmitted):
+            _prod_submit(v, **_market_args(**change))
+    _consent_conf(tmp_path, **{CONSENT: False})
+    with pytest.raises(wb.NotTransmitted):
+        _prod_submit(v, **_market_args())
+    assert client.placed() == []
+
+
+def _world(rng, tmp_path, n):
+    """One seeded production world: a confirmation (consent in some form, a cap, a lapse), a venue, one order. Each
+    field is good, and is spoilt on its own with a probability of 0.12, so that worlds meeting every condition and
+    worlds missing one (or several) are both common."""
+    def spoil(good, bad):
+        return rng.choice(bad) if rng.random() < 0.12 else good
+    folder = tmp_path / f"w{n}"
+    folder.mkdir()
+    over = {CONSENT: spoil(True, [False, "true", 1, None, DROP, [True]]), "max_order_value": spoil(1000, [40, 60])}
+    if rng.random() < 0.06:
+        over["valid_until"] = "2020-01-01"
+    if rng.random() < 0.06:
+        over["account_ends"] = "9999"
+    held = spoil("2.5", ["0", "0.3"])
+    client = FakeClient(positions=[{"symbol": "SPY", "quantity": held, "instrument_type": "EQUITY"}])
+    v = wb.WebullVenue(KEY, SECRET, environment="production", client=client, confirmation_file=CONF(tmp_path))
+    CONF(tmp_path).write_text(_live(**over))
+    args = dict(symbol=spoil("SPY", ["BTC-USD"]),
+                units=spoil(rng.choice([0.5, -0.5, 0.99999, -0.2, 0.00001, 0.43859]), [1.0, 1.5, -1.0, 3.0, -0.9]),
+                tag=spoil("os-1-SPY.r", ["os-1-SPY", "x.r2"]),
+                price=spoil(100.0, [None, 0.0, 120.0]),
+                limit_price=spoil(None, [100.0, 0.0, -1.0, float("nan")]),
+                session=spoil("CORE", ["ALL", "NIGHT"]),
+                fractional_live=spoil(True, [False]))
+    return v, client, over, args, held
+
+
+def _oracle_without_limit(over, args, held):
+    """Everything B3 asks, spelled out once more: may this order go to production with no limit price?"""
+    if over.get(CONSENT) is not True or "valid_until" in over or "account_ends" in over:
+        return False
+    if args["fractional_live"] is not True or args["limit_price"] is not None or args["symbol"] != "SPY":
+        return False
+    if args["session"] != "CORE" or not args["tag"].endswith(".r"):
+        return False
+    if not 0 < abs(args["units"]) < 1:
+        return False
+    price = args["price"]
+    if not (type(price) is float and price > 0) or abs(args["units"]) * price > over["max_order_value"]:
+        return False
+    return args["units"] > 0 or abs(args["units"]) <= float(held)
+
+
+def test_b1_b2_b3_property_no_production_order_without_a_limit_is_ever_placed_unless_every_condition_holds(tmp_path):
+    sent_market = refused = limited = 0
+    for n in range(400):
+        rng = random.Random(51_000 + n)
+        v, client, over, args, held = _world(rng, tmp_path, n)
+        try:
+            _prod_submit(v, **dict(args))
+        except wb.WebullError:
+            pass
+        for call in client.placed():
+            order = call[2][0]
+            if order["order_type"] == "MARKET":
+                assert _oracle_without_limit(over, args, held), (n, over, args, order)
+                assert order["entrust_type"] == "QTY" and order["support_trading_session"] == "CORE"
+                assert 0 < float(order["quantity"]) < 1 and order["instrument_type"] == "EQUITY"
+                sent_market += 1
+            else:
+                limited += 1
+        if args["limit_price"] is None and not client.placed():
+            refused += 1
+        if _oracle_without_limit(over, args, held):                  # the other way: a world that meets every condition goes
+            assert [c[2][0]["order_type"] for c in client.placed()] == ["MARKET"], (n, over, args)
+    assert sent_market > 15 and refused > 100 and limited >= 0, (sent_market, refused, limited)
