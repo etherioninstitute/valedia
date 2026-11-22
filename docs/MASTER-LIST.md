@@ -307,6 +307,15 @@ After a first attended order:
   dividends (4.4).
 - **QUEUED** second price source: its delay inside the session is unmeasured and one source's terms unknown;
   not yet fit to guard real orders alone (roadmap 5.2, T28).
+- **QUEUED** (found 2026-11-22, Carbon dialogue) the live order step does not apply Carver's 10% no-trade
+  buffer: `execution_and_risk/buffering.py` is called only by `backtest/walkforward.py`. Check whether the
+  daily rebalance trades every small drift; if so, apply the same buffer to the book's targets (full blind
+  check; it touches the accepted order path).
+- **QUEUED** (2026-11-22) a settled-cash guard for T+1 before any stock order: the account is a shared cash
+  account; no Valedia lot bought with unsettled proceeds is sold before it settles, and new buys are capped by
+  settled cash on Valedia's own book. Goes on the stricter go-live gate's list.
+- **IDEA** (2026-11-22) execution clock: run at about 10:30 ET instead of 9:55, finish before 13:30 ET on FOMC
+  days, spread gate (live spread at most 2 x the 20-day median). Changes when, never what; an owner decision.
 
 ## 3. Prediction markets on Webull (the owner's first wish)
 
@@ -393,6 +402,52 @@ Ideas not committed to:
 - **IDEA** the price-range idea from the starred-repos audit as a swarm seed (blocked until MiroFish has one
   completed scored run).
 - **IDEA** TimesFM 3.0 weights are non-commercial; the owner has not ruled on personal use of them.
+
+From the Carbon dialogue (2026-11-22, rounds 1 to 5; replies `~/Valedia_Claude_Reply1..5.md`). Each test is
+locked in the research loop before any data is read; none has been run yet.
+- **QUEUED** Kronos volatility test (Kronos-small and Kronos-base = 2 trials). Bars from 2024-07-01 only;
+  2024-07..12 for plumbing and the scale factor; 2025 on sealed. 64 sampled paths, uncentered variance,
+  Yang-Zhang target, QLIKE, h = 1 and 5 with Holm. Baselines EWMA 0.94, blended EWMA, HAR-YZ (slopes fitted
+  2015-01-01..2024-06-30, pooled, per-fund intercepts; only the scale factor on H2 2024). Pass: HLN-DM t <= -2.33
+  against both blended EWMA and HAR-YZ, plus the 95% MCS. A pass changes sizing only: max(sigma_blend,
+  sigma_Kronos). Kronos-base DOWNLOADED 2026-11-22 (owner's yes): `trading-lab/models/Kronos-base/`, revision
+  2b554741eca47781b64468546e77fef3e85130e6, model.safetensors sha256 abff193a...5f4b83 (matches the hub's
+  record), 102.3M parameters, MIT; smoke test on the CPU: load 1.7 s, 5-day forecast 0.8 s.
+- **QUEUED** Stage A news-window steam test (sports; 1.18's near-start moneyline already failed). Owner's yes
+  2026-11-22 for about 8,100 Odds API credits. Heavy slate-days chosen by game count only; a free Kalshi
+  liquidity check at T_open - 5 min; 18 snapshots every 5 min in 90-min news windows (NHL 11:00-12:30 ET, MLB
+  15:30-17:00 ET, NCAAB 10:00-11:30 / 17:00-18:30 ET). Entry in the first candle after the snapshot's time at
+  max(open, close) of the ask + 1 cent; spread <= 5 cents; Pinnacle's move <= 120 s old. The MLB lineup trigger
+  is its own trial. Historical Kalshi candle pulls stay paced far below 3/s until 2026-12-03.
+- **QUEUED** Kalshi fees per series: the registry seeds one flat maker fee 0.0175 for every series
+  (`data_and_fees/venue_registry.py:76`), which is wrong. Read `fee_type` and `fee_multiplier` from
+  `GET /trade-api/v2/series/{ticker}` and `/series/fee_changes` (quadratic = maker 0;
+  quadratic_with_maker_fees = 0.0175; quadratic_with_combo_maker_fees = 0.035; anything else fails closed);
+  check against `fill.fee_cost` and `is_taker`. Needed before Candidates C and B.
+- **QUEUED** Candidate C first: passive NO on cheap YES longshots (YES bid 3-12 cents, 2-14 days left,
+  quadratic series only, no sports or weather). Fill = a later trade printed below the posted price. At most 2
+  contracts per event; clusters (category, settlement date) weighted 1/G; G >= 50, cluster t >= 2.5, t >= 2.0
+  after dropping the largest cluster; single binaries and bracket ladders logged apart. The 2025-on holdout
+  tests the current fee regime.
+- **QUEUED** Candidate B second: CPI and PCE bracket rounding against the Cleveland Fed nowcast.
+- **BLOCKED** Candidate A (option-implied index brackets): needs option-chain history.
+- **QUEUED** pooling test on Elephant-1 (does it add anything beyond Kalshi's mid): lock the document BEFORE
+  the scored period's results are read (scored period ends 2026-12-03); first confirm the collector stores bid
+  and ask size. Microprice in the null; prequential fit or a cluster wild bootstrap with Webb weights; 1/T_e
+  weights on tradable book states; one d_g per real event, sign permutation at p < 0.01, plus post-fee EV.
+- **QUEUED** calibration diagnostic (slope, intercept, out-of-fold AUC, reliability) on the tournament's
+  pre-2025 answers only (nimble-v3, qwen3:8b, qwen3.8-27b). Elephant-1's 852 answers are all forward questions
+  asked 2026-11-13..20, inside the sealed zone: scored only prequentially (Platt after a 200-question burn-in,
+  no isotonic).
+- **QUEUED** stocks, first family: insider cluster buys (roadmap 1.17), free inputs (EDGAR Form 4, Finnhub
+  insiders since 2015), matched-cohort benchmark; spec asked of Carbon in round 5.
+- **BLOCKED** stocks, second family: quality + payout + residual momentum with a rank buffer; needs
+  survivorship-free fundamentals (owner item 10). Third: busy-day multi-signal earnings.
+- **IDEA** postmortem spec: fee mismatch flagged at 1 fill, slippage by CUSUM at 25, CLV decay at 60 or more;
+  no return-decay alarm on the fund book (watch slippage, turnover, realized/target volatility).
+- **IDEA** bots: Arbiter (rule matching across venues) adopted as a design; Quant (read-only quant_engine
+  tool) and Risk (reconcile and explain only) proposed, not built. The Decider stays off the per-trade path
+  until 100 shadow vetoes show negative CLV.
 
 ## 5. Data collection
 
@@ -725,8 +780,20 @@ run beside MiroFish and Elephant-1):
     email; Spotlight privacy for the scratch area; TimesFM 3.0's licence.
 15. Starting the design session for Paperclip, RuFlo, the Kanban and the Live page; a download of an Ornith
     model, if wanted.
+16. Item 10's choice (2026-11-22): Carbon recommends the Sharadar bundle at about $399-499 a year (Norgate's
+    updater is Windows-only; EODHD restates financials; CRSP's licence forbids this use). The lead reads
+    Sharadar's licence before recommending.
+17. Tax: DBC issues a K-1; PDBC is the no-K-1 alternative. No code change until he rules.
+18. Whether to merge CTO with Planner and Coder with Builder (Carbon's suggestion).
+19. The execution-clock idea in section 2 (10:30 ET run, FOMC and spread rules).
 
 ## 14. Closed log (newest first)
+
+- 2026-11-22 Kronos-base downloaded and pinned (owner's yes; revision 2b554741..., sha256 checked), smoke test
+  passed on the CPU.
+- 2026-11-22 Odds API credits for the steam test: owner said yes (about 8,100).
+- 2026-11-22 bot short names: done by display title (Researcher, Decider, Auditor, CTO, Coder, Planner,
+  Builder, Reviewer); profile ids unchanged.
 
 - 2026-11-17 T52 the leaders' record: merged (main `bc4e8eb`); leaders fixed and the baseline pass taken.
 - 2026-11-17 T51 build A, fractional orders on the practice path: merged (main `5d944d4`); live still refused.
