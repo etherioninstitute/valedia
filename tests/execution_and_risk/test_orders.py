@@ -4111,3 +4111,29 @@ def test_b6_over_seeded_damages_every_one_is_refused_and_no_undamaged_file_is(tm
         if how is not None:
             assert path.read_bytes() == before, (seed, how)
     assert refused > 20 and passed > 4, (refused, passed)
+
+
+def test_b1_reconciles_lists_every_reconcile_in_order_and_reads_a_layout3_or_read_only_file_without_writing(tmp_path):
+    path = tmp_path / "r.sqlite"
+    clock = Clock()
+    led = ledger(path, clock=clock)
+    venue = FakeVenue()
+    for _ in range(3):
+        clock.t += 60
+        led.reconcile(venue, {})
+    got = led.reconciles()
+    assert [r["id"] for r in got] == [1, 2, 3] and all(r["clean"] and r["summary"]["clean"] is True for r in got)
+    assert [r["time"] for r in got] == [1_000_060.0, 1_000_120.0, 1_000_180.0]
+    led.close()
+    raw = path.read_bytes()
+    ro = orders.open_read_only(path)
+    assert ro.reconciles() == got
+    ro.close()
+    assert path.read_bytes() == raw
+    raw_db = sqlite3.connect(str(path))
+    raw_db.execute("INSERT INTO reconciles (time, clean, summary) VALUES (9, 0, 'not json')")
+    raw_db.commit()
+    raw_db.close()
+    ro = orders.open_read_only(path)
+    assert ro.reconciles()[-1] == {"id": 4, "time": 9.0, "clean": False, "summary": None}
+    ro.close()

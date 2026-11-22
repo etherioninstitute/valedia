@@ -2450,6 +2450,137 @@ def market_leg_clears_minimum(units, quote) -> bool:
         return abs(Decimal(repr(float(units)))) * Decimal(repr(float(quote))) * margin >= FRACTIONAL_MIN_VALUE
 
 
+PRACTICE_VENUE = "webull-sandbox"                 # T51 B1: the practice record's venue (go_live.PAPER_VENUE, held equal by a test)
+PROOF_PURCHASE = "a MARKET remainder PURCHASE that filled and reconciled cleanly"
+PROOF_SALE = "a MARKET remainder SALE that filled and reconciled cleanly"
+
+
+@dataclass(frozen=True)
+class PracticeProof:
+    """T51 B1: what a ledger and journal hold of MARKET remainder legs that filled and reconciled cleanly (see
+    `clean_remainder_fills`). `unreadable`: why the record could not be read at all, else None."""
+    purchases: int = 0
+    sales: int = 0
+    unreadable: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        """Both items: at least one purchase and at least one sale (B1)."""
+        return self.unreadable is None and self.purchases >= 1 and self.sales >= 1
+
+    @property
+    def missing(self) -> list[str]:
+        return [] if self.unreadable is not None else (
+            ([PROOF_PURCHASE] if self.purchases < 1 else []) + ([PROOF_SALE] if self.sales < 1 else []))
+
+    def words(self) -> str:
+        if self.unreadable is not None:
+            return f"the record cannot be used: {self.unreadable}"
+        if self.ok:
+            return (f"the record holds {self.purchases} MARKET remainder purchase(s) and {self.sales} sale(s) that filled "
+                    "and reconciled cleanly: both are there")
+        return "the record lacks " + " and ".join(self.missing)
+
+
+def _shortfall_in(summary: dict) -> bool:
+    """A shared run's summary whose last reconcile found a shortfall (as the go-live gate reads it): not clean."""
+    shared = summary.get("shared")
+    return False if shared is None else (True if not isinstance(shared, dict) else bool(shared.get("shortfalls")))
+
+
+def clean_remainder_fills(ledger_path, journal_dir, venue_name: str) -> PracticeProof:
+    """T51 B1, read-only: the MARKET remainder legs of `venue_name`'s own ledger and journal that filled and reconciled
+    cleanly, counted by side. A leg counts only when ALL of these hold:
+      - the ledger is layout 4 (a layout-3 file was written by an older code path and counts nothing) and holds the
+        order as filled, MARKET, with a collar price and no limit price, under one unit, and every fill row of it
+        applied, their units adding up to the order's;
+      - the journal holds an `order` line of this venue with that tag, `leg` remainder and `order_type` MARKET, and a
+        `fill` line with that tag (so this code path wrote it);
+      - every batch involved (the order's, and each that journaled a fill of it) has a run summary that ended `done`
+        with no fault, and no shortfall;
+      - "reconciled cleanly": the first reconcile on the ledger AFTER the one that wrote the order's last fill row
+        exists, read its positions, and shows no position difference and no shortfall for the fund and no anomaly or
+        unresolved entry naming the order's tag.
+    Nothing is written, upgraded or created; a record that cannot be read at all is `unreadable`, in words."""
+    try:
+        return _clean_remainder_fills(ledger_path, journal_dir, venue_name)
+    except Exception as exc:                          # reading a record never raises
+        return PracticeProof(unreadable=f"it could not be read ({_describe(exc)})")
+
+
+def _clean_remainder_fills(ledger_path, journal_dir, venue_name: str) -> PracticeProof:
+    from valedia_trader.execution_and_risk.orders import open_read_only
+    from valedia_trader.research_loop.paper import Journal, JournalDamaged
+    try:
+        led = open_read_only(ledger_path)
+    except OrderError as exc:
+        return PracticeProof(unreadable=f"the order ledger cannot be read: {_one_line_words(exc)}")
+    try:
+        layout = led._db.execute("PRAGMA user_version").fetchone()[0]
+        rows = [] if layout != 4 else [o for o in led.orders(("filled",)) if o["order_type"] == "MARKET"
+                                       and o["collar_price"] is not None and o["limit_price"] is None
+                                       and 0 < abs(o["units"]) < 1]
+        fills = {o["tag"]: led.fills(o["tag"]) for o in rows}
+        recs = led.reconciles()
+    finally:
+        led.close()
+    folder = Path(journal_dir)
+    if folder.is_symlink() or not folder.is_dir():
+        return PracticeProof(unreadable="the journal folder is not there")
+    try:
+        entries = Journal(folder).read_complete()
+    except JournalDamaged as exc:
+        n = len(getattr(exc, "skipped", []) or [])
+        return PracticeProof(unreadable=f"the journal is damaged ({n} line{'s' if n != 1 else ''} cannot be read)")
+    mine = [e for e in entries if isinstance(e, dict) and e.get("type") == "order_step" and e.get("venue") == venue_name]
+    summaries: dict = {}
+    for e in mine:
+        if e.get("event") == "summary" and type(e.get("batch")) is str:
+            summaries.setdefault(e["batch"], []).append(e)
+
+    def clean(batch) -> bool:
+        got = summaries.get(batch)
+        return bool(got) and all(e.get("status") == "done" and not e.get("faults") and not _shortfall_in(e) for e in got)
+    buys = sells = 0
+    for o in rows:
+        tag, sym, units = o["tag"], o["symbol"], o["units"]
+        line = [e for e in mine if e.get("event") == "order" and e.get("tag") == tag and e.get("leg") == "remainder"
+                and e.get("order_type") == "MARKET"]
+        fill_lines = [e for e in mine if e.get("event") == "fill" and e.get("tag") == tag]
+        rs = fills[tag]
+        if not (line and fill_lines and rs) or not all(f["applied"] for f in rs):
+            continue
+        if abs(math.fsum(f["units"] for f in rs) - units) > max(1e-9, REL_TOL * max(1.0, abs(units))):
+            continue
+        if not (clean(o["batch"]) and clean(line[0].get("batch")) and all(clean(e.get("batch")) for e in fill_lines)):
+            continue
+        last = max(f["id"] for f in rs)
+        at = [i for i, r in enumerate(recs) if r["summary"] and any(isinstance(f, dict) and f.get("id") == last
+                                                                    for f in r["summary"].get("fills") or [])]
+        if not at or at[0] + 1 >= len(recs):
+            continue                                  # the reconcile that wrote the fill is not "the next one"
+        nxt = recs[at[0] + 1]["summary"]
+        if not isinstance(nxt, dict) or nxt.get("positions_error"):
+            continue
+        if sym in (nxt.get("position_differences") or {}) or sym in (nxt.get("position_shortfalls") or {}):
+            continue
+        if any(isinstance(a, dict) and a.get("tag") == tag for a in (nxt.get("anomalies") or []) + (nxt.get("unresolved") or [])):
+            continue
+        buys += units > 0
+        sells += units < 0
+    return PracticeProof(purchases=int(buys), sales=int(sells))
+
+
+def _one_line_words(exc: BaseException) -> str:
+    return " ".join(str(exc).split())[:300]
+
+
+def practice_proof(ledger_path, journal_dir, venue_name: str = PRACTICE_VENUE) -> PracticeProof:
+    """T51 B1: the practice record's reading (`clean_remainder_fills` on the practice ledger and journal); `ok` only with
+    at least one clean MARKET remainder purchase AND one clean MARKET remainder sale."""
+    return clean_remainder_fills(ledger_path, journal_dir, venue_name)
+
+
 def _load_second_source():
     """T51 ruling C: the second price source's verdict function, the one live mode asks (read-only quotes), for the
     practice path too. Imported here and only here, so a test can stand it in."""

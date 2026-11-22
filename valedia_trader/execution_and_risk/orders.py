@@ -589,6 +589,19 @@ class OrderLedger:
             return None
         return {"time": rows[0]["time"], "clean": bool(rows[0]["clean"]), "summary": json.loads(rows[0]["summary"])}
 
+    def reconciles(self) -> list[dict]:
+        """T51 B1: every reconcile on record, oldest first: {id, time, clean, summary}, `summary` the stored record read back
+        (None for text that is not a JSON object). Reads only; the proof reading of a practice record uses it."""
+        out = []
+        for r in self._read("SELECT id, time, clean, summary FROM reconciles ORDER BY id"):
+            try:
+                summary = json.loads(r["summary"])
+            except (TypeError, ValueError):
+                summary = None
+            out.append({"id": r["id"], "time": r["time"], "clean": bool(r["clean"]),
+                        "summary": summary if isinstance(summary, dict) else None})
+        return out
+
     def attention(self, open_only: bool = True) -> list[dict]:
         """Items a person must look at (an order found at the venue after it was declared never arrived, a submit
         outcome that came back after that, a fee total below zero, a fee that could not be read (kind fee_unreadable:
