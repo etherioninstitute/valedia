@@ -18,7 +18,9 @@ matched by keyword only, not read one by one. Item H-1 closes that.
    one line of why.
 4. A failed or passed test adds its lesson to section 7 here AND to the lesson store the idea-proposing agents
    read (see L-6: that second half is not automatic yet).
-5. Status words: **NOW** (being worked today), **NEXT** (queued behind NOW, nothing else needed),
+6. Affordable paid options that could improve Valedia go in section 13b with price, what each unlocks and
+   whether it is needed now (owner, 2026-11-22). Listing one is not buying it: each is his to choose.
+7. Status words: **NOW** (being worked today), **NEXT** (queued behind NOW, nothing else needed),
    **QUEUED** (accepted, not scheduled), **OWNER** (waits for the owner), **BLOCKED** (waits for something
    named), **WATCH** (running; check on the date given), **IDEA** (not committed to). A status taken from the
    roadmap without a fresh check says "(roadmap)": the roadmap's rows were last refreshed 2026-11-14.
@@ -456,13 +458,29 @@ locked in the research loop before any data is read; none has been run yet.
   $0 path (round 7): Databento's free starting credit (daily bars with delisted names from 2018-05, plus
   minute bars on event mornings only) + SEC CompanyFacts shares + EDGAR Form 4 data sets; window
   2018-05..2024-12, 2025 on sealed. Blocked on the owner opening a free Databento account (owner item 20);
-  check Databento's credit, prices, dataset start and personal-use licence first.
+  check Databento's credit, prices, dataset start and personal-use licence first. Round 8: daily bars from
+  EQUS.SUMMARY, minute bars from XNAS.ITCH (both from 2018-05; EQUS.MINI only from 2023-03-28); get_cost before
+  every pull; the $125 credit expires 6 months after opening, so open only when the pull is ready. Bars are
+  unadjusted: splits found by overnight price ratio matched to a CompanyFacts share jump (Finnhub splits are 403
+  on the free plan). Locked: inverse pre-event YZ variance weights (floor 0.20^2, cap 3x), SIC-division
+  de-meaning, N >= 250, G_firm >= 180, G_month >= 55, ex-ante WLS SE <= 48 bps checked before any return is read.
 - **QUEUED** hygiene: `src/insider_mirror.py` (legacy) sends a named User-Agent to the SEC; give it a
   generic one or retire it.
 - **BLOCKED** stocks, second family: quality + payout + residual momentum with a rank buffer; needs
   survivorship-free fundamentals (owner item 10). Round 6: buy top 22, hold while rank <= 45; weights inverse
   blended-EWMA volatility (floor 15%, cap 7.5% a name) behind the 10% band. Third: busy-day multi-signal
   earnings.
+- **QUEUED** (round 8, $0) Kalshi cross-contract dominance, Stage 0: threshold ladders (YES(K_low) + NO(K_high))
+  and "before date" pairs, 2022-2024 one-minute candles, both legs at taker fee + T-bill carry for calendar
+  pairs, a window counts only if it lasts >= 2 candles; < 30 windows = closed, >= 50 = check depth on the
+  collector after 2026-12-03. Pairs need matched settlement terms (Arbiter); unmatched pairs excluded. Paced far
+  below 3/s, mostly after 2026-12-03. Read Shi & Zhai arXiv:2610.23517 first.
+- **QUEUED** (round 8) fund book variants, each one trial on development data (pre-2025) + forward practice, never
+  re-scored on the already-read sealed period: (A) drift bands 10% / 15% relative instead of the 21-session
+  reset, with month-end deferral (same gap as the live buffer); (B) Ledoit-Wolf portfolio volatility ceiling,
+  shrink-only <= 1.0x, 10% hysteresis, judged on drawdown and left tail; (C) HRP later. Carry overlay later
+  (DBC roll needs futures data).
+- **IDEA** (round 8) sweep-reversion passive maker on the 10-level book, after 2026-12-03.
 - **IDEA** postmortem spec: fee mismatch flagged at 1 fill, slippage by CUSUM at 25, CLV decay at 60 or more;
   no return-decay alarm on the fund book (watch slippage, turnover, realized/target volatility).
 - **IDEA** bots: Arbiter (rule matching across venues) adopted as a design; Quant (read-only quant_engine
@@ -814,6 +832,19 @@ run beside MiroFish and Elephant-1):
     pull also measures 9:55 vs 10:30 for free.
 20. A free Databento account (its starting credit; no subscription) for the $0 insider-test data path.
     Sharadar SEP ($199-299 a year) only later, if the 2018+ test passes or the ranker is next.
+
+## 13b. Affordable paid options (the owner's to choose; none needed today unless marked)
+
+| Option | Price | What it unlocks | Needed now? |
+|---|---|---|---|
+| Databento usage-based account | $0 (free $125 credit, 6-month expiry) | delisted daily bars 2018-05+, event-morning minute bars | yes for the insider test; open when ready |
+| Sharadar SEP (prices only) | $199/yr (10 yrs) or $299/yr (1998+) | delisted daily prices back to 2015 | only if the 2018+ insider test passes |
+| Sharadar bundle (SEP + SF1 + DAILY) | about $399-499/yr | point-in-time fundamentals and daily market cap | only for the stock ranker (family 1) |
+| EODHD All World EOD | $19.99/mo | delisted prices (some gaps; do not use its fundamentals) | no; fallback to Sharadar SEP |
+| Tiingo Power | $30/mo or $300/yr | 30 yrs of daily bars incl. delisted by old symbol | no |
+| Massive (Polygon) Stocks Developer | $79 for one month | 10 yrs of daily + minute bars, point-in-time market cap | no |
+| Databento corporate actions | usage-priced | exact split and dividend adjustments | no; the $0 split check comes first |
+| Databento live | $199/mo | live US equity data | no (Webull's free quotes serve live orders) |
 
 ## 14. Closed log (newest first)
 
