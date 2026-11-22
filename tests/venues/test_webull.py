@@ -4265,7 +4265,7 @@ def test_b3_each_condition_alone_failing_refuses_the_order_without_a_limit_befor
     _consent_conf(tmp_path, **{CONSENT: True})
     with pytest.raises(wb.NotTransmitted):
         _prod_submit(v, **_market_args(**change))
-    assert client.placed() == []
+    assert client.calls == []                       # the first lock: before any call at all, the account list included
 
 
 def test_b3_the_per_order_cap_still_binds_a_market_remainder_and_so_does_the_confirmations_account(tmp_path):

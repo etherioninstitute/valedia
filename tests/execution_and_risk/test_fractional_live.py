@@ -857,3 +857,53 @@ def test_b3_the_day_stop_reads_the_loss_of_a_five_decimal_holding_to_the_last_di
     assert b["day_stop"] is not None, b                                         # past the working stop of 1.00%
     assert all(r["by"] == "day stop" for r in b["refused"]) and b["refused"], b   # no purchase goes; nothing is a fault
     assert "faults" not in b
+
+
+# ---- B6 (1): a ticket's stored limit and collar price are informational; the approval works out fresh ones
+
+def test_b6_a_tickets_stored_limit_and_collar_are_informational_the_approval_computes_fresh_ones(tmp_path):
+    from test_order_step import approve, propose
+    w = leg_world(tmp_path / "w", fill=1.0)
+    w.paper = paper({"a": {"SPY": 2.5}})
+    p = propose(w, fractional=True)
+    lines = {ln["leg"]: ln for ln in p["ticket"]["orders"]}
+    assert lines["whole"]["limit"] == 505.0 and lines["remainder"]["limit"] == 505.0        # the ticket's own (the 500 quote)
+    w.later(1)
+    w.prices["SPY"] = 502.0                                                                 # within the 0.5% band
+    out = approve(w, p["ticket_number"], fractional=True)
+    assert out["status"] == "done" and out["orders_sent"] == 2, out
+    o = {x["tag"].rsplit("-", 1)[-1]: x for x in w.orders() if x["batch"] == out["batch"]}
+    assert o["SPY"]["limit_price"] == osx.limit_price(2.0, 502.0) == 507.02 != lines["whole"]["limit"]
+    assert o["SPY.r"]["collar_price"] == osx.limit_price(0.5, 502.0) == 507.02 != lines["remainder"]["limit"]
+    assert o["SPY.r"]["reference_price"] == 502.0
+
+
+def test_b3_a_live_run_that_is_not_the_shared_book_holds_its_remainders_though_consent_and_proof_are_there(mkl):
+    lw = mkl(conf={CONSENT: True})                        # no owner's entry: the book is not opened, the state is not latched
+    practice_record(lw)
+    lw.paper = paper({"a": {"SPY": 125.0}})
+    out = lw.run(**lw.live_kw({"propose": True, "capital": 5000.0, "fractional": True}))
+    assert out["status"] == "done" and out["live_fractions"]["open"] is False, out
+    assert "shared" in out["live_fractions"]["why"] and out["live_fractions"]["consent"] is True
+    assert all(ln.get("leg") == "whole" for ln in out["ticket"]["orders"]) and out["residuals"][0]["reason"] == "live_fractions"
+
+
+def test_b3_even_a_forged_live_market_candidate_is_refused_by_the_order_step_when_the_opening_is_shut(mkl, monkeypatch):
+    """A second line behind _differences: were a MARKET candidate to reach the send loop of a shut live run, it is refused
+    there (never intended, never handed to the venue)."""
+    lw = frac_world(mkl, consent=False)
+    real = osx._Run._differences
+
+    def forged(self, *a, **k):
+        out = real(self, *a, **k)
+        whole = next(c for c in out if c["leg"] == "whole")
+        return out + [{**whole, "units": 0.5, "value": 0.5 * whole["quote"], "leg": "remainder", "order_type": "MARKET",
+                       "after_whole": False}]
+    monkeypatch.setattr(osx._Run, "_differences", forged)
+    out = lw.propose(fractional=True)
+    assert [(r["leg"], r["by"]) for r in out["refused"]] == [("remainder", "order step")], out
+    assert "opening is shut" in out["refused"][0]["reason"] and "faults" not in out
+    assert all(ln["leg"] == "whole" for ln in out["ticket"]["orders"])
+    lw.later(1)
+    lw.approve(out["ticket_number"], fractional=True)
+    assert lw.venue.limitless() == []
