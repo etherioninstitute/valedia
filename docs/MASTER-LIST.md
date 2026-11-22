@@ -440,7 +440,12 @@ dominance Stage 0 from 2026-12-04, (8) Candidate C. The live path (stricter go-l
   (`data_and_fees/venue_registry.py:76`), which is wrong. Read `fee_type` and `fee_multiplier` from
   `GET /trade-api/v2/series/{ticker}` and `/series/fee_changes` (quadratic = maker 0;
   quadratic_with_maker_fees = 0.0175; quadratic_with_combo_maker_fees = 0.035; anything else fails closed);
-  check against `fill.fee_cost` and `is_taker`. Needed before Candidates C and B.
+  check against `fill.fee_cost` and `is_taker`. Needed before Candidates C and B. Round 11: a mismatch at N=1
+  quarantines that series inside fill handling (cumulative fee_cost vs cumulative theoretical fee, tolerance
+  $0.0101, or any fee on a maker fill where the maker rate is 0): new entries blocked, resting entries
+  cancelled, unwinds and the kill switch never blocked, one re-read of the series and fee_changes logged,
+  cleared only by reviewed code or the owner. Confirm the partial-fill rounding against Kalshi's docs and a
+  real multi-fill order first.
 - **QUEUED** Candidate C first: passive NO on cheap YES longshots (YES bid 3-12 cents, 2-14 days left,
   quadratic series only, no sports or weather). Fill = a later trade printed below the posted price. At most 2
   contracts per event; clusters (category, settlement date) weighted 1/G; G >= 50, cluster t >= 2.5, t >= 2.0
@@ -454,7 +459,10 @@ dominance Stage 0 from 2026-12-04, (8) Candidate C. The live path (stricter go-l
   2013-07..2021-12. Stage 0 first (no fill code): paired cluster Brier, Cleveland Fed p vs Kalshi's 14:00 mid at
   T-5 and T-2, about 36 releases 2022-2024, one-sided Wilcoxon p < 0.05; fail = closed. Round 11: event
   suffixes use the BLS reference month; the 36 releases are -21DEC (2022-01-12) to -24NOV (2024-12-11); -24DEC
-  (released 2025-01-15) is sealed; Carbon's date table still owed (its reply was cut off). Check first: legacy
+  (released 2025-01-15) is sealed. T-5 and T-2 counted back through the days that HAVE a row in the Cleveland
+  Fed download (no hand calendar); Carbon's 36-row table is a cross-check only (34 of 36 matched the federal
+  calendar; 23MAR and 23OCT differ); BLS release dates checked against BLS's schedule archive; markets listed
+  per event under both legacy and KX prefixes, strike_type greater only. Check first: legacy
   tickers reachable in our history client; the nowcast download is as first published (two fetches compared);
   October 2025 CPI cancelled.
 - **BLOCKED** Candidate A (option-implied index brackets): needs option-chain history.
