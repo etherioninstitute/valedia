@@ -392,6 +392,12 @@ Queued (roadmap):
 - **QUEUED** 1.23 the openInvest methods (c) and (d); T39-2c (three readers that present a pass by its status
   alone; ticket not yet written); T39-2d (the gate's remaining unguarded figures; ticket written).
 - **QUEUED** the Deflated Sharpe recount across all tries (owed since T22).
+  Round 12 rules, before the first lock: append-only trial ledger; per-period Sharpes; Pearson kurtosis (already
+  so, `level10_ml_research.py:245`); ADD a dispersion floor sigma_z = max(1, SD(SR_k*sqrt(T-1))) (gate_study
+  uses the raw pool variance today); ADD Lo (2002) T_eff when |rho1| > 0.05 (no path does this today). Print
+  K_raw and K_eff; gate DSR(K_eff) >= 0.95. Counts: fee fix 0; drift band +2 raw/~0.01 eff; Kronos +2 (+1 if
+  sized); LW ceiling +1/~0.08; HRP +1/~0.25; each Stage 0 +1 even if it fails; insider and C +1 per locked run.
+  Closed tests are never re-run under the fixed fee table unless logged as new trials.
 - **QUEUED** 1.13 leftovers: the "lock" rule and four other cities were never tested (weather).
 - **QUEUED** shadow books for forward candidates, judged against the fund book by a paired test (agreed plan,
   not built).
@@ -407,7 +413,7 @@ Ideas not committed to:
   completed scored run).
 - **IDEA** TimesFM 3.0 weights are non-commercial; the owner has not ruled on personal use of them.
 
-From the Carbon dialogue (2026-11-22, rounds 1 to 10; replies `~/Valedia_Claude_Reply1..10.md`). Each test is
+From the Carbon dialogue (2026-11-22, rounds 1 to 12; replies `~/Valedia_Claude_Reply1..12.md`). Each test is
 locked in the research loop before any data is read; none has been run yet.
 **Queue order (round 10):** (1) drift-band trial (backtest only; the live buffer goes through the go-live gate
 work with a full blind check), (2) Kalshi fee fix, (3) CPI Stage 0, (4) insider event table from SEC data only,
@@ -453,7 +459,10 @@ dominance Stage 0 from 2026-12-04, (8) Candidate C. The live path (stricter go-l
   tests the current fee regime. CORRECTED round 6: a NO buy at 1-p rests as a YES ask at p; fills by a virtual
   queue on the trade tape (`taker_side == "yes"` at yes_price == p uses up Q_ahead; yes_price > p fills at most
   that print's count; block trades out); must hold at Q_ahead 100, 250 and 500. Fee history from
-  `/series/fee_changes?show_historical=true` (check the docs first).
+  `/series/fee_changes?show_historical=true` (check the docs first). Round 12 cap: legacy and KX merge into one
+  logical_series_id; <= 2 markets per event (yes_ask nearest $0.075 at t0, tie by ticker); <= 6 events per
+  (series, quarter) at evenly spaced positions by (expected_expiration_time, event_ticker), never by volume;
+  each series <= 15% weight; leave-one-series-out t >= 2.0.
 - **QUEUED** Candidate B second, narrowed round 7: headline CPI only (KXCPI/CPI, KXCPIYOY/CPIYOY), quadratic
   series; "strictly above k" on the 1-decimal print; day d's nowcast usable from 14:00 ET; error scale fitted
   2013-07..2021-12. Stage 0 first (no fill code): paired cluster Brier, Cleveland Fed p vs Kalshi's 14:00 mid at
@@ -464,7 +473,8 @@ dominance Stage 0 from 2026-12-04, (8) Candidate C. The live path (stricter go-l
   calendar; 23MAR and 23OCT differ); BLS release dates checked against BLS's schedule archive; markets listed
   per event under both legacy and KX prefixes, strike_type greater only. Check first: legacy
   tickers reachable in our history client; the nowcast download is as first published (two fetches compared);
-  October 2025 CPI cancelled.
+  October 2025 CPI cancelled. Round 12 quote filter: a strike counts only if its last candle in 10:00-14:00 ET
+  has yes_bid > 0, yes_ask < 1 and spread <= $0.10; others dropped and counted.
 - **BLOCKED** Candidate A (option-implied index brackets): needs option-chain history.
 - **QUEUED** pooling test on Elephant-1 (does it add anything beyond Kalshi's mid): lock the document BEFORE
   the scored period's results are read (scored period ends 2026-12-03); first confirm the collector stores bid
