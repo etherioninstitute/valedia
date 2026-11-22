@@ -318,6 +318,10 @@ After a first attended order:
   settled cash on Valedia's own book. Goes on the stricter go-live gate's list. Round 6: cap = min(book
   settled cash, the account's `settled_cash`); live answers carry it, paper gives none, so it fails closed when
   missing and is tested on recorded answers.
+- **QUEUED** (Carbon round 14) two D13 ordinary-day trips onto the stricter go-live gate's list
+  (`docs/specs/2026-11-14-caps-ladder-design.md:58-70`): an EXPIRED day order maps to expired/partial instead of a
+  `reconcile` fault, and stake halving keyed by (order_id, anomaly type) so one anomaly halves once. Check current
+  behavior first (`webull.py` already reads EXPIRED as dead).
 - **IDEA** (2026-11-22) execution clock: run at about 10:30 ET instead of 9:55, finish before 13:30 ET on FOMC
   days, spread gate (live spread at most 2 x the 20-day median). Changes when, never what; an owner decision.
 
@@ -398,6 +402,12 @@ Queued (roadmap):
   K_raw and K_eff; gate DSR(K_eff) >= 0.95. Counts: fee fix 0; drift band +2 raw/~0.01 eff; Kronos +2 (+1 if
   sized); LW ceiling +1/~0.08; HRP +1/~0.25; each Stage 0 +1 even if it fails; insider and C +1 per locked run.
   Closed tests are never re-run under the fixed fee table unless logged as new trials.
+  Round 14 bugs (all true, fix before the drift-band lock): `TrialRegistry.sharpe_variance` and
+  `distinct_sharpe_variance` (`level10_ml_research.py:273`) ignore n_obs -> use z_k = SR_k*sqrt(n_k-1), leave the
+  candidate out, floor 1; `gauntlet._fingerprint` (827-833) hashes class source only, so parameter variants
+  collapse into one trial -> add `describe()`, and audit past merges; R3 draws `r3_shifts` with replacement past
+  the number of distinct shifts -> use `timing_exact` when asked for more and print the count; check R4's
+  dispersion uses active-Sharpe z. Gate 2 Sharpe at rf = 0; DTB3 excess printed only.
   Round 13: replace the Gumbel E[max] in `expected_max_sharpe` with the exact normal-maximum integral (K=1 -> 0;
   Gumbel is negative for K < 1.2836, so fractional K_eff breaks it); unit test pins the table; the exact value is
   slightly lower above K~5, so past decisions are not re-judged. Every lock prints PSR(0), DSR at per-market
@@ -419,14 +429,14 @@ Ideas not committed to:
   completed scored run).
 - **IDEA** TimesFM 3.0 weights are non-commercial; the owner has not ruled on personal use of them.
 
-From the Carbon dialogue (2026-11-22, rounds 1 to 13; replies `~/Valedia_Claude_Reply1..13.md`). Each test is
+From the Carbon dialogue (2026-11-22, rounds 1 to 14; replies `~/Valedia_Claude_Reply1..14.md`). Each test is
 locked in the research loop before any data is read; none has been run yet.
 **Queue order (round 10):** (1) drift-band trial (backtest only; the live buffer goes through the go-live gate
 work with a full blind check), (2) Kalshi fee fix, (3) CPI Stage 0, (4) insider event table from SEC data only,
 (5) Kronos volatility, (6) the insider test's Databento pull and scoring, (7) the Arbiter before 2026-12-03, then
 dominance Stage 0 from 2026-12-04, (8) Candidate C. The live path (stricter go-live gate) stays first overall.
 - **QUEUED** Kronos volatility test (Kronos-small and Kronos-base = 2 trials). Bars from 2024-07-01 only;
-  2024-07..12 for plumbing and the scale factor; 2025 on sealed. 64 sampled paths, uncentered variance,
+  2024-07..12 for plumbing and the scale factor; 2025 on sealed. 64 sampled paths, CENTERED cross-path variance (round 14 fix; YZ target, RS log only),
   Yang-Zhang target, QLIKE, h = 1 and 5 with Holm. Baselines EWMA 0.94, blended EWMA, HAR-YZ (slopes fitted
   2015-01-01..2024-06-30, pooled, per-fund intercepts; only the scale factor on H2 2024). Pass: HLN-DM t <= -2.33
   against both blended EWMA and HAR-YZ, plus the 95% MCS. A pass changes sizing only: max(sigma_blend,
@@ -847,7 +857,9 @@ run beside MiroFish and Elephant-1):
   and data: metered AI (Claude API, Hermes chat models, Ollama Cloud, xAI, Gemini), subscriptions (Claude,
   Google AI Pro), data plans (Odds API, Finnhub, any others). For each: what uses it, monthly cost, and a
   cheaper route (local model, FreeLLMAPI, a flat subscription he already pays, a free source). Under his
-  low-cost rule; changes to Hermes or paid plans stay his to approve.
+  low-cost rule; changes to Hermes or paid plans stay his to approve. Found round 14: the `valedia` profile's
+  cron runs on `gpt-6-luna` (ChatGPT subscription); a cron naming a local model that is not loaded can make
+  LM Studio load it and evict the collector's model.
 - **QUEUED** `docs/GOALS_AND_MAP.md` is a stale snapshot of 2026-11-13.
 - **QUEUED** about 70 old candidate and checker worktrees and their scratch folders to clear.
 - **QUEUED** backups (5.1): the nightly job is installed; no scheduled run is recorded as checked.
@@ -887,6 +899,9 @@ run beside MiroFish and Elephant-1):
     pull also measures 9:55 vs 10:30 for free.
 20. A free Databento account (its starting credit; no subscription) for the $0 insider-test data path.
     Sharadar SEP ($199-299 a year) only later, if the 2018+ test passes or the ranker is next.
+21. Hermes CTO profile (`~/.hermes/profiles/valedia-cto/config.yaml`:220, 223, found by Carbon round 14):
+    `- curl -sS *` makes the localhost-only curl lines meaningless, and `allow_private_urls: true` (others are
+    false). Proposed: delete the wildcard line, set the flag false; takes effect in a new session.
 
 ## 13b. Affordable paid options (the owner's to choose; none needed today unless marked)
 
