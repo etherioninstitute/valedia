@@ -1,38 +1,38 @@
 """T51 A4, R2 with addendum 2's ruling A: with `fractional` OFF nothing changes.
 
 PROPERTY: for every input, a run with `fractional` off writes the same orders, ledger rows, journal lines, ticket
-file, tags, faults, summary and exit status as the order step at commit 33ace6f (T51's base), and hands the venue
-and the second price source exactly the same calls.
+file, tags, faults, summary and exit status as the accepted order path at commit 75a51f5 (the practice gate's commit,
+S4e merged on main), and hands the venue and the second price source exactly the same calls. This is the guard for
+T51 build B: whatever build B changes, a run with fractional off must still write exactly what 75a51f5 writes.
+
+History of the pin: it was 33ace6f (T51's own base) until T51c S4c-2 changed go_live.py and stake_ladder.py on purpose;
+it was then re-pinned on purpose to 75a51f5 (T51c re-pin ticket). Today every module either side imports is
+byte-identical between the two sides.
 
 How it is shown: seeded worlds of every kind of day (ordinary days, partial fills, refusals by the venue, an order
 left over by the day's cap, a fill through its limit, a stopped run, a ticket proposed and approved, a ticket that
 expires, a second run the same day, a baseline of holdings that are not the book's, and live mode on a stand-in
 production venue, propose and approve, its confirmation files in the test's own folder) are each driven twice from
-the same seed: once by a fresh interpreter that imports ONLY 33ace6f's whole `valedia_trader` package (taken with
-`git archive 33ace6f` into the test's temporary folder), once by a fresh interpreter that imports ONLY this tree's.
+the same seed: once by a fresh interpreter that imports ONLY 75a51f5's whole `valedia_trader` package (taken with
+`git archive 75a51f5` into the test's temporary folder), once by a fresh interpreter that imports ONLY this tree's.
 Each side reports the file of every `valedia_trader` module it imported: none may come from the other side, and
-every one of them must be byte-identical between the two sides except `execution_and_risk/order_step.py`,
-`execution_and_risk/orders.py` and (when imported) `core/alerts.py`. A later change on main to a module the run
-imports fails these tests in words naming it (the base must then be re-pinned on purpose); a changed module that no
-run imports does not matter. If 33ace6f cannot be read from this checkout's history the tests fail in words. After
-every run the whole world folder is compared, file by file.
+every one of them must be byte-identical between the two sides except `execution_and_risk/order_step.py` and
+`execution_and_risk/orders.py` (the subject of T51 build B). A later change on main to a module the run
+imports fails these tests in words naming it (the base must then be re-pinned on purpose, or the module added to
+the list on purpose); a changed module that no run imports does not matter. If 75a51f5 cannot be read from this
+checkout's history the tests fail in words. After every run the whole world folder is compared, file by file.
 
 What is masked, and why (nothing else is):
 - M1 the journal's `"timestamp": "..."` field: the journal stamps each line with the wall clock
   (paper.Journal.write, datetime.now), which no test controls. Every other byte of every journal file is compared.
-- M2 the order ledger's layout: 33ace6f writes layout 3 and this revision layout 4 (R7). The ledger is compared as
-  a dump (layout number, schema text, every row of every table): this revision's dump is first checked to BE
-  layout 4 with every row's `order_type` LIMIT and `collar_price` NULL (ruling A) and only then seen through the
-  layout-3 columns (`_t51_layout3_view`), which must equal 33ace6f's dump exactly. The ledger file's raw bytes are
-  not compared (its page layout follows its schema).
-- M3 the order step's state file's layout (T51c S3): 33ace6f writes layout 1 and this revision layout 2. The state
-  file is compared as a dump (layout number, schema text, every row of every table): this revision's dump is first
-  checked to BE layout 2 with its two new tables (`owner_entries`, `book_nav`) present and EMPTY and every statement
-  of the upgrade in its schema, and only then seen as layout 1 (`_t51c_layout1_view`: those tables and statements
-  left out, the number 1), which must equal 33ace6f's dump exactly. Its raw bytes are not compared (as M2).
+  STILL NEEDED against 75a51f5 (the clock is the same on both sides).
+- M2 (the order ledger's layout: 33ace6f wrote layout 3, this tree layout 4) and M3 (the order step's state file's
+  layout: 33ace6f wrote layout 1, this tree layout 2) are REMOVED. 75a51f5 writes layout 4 and layout 2 as this tree
+  does, so the ledger file and the state file are compared byte for byte like every other file; a difference in
+  either layout, schema or row now shows as a difference.
 - Random ids are NOT masked: the batch ids and the state file's account key (os.urandom) and the ticket numbers
   (secrets.randbelow) are drawn on both sides from the same seeded source, so they must be equal too.
-Every other file (ticket file, the live owner's files, the limits file) is compared byte for byte.
+Every other file (ledger, state, ticket file, the live owner's files, the limits file) is compared byte for byte.
 
 A sanity pair shows the comparison can fail: two different worlds, and one world with a single input changed by a
 cent, are each reported as different.
@@ -59,15 +59,14 @@ from valedia_trader.data_and_fees import second_quote
 from valedia_trader.execution_and_risk import order_step as osx
 from valedia_trader.execution_and_risk import orders as _orders
 from valedia_trader.venues import webull as _wb
-from test_order_step import Booked, GENEROUS, LiveVenue, _dump, _run_with, _t51_layout3_view, _t51c_layout1_view, \
-    live_world, paper, ticket_world
+from test_order_step import Booked, GENEROUS, LiveVenue, _run_with, live_world, paper, ticket_world
 
-BASE = "33ace6f"
-MAY_DIFFER = ("valedia_trader/execution_and_risk/order_step.py", "valedia_trader/execution_and_risk/orders.py",
-              "valedia_trader/core/alerts.py",             # T51's own write set; alerts.py only matters if imported
-              "valedia_trader/venues/webull.py")           # T51c R33a (R39): the adapter's status answer gained
-# fee_unreadable; this file's runs use stand-in venues and never build the Webull adapter (shown on this tree's side by a
-# probe that raised on construction; the old side's archived copy is the base's own and was not probed)
+BASE = "75a51f5"
+# What may differ between the base and this tree: the two modules T51 build B changes on purpose (the order step and
+# its ledger, the subject of the comparison), and nothing else. Not listed, each judged against 75a51f5: core/alerts.py
+# (no run imports it; if one does and it changed, the test fails in words), venues/webull.py (R33a, R39; byte-identical
+# to the base, the old reason is gone), go_live.py and stake_ladder.py (S4c-2; byte-identical to the base).
+MAY_DIFFER = ("valedia_trader/execution_and_risk/order_step.py", "valedia_trader/execution_and_risk/orders.py")
 TESTS = Path(__file__).resolve().parent
 KINDS = ("ordinary", "partial", "refusal", "cap", "breach", "stopped", "approved", "expired", "second_run",
          "baseline", "live")
@@ -169,10 +168,10 @@ def _worlds():
 
 @pytest.fixture(scope="module")
 def sides(tmp_path_factory):
-    """Both sides, every world, each in its own interpreter: 33ace6f's from its archive, this tree's (the package
+    """Both sides, every world, each in its own interpreter: the base's from its archive, this tree's (the package
     this test process imports, so a mutant copy when one is run) from its own folder."""
     folder = tmp_path_factory.mktemp("r2")
-    old_root, why = _archive(folder / "base_33ace6f")
+    old_root, why = _archive(folder / "base")
     if why is not None:
         return {"error": why}
     new_root = Path(osx.__file__).resolve().parents[2]
@@ -184,7 +183,7 @@ def sides(tmp_path_factory):
 
 def check_pinned(sides):
     """Rule 1: no module crossed over. Rule 2: every `valedia_trader` module either side imported is byte-identical
-    between 33ace6f and this tree, or is one of MAY_DIFFER. Fails in words naming every module that breaks either
+    between the base and this tree, or is one of MAY_DIFFER. Fails in words naming every module that breaks either
     (and, first, when the base could not be read)."""
     if "error" in sides:
         pytest.fail(sides["error"])
@@ -226,7 +225,7 @@ def test_each_side_imports_only_its_own_package_and_every_shared_module_is_uncha
         print(f"T51-A4-IMPORT modules compared byte for byte: {len([r for r in rels if r not in MAY_DIFFER])}; "
               f"allowed to differ and imported: {[r for r in rels if r in MAY_DIFFER]}")
     old_step = sides["old"]["modules"]["valedia_trader.execution_and_risk.order_step"]
-    assert b"def split_difference" not in Path(old_step).read_bytes()
+    assert b"def split_difference" in Path(old_step).read_bytes()      # the base is the fractional-capable order path
     assert b"def split_difference" in Path(sides["new"]["modules"]["valedia_trader.execution_and_risk.order_step"]).read_bytes()
 
 
@@ -257,7 +256,7 @@ def test_the_pin_fails_in_words_when_an_imported_module_changed_or_crossed_over(
     fake["old_root"] = root
     fake["old"] = dict(sides["old"], modules={n: str(root / Path(f).resolve().relative_to(sides["old_root"].resolve()))
                                               for n, f in sides["old"]["modules"].items()})
-    with pytest.raises(pytest.fail.Exception, match=r"changed since 33ace6f .*valedia_trader/venues/__init__.py"):
+    with pytest.raises(pytest.fail.Exception, match=rf"changed since {BASE} .*valedia_trader/venues/__init__.py"):
         check_pinned(fake)
 
 
@@ -298,19 +297,15 @@ def _follow(mod, book):
 
 
 def _snapshot(w, out):
-    """Every file of the world after a run, as compared: the journal with M1, the ledger as a dump (M2 applied by the
-    comparison), every other file's raw bytes; and the venue's and the second source's calls, the summary, the
-    exit status the command line gives it (cli.py: 0 when done, else 2)."""
+    """Every file of the world after a run, as compared: the journal with M1, every other file's raw bytes (the
+    ledger and the state file too: both sides write the same layouts); and the venue's and the second source's
+    calls, the summary, the exit status the command line gives it (cli.py: 0 when done, else 2)."""
     files = {}
     for p in sorted(w.tmp.rglob("*")):
         if not p.is_file():
             continue
         rel = str(p.relative_to(w.tmp))
-        if p == w.ledger_path:
-            files[rel] = ("ledger", _dump(p))
-        elif p == Path(w.state_path):                                    # M3: compared as a dump
-            files[rel] = ("state", _dump(p))
-        elif p.parent == w.tmp / "journal":
+        if p.parent == w.tmp / "journal":
             files[rel] = ("journal", STAMP.sub(b'"timestamp": "T"', p.read_bytes()))
         else:
             files[rel] = ("bytes", p.read_bytes())
@@ -335,7 +330,7 @@ def _column(path, sql):
 
 
 def world_runs(mod, tmp, seed, kind):
-    """One seeded world of `kind` driven through `mod` (33ace6f's order step or this revision's), `fractional` off.
+    """One seeded world of `kind` driven through `mod` (the base's order step or this revision's), `fractional` off.
     Returns one snapshot per run. The draws depend only on the seed and on what the runs return."""
     rng = random.Random(seed)
     urandom, numbers = random.Random(seed + 1), random.Random(seed + 2)
@@ -426,7 +421,7 @@ def _drive(mod, tmp, rng, kind):
 
 
 def differences(b_runs, m_runs):
-    """Every difference between 33ace6f's runs and this revision's, as (run, artefact) pairs, with M1, M2 and M3."""
+    """Every difference between the base's runs and this revision's, as (run, artefact) pairs, with M1."""
     diffs = []
     if len(b_runs) != len(m_runs):
         return [("runs", f"{len(b_runs)} against {len(m_runs)}")]
@@ -438,24 +433,7 @@ def differences(b_runs, m_runs):
             diffs.append((i, ("file names", sorted(set(b["files"]) ^ set(m["files"])))))
             continue
         for rel, (how, data) in b["files"].items():
-            mhow, mdata = m["files"][rel]
-            if how == "ledger":
-                assert data is None or data["version"] == 3, data["version"]
-                if mdata is None or mdata["version"] != 4:
-                    diffs.append((i, (rel, "layout")))
-                    continue
-                try:
-                    mdata = _t51_layout3_view(mdata)                     # asserts every row LIMIT, collar NULL
-                except AssertionError as e:
-                    diffs.append((i, (rel, f"ruling A: {e}"[:200])))
-                    continue
-            if how == "state" and mhow == "state" and data is not None and data["version"] == 1:
-                try:
-                    mdata = _t51c_layout1_view(mdata)                    # M3: asserts layout 2, its new tables empty
-                except AssertionError as e:
-                    diffs.append((i, (rel, f"M3: {e}"[:200])))
-                    continue
-            if (how, data) != (mhow, mdata):
+            if (how, data) != m["files"][rel]:
                 diffs.append((i, rel))
     return diffs
 
@@ -489,7 +467,7 @@ def _seen(snaps, kind):
 
 
 @pytest.mark.parametrize("kind", KINDS)
-def test_r2_a_run_with_fractional_off_writes_exactly_what_33ace6f_writes(sides, kind):
+def test_r2_a_run_with_fractional_off_writes_exactly_what_the_accepted_order_path_writes(sides, kind):
     check_pinned(sides)
     shown, runs, submits, faults = 0, 0, 0, 0
     for k in range(WORLDS_PER_KIND):
