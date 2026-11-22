@@ -154,8 +154,24 @@ environment only). Without `propose` or `approve` a run is exactly the one above
             (fractional: within TICKET_UNITS_SAME), its quote (the one the gate judged) is within TICKET_QUOTE_MOVE of
             the ticket's, the ticket is still live (checked before intend and again at the last look), and every check
             of an ordinary run passes; otherwise it is dropped with the reason. Orders not on the ticket are not sent.
+            A ticket's stored limit (for a remainder line, its collar price) and quote are INFORMATIONAL (T51 B6): the
+            approval works out a fresh limit or collar price from the quote it judges, as an ordinary run does; the
+            ticket fixes the fund, the side, the leg and the size, and the quote the fresh one must stay within
+            TICKET_QUOTE_MOVE of. (The ticket file is a database with no header of its own: this note and
+            docs/WEBULL.md carry the wording.)
 Tickets live in their own file beside the state file (ticket_path_for, TicketBook): append-only tables, natural keys,
 no update, no delete, no replacement; the state file's layout is unchanged.
+
+Fractions on live (T51 build B; docs/WEBULL.md, "Fractions on live"): with `fractional` on in live mode the run reads, once
+at its start and read-only, the three things its remainder legs need: the shared book, the owner's consent in the
+confirmation the locks judged (`fractional_live_consent`, JSON true only), and the practice proof (`practice_proof`: a
+clean MARKET remainder purchase and sale in the practice ledger and journal). Missing any, the run HOLDS its remainder legs
+(residuals with reason `live_fractions`, never a fault) and sends its whole-share LIMIT legs as without `fractional`; all
+present, a remainder leg is a MARKET order by quantity handed to the venue with `fractional_live=True`, and until one live
+remainder leg has filled and reconciled cleanly in the live record at most ONE goes per run (reason `first_contact`).
+The adapter takes a production order with no limit price only for such a leg and judges it again at its place_order call.
+A MARKET leg whose quote has passed MARKET_QUOTE_MAX_AGE_SECONDS at the moment its collar is about to judge it is asked
+for once more (`_ask_again`), judged again from the top on a newer usable quote, once.
 
 Live mode (`live`, T22d-1) adds five checks to a ticket run; a practice run never makes them:
  - the run lock must still be the file the run locked (not unlinked, not replaced): judged at the start, before the
