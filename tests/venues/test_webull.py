@@ -4402,3 +4402,75 @@ def test_b3_the_order_steps_own_hand_over_reaches_the_real_adapter_through_the_l
         assert placed[2][0]["order_type"] == "MARKET" and placed[2][0]["quantity"] == "0.5"
     finally:
         led.close()
+
+
+# ==== T51 B repair F3: the second lock (at the place_order call) judges quantity and session by itself
+
+def _market_payload(**over):
+    order = wb.order_payload("SPY", 0.5, "os-1-SPY.r")
+    order.update(over)
+    return order
+
+
+@pytest.mark.parametrize("change, ok", [
+    ({}, True), ({"quantity": "0.99999"}, True), ({"quantity": "0.00001"}, True),
+    ({"quantity": "1"}, False), ({"quantity": "1.5"}, False), ({"quantity": "0"}, False), ({"quantity": "-0.5"}, False),
+    ({"quantity": "nan"}, False), ({"quantity": "text"}, False),
+    ({"support_trading_session": "ALL"}, False), ({"support_trading_session": "NIGHT"}, False),
+    ({"support_trading_session": "core"}, False), ({"support_trading_session": None}, False),
+    ({"entrust_type": "AMOUNT"}, False), ({"instrument_type": "CRYPTO"}, False), ({"market": "HK"}, False),
+    ({"limit_price": "100.00"}, False)])
+def test_f3_the_place_locks_payload_judgement_on_its_own(change, ok):
+    assert wb._production_payload_ok(_market_payload(**change), True) is ok
+    assert wb._production_payload_ok(_market_payload(**change), False) is False         # never without the vouching
+
+
+@pytest.mark.parametrize("units, session", [(1.5, "CORE"), (1.0, "CORE"), (0.5, "ALL")])
+def test_f3_with_the_first_lock_bypassed_the_place_call_still_refuses_a_size_or_a_session_alone(tmp_path, monkeypatch, units, session):
+    v, client = venue(tmp_path, env="production")
+    _consent_conf(tmp_path, **{CONSENT: True})
+    monkeypatch.setattr(wb, "_live_remainder_exemption", lambda *a, **k: True)          # the first lock says yes to everything
+    with pytest.raises(wb.NotTransmitted, match="limit price"):
+        _prod_submit(v, **_market_args(units=units, session=session))
+    assert client.placed() == []
+    assert _prod_submit(v, **_market_args(units=0.5, session="CORE", tag="os-9-SPY.r"))["status"] == "accepted"
+
+
+# ==== T51 B repair F2: whole-share production LIMIT payloads, byte for byte against what 75a51f5 sends
+#
+# The fixture below was NOT copied from this tree's output. It was produced by running 75a51f5's own
+# valedia_trader/venues/webull.py (`git archive 75a51f5 valedia_trader src` into a scratch folder, put first on sys.path, its
+# WebullVenue shown to be that file and to hold no `market_ok`) on this module's FakeClient with a valid confirmation, one
+# production `submit(sym, units, tag, price=..., limit_price=..., session=...)` per case, and recording what the client's
+# `order_v3.place_order` was handed. A change of the production adapter's order path for LIMIT orders (a refusal of
+# every LIMIT order, a changed field, a changed text) fails this test; R2 of test_fractional_off_against_base cannot see it
+# (its worlds use a stand-in venue), so this test is the guard of the adapter's order path.
+BASE_75A51F5_PAYLOADS = [
+    (('SPY', 3.0, 'os-20261113-100000-abc123-SPY', 500.0, 505.0, 'CORE'),
+     [{"client_order_id": "89c9ca770dae697306d2c7dcaf907769", "combo_type": "NORMAL", "entrust_type": "QTY", "instrument_type": "EQUITY", "limit_price": "505.00", "market": "US", "order_type": "LIMIT", "quantity": "3", "side": "BUY", "support_trading_session": "CORE", "symbol": "SPY", "time_in_force": "DAY"}]),
+    (('SPY', -2.0, 'os-20261113-100000-abc123-SPY', 500.0, 495.0, 'CORE'),
+     [{"client_order_id": "89c9ca770dae697306d2c7dcaf907769", "combo_type": "NORMAL", "entrust_type": "QTY", "instrument_type": "EQUITY", "limit_price": "495.00", "market": "US", "order_type": "LIMIT", "quantity": "2", "side": "SELL", "support_trading_session": "CORE", "symbol": "SPY", "time_in_force": "DAY"}]),
+    (('QQQ', 12.0, 'os-20261113-100001-abc124-QQQ', 400.0, 404.0, 'CORE'),
+     [{"client_order_id": "d78bbf53758da5ba47b530ddf3e0e39e", "combo_type": "NORMAL", "entrust_type": "QTY", "instrument_type": "EQUITY", "limit_price": "404.00", "market": "US", "order_type": "LIMIT", "quantity": "12", "side": "BUY", "support_trading_session": "CORE", "symbol": "QQQ", "time_in_force": "DAY"}]),
+    (('TLT', 7.0, 'os-20261113-100002-abc125-TLT', 0.51, 0.5, 'CORE'),
+     [{"client_order_id": "6500e00cdd02e14969a9f63b87a0ec0a", "combo_type": "NORMAL", "entrust_type": "QTY", "instrument_type": "EQUITY", "limit_price": "0.50", "market": "US", "order_type": "LIMIT", "quantity": "7", "side": "BUY", "support_trading_session": "CORE", "symbol": "TLT", "time_in_force": "DAY"}]),
+    (('IWM', 1.0, 'os-20261113-100003-abc126-IWM', None, 1234.56, 'ALL'),
+     [{"client_order_id": "a358cc237385595cdeba140cf4815334", "combo_type": "NORMAL", "entrust_type": "QTY", "instrument_type": "EQUITY", "limit_price": "1234.56", "market": "US", "order_type": "LIMIT", "quantity": "1", "side": "BUY", "support_trading_session": "ALL", "symbol": "IWM", "time_in_force": "DAY"}]),
+    (('GLD', 1000.0, 'os-20261113-100004-abc127-GLD', 40.0, 40.4, 'CORE'),
+     [{"client_order_id": "231ba524e0bb9c4e83e7e8538a53cf7f", "combo_type": "NORMAL", "entrust_type": "QTY", "instrument_type": "EQUITY", "limit_price": "40.40", "market": "US", "order_type": "LIMIT", "quantity": "1000", "side": "BUY", "support_trading_session": "CORE", "symbol": "GLD", "time_in_force": "DAY"}]),
+    (('XLK', 25.0, 'tag.with-dots_and-dashes.r2', 99.5, 99.99, 'CORE'),
+     [{"client_order_id": "c746f3aa5a8579389afbf2f981d7d7ad", "combo_type": "NORMAL", "entrust_type": "QTY", "instrument_type": "EQUITY", "limit_price": "99.99", "market": "US", "order_type": "LIMIT", "quantity": "25", "side": "BUY", "support_trading_session": "CORE", "symbol": "XLK", "time_in_force": "DAY"}]),
+]
+
+
+@pytest.mark.parametrize("args, expected", BASE_75A51F5_PAYLOADS)
+def test_f2_a_whole_share_production_limit_order_is_placed_byte_for_byte_as_75a51f5_places_it(tmp_path, args, expected):
+    sym, units, tag, price, limit, session = args
+    client = FakeClient(positions=[{"symbol": sym, "quantity": "50", "instrument_type": "EQUITY"}])
+    v = wb.WebullVenue(KEY, SECRET, environment="production", client=client, confirmation_file=CONF(tmp_path))
+    _conf_file(tmp_path, _live(max_order_value=1_000_000, max_capital=2_000_000))
+    out = v.submit(sym, units, tag, price=price, limit_price=limit, session=session)
+    assert out["status"] == "accepted" and out["environment"] == "production"
+    (placed,) = client.placed()
+    assert json.dumps(placed[2], sort_keys=True) == json.dumps(expected, sort_keys=True)
+    assert placed[2][0]["order_type"] == "LIMIT" and "fractional_live" not in placed[2][0]
