@@ -416,10 +416,19 @@ NOT stop and does NOT turn fractional: it is, in what it reads, decides and writ
 fractional), because a stop, or a half-fractional run, would change the whole-share path. The one addition is the
 `live_fractions` block on its summary, which says why: `open` (false), `consent`, the practice reading (`practice`:
 purchases and sales found, and why if it could not be read) and `why` (what is missing, in words). When the opening is
-open the block also carries `first_contact` and the live reading (`live_clean`). A ticket made with an open opening is
-approved only with `--fractional` (and a ticket made with a shut one is marked as without; if the opening opens
-before the approval the approval is refused, as the owner's files then differ), and the command line prints the approve
-line with `--fractional`. The first MARKET order on live is therefore your own decision twice over: the practice proof
+open the block also carries `first_contact` and the live reading (`live_clean`). A live run that stops before the opening
+is judged (a lapsed or absent confirmation, an unmet lock, a flag combination refused) is also exactly the stop of the
+run without `--fractional`, its summary carrying only a `live_fractions` block that says it stopped before the opening
+was judged. A ticket made with an open opening is marked fractional and a ticket made with a shut one is marked as
+without. An approval must have the same opening as its ticket, and what refuses it is: (a) when the owner changed any of
+his three files since the ticket (his consent withdrawn or given, a limit changed), "the owner's files ... changed since
+that ticket was made", at the ticket check (the digest of the three files); (b) when his files are untouched but the practice proof
+appeared or vanished, so that the opening opened or shut, the ticket's fractional mark: "that ticket was made without
+fractional units" (a shut ticket, an approval now open) or "that ticket was made with fractional units" (an open
+ticket, an approval now shut). The command line prints the approve hint with `--fractional` only when the opening was
+open; when it was shut, or the run stopped before it was judged, it prints exactly what the run without the flag prints.
+`--live --check --fractional` is refused in words, as `--live --check --shared` is (a check judges the locks and sends
+nothing). The first MARKET order on live is therefore your own decision twice over: the practice proof
 you ran, and the line you wrote.
 
 **The quote re-ask** (B5, see the collar's `quote_age`) applies to a live remainder leg as to a practice one.

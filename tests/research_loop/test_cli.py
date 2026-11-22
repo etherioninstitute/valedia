@@ -619,7 +619,8 @@ def _tree(root):
                                   ["--live", "--approve", "123456", "--fractional"],    # live, but the other live rules still bind it
                                   ["--live", "--shared", "--propose", "--capital", "nan"],
                                   ["--live", "--shared", "--propose", "--capital", "-5"],
-                                  ["--check"], ["--check", "--capital", "5"], ["--live", "--check", "--shared"]])
+                                  ["--check"], ["--check", "--capital", "5"], ["--live", "--check", "--shared"],
+                                  ["--live", "--check", "--fractional"]])       # T51 B repair2: as at 4db3192, never ignored
 def test_live_flags_that_cannot_run_are_refused_before_anything_is_read(live_project, monkeypatch, capsys, argv):
     root, venue, built, asked = live_project
     monkeypatch.setattr(cli, "_live_environ", lambda: pytest.fail("the environment was loaded"))

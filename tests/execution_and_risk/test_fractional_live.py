@@ -1136,3 +1136,37 @@ def test_r2_2_a_newer_quote_still_past_120_seconds_is_not_asked_for_a_third_time
         assert led.attention() == []
     finally:
         led.close()
+
+
+# ---- T51 B repair2 (4): what refuses an approval whose opening changed since its ticket
+
+def test_r2_4_a_ticket_made_with_a_shut_opening_is_refused_by_its_fractional_mark_when_the_proof_appears(mkl):
+    lw = frac_world(mkl, proof=(False, False))
+    out = lw.propose(fractional=True)                                 # shut: no practice proof; the ticket carries no mark
+    assert out["live_fractions"]["open"] is False
+    lw.later(1)
+    now = lw.clock.t
+    practice_record(lw)                                               # the proof appears; the owner's files are untouched
+    lw.clock.t = now                                                  # (the practice runs took their own time: the ticket lives)
+    refused = lw.approve(out["ticket_number"], fractional=True)       # the opening is open now: a fractional run
+    assert refused["status"] == "stopped" and "made without fractional units" in refused["reason"], refused
+    assert "changed" not in refused["reason"] and lw.venue.sent == []
+
+
+def test_r2_4_a_ticket_made_with_an_open_opening_is_refused_when_the_owner_takes_the_consent_back_by_the_files_digest(mkl):
+    lw = frac_world(mkl)
+    out = lw.propose(fractional=True)
+    lw.later(1)
+    lw.write_conf(**{CONSENT: False})
+    refused = lw.approve(out["ticket_number"], fractional=True)
+    assert refused["status"] == "stopped" and "files" in refused["reason"] and "changed" in refused["reason"], refused
+    assert "fractional units" not in refused["reason"]
+
+
+def test_r2_4_a_ticket_made_with_an_open_opening_is_refused_by_its_mark_when_the_proof_goes_while_the_files_stay(mkl):
+    lw = frac_world(mkl)
+    out = lw.propose(fractional=True)
+    lw.later(1)
+    osx.ledger_path_for(lw.tmp / "memory", "webull-sandbox").unlink()   # the practice ledger is gone: no proof
+    refused = lw.approve(out["ticket_number"], fractional=True)
+    assert refused["status"] == "stopped" and "made with fractional units" in refused["reason"], refused

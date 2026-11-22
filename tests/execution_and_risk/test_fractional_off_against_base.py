@@ -70,7 +70,7 @@ BASE = "75a51f5"
 #   - venues/webull.py (build B, B2 and B3): the owner's consent key `fractional_live_consent` is judged by the
 #     confirmation's reader (an optional key; the judged dict holds it only when JSON true), and the production adapter
 #     takes an order with no limit price in ONE case (a remainder leg of a run that passed its locks: flag, consent re-read,
-#     size under one, CORE, a ".r" tag) and judges the payload again at its single place_order call. THIS TEST DOES NOT
+#     size under one, a stock or fund and not crypto, CORE, a ".r" tag) and judges the payload again at its single place_order call. THIS TEST DOES NOT
 #     GUARD THE ADAPTER: its worlds use a stand-in venue, so R2 cannot see the adapter's order path (a mutant that refused
 #     every production LIMIT order survived it). The guard of the adapter is tests/venues/test_webull.py: its
 #     production-order tests, the seeded property over 400 production worlds, and `test_f2_...`, which pins the payload of

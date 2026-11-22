@@ -160,6 +160,14 @@ def test_live_without_shared_is_refused_in_words_and_a_capital_with_it(lw):
     assert "--shared" in cli._live_args_refusal(ns(live=True, fractional=True, propose=True))             # the others stay
 
 
+def test_check_takes_no_fractional_as_before_t51_b():
+    """4db3192 refused `--live --check --fractional`; the flag is not silently ignored."""
+    for kw in ({}, {"capital": 1000.0}):
+        why = cli._live_args_refusal(ns(live=True, check=True, fractional=True, **kw))
+        assert why and "--check" in why and "--fractional" in why, why
+    assert cli._live_args_refusal(ns(live=True, check=True)) is None
+
+
 def test_check_is_as_it_was_and_shared_with_check_is_refused():
     assert cli._live_args_refusal(ns(live=True, check=True)) is None
     assert cli._live_args_refusal(ns(live=True, check=True, capital=1000.0)) is None
@@ -189,11 +197,18 @@ def test_the_live_command_hands_the_run_shared_and_no_capital_and_prints_a_share
     printed = capsys.readouterr().out
     assert "--live --shared --approve NUMBER" in printed and "--capital" not in printed, printed
     assert seen["practice_ledger"] == osx.ledger_path_for(paths.memory, gl.PAPER_VENUE)     # T51 B1: where the proof is read
+    plain = printed
     seen.clear()                                                                               # T51 B3: --fractional goes through
-    assert cli._run_live(ns(live=True, shared=True, propose=True, fractional=True), paths, T.LiveVenue(), "FILES", None) == 0
-    assert seen["fractional"] is True and seen["shared"] is True and seen["capital"] is None
-    printed = capsys.readouterr().out
-    assert "--live --shared --fractional --approve NUMBER" in printed and "--capital" not in printed, printed
+    for block, flagged in (({"open": True}, True), ({"open": False, "why": "no consent"}, False), (None, False)):
+        out = {"status": "done", "ticket_number": "123456", **({} if block is None else {"live_fractions": block})}
+        monkeypatch.setattr(osx, "run_order_step", lambda **kw: (seen.update(kw), dict(out))[1])
+        assert cli._run_live(ns(live=True, shared=True, propose=True, fractional=True), paths, T.LiveVenue(), "FILES", None) == 0
+        assert seen["fractional"] is True and seen["shared"] is True and seen["capital"] is None
+        printed = capsys.readouterr().out
+        hint = [ln for ln in printed.splitlines() if ln.startswith("ticket number:")]
+        assert ("--live --shared --fractional --approve NUMBER" in printed) is flagged and "--capital" not in printed, printed
+        if not flagged:                                   # T51 B repair2 (3): exactly what the run without the flag prints
+            assert hint == [ln for ln in plain.splitlines() if ln.startswith("ticket number:")], (hint, plain)
 
 
 def test_a_live_shared_run_given_a_capital_is_refused_before_the_lock(lw):

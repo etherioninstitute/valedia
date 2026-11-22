@@ -761,6 +761,9 @@ def _live_args_refusal(args) -> str | None:
     shared = getattr(args, "shared", False)
     if shared and check:
         return "--check judges the locks and sends nothing: it takes no --shared (a live run is --live --shared --propose)"
+    if check and getattr(args, "fractional", False) and live:
+        return ("--check judges the locks and sends nothing: it takes no --fractional (a live fractional run is "
+                "--live --shared --fractional --propose)")
     if not live:
         return None
     capital = getattr(args, "capital", None)
@@ -916,7 +919,8 @@ def _run_live(args, paths: LoopPaths, venue, files, second_opinion) -> int:
     number = out.pop("ticket_number", None)
     print(json.dumps(out, indent=2, default=str))
     if number is not None:
-        again = " --fractional" if getattr(args, "fractional", False) else ""
+        opened = isinstance(out.get("live_fractions"), dict) and out["live_fractions"].get("open") is True
+        again = " --fractional" if getattr(args, "fractional", False) and opened else ""   # shut: what the run without it prints
         print(f"ticket number: {number} (approve within {order_step.TICKET_LIFE_SECONDS // 60} minutes with: "
               f"order-step --live --shared{again} --approve NUMBER)")
     return 0 if out["status"] == "done" else 2
