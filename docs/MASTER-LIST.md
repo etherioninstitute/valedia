@@ -313,7 +313,9 @@ After a first attended order:
   check; it touches the accepted order path).
 - **QUEUED** (2026-11-22) a settled-cash guard for T+1 before any stock order: the account is a shared cash
   account; no Valedia lot bought with unsettled proceeds is sold before it settles, and new buys are capped by
-  settled cash on Valedia's own book. Goes on the stricter go-live gate's list.
+  settled cash on Valedia's own book. Goes on the stricter go-live gate's list. Round 6: cap = min(book
+  settled cash, the account's `settled_cash`); live answers carry it, paper gives none, so it fails closed when
+  missing and is tested on recorded answers.
 - **IDEA** (2026-11-22) execution clock: run at about 10:30 ET instead of 9:55, finish before 13:30 ET on FOMC
   days, spread gate (live spread at most 2 x the 20-day median). Changes when, never what; an owner decision.
 
@@ -428,7 +430,10 @@ locked in the research loop before any data is read; none has been run yet.
   quadratic series only, no sports or weather). Fill = a later trade printed below the posted price. At most 2
   contracts per event; clusters (category, settlement date) weighted 1/G; G >= 50, cluster t >= 2.5, t >= 2.0
   after dropping the largest cluster; single binaries and bracket ladders logged apart. The 2025-on holdout
-  tests the current fee regime.
+  tests the current fee regime. CORRECTED round 6: a NO buy at 1-p rests as a YES ask at p; fills by a virtual
+  queue on the trade tape (`taker_side == "yes"` at yes_price == p uses up Q_ahead; yes_price > p fills at most
+  that print's count; block trades out); must hold at Q_ahead 100, 250 and 500. Fee history from
+  `/series/fee_changes?show_historical=true` (check the docs first).
 - **QUEUED** Candidate B second: CPI and PCE bracket rounding against the Cleveland Fed nowcast.
 - **BLOCKED** Candidate A (option-implied index brackets): needs option-chain history.
 - **QUEUED** pooling test on Elephant-1 (does it add anything beyond Kalshi's mid): lock the document BEFORE
@@ -438,11 +443,18 @@ locked in the research loop before any data is read; none has been run yet.
 - **QUEUED** calibration diagnostic (slope, intercept, out-of-fold AUC, reliability) on the tournament's
   pre-2025 answers only (nimble-v3, qwen3:8b, qwen3.8-27b). Elephant-1's 852 answers are all forward questions
   asked 2026-11-13..20, inside the sealed zone: scored only prequentially (Platt after a 200-question burn-in,
-  no isotonic).
-- **QUEUED** stocks, first family: insider cluster buys (roadmap 1.17), free inputs (EDGAR Form 4, Finnhub
-  insiders since 2015), matched-cohort benchmark; spec asked of Carbon in round 5.
+  no isotonic). qwen3.8-27b (151 answers) by time-ordered 5-fold CV, secondary only.
+- **BLOCKED** stocks, first family: insider cluster buys (roadmap 1.17). Spec from Carbon round 6 adopted with
+  changes (reply 6): entry stand-in max(Open, OHLC/4) + 12 bps since the job runs 9:55 ET; delisting returns
+  -30% NYSE/AMEX, -55% Nasdaq; sample size measured; Zhao arXiv:2602.06198v2 and the SEC data sets'
+  AFF10B5ONE field checked before the lock. Blocked: needs daily prices and market caps of dead companies
+  2015-2024 (owner item 10); Finnhub's free plan has no price history.
+- **QUEUED** hygiene: `src/insider_mirror.py` (legacy) sends a named User-Agent to the SEC; give it a
+  generic one or retire it.
 - **BLOCKED** stocks, second family: quality + payout + residual momentum with a rank buffer; needs
-  survivorship-free fundamentals (owner item 10). Third: busy-day multi-signal earnings.
+  survivorship-free fundamentals (owner item 10). Round 6: buy top 22, hold while rank <= 45; weights inverse
+  blended-EWMA volatility (floor 15%, cap 7.5% a name) behind the 10% band. Third: busy-day multi-signal
+  earnings.
 - **IDEA** postmortem spec: fee mismatch flagged at 1 fill, slippage by CUSUM at 25, CLV decay at 60 or more;
   no return-decay alarm on the fund book (watch slippage, turnover, realized/target volatility).
 - **IDEA** bots: Arbiter (rule matching across venues) adopted as a design; Quant (read-only quant_engine
