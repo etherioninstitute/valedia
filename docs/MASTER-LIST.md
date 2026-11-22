@@ -462,7 +462,10 @@ locked in the research loop before any data is read; none has been run yet.
   EQUS.SUMMARY, minute bars from XNAS.ITCH (both from 2018-05; EQUS.MINI only from 2023-03-28); get_cost before
   every pull; the $125 credit expires 6 months after opening, so open only when the pull is ready. Bars are
   unadjusted: splits found by overnight price ratio matched to a CompanyFacts share jump (Finnhub splits are 403
-  on the free plan). Locked: inverse pre-event YZ variance weights (floor 0.20^2, cap 3x), SIC-division
+  on the free plan). Round 9 asymmetric rule: a down gap <= 0.70 is a split only if shares in the first 10-Q/10-K
+  filed in [t_entry, t_exit + 100 days] rose by the reciprocal (+-10%; 8-K 5.03/3.03 or the split-ratio tag
+  confirms), otherwise KEPT as a real crash; an up jump >= 1.80 is adjusted if shares fell by the reciprocal,
+  dropped only when unresolved. Locked: inverse pre-event YZ variance weights (floor 0.20^2, cap 3x), SIC-division
   de-meaning, N >= 250, G_firm >= 180, G_month >= 55, ex-ante WLS SE <= 48 bps checked before any return is read.
 - **QUEUED** hygiene: `src/insider_mirror.py` (legacy) sends a named User-Agent to the SEC; give it a
   generic one or retire it.
@@ -474,10 +477,17 @@ locked in the research loop before any data is read; none has been run yet.
   and "before date" pairs, 2022-2024 one-minute candles, both legs at taker fee + T-bill carry for calendar
   pairs, a window counts only if it lasts >= 2 candles; < 30 windows = closed, >= 50 = check depth on the
   collector after 2026-12-03. Pairs need matched settlement terms (Arbiter); unmatched pairs excluded. Paced far
-  below 3/s, mostly after 2026-12-03. Read Shi & Zhai arXiv:2610.23517 first.
+  below 3/s, mostly after 2026-12-03. Read Shi & Zhai arXiv:2610.23517 first (a prior only: their replay is on
+  Polymarket books). Round 9: markets with strike_type greater/greater_or_equal/less/less_or_equal under events
+  with mutually_exclusive false (no `between` buckets); families FED/KXFED, INXU/NASDAQ100U, BTCD/BTCMAX/ETHD,
+  macro ladders, then before-date deadlines; >= 3 candles with the middle one inverted at open and close =
+  REST-safe; if it passes, thinner leg first as fill-or-kill, quotes by WebSocket.
 - **QUEUED** (round 8) fund book variants, each one trial on development data (pre-2025) + forward practice, never
   re-scored on the already-read sealed period: (A) drift bands 10% / 15% relative instead of the 21-session
-  reset, with month-end deferral (same gap as the live buffer); (B) Ledoit-Wolf portfolio volatility ceiling,
+  reset, with month-end deferral (same gap as the live buffer). Round 9: primary = `buffering.py` as is
+  (half-width 10% of the average target weight, trade to the band edge), 15% only if orders fall a further 25%;
+  gates on 2007-2024: turnover -30% and orders -50%, Sharpe >= reset - 0.02, tracking error <= 1.25%, drawdown
+  no worse by > 1 point; (B) Ledoit-Wolf portfolio volatility ceiling,
   shrink-only <= 1.0x, 10% hysteresis, judged on drawdown and left tail; (C) HRP later. Carry overlay later
   (DBC roll needs futures data).
 - **IDEA** (round 8) sweep-reversion passive maker on the 10-level book, after 2026-12-03.
@@ -845,6 +855,10 @@ run beside MiroFish and Elephant-1):
 | Massive (Polygon) Stocks Developer | $79 for one month | 10 yrs of daily + minute bars, point-in-time market cap | no |
 | Databento corporate actions | usage-priced | exact split and dividend adjustments | no; the $0 split check comes first |
 | Databento live | $199/mo | live US equity data | no (Webull's free quotes serve live orders) |
+| Ohio VPS near Kalshi's servers | $5-10/mo | 1-3 ms to Kalshi instead of 55-75 ms; always-on WebSockets off the Mac | no; only after a speed-sensitive Kalshi test passes; location to verify; a key on a remote host is his call |
+| Massive (Polygon) Stocks Starter | $29 for one month | full split history + 5 yrs of minute files | no; only if the Databento credit runs out or split edge cases exceed 2% |
+| Databento OPRA options slices | usage-priced (costed first) | 1-minute options quotes from 2013 for Candidate A | no; only if Candidate A is revived |
+| Not worth buying (Carbon round 9) | | TradingView, Finviz, EODHD, metered AI credits | no |
 
 ## 14. Closed log (newest first)
 
