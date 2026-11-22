@@ -398,6 +398,12 @@ Queued (roadmap):
   K_raw and K_eff; gate DSR(K_eff) >= 0.95. Counts: fee fix 0; drift band +2 raw/~0.01 eff; Kronos +2 (+1 if
   sized); LW ceiling +1/~0.08; HRP +1/~0.25; each Stage 0 +1 even if it fails; insider and C +1 per locked run.
   Closed tests are never re-run under the fixed fee table unless logged as new trials.
+  Round 13: replace the Gumbel E[max] in `expected_max_sharpe` with the exact normal-maximum integral (K=1 -> 0;
+  Gumbel is negative for K < 1.2836, so fractional K_eff breaks it); unit test pins the table; the exact value is
+  slightly lower above K~5, so past decisions are not re-judged. Every lock prints PSR(0), DSR at per-market
+  K_eff (gate_study pools per market today) and DSR at global K_eff; a new strategy must pass the global one.
+  Pre-flight lock manifest (14 rows, hashes, `lock_manifest` never sees returns, `score_locked_trial` re-checks
+  rows 1-4) required for every locked run, starting with the drift band.
 - **QUEUED** 1.13 leftovers: the "lock" rule and four other cities were never tested (weather).
 - **QUEUED** shadow books for forward candidates, judged against the fund book by a paired test (agreed plan,
   not built).
@@ -413,7 +419,7 @@ Ideas not committed to:
   completed scored run).
 - **IDEA** TimesFM 3.0 weights are non-commercial; the owner has not ruled on personal use of them.
 
-From the Carbon dialogue (2026-11-22, rounds 1 to 12; replies `~/Valedia_Claude_Reply1..12.md`). Each test is
+From the Carbon dialogue (2026-11-22, rounds 1 to 13; replies `~/Valedia_Claude_Reply1..13.md`). Each test is
 locked in the research loop before any data is read; none has been run yet.
 **Queue order (round 10):** (1) drift-band trial (backtest only; the live buffer goes through the go-live gate
 work with a full blind check), (2) Kalshi fee fix, (3) CPI Stage 0, (4) insider event table from SEC data only,
