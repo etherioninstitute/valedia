@@ -16,8 +16,8 @@ production venue, propose and approve, its confirmation files in the test's own 
 the same seed: once by a fresh interpreter that imports ONLY 75a51f5's whole `valedia_trader` package (taken with
 `git archive 75a51f5` into the test's temporary folder), once by a fresh interpreter that imports ONLY this tree's.
 Each side reports the file of every `valedia_trader` module it imported: none may come from the other side, and
-every one of them must be byte-identical between the two sides except `execution_and_risk/order_step.py` and
-`execution_and_risk/orders.py` (the subject of T51 build B). A later change on main to a module the run
+every one of them must be byte-identical between the two sides except `execution_and_risk/order_step.py`,
+`execution_and_risk/orders.py` and `venues/webull.py` (T51 build B changes these three on purpose; MAY_DIFFER says why). A later change on main to a module the run
 imports fails these tests in words naming it (the base must then be re-pinned on purpose, or the module added to
 the list on purpose); a changed module that no run imports does not matter. If 75a51f5 cannot be read from this
 checkout's history the tests fail in words. After every run the whole world folder is compared, file by file.
@@ -62,11 +62,22 @@ from valedia_trader.venues import webull as _wb
 from test_order_step import Booked, GENEROUS, LiveVenue, _run_with, live_world, paper, ticket_world
 
 BASE = "75a51f5"
-# What may differ between the base and this tree: the two modules T51 build B changes on purpose (the order step and
-# its ledger, the subject of the comparison), and nothing else. Not listed, each judged against 75a51f5: core/alerts.py
-# (no run imports it; if one does and it changed, the test fails in words), venues/webull.py (R33a, R39; byte-identical
-# to the base, the old reason is gone), go_live.py and stake_ladder.py (S4c-2; byte-identical to the base).
-MAY_DIFFER = ("valedia_trader/execution_and_risk/order_step.py", "valedia_trader/execution_and_risk/orders.py")
+# What may differ between the base and this tree: the modules T51 build B changes on purpose, each for a reason, and
+# nothing else:
+#   - execution_and_risk/order_step.py and execution_and_risk/orders.py: the subject of the comparison (the live
+#     opening for fractions, the proof reading, first contact, the quote re-ask; the ledger's schema check and its
+#     reconciles() reader, B6 (2));
+#   - venues/webull.py (build B, B2 and B3): the owner's consent key `fractional_live_consent` is judged by the
+#     confirmation's reader (an optional key; the judged dict holds it only when JSON true), and the production adapter
+#     takes an order with no limit price in ONE case (a remainder leg of a run that passed its locks: flag, consent re-read,
+#     size under one, CORE, a ".r" tag) and judges the payload again at its single place_order call. With the flag
+#     absent (every call a `fractional`-off run makes) the adapter does what it did; the byte-for-byte comparison of
+#     every written artefact, live runs included, is what still guards that.
+# Not listed, each judged against 75a51f5: core/alerts.py (no run imports it; if one does and it changed, the test
+# fails in words), go_live.py and stake_ladder.py (byte-identical to the base), research_loop/cli.py (the command line is
+# not what these worlds drive; they call run_order_step).
+MAY_DIFFER = ("valedia_trader/execution_and_risk/order_step.py", "valedia_trader/execution_and_risk/orders.py",
+              "valedia_trader/venues/webull.py")
 TESTS = Path(__file__).resolve().parent
 KINDS = ("ordinary", "partial", "refusal", "cap", "breach", "stopped", "approved", "expired", "second_run",
          "baseline", "live")

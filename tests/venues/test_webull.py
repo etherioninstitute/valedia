@@ -4379,3 +4379,25 @@ def test_b1_b2_b3_property_no_production_order_without_a_limit_is_ever_placed_un
         if _oracle_without_limit(over, args, held):                  # the other way: a world that meets every condition goes
             assert [c[2][0]["order_type"] for c in client.placed()] == ["MARKET"], (n, over, args)
     assert sent_market > 15 and refused > 100 and limited >= 0, (sent_market, refused, limited)
+
+
+def test_b3_the_order_steps_own_hand_over_reaches_the_real_adapter_through_the_ledger(tmp_path):
+    """The path a live remainder leg takes: the ledger's MARKET order (a collar price, no limit), the order step's
+    submit wrapper adding the flag, the ledger's submit_once calling the adapter. With the flag the adapter places a MARKET
+    order by quantity; without it, the same order is refused before any call and the ledger records it as not sent."""
+    from valedia_trader.execution_and_risk import order_step as osx
+    from valedia_trader.execution_and_risk.orders import OrderLedger
+    v, client = venue(tmp_path, env="production")
+    _consent_conf(tmp_path, **{CONSENT: True})
+    led = OrderLedger(tmp_path / "orders.sqlite", not_sent=osx.NOT_SENT, clock=lambda: 1_000_000.0)
+    try:
+        for tag in ("os-1-SPY.r", "os-2-SPY.r"):
+            led.intend(tag, "SPY", 0.5, 100.0, batch=tag[:4], order_type="MARKET", collar_price=101.0)
+        rec = led.submit_once(osx._SubmitWatch(v), "os-1-SPY.r")                              # no flag
+        assert rec["state"] == "refused" and client.placed() == [], rec
+        rec = led.submit_once(osx._SubmitWatch(v, {"fractional_live": True}), "os-2-SPY.r")   # the order step's wrapper
+        assert rec["state"] == "accepted", rec
+        (placed,) = client.placed()
+        assert placed[2][0]["order_type"] == "MARKET" and placed[2][0]["quantity"] == "0.5"
+    finally:
+        led.close()
