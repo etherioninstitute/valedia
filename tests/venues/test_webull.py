@@ -4391,6 +4391,7 @@ def test_b3_the_order_steps_own_hand_over_reaches_the_real_adapter_through_the_l
     _consent_conf(tmp_path, **{CONSENT: True})
     led = OrderLedger(tmp_path / "orders.sqlite", not_sent=osx.NOT_SENT, clock=lambda: 1_000_000.0)
     try:
+        assert led.reconcile(v, {})["clean"]                      # the ledger sends nothing before one clean reconcile
         for tag in ("os-1-SPY.r", "os-2-SPY.r"):
             led.intend(tag, "SPY", 0.5, 100.0, batch=tag[:4], order_type="MARKET", collar_price=101.0)
         rec = led.submit_once(osx._SubmitWatch(v), "os-1-SPY.r")                              # no flag
