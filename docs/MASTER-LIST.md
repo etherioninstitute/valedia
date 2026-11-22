@@ -59,8 +59,8 @@ matched by keyword only, not read one by one. Item H-1 closes that.
    confirmation file, `--fractional`, and a shared live run; one live remainder per run until one reconciles
    cleanly. With the opening shut, a live run is exactly the run without the flag. **Practice gate moved** to
    1d60247 (backup `.before-t51b`, tested both ways). Follow-ups in `.foreman/tickets/T51d-build-b-followups.md`
-   (docs wording, three test gaps, the doctor's consent-key count). LEAD: run `order_step.practice_proof`
-   read-only on the real practice record. NEXT: the stricter go-live gate. AFTER BUILD B (owner's yes 2026-11-21):
+   (docs wording, three test gaps, the doctor's consent-key count). Practice proof CHECKED 2026-11-21 on a copy of
+   the real record: 2 clean MARKET remainder purchases, 1 clean sale, ok (B1 met). NEXT: the stricter go-live gate. AFTER BUILD B (owner's yes 2026-11-21):
    move the MiroFish-Offline backend files the native pipeline pins (`src/mirofish_native_run.py` ARCHIVE, now in
    `/Volumes/NIMROD_SSD/backups/2026-10-22/home/mirofish-offline/backend`) into this repo with its AGPL-3.0 notice,
    re-hash the pins, re-run the qualification tests.
