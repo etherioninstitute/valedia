@@ -50,9 +50,10 @@ matched by keyword only, not read one by one. Item H-1 closes that.
    PASS_WITH_NOTES): shared stop and shortfall alerts per venue and class (unattended critical), cleared only by a
    strictly later clean run; the owner's page "Shared book" section; R34's `mark` entry. **Practice gate moved** to
    75a51f5 (backup `.before-s4e`, tested both ways). OWNER: try a `mark` entry on a COPY of the practice state file
-   first (the first one rebuilds a layout-2 file in place). NEXT: a small ticket (re-pin
-   test_fractional_off_against_base, which fails on main since S4c-2; drop alerts.py's cached shared view when the
-   open alerts are set), then T51 build B, then the stricter go-live gate. AFTER BUILD B (owner's yes 2026-11-21):
+   first (the first one rebuilds a layout-2 file in place). Small ticket MERGED (main 3b83960,
+   f5daa44, blind check PASS_WITH_NOTES): test_fractional_off_against_base re-pinned to 75a51f5 and green (it now
+   guards build B: fractional off writes what the accepted order path writes); alerts.py drops its cached shared
+   view in each watch. NEXT: T51 build B, then the stricter go-live gate. AFTER BUILD B (owner's yes 2026-11-21):
    move the MiroFish-Offline backend files the native pipeline pins (`src/mirofish_native_run.py` ARCHIVE, now in
    `/Volumes/NIMROD_SSD/backups/2026-10-22/home/mirofish-offline/backend`) into this repo with its AGPL-3.0 notice,
    re-hash the pins, re-run the qualification tests.
