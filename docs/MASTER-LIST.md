@@ -434,7 +434,12 @@ locked in the research loop before any data is read; none has been run yet.
   queue on the trade tape (`taker_side == "yes"` at yes_price == p uses up Q_ahead; yes_price > p fills at most
   that print's count; block trades out); must hold at Q_ahead 100, 250 and 500. Fee history from
   `/series/fee_changes?show_historical=true` (check the docs first).
-- **QUEUED** Candidate B second: CPI and PCE bracket rounding against the Cleveland Fed nowcast.
+- **QUEUED** Candidate B second, narrowed round 7: headline CPI only (KXCPI/CPI, KXCPIYOY/CPIYOY), quadratic
+  series; "strictly above k" on the 1-decimal print; day d's nowcast usable from 14:00 ET; error scale fitted
+  2013-07..2021-12. Stage 0 first (no fill code): paired cluster Brier, Cleveland Fed p vs Kalshi's 14:00 mid at
+  T-5 and T-2, about 36 releases 2022-2024, one-sided Wilcoxon p < 0.05; fail = closed. Check first: legacy
+  tickers reachable in our history client; the nowcast download is as first published (two fetches compared);
+  October 2025 CPI cancelled.
 - **BLOCKED** Candidate A (option-implied index brackets): needs option-chain history.
 - **QUEUED** pooling test on Elephant-1 (does it add anything beyond Kalshi's mid): lock the document BEFORE
   the scored period's results are read (scored period ends 2026-12-03); first confirm the collector stores bid
@@ -445,10 +450,13 @@ locked in the research loop before any data is read; none has been run yet.
   asked 2026-11-13..20, inside the sealed zone: scored only prequentially (Platt after a 200-question burn-in,
   no isotonic). qwen3.8-27b (151 answers) by time-ordered 5-fold CV, secondary only.
 - **BLOCKED** stocks, first family: insider cluster buys (roadmap 1.17). Spec from Carbon round 6 adopted with
-  changes (reply 6): entry stand-in max(Open, OHLC/4) + 12 bps since the job runs 9:55 ET; delisting returns
-  -30% NYSE/AMEX, -55% Nasdaq; sample size measured; Zhao arXiv:2602.06198v2 and the SEC data sets'
-  AFF10B5ONE field checked before the lock. Blocked: needs daily prices and market caps of dead companies
-  2015-2024 (owner item 10); Finnhub's free plan has no price history.
+  changes (reply 6, 7): entry at the real 9:55 ET one-minute bar + half spread (the OHLC/4 stand-in was not
+  causal; dropped); delisting returns -30% NYSE/AMEX, -55% Nasdaq; sample size measured; AFF10B5ONE only from
+  2023-04-01, footnote regex + repeat-month filter on all years; read Zhao arXiv:2602.06198v2 before the lock.
+  $0 path (round 7): Databento's free starting credit (daily bars with delisted names from 2018-05, plus
+  minute bars on event mornings only) + SEC CompanyFacts shares + EDGAR Form 4 data sets; window
+  2018-05..2024-12, 2025 on sealed. Blocked on the owner opening a free Databento account (owner item 20);
+  check Databento's credit, prices, dataset start and personal-use licence first.
 - **QUEUED** hygiene: `src/insider_mirror.py` (legacy) sends a named User-Agent to the SEC; give it a
   generic one or retire it.
 - **BLOCKED** stocks, second family: quality + payout + residual momentum with a rank buffer; needs
@@ -797,9 +805,15 @@ run beside MiroFish and Elephant-1):
     Sharadar's licence before recommending.
 17. Tax: DBC issues a K-1; PDBC is the no-K-1 alternative. No code change until he rules.
 18. Whether to merge CTO with Planner and Coder with Builder (Carbon's suggestion).
-19. The execution-clock idea in section 2 (10:30 ET run, FOMC and spread rules).
+19. The execution-clock idea in section 2 (10:30 ET run, FOMC and spread rules). The insider test's minute
+    pull also measures 9:55 vs 10:30 for free.
+20. A free Databento account (its starting credit; no subscription) for the $0 insider-test data path.
+    Sharadar SEP ($199-299 a year) only later, if the 2018+ test passes or the ranker is next.
 
 ## 14. Closed log (newest first)
+
+- 2026-11-22 owner's standing rule: Valedia as low-cost as possible, data to AI; free or cheapest licence-clean
+  path first, frontier AI on flat subscriptions rather than metered spend; purchases and accounts stay his.
 
 - 2026-11-22 Kronos-base downloaded and pinned (owner's yes; revision 2b554741..., sha256 checked), smoke test
   passed on the CPU.
