@@ -407,8 +407,12 @@ Ideas not committed to:
   completed scored run).
 - **IDEA** TimesFM 3.0 weights are non-commercial; the owner has not ruled on personal use of them.
 
-From the Carbon dialogue (2026-11-22, rounds 1 to 5; replies `~/Valedia_Claude_Reply1..5.md`). Each test is
+From the Carbon dialogue (2026-11-22, rounds 1 to 10; replies `~/Valedia_Claude_Reply1..10.md`). Each test is
 locked in the research loop before any data is read; none has been run yet.
+**Queue order (round 10):** (1) drift-band trial (backtest only; the live buffer goes through the go-live gate
+work with a full blind check), (2) Kalshi fee fix, (3) CPI Stage 0, (4) insider event table from SEC data only,
+(5) Kronos volatility, (6) the insider test's Databento pull and scoring, (7) the Arbiter before 2026-12-03, then
+dominance Stage 0 from 2026-12-04, (8) Candidate C. The live path (stricter go-live gate) stays first overall.
 - **QUEUED** Kronos volatility test (Kronos-small and Kronos-base = 2 trials). Bars from 2024-07-01 only;
   2024-07..12 for plumbing and the scale factor; 2025 on sealed. 64 sampled paths, uncentered variance,
   Yang-Zhang target, QLIKE, h = 1 and 5 with Holm. Baselines EWMA 0.94, blended EWMA, HAR-YZ (slopes fitted
@@ -417,6 +421,12 @@ locked in the research loop before any data is read; none has been run yet.
   sigma_Kronos). Kronos-base DOWNLOADED 2026-11-22 (owner's yes): `trading-lab/models/Kronos-base/`, revision
   2b554741eca47781b64468546e77fef3e85130e6, model.safetensors sha256 abff193a...5f4b83 (matches the hub's
   record), 102.3M parameters, MIT; smoke test on the CPU: load 1.7 s, 5-day forecast 0.8 s.
+  Round 10, checked against upstream 67b630e: `predict` averages samples (kronos.py:467); our worker already
+  draws one path per call, but 64 calls x 0.8 s is about 80 h, so batch the 64 seeded copies through
+  `predict_batch` (sample_count=1 each; prove batched = one-at-a-time and MPS = CPU on 5 dates). Raw-price
+  z-scoring over the whole context (544-547): context 128 vs 512 chosen on 2024-H2 only; target = centered
+  cross-path variance (path-averaged Rogers-Satchell logged). Sampling T=1.0, top_p=1.0, top_k=0 (the worker
+  passes 0.9 today). Pass amount = volume x OHLC/4 (missing today, filled with zeros).
 - **QUEUED** Stage A news-window steam test (sports; 1.18's near-start moneyline already failed). Owner's yes
   2026-11-22 for about 8,100 Odds API credits. Heavy slate-days chosen by game count only; a free Kalshi
   liquidity check at T_open - 5 min; 18 snapshots every 5 min in 90-min news windows (NHL 11:00-12:30 ET, MLB
@@ -493,6 +503,12 @@ locked in the research loop before any data is read; none has been run yet.
 - **IDEA** (round 8) sweep-reversion passive maker on the 10-level book, after 2026-12-03.
 - **IDEA** postmortem spec: fee mismatch flagged at 1 fill, slippage by CUSUM at 25, CLV decay at 60 or more;
   no return-decay alarm on the fund book (watch slippage, turnover, realized/target volatility).
+- **QUEUED** (round 10) the Arbiter as code: five gates (same settlement sources and terms-PDF sha256 or
+  matched PDF blocks; rule text identical outside the strike or date slot; comparator text agrees with
+  strike_type; same expiry and can_close_early for strike pairs, cumulative wording for date pairs; anything
+  else UNPARSED_NEEDS_REVIEW = blocked, a local model only drafts a diff). Our Kalshi client must first keep
+  rules_primary/secondary, can_close_early, early_close_condition, expected/latest_expiration_time,
+  functional/custom_strike, market_type, and the series' settlement_sources + contract_terms_url.
 - **IDEA** bots: Arbiter (rule matching across venues) adopted as a design; Quant (read-only quant_engine
   tool) and Risk (reconcile and explain only) proposed, not built. The Decider stays off the per-trade path
   until 100 shadow vetoes show negative CLV.
@@ -855,7 +871,7 @@ run beside MiroFish and Elephant-1):
 | Massive (Polygon) Stocks Developer | $79 for one month | 10 yrs of daily + minute bars, point-in-time market cap | no |
 | Databento corporate actions | usage-priced | exact split and dividend adjustments | no; the $0 split check comes first |
 | Databento live | $199/mo | live US equity data | no (Webull's free quotes serve live orders) |
-| Ohio VPS near Kalshi's servers | $5-10/mo | 1-3 ms to Kalshi instead of 55-75 ms; always-on WebSockets off the Mac | no; only after a speed-sensitive Kalshi test passes; location to verify; a key on a remote host is his call |
+| Ohio VPS near Kalshi's servers | $5-10/mo | 1-3 ms to Kalshi instead of 55-75 ms; always-on WebSockets off the Mac | no; only after a speed-sensitive Kalshi test passes; location to verify behind the CDN (demo or an authenticated read, never live orders); a key on a remote host is his call |
 | Massive (Polygon) Stocks Starter | $29 for one month | full split history + 5 yrs of minute files | no; only if the Databento credit runs out or split edge cases exceed 2% |
 | Databento OPRA options slices | usage-priced (costed first) | 1-minute options quotes from 2013 for Candidate A | no; only if Candidate A is revived |
 | Not worth buying (Carbon round 9) | | TradingView, Finviz, EODHD, metered AI credits | no |
