@@ -53,7 +53,14 @@ matched by keyword only, not read one by one. Item H-1 closes that.
    first (the first one rebuilds a layout-2 file in place). Small ticket MERGED (main 3b83960,
    f5daa44, blind check PASS_WITH_NOTES): test_fractional_off_against_base re-pinned to 75a51f5 and green (it now
    guards build B: fractional off writes what the accepted order path writes); alerts.py drops its cached shared
-   view in each watch. NEXT: T51 build B, then the stricter go-live gate. AFTER BUILD B (owner's yes 2026-11-21):
+   view in each watch. T51 build B MERGED 2026-11-21 (main 4db3192..1d60247; four blind checks, the last
+   PASS_WITH_NOTES; the safety property held in every round). Live fractional remainder legs need: the practice
+   proof (one remainder purchase and one sale, clean), the owner's `"fractional_live_consent": true` in his live
+   confirmation file, `--fractional`, and a shared live run; one live remainder per run until one reconciles
+   cleanly. With the opening shut, a live run is exactly the run without the flag. **Practice gate moved** to
+   1d60247 (backup `.before-t51b`, tested both ways). Follow-ups in `.foreman/tickets/T51d-build-b-followups.md`
+   (docs wording, three test gaps, the doctor's consent-key count). LEAD: run `order_step.practice_proof`
+   read-only on the real practice record. NEXT: the stricter go-live gate. AFTER BUILD B (owner's yes 2026-11-21):
    move the MiroFish-Offline backend files the native pipeline pins (`src/mirofish_native_run.py` ARCHIVE, now in
    `/Volumes/NIMROD_SSD/backups/2026-10-22/home/mirofish-offline/backend`) into this repo with its AGPL-3.0 notice,
    re-hash the pins, re-run the qualification tests.
@@ -230,7 +237,7 @@ trading (his word, 2026-11-17).
    DBC (thinly traded) missed, 5 times in 25. The remainder leg of the XLK sale was held back for another
    reason: it followed its own whole-share leg and was judged on the quote asked for before that leg went.
    **For build B:** the remainder leg asks once more for its own quote right before it is judged.
-3. **NEXT** T51 build B: the proof reading (only fills of this code path count; one purchase and one sale in
+3. **MERGED 2026-11-21 (1d60247)** T51 build B: the proof reading (only fills of this code path count; one purchase and one sale in
    clean batches), the owner's consent field for live fractions, the live opening, and the FIRST-CONTACT RULE
    (in production one fractional order per run until one has filled and reconciled cleanly: practice is looser
    than production, so practice cannot prove what production refuses).
