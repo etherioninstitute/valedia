@@ -3651,6 +3651,9 @@ def run_order_step(*, ledger: OrderLedger, venue, paper, quotes: Callable, journ
     run = _Run(ledger, venue, paper, quotes, journal, limits_file, state, clock, calendar, halt_file, latch_file,
                capital, fractional)
     run.shared = bool(shared)
+    if live is not None:                                 # T51 B repair2 (1): a live run is no fractional run until
+        run.fractional = False                           # `_live_fractions` has judged the opening and opened it; so no
+                                                         # path, a stop before it included, can write a fractional-only key
     run.practice_ledger = practice_ledger
     if follow is not None:
         run.follow, run.follow_problem = follow, _follow_problem(follow)
@@ -3682,6 +3685,7 @@ class _Run:
         self.ledger, self.venue, self.paper, self.quotes, self.journal = ledger, venue, paper, quotes, journal
         self.limits_file, self.state_arg, self.clock, self.calendar = limits_file, state, clock, calendar
         self.halt_file, self.latch_file, self.capital, self.fractional = halt_file, latch_file, capital, bool(fractional)
+        self.fractional_asked = bool(fractional)         # T51 B repair2: what the command asked (live: self.fractional starts off)
         self.name = "?"
         self.batch = None
         self.day = None
@@ -3876,7 +3880,7 @@ class _Run:
                 why = self._live_locks(path)
                 if why is not None:
                     return self._finish("stopped", "lock", why)
-                if self.fractional:                      # T51 B1 to B4: read at the start, read-only; a hold, never a stop
+                if self.fractional_asked:                # T51 B1 to B4: read at the start, read-only; a hold, never a stop
                     self._live_fractions()
             try:
                 self._scan_journal()                     # before anything is asked of the venue
@@ -4346,9 +4350,9 @@ class _Run:
             info["first_contact"] = self.first_contact
             info["live_clean"] = {"purchases": 0 if live is None else live.purchases, "sales": 0 if live is None else live.sales}
         self.live_fractions, self.live_open = info, not missing
-        if missing:                                      # T51 B repair F1: a shut opening is no fractional run at all:
-            self.fractional = False                      # no split, no zero rule, no 5-decimal units, no residual, the
-                                                         # ticket flag as without --fractional; only the words are added
+        self.fractional = not missing                    # T51 B repair F1: a shut opening is no fractional run at all (it
+                                                         # started off): no split, no zero rule, no 5-decimal units, no
+                                                         # residual, the ticket flag as without --fractional; only the words
 
     def _live_account(self, account: str) -> str | None:
         """Live mode, at the first account read: the account the venue will trade is the confirmation's (its class,
@@ -5947,7 +5951,8 @@ class _Run:
                 continue
             quote, judged = in_hand.get(sym, c["quote"]), None   # the latest quote in hand (a holding's may be newer)
             for round_ in (1, 2):
-                quote, stale, unpriced = self._refresh(sym, quote, held, in_hand, market)   # 1. fresh quotes, one ask
+                quote, stale, unpriced = self._refresh(sym, quote, held, in_hand, market and not c.get("reasked"))   # 1. one ask
+                                                         # (T51 B5: a leg put back after its re-ask asks no more)
                 if quote is None:
                     self._leave(c, stale)
                     break
@@ -6306,6 +6311,9 @@ class _Run:
             summary["residuals"] = [dict(r) for r in self.residuals]
         if self.live_fractions is not None:              # T51 B1 to B4: a live fractional run says how the opening stood
             summary["live_fractions"] = dict(self.live_fractions)   # (the only addition when it is shut: the words)
+        elif self.live is not None and self.fractional_asked:   # a live run that stopped before the opening was judged
+            summary["live_fractions"] = {"open": False, "why": "the run stopped before the opening for fractions was judged "
+                                                               "(see its reason); it is the live run without --fractional"}
         if self.follow_names is not None:                # T32: which strategies the broker book followed
             summary["follow"] = self._follow_view()
         if self.shared:                                  # T51c S4c: the book's figures, its fees bounded, its shortfalls

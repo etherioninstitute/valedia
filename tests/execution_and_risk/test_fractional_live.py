@@ -1041,3 +1041,98 @@ def test_f4_a_live_buy_judged_again_after_its_re_ask_counts_once_against_max_cap
     assert [c for c in lw.quote_calls[before:] if c == ["SPY"]] == [["SPY"], ["SPY"]], "the leg was not asked for again"
     assert done["status"] == "done" and done["orders_sent"] == 1 and done["dropped"] == [], done
     assert [s["fractional_live"] for s in lw.venue.limitless()] == [True]
+
+
+# ---- T51 B repair2 (1): R-F1 holds for EVERY live run outcome, stops included
+
+STOPS = ("lapsed confirmation", "absent confirmation", "no checklist", "limits file elsewhere", "no ticket mode",
+         "capital given", "wrong approval number", "propose and approve", "venue not production")
+
+
+def _stop_run(lw, how, flag):
+    """One live run that is bound to stop, made the same way with and without --fractional."""
+    kw = {"fractional": flag}
+    if how == "lapsed confirmation":
+        lw.write_conf(valid_until="2020-01-01")
+    elif how == "absent confirmation":
+        (lw.cfg / "webull_live.json").unlink()
+    elif how == "no checklist":
+        (lw.cfg / "go_live.json").unlink()
+    elif how == "limits file elsewhere":
+        other = lw.tmp / "elsewhere.json"
+        other.write_text((lw.cfg / "risk.json").read_text())
+        other.chmod(0o644)
+        lw.limits = other
+    elif how == "venue not production":
+        lw.venue.environment = "sandbox"
+    if how == "no ticket mode":
+        return lw.lshared(**kw)
+    if how == "capital given":
+        return lw.lshared(propose=True, capital=5000.0, **kw)
+    if how == "wrong approval number":
+        return lw.approve("000000", **kw)
+    if how == "propose and approve":
+        return lw.lshared(propose=True, approve="123456", **kw)
+    return lw.propose(**kw)
+
+
+def _everything(lw, out):
+    """What a run left: what it returned, EVERY journal line (any event type), the ledger's orders and fills, the venue's calls."""
+    led = lw.ledger()
+    try:
+        ledger = {"orders": led.orders(), "fills": led.fills()}
+    finally:
+        led.close()
+    return _plain({"out": out, "journal": lw.journal_events(), "ledger": ledger, "calls": [list(c) for c in lw.venue.calls]})
+
+
+def test_r2_1_every_live_stop_with_the_flag_is_the_live_stop_without_it_and_no_fractional_key_leaks(mkl):
+    stopped = 0
+    for how in STOPS:
+        got = []
+        for flag in (True, False):
+            # every lock would hold if the run got as far as judging them; only the run that DOES get that far (a wrong
+            # approval number stops after it) has its consent withheld, because an open opening is a fractional run
+            lw = mkl(conf={CONSENT: how != "wrong approval number"})
+            lw.open_book("10000")
+            practice_record(lw)
+            lw.paper = paper({"a": {"SPY": 125.0}})
+            out = _stop_run(lw, how, flag)
+            assert out["status"] == "stopped", (how, flag, out)
+            for key in ("residuals",):
+                assert key not in out, (how, flag, key)
+            for e in lw.journal_events("summary"):
+                assert "residuals" not in e or e["batch"] != out["batch"], (how, "a journaled summary holds `residuals`", e)
+            got.append((_everything(lw, out), out))
+            stopped += 1
+        assert got[0][0] == got[1][0], how
+    assert stopped == 2 * len(STOPS)
+
+
+# ---- T51 B repair2 (2): the re-judge after a re-ask does not ask again
+
+def test_r2_2_a_newer_quote_still_past_120_seconds_is_not_asked_for_a_third_time(tmp_path, monkeypatch):
+    w = collar_world(tmp_path / "w")                                   # the first quote is 60 s old: time T0 - 60
+    t0 = w.clock.t
+    age_the_market_leg_after_its_checks(w, monkeypatch, 61.0)          # 121 s old at the collar
+    asks = []
+    real = w.quotes
+
+    def quotes(symbols):
+        asks.append(list(symbols))
+        if len(asks) > 1:                                              # newer than the first (T0 - 59.5), and 120.5 s old then
+            return {s: (500.0, t0 - 59.5) for s in symbols}
+        return real(symbols)
+    w.quotes = quotes
+    out = w.run(fractional=True)
+    b = out["batch"]
+    assert out["status"] == "done" and "faults" not in out and "cap_unjudged" not in out, out
+    assert [a["tag"] for a in w.venue.args] == [f"{b}-SPY"], out        # its LIMIT leg went
+    (left,) = held_back(out)
+    assert left["collar"] == "quote_age", left
+    assert asks == [["SPY"], ["SPY"]], asks                            # the run's first ask and ONE once more, no third
+    led = w.ledger()
+    try:
+        assert led.attention() == []
+    finally:
+        led.close()
