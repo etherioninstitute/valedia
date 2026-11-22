@@ -770,6 +770,11 @@ run beside MiroFish and Elephant-1):
 ## 12. Infrastructure and hygiene
 
 - **NEXT** refresh `docs/ROADMAP.md` (rows are as of 2026-11-14) and add rows for T50, T51, T51c, T52.
+- **QUEUED** REMINDER (owner, 2026-11-22: "audit costs later") cost audit of everything Valedia pays for, AI
+  and data: metered AI (Claude API, Hermes chat models, Ollama Cloud, xAI, Gemini), subscriptions (Claude,
+  Google AI Pro), data plans (Odds API, Finnhub, any others). For each: what uses it, monthly cost, and a
+  cheaper route (local model, FreeLLMAPI, a flat subscription he already pays, a free source). Under his
+  low-cost rule; changes to Hermes or paid plans stay his to approve.
 - **QUEUED** `docs/GOALS_AND_MAP.md` is a stale snapshot of 2026-11-13.
 - **QUEUED** about 70 old candidate and checker worktrees and their scratch folders to clear.
 - **QUEUED** backups (5.1): the nightly job is installed; no scheduled run is recorded as checked.
