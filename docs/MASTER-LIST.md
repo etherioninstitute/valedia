@@ -414,6 +414,13 @@ Queued (roadmap):
   Epoch-0 r_true: a run counts +1 if new version OR same version with a changed variant spec (guard miss); r_true>5
   dev-only pass -> RETRO_CAP_FAIL; sealed pass -> GRANDFATHERED_POST_SEAL only if sibling-adjusted dev DSR clears
   and siblings plateau, else HOLD_FOR_OWNER_AUDIT (hypothesis 26 = go-live item, shown first).
+  Round 19: Condition B needs m >= 5 finite-Sharpe siblings in the hypothesis (fewer -> HOLD_FOR_OWNER_AUDIT),
+  runs only when r_true > 5 (else WITHIN_CAP); spike test = Grubbs/externally studentized cutoff plus a winsorized
+  check, alpha 0.025 each (simulated: raw >2 SD wrongly flags 43% of plateaus at m = 5; both checks at 0.05 give
+  8.6%); winner - median(siblings) <= 0.02 -> PLATEAU (own locked constant). r_true compares each run's
+  frozenset(label, sha, spec) with the previous run. Permutation test tolerance 4*hypot(se_R, se_perm). Rehearse
+  Thanksgiving (Thu 11-26 = session stop, no fault) and Fri 11-27 (13:00 close, 12:45 cutoff); the settled-cash cap
+  uses the venue's settled figure, never its own T+1 dates.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
@@ -951,6 +958,9 @@ run beside MiroFish and Elephant-1):
     `cos-team` checks placement before each local call (`lms ps --json`): if `splash27` is not loaded on another
     device it runs that bot on gpt-6-luna instead and says so, so nothing ever loads beside the collector. Tested
     in every state (remote, unloaded, local, bad output, lms failing) and one real fallback run.
+    The trader's own Hermes calls (desk, panel, research; the trading Scout is on `splash27`) are guarded too
+    (`agents/placement.py`, 2026-11-22): an LM Studio model that is not already loaded, or a failed check, refuses
+    the call. There is no cloud fallback, because trader prompts stay on the machine. Blind-verified.
 
 ## 13b. Affordable paid options (the owner's to choose; none needed today unless marked)
 
