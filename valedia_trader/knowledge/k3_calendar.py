@@ -585,10 +585,15 @@ def _store_facts(conn, facts: list[dict]) -> dict:
     counts = {"stored": 0, "unchanged": 0, "error": 0}
     if not facts:
         return counts
-    before = {(r["entity_key"], r["source_id"]): r["fact_version_id"]
-              for r in store.facts_as_of(conn, facts[0]["fetched_at_utc"], domain=_DOMAIN)}
+    prior = {(r["entity_key"], r["source_id"]): r
+             for r in store.facts_as_of(conn, facts[0]["fetched_at_utc"], domain=_DOMAIN)}
+    before = {k: r["fact_version_id"] for k, r in prior.items()}
     detail = None
     for f in facts:
+        old = prior.get((f["entity_key"], f["source_id"]))
+        if old is not None and old["raw_sha256"] != f["raw_sha256"] and f["published_proven"]:
+            # a revision of a stored entity is known when we fetched it, never back at the first publication
+            f = dict(f, published_at_utc=None, published_proven=False)
         try:
             version = store.add_fact(conn, **f)
         except store.StoreError as exc:
