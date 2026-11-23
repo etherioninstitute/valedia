@@ -41,6 +41,14 @@ checks only the id range, the schema identity and the version. Rows written with
 than out-of-range ids, are not detected.
 
 Known limits:
+- SQLite cannot check UTF-8 validity in a CHECK constraint (no function does it, and a CHECK may not contain a
+  subquery), so text that is not valid UTF-8 can be stored through raw SQL; every read of it raises
+  StoreError instead of a raw error. `connect` refuses a store whose text encoding is not UTF-8.
+- `connect` runs `PRAGMA integrity_check` on an existing store: a full-file read on every open. `quick=True`
+  runs `quick_check` instead, which is faster and skips some index checks.
+- What the store can see is limited: temp objects on the caller's own connection are outside it. A raw
+  connection that uses writable_schema, or relies on overridden SQL functions, between integrity checks can
+  alter the file; the next `connect` (its schema comparison and integrity check) is where that is caught.
 - A raw number such as 1e999 inside payload JSON, and an escaped lone surrogate such as "\\ud800" inside a JSON
   string, are refused by `add_fact` (in code) but not by the database itself, which accepts them as valid JSON.
 - The test that guards the single read path is text-only: it finds the facts table by its name written out in
@@ -231,9 +239,15 @@ def _conn(conn) -> None:
         raise StoreError("conn: must be a sqlite3 connection, normally the one `connect` returns")
 
 
-def connect(path) -> sqlite3.Connection:
+def connect(path, *, quick: bool = False) -> sqlite3.Connection:
     """Open (and create if needed) the store at `path`. The one place connections are made. A store with a
-    different schema version, or with any expected table, index or trigger missing or changed, is refused."""
+    different schema version or text encoding, with any expected table, index or trigger missing or changed,
+    or that fails SQLite's own integrity check, is refused. A new empty file is created at the current version.
+
+    Cost: opening an existing store runs `PRAGMA integrity_check`, which is a full-file read on every open
+    (measured 0.14 s for 10,000 facts in a 5 MB file, so roughly 1.4 s per hundred thousand). `quick=True` runs
+    `PRAGMA quick_check` instead, which skips some index and uniqueness checks."""
+    quick = _flag(quick, "quick")
     path = _path(path)
     try:
         conn = sqlite3.connect(path, isolation_level=None)  # autocommit; writes use explicit BEGIN
@@ -247,16 +261,25 @@ def connect(path) -> sqlite3.Connection:
             raise StoreError(
                 f"{path}: store schema version is {version}, this code needs {SCHEMA_VERSION}; "
                 "it was made by an older or different build and is not opened silently")
+        encoding = conn.execute("PRAGMA encoding").fetchone()[0]
+        if encoding != "UTF-8":
+            raise StoreError(f"{path}: store text encoding is {encoding}, this code needs UTF-8")
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA synchronous = FULL")
         conn.execute("PRAGMA ignore_check_constraints = OFF")
         if version == 0:   # a brand-new empty file: create everything and stamp the version in one transaction
             conn.executescript(f"BEGIN IMMEDIATE;{_SCHEMA}PRAGMA user_version = {SCHEMA_VERSION};COMMIT;")
+        else:              # an existing store: SQLite's own consistency check, before anything is trusted
+            check = "quick_check" if quick else "integrity_check"
+            found = [row[0] for row in conn.execute(f"PRAGMA {check}(5)").fetchall()]
+            if found != ["ok"]:
+                raise StoreError(f"{path}: {check} failed, the file is damaged or was altered: "
+                                 f"{' | '.join(found)[:300]!r}")
         _verify_schema(conn, path)
     except StoreError:
         conn.close()
         raise
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, UnicodeError) as exc:
         conn.close()
         raise StoreError(f"{path}: cannot open as a store: {exc}") from exc
     except BaseException:
@@ -372,7 +395,7 @@ def _write(conn: sqlite3.Connection, fn):
     except StoreError:
         rollback()
         raise
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, UnicodeError) as exc:      # (a decode error: text in the file that is not UTF-8)
         rollback()
         raise StoreError(f"write failed: {exc}") from exc
     except BaseException:
@@ -576,6 +599,12 @@ def facts_as_of(
         " FROM knowledge_facts f JOIN source_registry s ON s.source_id = f.source_id" + where + ")"
         " WHERE _rank = 1 ORDER BY domain, entity_key, source_id"
     )
-    cur = conn.execute(sql, args)
-    names = [d[0] for d in cur.description]                 # works whatever row factory the connection has
-    return [{k: v for k, v in zip(names, row) if k != "_rank"} for row in cur.fetchall()]
+    try:
+        cur = conn.execute(sql, args)
+        names = [d[0] for d in cur.description]             # works whatever row factory the connection has
+        rows = [{k: v for k, v in zip(names, row) if k != "_rank"} for row in cur.fetchall()]
+    except (sqlite3.Error, UnicodeError) as exc:           # e.g. text in the file that is not valid UTF-8
+        raise StoreError(f"read failed: {exc}") from exc
+    if outside:     # belt and braces, in Python (not a SQL function): nothing Finnhub-named, whatever the registry says
+        rows = [r for r in rows if "finnhub" not in r["source_id"].casefold()]
+    return rows

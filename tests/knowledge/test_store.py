@@ -1296,9 +1296,13 @@ def test_a_store_with_a_minus_one_inserted_while_checks_were_off_is_refused_and_
     assert raw.execute("SELECT min(fact_version_id) FROM knowledge_facts").fetchone()[0] == -1   # it went in
     raw.close()
     before = hashlib.sha256(path.read_bytes()).hexdigest()
-    with pytest.raises(StoreError, match="fact_version_id"):
+    with pytest.raises(StoreError, match="integrity_check|fact_version_id"):
         connect(path)
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+    raw = sqlite3.connect(path)                                  # the id-range check on its own, past integrity_check
+    with pytest.raises(StoreError, match="fact_version_id"):
+        store._verify_schema(raw, path)
+    raw.close()
 
 
 @pytest.mark.parametrize("bad_id", [0, -7, 4611686018427387905, 9223372036854775807])
@@ -1311,9 +1315,13 @@ def test_a_store_with_an_id_outside_the_bound_is_refused_and_a_clean_one_opens(t
     connect(path).close()                                            # clean: opens
     _force_id(path, 1, bad_id)
     before = hashlib.sha256(path.read_bytes()).hexdigest()
-    with pytest.raises(StoreError, match="fact_version_id"):
+    with pytest.raises(StoreError, match="integrity_check|fact_version_id"):
         connect(path)
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+    raw = sqlite3.connect(path)
+    with pytest.raises(StoreError, match="fact_version_id"):
+        store._verify_schema(raw, path)
+    raw.close()
     _force_id(path, bad_id, 1)
     connect(path).close()                                            # and clean again: opens
 
@@ -1433,13 +1441,26 @@ def test_a_trigger_with_a_reserved_name_written_into_the_schema_is_refused(tmp_p
 def test_a_fake_statistics_table_is_refused(tmp_path):
     path = tmp_path / "stat.db"
     connect(path).close()
-    _write_schema_row(path, "table", "sqlite_stat1", "sqlite_stat1", "CREATE TABLE sqlite_stat1(evil)")
-    with pytest.raises(StoreError, match="sqlite_stat1"):
+    raw = sqlite3.connect(path)
+    raw.execute("CREATE TABLE IF NOT EXISTS knowledge_facts_scratch (x)")      # something for ANALYZE to count
+    raw.execute("DROP TABLE knowledge_facts_scratch")
+    raw.execute("ANALYZE")                                                       # makes the real sqlite_stat1
+    raw.execute("PRAGMA writable_schema = ON")
+    raw.execute("UPDATE sqlite_master SET sql = 'CREATE TABLE sqlite_stat1(evil)' WHERE name = 'sqlite_stat1'")
+    raw.commit()
+    raw.close()
+    raw = sqlite3.connect(path)
+    names = {r[0] for r in raw.execute("SELECT name FROM sqlite_master")}
+    assert "sqlite_stat1" in names
+    with pytest.raises(StoreError, match="sqlite_stat1"):                        # the exact-SQL allowance on its own
+        store._verify_schema(raw, path)
+    raw.close()
+    with pytest.raises(StoreError):
         connect(path)
     path2 = tmp_path / "stat2.db"
     connect(path2).close()
     _write_schema_row(path2, "view", "sqlite_stat1", "sqlite_stat1", "CREATE VIEW sqlite_stat1 AS SELECT 1")
-    with pytest.raises(StoreError, match="sqlite_stat1"):
+    with pytest.raises(StoreError):                  # (SQLite itself calls this file malformed)
         connect(path2)
 
 
@@ -1566,6 +1587,190 @@ def test_a_planted_trigger_would_really_fire_if_the_store_were_opened(tmp_path):
                 list(cols.values()))
     assert raw.execute("SELECT count(*) FROM knowledge_facts WHERE entity_key = 'planted'").fetchone()[0] == 1
     raw.close()
+
+
+# ---- integrity check on open ---------------------------------------------------------------------
+
+_FACT_COLS = ("domain, entity_key, effective_from_utc, fetched_at_utc, known_at_utc, known_at_basis, source_id,"
+              " raw_sha256, payload_json")
+
+
+def _filled_store(tmp_path, name, rows=5):
+    path = tmp_path / name
+    c = connect(path)
+    src(c)
+    for i in range(rows):
+        fact(c, entity_key=f"E{i}", raw_sha256=sha(f"row{i}"))
+    c.close()
+    return path
+
+
+def _file_hash(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _hostile_stat1_rootpage(path):
+    raw = sqlite3.connect(path)
+    raw.execute("ANALYZE")
+    raw.execute("PRAGMA writable_schema = ON")        # point the statistics table at the facts table's pages
+    raw.execute("UPDATE sqlite_master SET rootpage = (SELECT rootpage FROM sqlite_master WHERE name = "
+                "'knowledge_facts') WHERE name = 'sqlite_stat1'")
+    raw.commit()
+    raw.close()
+
+
+def _hostile_index_restored(path):
+    raw = sqlite3.connect(path)                       # 1: take the index out of the schema
+    raw.execute("PRAGMA writable_schema = ON")
+    row = raw.execute("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master "
+                      "WHERE name = 'knowledge_facts_lookup'").fetchone()
+    raw.execute("DELETE FROM sqlite_master WHERE name = 'knowledge_facts_lookup'")
+    raw.commit()
+    raw.close()
+    raw = sqlite3.connect(path, isolation_level=None)   # 2: write a fact while nothing maintains the index
+    raw.execute(f"INSERT INTO knowledge_facts ({_FACT_COLS}) VALUES ('K2_NEWS', 'HIDDEN', "
+                "'2026-01-01T00:00:00.000000Z', '2026-01-02T00:00:00.000000Z', '2026-01-02T00:00:00.000000Z', "
+                f"'FETCHED', 'example_public', '{'a' * 64}', '{{}}')")
+    raw.close()
+    raw = sqlite3.connect(path)                       # 3: put the index back, byte for byte the same entry
+    raw.execute("PRAGMA writable_schema = ON")
+    raw.execute("INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) VALUES (?,?,?,?,?)", row)
+    raw.commit()
+    raw.close()
+
+
+def _hostile_finnhub_checks_off(path):
+    raw = sqlite3.connect(path)
+    raw.execute("PRAGMA ignore_check_constraints = ON")
+    raw.execute("INSERT INTO source_registry VALUES ('finnhub_local','u','x',1,1,'GENERIC_CLIENT',0,"
+                "'2026-01-01T00:00:00.000000Z',NULL)")
+    raw.commit()
+    raw.close()
+
+
+_HOSTILE = {"stat1_rootpage": _hostile_stat1_rootpage, "index_entry_removed_then_restored": _hostile_index_restored,
+            "finnhub_external_with_checks_off": _hostile_finnhub_checks_off}
+
+
+@pytest.mark.parametrize("quick", [False, True])
+@pytest.mark.parametrize("probe", sorted(_HOSTILE))
+def test_a_store_that_fails_the_integrity_check_is_refused_and_left_untouched(tmp_path, probe, quick):
+    path = _filled_store(tmp_path, "hostile.db")
+    connect(path, quick=quick).close()                    # two-way: the clean store opens
+    _HOSTILE[probe](path)
+    raw = sqlite3.connect(path)
+    assert raw.execute("PRAGMA integrity_check").fetchall() != [("ok",)]     # the probe really damaged it
+    raw.close()
+    before = _file_hash(path)
+    with pytest.raises(StoreError, match="integrity|quick_check"):
+        connect(path, quick=quick)
+    assert _file_hash(path) == before
+
+
+@pytest.mark.parametrize("quick", [False, True])
+def test_a_clean_store_opens_with_either_check_and_a_new_file_needs_none(tmp_path, quick):
+    path = _filled_store(tmp_path, "clean.db")
+    c = connect(path, quick=quick)
+    assert count(c) == 5
+    c.close()
+    connect(tmp_path / "fresh.db", quick=quick).close()
+
+
+@pytest.mark.parametrize("bad", ["yes", "no", 2, None, 1.0, [], b"1"])
+def test_quick_must_be_a_flag(tmp_path, bad):
+    with pytest.raises(StoreError, match="quick"):
+        connect(tmp_path / "q.db", quick=bad)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_connect_defaults_to_the_full_integrity_check():
+    import inspect as _inspect
+    assert _inspect.signature(connect).parameters["quick"].default is False
+    assert "integrity_check" in _inspect.getsource(connect) and "quick_check" in _inspect.getsource(connect)
+
+
+# ---- text encoding -------------------------------------------------------------------------------
+
+def test_a_store_whose_encoding_is_not_utf8_is_refused_on_open(tmp_path):
+    path = tmp_path / "u16.db"
+    raw = sqlite3.connect(path)
+    raw.execute("PRAGMA encoding = 'UTF-16le'")
+    raw.executescript(store._SCHEMA)
+    raw.execute(f"PRAGMA user_version = {store.SCHEMA_VERSION}")
+    raw.close()
+    assert sqlite3.connect(path).execute("PRAGMA encoding").fetchone()[0] == "UTF-16le"
+    before = _file_hash(path)
+    with pytest.raises(StoreError, match="encoding"):
+        connect(path)
+    assert _file_hash(path) == before
+    c = connect(tmp_path / "u8.db")                        # two-way: a new store is UTF-8 and opens
+    assert c.execute("PRAGMA encoding").fetchone()[0] == "UTF-8"
+    c.close()
+
+
+_BAD_UTF8 = {"lone_ff": "x'ff41'", "cesu_surrogate": "x'eda080'", "truncated_sequence": "x'e282'", "overlong": "x'c080'"}
+
+
+@pytest.mark.parametrize("hexbytes", sorted(_BAD_UTF8))
+def test_invalid_utf8_bytes_that_reach_the_database_are_a_store_error_on_every_read(conn, hexbytes):
+    # SQLite cannot check UTF-8 validity in a CHECK (no function does it, and a subquery is not allowed there),
+    # so such text can be stored through raw SQL; every read must still raise StoreError, never a raw error.
+    blob = _BAD_UTF8[hexbytes]
+    conn.execute(f"INSERT INTO knowledge_facts ({_FACT_COLS}) VALUES ('K2_NEWS', CAST({blob} AS TEXT), "
+                 "'2026-01-01T00:00:00.000000Z', '2026-01-02T00:00:00.000000Z', '2026-01-02T00:00:00.000000Z', "
+                 f"'FETCHED', 'example_public', '{'c' * 64}', '{{}}')")
+    with pytest.raises(StoreError):
+        facts_as_of(conn, T3)
+    with pytest.raises(StoreError):
+        facts_as_of(conn, T3, domain="K2_NEWS")
+    conn.execute(f"INSERT INTO source_registry VALUES ('example_badtext', CAST({blob} AS TEXT), 'x', 1, 0, "
+                 "'GENERIC_CLIENT', 0, '2026-01-01T00:00:00.000000Z', NULL)")
+    with pytest.raises(StoreError):
+        src(conn, "example_badtext")                       # reading the stored row to compare it
+    assert not conn.in_transaction
+    assert fact(conn, entity_key="CLEAN", raw_sha256=sha("clean")) > 0     # and the connection still works
+
+
+def test_invalid_utf8_in_a_stored_store_is_a_store_error_on_open_not_a_raw_error(tmp_path):
+    path = tmp_path / "badtext.db"
+    c = connect(path)
+    src(c)
+    c.execute("INSERT INTO source_registry VALUES ('example_badtext', CAST(x'ff41' AS TEXT), 'x', 1, 0, "
+              "'GENERIC_CLIENT', 0, '2026-01-01T00:00:00.000000Z', NULL)")
+    c.close()
+    connect(path).close()                                  # the schema itself is fine, so it opens
+
+
+# ---- the read path drops anything Finnhub-named, whatever the registry says --------------------
+
+@pytest.mark.parametrize("name", ["finnhub_local", "FINNHUB_X", "My-FinnHub-feed", "xFiNnHuBx"])
+def test_for_outside_llm_never_returns_a_finnhub_source_even_if_the_registry_says_external(conn, name):
+    keep = fact(conn)                                      # an allowed source, kept
+    conn.execute("PRAGMA ignore_check_constraints = ON")   # a hostile writer: the registry row bypasses the checks
+    conn.execute("INSERT INTO source_registry VALUES (?, 'u', 'x', 1, 1, 'GENERIC_CLIENT', 0, "
+                 "'2026-01-01T00:00:00.000000Z', NULL)", (name,))
+    conn.execute("PRAGMA ignore_check_constraints = OFF")
+    bad = fact(conn, source_id=name, raw_sha256=sha("finn"))
+    allowed = {r["fact_version_id"] for r in facts_as_of(conn, T3)}
+    assert allowed == {keep, bad}                          # two-way: without the flag both are returned
+    outside = {r["fact_version_id"] for r in facts_as_of(conn, T3, for_outside_llm=True)}
+    assert outside == {keep}
+    assert bad not in {r["fact_version_id"] for r in facts_as_of(conn, T3, for_outside_llm=True, domain="K2_NEWS")}
+
+
+def test_the_finnhub_filter_is_done_in_python_not_with_a_sql_function():
+    body = inspect.getsource(store.facts_as_of)
+    assert "finnhub" in body and "casefold()" in body
+    sql_part = body[body.index("sql = ("):body.index("cur = conn.execute")]
+    assert "finnhub" not in sql_part.lower() and "lower(" not in sql_part.lower()
+
+
+def test_the_module_docstring_states_the_hostile_connection_limits():
+    doc = " ".join((store.__doc__ or "").split())
+    assert "temp objects on the caller's own connection" in doc
+    assert "writable_schema" in doc and "overridden SQL functions" in doc and "between integrity checks" in doc
+    assert "full-file read on every open" in doc and "quick=True" in doc
+    assert "cannot check UTF-8" in doc
 
 
 # ---- the path and connection arguments -----------------------------------------------------------
