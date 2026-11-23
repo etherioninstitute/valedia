@@ -522,6 +522,14 @@ Queued (roadmap):
   Owner YES 2026-11-23: PRACTICE GATE MOVED to 8fb509f (+ valedia_trader/agents/placement.py, 54 files; backups
   `.before-placement`); tested both ways (8fb509f passes, 1d60247 refused, 0 uncommitted order-path edits). First shared
   practice run: Tue 2026-11-24 6:55 AM PST; clean-week streak can start then.
+  MARKET HOLIDAYS CHECKED 2026-11-23 (owner asked; goes in the NEXT Carbon reply): every session check (order step,
+  go-live gate, stake ladder, decay, strategy, venue registry) reads XNYS from exchange_calendars 4.13.2 (holidays AND
+  early closes; the order step's windows use the half-day close). 2026: closed 01-01, 01-19, 02-16, 04-03, 05-25, 06-19,
+  07-03, 09-07, 11-26, 12-25; 1 PM closes 11-27, 12-24. 2027: 01-01, 01-18, 02-15, 03-26, 05-31, 06-18, 07-05, 09-06,
+  11-25, 12-24; 1 PM close 11-26. 2025 includes the unscheduled 01-09 closure. Latest 4.13.3 (11-14) changes no XNYS
+  date. GAP: an UNSCHEDULED closure (mourning day, storm) is known only after a library release. QUESTION for Carbon:
+  how should the order step treat a day the calendar calls open but the venue is closed (ordinary stop, not a fault),
+  and should the pre-flight compare against the exchange's published notice?
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
