@@ -513,10 +513,12 @@ Queued (roadmap):
   not a reconcile fault. Later (stake ladder): halving keyed by (order_id, anomaly), Carver's live buffer.
   DONE 2026-11-23 T57 run ledger + alert policy merged cd5b0b3 (312 tests; 2 blind checks, 1 FAIL -> repaired:
   REPLACE on incidents/attempts). `valedia_trader/core/run_ledger.py`: run_events / alert_incidents / send_attempts
-  append-only; decide() P0-P3; streak(); preflight(); deadman(); CLI. WIRING STAGED, NOT LIVE (owner's yes needed:
-  new launchd job): valedia-deploy/staged-t57/ (ledger-lib.zsh, alerts-morning.sh 6:30 pre-flight + 7:25 dead-man,
-  wrapper records every skip/run and notifies). Rehearsed on a throwaway ledger: pre-flight OK at 8fb509f.
-  QUEUED, live path, in order: (1) install the T57 wiring; (2) the order step's own entry point so cli.py's imports of desk/panel/research leave the pinned list (full
+  append-only; decide() P0-P3; streak(); preflight(); deadman(); CLI. WIRING LIVE 2026-11-23 (owner's yes):
+  launchd com.valedia.orderstep.alerts (6:30 pre-flight, 7:25 dead-man, weekdays PT; log
+  ~/Library/Logs/valedia-orderstep-alerts.log); valedia-deploy/ledger-lib.zsh + alerts-morning.sh; the wrapper records
+  every skip/run and notifies (backup orderstep-paper.sh.bak-20261123). Ledger ~/valedia-data/run-ledger/. First live
+  morning Tue 11-24: CHECK the alerts log and the ledger. Rehearsed on a throwaway ledger: pre-flight OK at 8fb509f.
+  QUEUED, live path, in order: (1) check the first live morning; (2) the order step's own entry point so cli.py's imports of desk/panel/research leave the pinned list (full
   blind check); (3) the 'before order #1' gate items. CHECK: cancel_all_open cancels only Valedia's own ids.
   OWNER: replace roadmap 4.2's organic sightings (partial fill, cancel 'not yet') with recorded-answer rehearsals?
   OWNER: keep his hand trades out of the 15 fund symbols? Not adopted: caffeinate (sleep already 0); 'no market orders'
