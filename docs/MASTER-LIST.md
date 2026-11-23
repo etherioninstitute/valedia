@@ -462,6 +462,16 @@ Queued (roadmap):
   Tier 0. Failed-seal lessons hidden by a read filter in get()/search (raw rows kept for the owner's logged read);
   once the owner reads a failed seal, that family's later seal on EPOCH_1 -> HOLD_FOR_OWNER_AUDIT. Mac mini = a
   fallback puller only with the owner's yes.
+  Round 25 (reply 25, commit 58ebfe2): CPI pull built. Ticker months are NOT a calendar: up to CPI-22MAR tickers
+  name the RELEASE month (CPI-21DEC settled 2021-12-10), from CPI-22APR the reference month; KXCPI's listing holds
+  the legacy CPI- tickers, the CPI/CPIYOY listings are empty. Releases chosen by each market's own ET
+  expected_expiration_time in 2022-01-01..2024-12-31, hard ceiling 2024-12-31 (24DEC counted sealed, never pulled).
+  Headline 35 releases (no market for 2022-04-12), YoY 25; 690 "above k" markets; 2022 rows lack strike_type
+  ("above" read from the terms). Candles 10:00-14:00 ET on weekdays T-1..T-6. Pilot: 98 requests, guard quiet,
+  36/60 windows empty. Adopted: mask every lesson-returning ledger read, Epoch-0 prints hash + EPOCH_0_REDACTED;
+  pacer option to skip a minute the collector hasn't decided yet (later); cluster = one underlying release shock
+  (agency release+date / asset family+date / category+date); G_venue >= 60 for the 2028 rotation; seal() needs
+  G_cand >= 30; multi-week stock-event sleeves stay on the 2029 vault (corrects round 24).
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
