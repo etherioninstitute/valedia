@@ -76,7 +76,14 @@ def _sql_in(values: Iterable[str]) -> str:
 
 
 def _cause_check(col: str, nullable: bool) -> str:
-    body = f"length({col}) BETWEEN 1 AND 120 AND {col} NOT GLOB '*[^a-z0-9_:.-]*'"
+    body = f"typeof({col}) = 'text' AND length({col}) BETWEEN 1 AND 120 AND {col} NOT GLOB '*[^a-z0-9_:.-]*'"
+    return f"{col} IS NULL OR ({body})" if nullable else body
+
+
+def _stamp_check(col: str, nullable: bool = False) -> str:
+    """A time written as YYYY-MM-DDTHH:MM:SSZ that is a real time: SQLite reads an hour of 24 as the next day, so it is refused."""
+    body = (f"typeof({col}) = 'text' AND {col} GLOB '{_STAMP}' AND substr({col}, 12, 2) < '24' "
+            f"AND strftime('%Y-%m-%dT%H:%M:%SZ', {col}) IS {col}")
     return f"{col} IS NULL OR ({body})" if nullable else body
 
 
@@ -92,7 +99,7 @@ CREATE TABLE IF NOT EXISTS run_events (
     fault_count INTEGER NOT NULL DEFAULT 0 CHECK (typeof(fault_count) = 'integer' AND fault_count >= 0),
     revision_ok INTEGER CHECK (revision_ok IS NULL OR (typeof(revision_ok) = 'integer' AND revision_ok IN (0, 1))),
     detail      TEXT,
-    at_utc      TEXT NOT NULL CHECK (at_utc GLOB '{_STAMP}' AND strftime('%Y-%m-%dT%H:%M:%SZ', at_utc) IS at_utc)
+    at_utc      TEXT NOT NULL CHECK ({_stamp_check("at_utc")})
 );
 CREATE INDEX IF NOT EXISTS run_events_day ON run_events (trade_date, book);
 CREATE TRIGGER IF NOT EXISTS run_events_no_update BEFORE UPDATE ON run_events
@@ -110,9 +117,9 @@ CREATE TABLE IF NOT EXISTS alert_incidents (
     root_cause     TEXT NOT NULL CHECK ({_cause_check("root_cause", False)}),
     severity       TEXT NOT NULL CHECK (severity IN ({_sql_in(SEVERITIES)})),
     first_event_id INTEGER NOT NULL REFERENCES run_events (event_id),
-    first_seen_utc TEXT NOT NULL CHECK (first_seen_utc GLOB '{_STAMP}' AND strftime('%Y-%m-%dT%H:%M:%SZ', first_seen_utc) IS first_seen_utc),
+    first_seen_utc TEXT NOT NULL CHECK ({_stamp_check("first_seen_utc")}),
     sent_count     INTEGER NOT NULL DEFAULT 0 CHECK (typeof(sent_count) = 'integer' AND sent_count >= 0),
-    last_sent_utc  TEXT CHECK (last_sent_utc IS NULL OR (last_sent_utc GLOB '{_STAMP}' AND strftime('%Y-%m-%dT%H:%M:%SZ', last_sent_utc) IS last_sent_utc)),
+    last_sent_utc  TEXT CHECK ({_stamp_check("last_sent_utc", True)}),
     followup_sent  INTEGER NOT NULL DEFAULT 0 CHECK (followup_sent IN (0, 1)),
     UNIQUE (trade_date, book, root_cause)
 );
@@ -123,6 +130,10 @@ WHEN NEW.incident_id IS NOT OLD.incident_id OR NEW.trade_date IS NOT OLD.trade_d
   OR NEW.sent_count < OLD.sent_count OR NEW.followup_sent < OLD.followup_sent
   OR (OLD.last_sent_utc IS NOT NULL AND (NEW.last_sent_utc IS NULL OR NEW.last_sent_utc < OLD.last_sent_utc))
 BEGIN SELECT RAISE(ABORT, 'alert_incidents: only the sent count, the last sent time and the follow-up flag may rise'); END;
+CREATE TRIGGER IF NOT EXISTS alert_incidents_no_replace BEFORE INSERT ON alert_incidents
+WHEN (NEW.incident_id IS NOT NULL AND EXISTS (SELECT 1 FROM alert_incidents WHERE incident_id = NEW.incident_id))
+  OR EXISTS (SELECT 1 FROM alert_incidents WHERE trade_date IS NEW.trade_date AND book IS NEW.book AND root_cause IS NEW.root_cause)
+BEGIN SELECT RAISE(ABORT, 'alert_incidents: that incident exists; it can only be raised, never inserted again'); END;
 CREATE TRIGGER IF NOT EXISTS alert_incidents_no_delete BEFORE DELETE ON alert_incidents
 BEGIN SELECT RAISE(ABORT, 'alert_incidents: no delete'); END;
 
@@ -134,9 +145,12 @@ CREATE TABLE IF NOT EXISTS send_attempts (
     event_id   INTEGER NOT NULL REFERENCES run_events (event_id),
     ok         INTEGER NOT NULL CHECK (ok IN (0, 1)),
     error      TEXT,
-    at_utc     TEXT NOT NULL CHECK (at_utc GLOB '{_STAMP}' AND strftime('%Y-%m-%dT%H:%M:%SZ', at_utc) IS at_utc)
+    at_utc     TEXT NOT NULL CHECK ({_stamp_check("at_utc")})
 );
 CREATE INDEX IF NOT EXISTS send_attempts_event ON send_attempts (event_id, root_cause);
+CREATE TRIGGER IF NOT EXISTS send_attempts_no_replace BEFORE INSERT ON send_attempts
+WHEN NEW.attempt_id IS NOT NULL AND EXISTS (SELECT 1 FROM send_attempts WHERE attempt_id = NEW.attempt_id)
+BEGIN SELECT RAISE(ABORT, 'send_attempts is append-only: that id is taken'); END;
 CREATE TRIGGER IF NOT EXISTS send_attempts_no_update BEFORE UPDATE ON send_attempts
 BEGIN SELECT RAISE(ABORT, 'send_attempts is append-only: no update'); END;
 CREATE TRIGGER IF NOT EXISTS send_attempts_no_delete BEFORE DELETE ON send_attempts
@@ -301,12 +315,15 @@ def _outbound(severity, event, cause, title, text, followup=False) -> Outbound:
 def decide(events_today: Sequence[dict], incidents_today: Sequence[dict]) -> list[Outbound]:
     """What is owed to the owner now, from one day's events of one book and the day's incidents. No input or output.
 
-    An incident row means "this cause was told today"; its `sent_event_ids` (when given) are the events whose alert
-    was shown. Events are read in order, as if each had just arrived, so a warning and the skip it warned of, both
+    An incident row means "this cause was told today"; its `sent_event_ids` (required: a row without it is a
+    ValueError, as every P0 would look unsent) are the events whose alert was shown. Events are read in order, as if each had just arrived, so a warning and the skip it warned of, both
     still unsent, give the warning and then the follow-up. The result is ordered P0, P1, P2 and then by event."""
     events = sorted(events_today, key=lambda e: e["event_id"])
     told = {i["root_cause"]: dict(i) for i in incidents_today}                  # cause -> incident, grown as we go
-    shown_ids = {n for i in incidents_today for n in (i.get("sent_event_ids") or ())}
+    if any("sent_event_ids" not in i for i in incidents_today):
+        raise ValueError("every incident row needs `sent_event_ids` (read the rows with incidents_for); without it every P0 "
+                         "would look unsent and be sent again")
+    shown_ids = {n for i in incidents_today for n in i["sent_event_ids"]}
     first_kind = {i["root_cause"]: _first_kind(i, events) for i in incidents_today}
     out: list[Outbound] = []
     for e in events:
@@ -375,13 +392,18 @@ def apply(conn, outbound: Outbound, sender, now: datetime) -> str:
     with _tx(conn):
         conn.execute("INSERT INTO send_attempts (trade_date, book, root_cause, event_id, ok, error, at_utc) VALUES (?, ?, ?, ?, 1, NULL, ?)",
                      (outbound.trade_date, outbound.book, outbound.root_cause, outbound.event_id, at))
-        conn.execute(
-            "INSERT INTO alert_incidents (trade_date, book, root_cause, severity, first_event_id, first_seen_utc, sent_count, last_sent_utc, followup_sent) "
-            "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?) ON CONFLICT (trade_date, book, root_cause) DO UPDATE SET "
-            "sent_count = sent_count + 1, last_sent_utc = max(coalesce(last_sent_utc, ''), excluded.last_sent_utc), "
-            "followup_sent = max(followup_sent, excluded.followup_sent)",
-            (outbound.trade_date, outbound.book, outbound.root_cause, outbound.severity, outbound.event_id,
-             outbound.event_at_utc, at, int(outbound.followup)))
+        known = conn.execute("SELECT incident_id FROM alert_incidents WHERE trade_date = ? AND book = ? AND root_cause = ?",
+                             (outbound.trade_date, outbound.book, outbound.root_cause)).fetchone()
+        if known is None:                                                        # a plain INSERT, never a replace or an upsert
+            conn.execute(
+                "INSERT INTO alert_incidents (trade_date, book, root_cause, severity, first_event_id, first_seen_utc, sent_count, "
+                "last_sent_utc, followup_sent) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                (outbound.trade_date, outbound.book, outbound.root_cause, outbound.severity, outbound.event_id,
+                 outbound.event_at_utc, at, int(outbound.followup)))
+        else:                                                                    # only the three fields that may rise
+            conn.execute("UPDATE alert_incidents SET sent_count = sent_count + 1, "
+                         "last_sent_utc = max(coalesce(last_sent_utc, ''), ?), followup_sent = max(followup_sent, ?) "
+                         "WHERE incident_id = ?", (at, int(outbound.followup), known[0]))
     return "sent"
 
 
@@ -496,7 +518,7 @@ def preflight(repo, accepted_commit_file, files_file, venv_python, now: datetime
         names = [ln.strip() for ln in Path(files_file).read_text().splitlines()]
     except (OSError, UnicodeDecodeError):
         names = []
-    names = [n for n in names if n and not n.startswith("#")]
+    names = list(dict.fromkeys(n for n in names if n and not n.startswith("#")))      # each file once
     if len(names) < MIN_FILES:
         return PreflightResult("WARN", "gate:files-list-short", f"the files list has {len(names)} entries; at least {MIN_FILES} are needed")
     try:

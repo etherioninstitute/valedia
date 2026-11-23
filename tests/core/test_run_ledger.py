@@ -266,6 +266,175 @@ def test_send_attempts_are_append_only(conn):
         conn.execute("DELETE FROM send_attempts")
 
 
+# ---- round 2: replace guards on the incidents and the attempts, the hour 24, a blob cause, duplicates, raw incident rows
+
+INCIDENT_COLS = ("trade_date, book, root_cause, severity, first_event_id, first_seen_utc, sent_count, last_sent_utc, followup_sent")
+
+
+def incident_row(conn):
+    return tuple(conn.execute("SELECT * FROM alert_incidents").fetchone())
+
+
+def raised_incident(conn):
+    """An incident that has been sent three times with its follow-up: what a replace would reset."""
+    e = raw_event(conn)
+    raw_incident(conn, e, severity="P2", sent_count=3, last_sent_utc="2026-11-23T14:56:00Z", followup_sent=1)
+    return e
+
+
+@pytest.mark.parametrize("verb", ["INSERT OR REPLACE INTO", "REPLACE INTO", "INSERT OR IGNORE INTO", "INSERT INTO"])
+def test_an_incident_key_that_exists_cannot_be_inserted_again(conn, verb):
+    e = raised_incident(conn)
+    before = incident_row(conn)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(f"{verb} alert_incidents ({INCIDENT_COLS}) VALUES (?, ?, 'gate:orderpath-mismatch', 'P0', ?, "
+                     "'2026-11-23T15:00:00Z', 0, NULL, 0)", (MON, BOOK, e))
+    assert incident_row(conn) == before and count(conn, "alert_incidents") == 1
+
+
+@pytest.mark.parametrize("verb", ["INSERT OR REPLACE INTO", "REPLACE INTO", "INSERT OR IGNORE INTO"])
+def test_an_incident_id_that_exists_cannot_be_inserted_again(conn, verb):
+    e = raised_incident(conn)
+    before = incident_row(conn)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(f"{verb} alert_incidents (incident_id, {INCIDENT_COLS}) VALUES (?, ?, ?, 'gate:other', 'P0', ?, "
+                     "'2026-11-23T15:00:00Z', 0, NULL, 0)", (before[0], MON, BOOK, e))
+    assert incident_row(conn) == before and count(conn, "alert_incidents") == 1
+
+
+def test_an_incident_upsert_on_its_key_is_refused_and_changes_nothing(conn):
+    e = raised_incident(conn)
+    before = incident_row(conn)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(f"INSERT INTO alert_incidents ({INCIDENT_COLS}) VALUES (?, ?, 'gate:orderpath-mismatch', 'P0', ?, "
+                     "'2026-11-23T15:00:00Z', 0, NULL, 0) ON CONFLICT (trade_date, book, root_cause) DO UPDATE SET sent_count = 0", (MON, BOOK, e))
+    assert incident_row(conn) == before
+
+
+def test_a_new_incident_key_still_goes_in_by_every_insert_form(conn):
+    e = raw_event(conn)
+    for n, verb in enumerate(["INSERT INTO", "INSERT OR REPLACE INTO", "REPLACE INTO", "INSERT OR IGNORE INTO"]):
+        conn.execute(f"{verb} alert_incidents ({INCIDENT_COLS}) VALUES (?, ?, ?, 'P2', ?, '2026-11-23T15:00:00Z', 1, NULL, 0)",
+                     (MON, BOOK, f"gate:new-{n}", e))
+    assert count(conn, "alert_incidents") == 4
+
+
+def test_apply_raises_an_existing_incident_without_replacing_it(conn):
+    add(conn, "SKIP", "0655", "SKIPPED", T0655, root_cause="gate:x")
+    o = rl.decide(rl.events_for(conn, MON, BOOK), [])[0]
+    rl.apply(conn, o, FakeSender(), T0655)
+    before = incident_row(conn)
+    rl.apply(conn, o, FakeSender(), T0710)                                          # the same alert again: an update, no insert
+    after = incident_row(conn)
+    assert after[:7] == before[:7] and after[7] == before[7] + 1 and count(conn, "alert_incidents") == 1
+
+
+def test_the_python_code_creates_incidents_with_a_plain_insert_only():
+    src = Path(rl.__file__).read_text()
+    assert "ON CONFLICT" not in src and "INSERT OR" not in src and "REPLACE INTO" not in src.replace("run_events_no_replace", "")
+
+
+ATTEMPT_COLS = "trade_date, book, root_cause, event_id, ok, error, at_utc"
+
+
+def raw_attempt(conn, event_id, ok=0, **over):
+    row = dict(trade_date=MON, book=BOOK, root_cause="gate:x", event_id=event_id, ok=ok, error="down",
+               at_utc="2026-11-23T14:55:00Z")
+    row.update(over)
+    cols = ", ".join(row)
+    return conn.execute(f"INSERT INTO send_attempts ({cols}) VALUES ({', '.join('?' * len(row))})", list(row.values())).lastrowid
+
+
+@pytest.mark.parametrize("verb", ["INSERT OR REPLACE INTO", "REPLACE INTO", "INSERT OR IGNORE INTO", "INSERT INTO"])
+def test_a_failed_attempt_cannot_be_replaced_by_a_success(conn, verb):
+    e = raw_event(conn)
+    a = raw_attempt(conn, e)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(f"{verb} send_attempts (attempt_id, {ATTEMPT_COLS}) VALUES (?, ?, ?, 'gate:x', ?, 1, NULL, '2026-11-23T14:56:00Z')",
+                     (a, MON, BOOK, e))
+    assert [tuple(r) for r in conn.execute("SELECT ok, error FROM send_attempts")] == [(0, "down")]
+
+
+def test_an_attempt_upsert_on_its_id_is_refused(conn):
+    e = raw_event(conn)
+    a = raw_attempt(conn, e)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(f"INSERT INTO send_attempts (attempt_id, {ATTEMPT_COLS}) VALUES (?, ?, ?, 'gate:x', ?, 1, NULL, '2026-11-23T14:56:00Z') "
+                     "ON CONFLICT (attempt_id) DO UPDATE SET ok = 1", (a, MON, BOOK, e))
+    assert conn.execute("SELECT ok FROM send_attempts").fetchone()[0] == 0
+
+
+def test_a_replace_cannot_reset_the_five_try_cap(conn):
+    s = FakeSender(always=True)
+    add(conn, "SKIP", "0655", "SKIPPED", T0655, root_cause="gate:x")
+    for _ in range(5):
+        notify(conn, s, T0655)
+    first = conn.execute("SELECT attempt_id, event_id FROM send_attempts ORDER BY attempt_id").fetchone()
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(f"INSERT OR REPLACE INTO send_attempts (attempt_id, {ATTEMPT_COLS}) VALUES (?, ?, ?, 'gate:x', ?, 1, NULL, "
+                     "'2026-11-23T15:00:00Z')", (first[0], MON, BOOK, first[1]))
+    notify(conn, s, T0655)
+    assert s.calls == 5 and rl.incidents_for(conn, MON, BOOK) == []                   # still given up, and nothing was faked as sent
+
+
+@pytest.mark.parametrize("table,field", [("run_events", "at_utc"), ("incident", "first_seen_utc"), ("incident", "last_sent_utc"),
+                                         ("attempt", "at_utc")])
+@pytest.mark.parametrize("stamp,good", [("2026-11-24T24:00:00Z", False), ("2026-11-24T24:59:59Z", False), ("2026-11-24T25:00:00Z", False),
+                                        ("2026-11-24T23:59:59Z", True), ("2026-11-24T00:00:00Z", True)])
+def test_an_hour_of_24_is_refused_in_every_time_column(conn, table, field, stamp, good):
+    e = raw_event(conn)
+
+    def put():
+        if table == "run_events":
+            raw_event(conn, at_utc=stamp)
+        elif table == "incident":
+            raw_incident(conn, e, **{field: stamp})
+        else:
+            raw_attempt(conn, e, at_utc=stamp)
+    if good:
+        put()
+    else:
+        with pytest.raises(sqlite3.IntegrityError):
+            put()
+
+
+@pytest.mark.parametrize("table", ["run_events", "incident", "attempt"])
+def test_a_blob_root_cause_is_refused(conn, table):
+    e = raw_event(conn)
+    blob = b"gate:x"
+    with pytest.raises(sqlite3.IntegrityError):
+        if table == "run_events":
+            raw_event(conn, root_cause=blob)
+        elif table == "incident":
+            raw_incident(conn, e, root_cause=blob)
+        else:
+            raw_attempt(conn, e, root_cause=blob)
+    assert conn.execute("SELECT count(*) FROM run_events WHERE root_cause IS NOT NULL").fetchone()[0] == 0
+
+
+def test_a_text_or_null_root_cause_is_still_allowed(conn):
+    raw_event(conn, root_cause=None)
+    raw_event(conn, root_cause="gate:x")
+    assert count(conn) == 2
+
+
+def test_decide_refuses_an_incident_row_without_sent_event_ids():
+    ev = [dict(event_id=1, trade_date=MON, book=BOOK, kind="RUN_END", trigger="0655", outcome="FAULT", root_cause="r:x",
+               fault_count=1, revision_ok=1, detail=None, at_utc="2026-11-23T14:55:00Z")]
+    raw_row = dict(trade_date=MON, book=BOOK, root_cause="r:x", severity="P0", first_event_id=1, sent_count=1, followup_sent=0)
+    with pytest.raises(ValueError, match="sent_event_ids"):
+        rl.decide(ev, [raw_row])
+    assert len(rl.decide(ev, [])) == 1                                                # no incidents at all is fine
+    assert rl.decide(ev, [{**raw_row, "sent_event_ids": [1]}]) == []                  # with the field the P0 is known as sent
+
+
+def test_decide_given_the_rows_incidents_for_reads_does_not_resend_a_p0(conn):
+    s = FakeSender()
+    run_end(conn, T0655, "FAULT", root_cause="run:status-stopped:send", fault_count=1)
+    notify(conn, s, T0655)
+    assert rl.decide(rl.events_for(conn, MON, BOOK), rl.incidents_for(conn, MON, BOOK)) == []
+
+
 # ---- record_event
 
 def test_record_event_stores_the_row_and_the_new_york_date(conn):
@@ -861,6 +1030,14 @@ def test_ten_entries_are_enough_and_blank_lines_do_not_count(repo):
     assert pre(repo).outcome == "OK"
     repo["files_file"].write_text("\n\n".join(repo["names"][:9]) + "\n\n   \n")
     assert pre(repo).root_cause == "gate:files-list-short"
+
+
+def test_duplicate_entries_count_once_toward_the_minimum(repo):
+    repo["files_file"].write_text("\n".join(repo["names"][:5] * 3) + "\n")                  # 15 lines, 5 different files
+    res = pre(repo)
+    assert (res.outcome, res.root_cause) == ("WARN", "gate:files-list-short") and "5 " in res.detail
+    repo["files_file"].write_text("\n".join(repo["names"][:10] + repo["names"][:3]) + "\n")   # 13 lines, 10 different files
+    assert pre(repo).outcome == "OK"
 
 
 def test_a_missing_files_list_warns(repo, tmp_path):
