@@ -506,6 +506,19 @@ Queued (roadmap):
   The CPI pull died with its session; relaunched detached 10:31 AM PST under guard 8 (pull6 log); 976 candles, held.
   Round 26 addendum (reply 26 addendum): round 27 asks Carbon which go-live gate items are needed before the first
   attended order, how a skipped practice day counts in the clean week (outcome-blind), and what a referee would add.
+  Round 27 (reply 27): CLEAN WEEK RULE adopted: open session + accepted revision + 0 faults + completed or ordinary
+  stop = +1; exchange holiday with a clean session stop = pause; any skip/mismatch/crash/fault = reset (today = reset).
+  Before order #1: fault/order-type counting, recorded-answer rehearsals (partial, EXPIRED, cancel 'not yet', sale) + 5
+  clean sessions, the T+1 settled-cash guard (buys and the sell cap min(book settled qty, account sellable qty)), EXPIRED
+  not a reconcile fault. Later (stake ladder): halving keyed by (order_id, anomaly), Carver's live buffer.
+  QUEUED, live path, in order: (1) a 6:30 AM PST zero-network pre-flight of the order-path revision, an alert on a
+  skipped run, and an out-of-band dead-man job 15 min after the 2nd trigger on open days (no outcome dated today ->
+  alert); (2) the order step's own entry point so cli.py's imports of desk/panel/research leave the pinned list (full
+  blind check); (3) the 'before order #1' gate items. CHECK: cancel_all_open cancels only Valedia's own ids.
+  OWNER: replace roadmap 4.2's organic sightings (partial fill, cancel 'not yet') with recorded-answer rehearsals?
+  OWNER: keep his hand trades out of the 15 fund symbols? Not adopted: caffeinate (sleep already 0); 'no market orders'
+  (would undo build B's fractional legs; the narrow market rule stays). Clock stays 9:55 ET (10:30 ET = IDEA). Carbon's
+  crossed round-27 answer on pull order never arrived; asked for a resend.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
