@@ -41,7 +41,13 @@ these hold, and returns an empty list otherwise (it never guesses):
    departments and agencies;
 4. that same sentence states each date in full ("December 24, 2025": month name, day, year);
 5. the sentence has no half-stated date (a month and day with no year) and, when it has several dates, they are a
-   plain list joined by commas or "and". Any other mix (for example a death date and a mourning date) is unsure.
+   plain list joined by commas or "and". Any other mix (for example a death date and a mourning date) is unsure;
+6. the dates are grammatically the closure day, in one of four forms: "<date>, as a National Day of Mourning";
+   "National Day of Mourning on <date>"; "declare/designate <date> ... National Day of Mourning"; or an order closing
+   executive departments and agencies "... on <date>" (letters and spaces only between the order and "on");
+7. the sentence has none of the words through, beginning, until, died, death, passed, half-staff, flag, following,
+   after, since, from, born, anniversary (a span, a start or a death is not the closure day).
+One unsure sentence voids the whole document: the result is then an empty list, whatever other sentences say.
 
 Quorum (`closure_votes`): `ordinary_stop` is "the calendar says open and at least two authorities say closed";
 `suspected` is "open and exactly one says closed". A Finnhub status counts only with a non-null `holiday`: before the
@@ -293,8 +299,9 @@ def parse_finnhub_holiday(raw, *, fetched_at_utc) -> list[dict]:
     if body.get("exchange") != "US" or body.get("timezone") != _NY:
         raise K3Error("finnhub holiday: expected exchange US and timezone America/New_York")
     data = body.get("data")
-    if not isinstance(data, list):
-        raise K3Error("finnhub holiday: `data` must be a list")
+    if not isinstance(data, list) or not data:
+        raise K3Error("finnhub holiday: `data` must be a non-empty list (Finnhub always lists years of holidays, so "
+                      "an empty list is a broken feed, not 'no holidays')")
     facts, seen = [], set()
     for item in data:
         if not isinstance(item, dict) or not {"eventName", "atDate", "tradingHour"} <= set(item):
@@ -350,14 +357,40 @@ _CHANGE = re.compile(r"\b(?:amend\w*|revok\w*|revocation|rescind\w*|rescission|c
 _FR_KINDS = ("executive order", "proclamation")
 
 
+_WEEKDAY = r"(?:(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+)?"
+_ONE_DATE = rf"{_MONTH}\s+[0-9]{{1,2}},\s+[0-9]{{4}}"
+_DATE_LIST = rf"(?P<dl>{_ONE_DATE}(?:(?:\s*,\s+and\s+|\s*,\s*|\s+and\s+){_ONE_DATE})*)"
+_MOURN = r"(?i:national\s+day\s+of\s+mourning)"
+_CLOSE = r"(?i:clos(?:ing|ure|es|e)\s+(?:of\s+)?(?:the\s+)?executive\s+departments?\s+and\s+agenc(?:y|ies))"
+# The only grammatical forms that make a date the closure day. The date list (`dl`) must be all the dates of the sentence.
+_ANCHORS = (
+    re.compile(rf"{_CLOSE}[A-Za-z ]{{0,100}}?\b(?i:on)\s+{_WEEKDAY}{_DATE_LIST}"),         # closing ... on <date>
+    re.compile(rf"{_DATE_LIST},?\s+as\s+(?:(?i:a|the)\s+)?{_MOURN}"),                       # <date>, as a National Day of Mourning
+    re.compile(rf"{_MOURN}\s+(?i:on)\s+{_WEEKDAY}{_DATE_LIST}"),                             # National Day of Mourning on <date>
+    re.compile(rf"(?i:\b(?:declar|designat)\w*)\s+{_WEEKDAY}{_DATE_LIST}[^.;]{{0,60}}?{_MOURN}"),   # designate <date> ... Mourning
+)
+# Words that make a date in a trigger sentence something else: a span, a start, a death, a flag order.
+_NOT_THE_DAY = re.compile(r"\b(?:through|beginning|begins?|until|died|dies|death|deaths|passed|passing|half-staff|"
+                          r"flags?|following|after|since|from|born|anniversary)\b", re.I)
+
+
 def _sentence_dates(sentence: str):
-    """The dates a trigger sentence states in full, as ISO text; None when the sentence is unsure."""
+    """The closure dates a trigger sentence states, as ISO text ([] when it states none); None when the sentence is
+    unsure. A date counts only in one of the four forms of `_ANCHORS`, as the whole of the sentence's dates, with no
+    word of `_NOT_THE_DAY` in the sentence."""
     full = list(_FULL_DATE.finditer(sentence))
     if len(_MONTH_DAY.findall(sentence)) != len(full):
         return None                                        # a month and day with no year: not a stated date
+    if not full:
+        return []
     for a, b in zip(full, full[1:]):
         if not _LIST_GAP.fullmatch(sentence[a.end():b.start()]):
             return None                                    # the dates are not a plain list
+    if _NOT_THE_DAY.search(sentence):
+        return None
+    first, last = full[0].start(), full[-1].end()
+    if not any(m.start("dl") == first and m.end("dl") == last for rx in _ANCHORS for m in rx.finditer(sentence)):
+        return None                                        # a date, but not grammatically the closure day
     out = []
     for m in full:
         try:

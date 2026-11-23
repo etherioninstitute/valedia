@@ -319,8 +319,10 @@ def test_finnhub_holiday_parser_refuses_anything_unexpected_whole(name):
         k3.parse_finnhub_holiday(BAD_HOLIDAYS[name], fetched_at_utc=NOW_S)
 
 
-def test_finnhub_holiday_parser_accepts_an_empty_list():
-    assert parse_h(holiday_body()) == []
+def test_finnhub_holiday_parser_refuses_an_empty_list_but_not_a_one_item_list():
+    with pytest.raises(k3.K3Error):
+        parse_h(holiday_body())                                  # a broken feed, not "no holidays"
+    assert len(parse_h(holiday_body(("a", "2026-11-26", "")))) == 1
 
 
 def test_finnhub_holiday_parser_refuses_a_bad_fetch_time():
@@ -467,6 +469,18 @@ EO, PR = "Executive Order", "Proclamation"
     ("A National Day of Mourning on January 9, 2025", None, PR, ["2025-01-09"]),
     ("Executive Order", "The order closes things. It provides for the closing of executive departments and agencies "
                         "on Friday, December 26, 2025.", EO, ["2025-12-26"]),
+    # positives: each accepted grammatical form
+    ("Designating a Day", "The President declares Friday, March 6, 2026, to be a National Day of Mourning.", PR,
+     ["2026-03-06"]),
+    ("Day", "The President declares Friday, March 6, 2026 a National Day of Mourning.", PR, ["2026-03-06"]),
+    ("National Day of Mourning", "Thursday, March 5, 2026, as a National Day of Mourning for X.", PR, ["2026-03-05"]),
+    ("National Day of Mourning", "This proclamation designates March 5, 2026 and March 6, 2026, as a National Day of "
+                                 "Mourning.", PR, ["2026-03-05", "2026-03-06"]),
+    ("A proclamation", "I hereby designate Thursday, January 9, 2025, as a National Day of Mourning.", PR,
+     ["2025-01-09"]),
+    ("National Day of Mourning on Thursday, January 9, 2025", None, PR, ["2025-01-09"]),
+    ("Order", "An order closing executive departments and agencies of the Federal Government on Friday, "
+              "December 26, 2025.", EO, ["2025-12-26"]),
     # negatives: no date, never guess
     (CLOSING_TITLE.format(d="the Day After Christmas"), None, EO, []),
     ("National Day of Mourning for Jimmy Carter", "Designates a national day of mourning.", PR, []),
@@ -481,6 +495,17 @@ EO, PR = "Executive Order", "Proclamation"
     # two dates that are not a plain list: unsure, so none
     ("National Day of Mourning for X", "President X died on December 29, 2024; the national day of mourning is "
                                        "January 9, 2025.", PR, []),
+    # a trigger sentence with a date that is not the closure day, whatever the date's grammar
+    ("National Day of Mourning; flags at half-staff through December 31, 2026", None, PR, []),
+    ("National Day of Mourning for X who died on December 5, 2026", None, PR, []),
+    ("National Day of Mourning Beginning December 5, 2026", None, PR, []),
+    ("National Day of Mourning", "Flags at half-staff until December 12, 2026.", PR, []),
+    ("National Day of Mourning for X", "X passed on December 5, 2026, and the nation mourns.", PR, []),
+    ("Closing of Executive Departments and Agencies", "Following the death of X on December 5, 2026, the order is "
+                                                      "issued.", EO, []),
+    ("Closing of Executive Departments and Agencies after December 24, 2026", None, EO, []),
+    ("National Day of Mourning observed from December 5, 2026", None, PR, []),
+    ("Closing of Executive Departments and Agencies, due to the death of X, on December 5, 2026", None, EO, []),
     # no trigger at all
     ("Thanksgiving Day, 2026", "Sets November 26, 2026 as a day of thanks.", PR, []),
     ("Announcing the Death of a Former President", "Flags at half-staff through January 9, 2025.", PR, []),
@@ -495,6 +520,23 @@ EO, PR = "Executive Order", "Proclamation"
 ])
 def test_fr_closure_date_rule(title, abstract, subtype, want):
     assert k3.fr_closure_dates(title, abstract, subtype) == want
+
+
+CLEAN = "This proclamation designates January 9, 2025, as a National Day of Mourning."
+UNSURE = "Flags will fly at half-staff through January 12, 2025, for the National Day of Mourning."
+
+
+@pytest.mark.parametrize("title,abstract,alone_title,alone_abstract", [
+    ("National Day of Mourning", f"{CLEAN} {UNSURE}", "National Day of Mourning", CLEAN),
+    ("National Day of Mourning", f"{UNSURE} {CLEAN}", "National Day of Mourning", CLEAN),
+    ("National Day of Mourning for X who died on December 5, 2026", CLEAN, "National Day of Mourning for X", CLEAN),
+    ("Closing of Executive Departments and Agencies on January 9, 2025", "National Day of Mourning begins "
+     "January 8, 2025.", "Closing of Executive Departments and Agencies on January 9, 2025", ""),
+])
+def test_one_unsure_sentence_voids_the_whole_document(title, abstract, alone_title, alone_abstract):
+    for kind in ("Proclamation", "Executive Order"):
+        assert k3.fr_closure_dates(alone_title, alone_abstract, kind) == ["2025-01-09"]      # the clean part alone counts
+        assert k3.fr_closure_dates(title, abstract, kind) == []                              # beside an unsure one it does not
 
 
 def test_fr_closure_dates_are_sorted_unique():
@@ -1002,11 +1044,14 @@ def test_a_re_added_date_is_closed_again(conn):
     assert votes(conn, as_of="2026-11-24T17:00:00Z")["authorities_closed"] == [H]
 
 
-def test_an_empty_list_removes_nothing(conn):
+def test_an_empty_list_is_refused_whole_and_old_closures_stay_as_they_were(conn):
     seed(conn)
     refresh_h(conn, LIST_1, T_A)
-    assert refresh_h(conn, holiday_body(), T_B) == {"stored": 0, "unchanged": 0, "error": 0}
-    assert closure_payload(conn, D)["closed"] is True
+    got = refresh_h(conn, holiday_body(), T_B)
+    assert got["error"] == 1 and got["stored"] == 0 and got["unchanged"] == 0
+    assert closure_payload(conn, D)["closed"] is True and "removed" not in closure_payload(conn, D)
+    assert facts_as_of(conn, "2099-01-01T00:00:00Z", domain="K3_CAL", entity_key="XNYS:CLOSURE:2026-11-26")[0][
+        "known_at_utc"] == "2026-11-23T20:00:00.000000Z"            # no new version of anything
 
 
 def test_a_removed_half_day_is_also_marked_removed(conn):

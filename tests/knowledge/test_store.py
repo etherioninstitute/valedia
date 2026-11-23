@@ -1879,25 +1879,111 @@ def test_public_surface_is_exactly_the_allowed_names():
 
 
 def _alias_bindings(files):
-    """(file, name) for every public module-level name bound by assignment to a function, class or lambda defined in
-    the same module (`fetch = _fetch`), or put into the module's globals by subscript. The public-surface test reads
-    only `def` and `class` statements, so such a binding would hide a public function from it."""
+    """What would hide a public function or class from the public-surface test, which reads only `def` and `class`
+    statements. Returns (file, name-or-form) pairs, for every module of the package:
+    - a public name bound to a function, class or lambda of the same module by assignment (also chained, tuple or
+      list unpacking, `a = b = f`, a conditional expression, a call that wraps one such as `partial(f)`, a walrus,
+      a `for` target), at any depth of module-level if/try/with/for/while/match statements;
+    - an import that renames to a public name (`import x as f`, `from x import y as f`), unless allowed, and
+      `from x import *`;
+    - dynamic binding anywhere in the file: globals(), locals(), vars() with no argument, setattr, exec, eval,
+      `sys.modules`, and a module-level `__getattr__` or `__dir__`.
+    Known limit: an opaque call that returns several functions, `f, g = make_pair()`, binds public names that this
+    scan cannot prove are functions, so it is not flagged; nor is a module-level `match` capture pattern."""
     found = set()
-    for f in files:
-        tree = ast.parse(f.read_text())
-        defined = {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+    for path in files:
+        rel = path.relative_to(_PKG).as_posix()
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                name = node.func.id
+                if name in ("globals", "locals", "setattr", "exec", "eval") or (name == "vars" and not node.args):
+                    found.add((rel, f"<{name}>"))
+            if isinstance(node, ast.Attribute) and node.attr == "modules" and getattr(node.value, "id", "") == "sys":
+                found.add((rel, "<sys.modules>"))
         for node in tree.body:
-            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-                continue
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            value = node.value
-            hides = isinstance(value, ast.Lambda) or (isinstance(value, ast.Name) and value.id in defined)
-            for t in targets:
-                if isinstance(t, ast.Name) and hides and not t.id.startswith("_"):
-                    found.add((f.relative_to(_PKG).as_posix(), t.id))
-                if (isinstance(t, ast.Subscript) and isinstance(t.value, ast.Call)
-                        and getattr(t.value.func, "id", "") in ("globals", "vars")):
-                    found.add((f.relative_to(_PKG).as_posix(), "<globals>"))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in ("__getattr__", "__dir__"):
+                found.add((rel, node.name))
+        fn_names = set()
+
+        def public(name):
+            return not name.startswith("_")
+
+        def hides(value):
+            if isinstance(value, ast.Lambda):
+                return True
+            if isinstance(value, ast.Name):
+                return value.id in fn_names
+            if isinstance(value, ast.IfExp):
+                return hides(value.body) or hides(value.orelse)
+            if isinstance(value, ast.BoolOp):
+                return any(hides(v) for v in value.values)
+            if isinstance(value, ast.NamedExpr):
+                return hides(value.value)
+            if isinstance(value, ast.Call):        # a call wrapping one (the callee itself is not what is bound)
+                return any(hides(a) for a in value.args) or any(hides(k.value) for k in value.keywords)
+            return False
+
+        def bind(target, value):
+            if isinstance(target, ast.Name):
+                if hides(value):
+                    fn_names.add(target.id)
+                    if public(target.id):
+                        found.add((rel, target.id))
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                if isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == len(target.elts) and not any(
+                        isinstance(e, ast.Starred) for e in value.elts + target.elts):
+                    for t, v in zip(target.elts, value.elts):
+                        bind(t, v)
+                elif hides(value):
+                    for t in target.elts:
+                        bind(t, ast.Lambda(args=None, body=None))      # every name of the unpack gets the wrapped function
+
+        class Walrus(ast.NodeVisitor):
+            """Walrus bindings at module level (a comprehension's walrus binds in the module too)."""
+            def visit_FunctionDef(self, node): pass
+            visit_AsyncFunctionDef = visit_ClassDef = visit_Lambda = visit_FunctionDef
+
+            def visit_NamedExpr(self, node):
+                bind(node.target, node.value)
+                self.generic_visit(node)
+
+        def walk(stmts):
+            for st in stmts:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    fn_names.add(st.name)
+                    continue
+                if isinstance(st, ast.Assign):
+                    Walrus().visit(st.value)
+                    for t in st.targets:
+                        bind(t, st.value)
+                elif isinstance(st, ast.AnnAssign) and st.value is not None:
+                    Walrus().visit(st.value)
+                    bind(st.target, st.value)
+                elif isinstance(st, (ast.Import, ast.ImportFrom)):
+                    for a in st.names:
+                        if a.name == "*":
+                            found.add((rel, "from-import-star"))
+                        elif a.asname and a.asname != a.name and public(a.asname) and (rel, a.asname) not in _ALLOWED_PUBLIC:
+                            found.add((rel, a.asname))
+                elif isinstance(st, (ast.For, ast.AsyncFor)):
+                    if isinstance(st.iter, (ast.Tuple, ast.List, ast.Set)) and any(hides(e) for e in st.iter.elts):
+                        bind(st.target, ast.Lambda(args=None, body=None))
+                    walk(st.body + st.orelse)
+                    continue
+                elif isinstance(st, ast.Expr):
+                    Walrus().visit(st.value)
+                elif isinstance(st, (ast.If, ast.While)):
+                    Walrus().visit(st.test)
+                for field in ("body", "orelse", "finalbody"):
+                    if isinstance(st, (ast.If, ast.While, ast.Try, ast.With, ast.AsyncWith)) and getattr(st, field, None):
+                        walk(getattr(st, field))
+                for h in getattr(st, "handlers", []):
+                    walk(h.body)
+                for case in getattr(st, "cases", []):
+                    walk(case.body)
+
+        walk(tree.body)
     return found
 
 
@@ -1905,29 +1991,100 @@ def test_no_module_binds_a_public_name_by_assignment_to_a_function_or_class():
     assert _alias_bindings(_package_files()) == set()
 
 
-@pytest.mark.parametrize("line", ["def _f():\n    pass\nf = _f\n", "class _C:\n    pass\nC = _C\n",
-                                  "g = lambda: 1\n", "def _h():\n    pass\nglobals()['h'] = _h\n"])
-def test_the_alias_check_catches_a_sidestep(tmp_path, monkeypatch, line):
+_SIDESTEPS = {
+    "plain alias": "def _f():\n    pass\nf = _f\n",
+    "class alias": "class _C:\n    pass\nC = _C\n",
+    "lambda": "g = lambda: 1\n",
+    "chain": "def _f():\n    pass\ng = _f\nh = g\n",
+    "multi target": "def _f():\n    pass\na = b = _f\n",
+    "tuple unpack": "def _f():\n    pass\ndef _g():\n    pass\nf, g = _f, _g\n",
+    "list unpack": "def _f():\n    pass\n[f, g] = [_f, 1]\n",
+    "nested tuple unpack": "def _f():\n    pass\n(f, (g, h)) = (1, (_f, 2))\n",
+    "annotated": "def _f():\n    pass\nf: object = _f\n",
+    "in if": "import sys\ndef _f():\n    pass\nif sys.version_info:\n    f = _f\n",
+    "in else": "def _f():\n    pass\nif 0:\n    pass\nelse:\n    f = _f\n",
+    "in try": "def _f():\n    pass\ntry:\n    f = _f\nexcept Exception:\n    pass\n",
+    "in except": "def _f():\n    pass\ntry:\n    pass\nexcept Exception:\n    f = _f\n",
+    "in finally": "def _f():\n    pass\ntry:\n    pass\nfinally:\n    f = _f\n",
+    "in with": "import contextlib\ndef _f():\n    pass\nwith contextlib.nullcontext():\n    f = _f\n",
+    "in for": "def _f():\n    pass\nfor _ in range(1):\n    f = _f\n",
+    "in while": "def _f():\n    pass\nwhile True:\n    f = _f\n    break\n",
+    "def inside if": "if True:\n    def _f():\n        pass\n    f = _f\n",
+    "for target": "def _f():\n    pass\nfor f in (_f,):\n    pass\n",
+    "walrus": "def _f():\n    pass\n(f := _f)\n",
+    "walrus in test": "def _f():\n    pass\nif (f := _f):\n    pass\n",
+    "walrus in comprehension": "def _f():\n    pass\n[(f := _f) for _ in range(1)]\n",
+    "partial": "import functools\ndef _f():\n    pass\nf = functools.partial(_f)\n",
+    "any wrapping call": "def _f():\n    pass\nf = staticmethod(_f)\n",
+    "wrapping call with keyword": "def _f():\n    pass\nf = wrap(fn=_f)\n",
+    "nested wrapping call": "def _f():\n    pass\nf = outer(inner(_f))\n",
+    "unpacked wrapping call": "def _f():\n    pass\nf, g = pair(_f)\n",
+    "conditional": "def _f():\n    pass\nf = _f if 1 else None\n",
+    "or": "def _f():\n    pass\nf = None or _f\n",
+    "import as": "import json as j\n",
+    "from import as": "from json import dumps as d\n",
+    "dotted import as": "import os.path as p\n",
+    "star import": "from json import *\n",
+    "star import nested": "try:\n    from json import *\nexcept Exception:\n    pass\n",
+    "setattr": "import sys\ndef _f():\n    pass\nsetattr(sys.modules[__name__], 'f', _f)\n",
+    "setattr in a function": "def _install(m, f):\n    setattr(m, 'f', f)\n",
+    "globals subscript": "def _f():\n    pass\nglobals()['f'] = _f\n",
+    "globals update": "def _f():\n    pass\nglobals().update(f=_f)\n",
+    "globals in a function": "def _install(f):\n    globals()['f'] = f\n",
+    "vars update": "def _f():\n    pass\nvars().update(f=_f)\n",
+    "locals update": "def _f():\n    pass\nlocals().update(f=_f)\n",
+    "sys.modules": "import sys\nm = sys.modules[__name__]\n",
+    "sys.modules in a function": "import sys\ndef _install():\n    return sys.modules\n",
+    "exec": "exec('def f(): pass')\n",
+    "eval": "eval('1')\n",
+    "module __getattr__": "def __getattr__(name):\n    raise AttributeError(name)\n",
+    "module __dir__": "def __dir__():\n    return []\n",
+}
+
+_PLAIN = {
+    "text constant": "NAME = 'text'\n",
+    "dict constant": "TABLE = {'a': 1}\n",
+    "tuple constant": "A, B = 1, 2\n",
+    "private lambda": "_f = lambda: 1\n",
+    "private alias": "def _f():\n    pass\n_g = _f\n",
+    "private chain then call": "def _f():\n    return 1\n_g = _f\nVALUE = _f()\n",
+    "a call result": "def _f():\n    return 1\nVALUE = _f()\nOTHER = max(1, 2)\n",
+    "dict of functions is a table, not a def": "def _f():\n    pass\nTABLE = {'a': _f}\n",
+    "walrus of a constant": "(n := 5)\n",
+    "unpack of constants in if": "import sys\nif sys.version_info:\n    A, B = 1, 2\n",
+    "plain imports": "import json\nfrom json import dumps\nimport os.path\nfrom os import path as path\n",
+    "private import alias": "import json as _j\n",
+    "a function that uses vars(obj)": "def _f(o):\n    return vars(o)\n",
+    "for over constants": "for n in (1, 2):\n    pass\n",
+    "class attribute alias is not module level": "class _C:\n    def _m(self):\n        pass\n    m = _m\n",
+    "function-local alias": "def _f():\n    def _g():\n        pass\n    h = _g\n    return h\n",
+}
+
+
+def _in_a_copy(tmp_path, monkeypatch, source):
     extra = tmp_path / "pkg"
     extra.mkdir()
     (extra / "__init__.py").write_text("")
     (extra / "store.py").write_text(Path(store.__file__).read_text())
     monkeypatch.setattr(sys.modules[__name__], "_PKG", extra)
     assert _alias_bindings(_package_files()) == set()                  # the clean copy passes
-    (extra / "k.py").write_text(line)
-    assert _alias_bindings(_package_files())                           # and the sidestep is found
+    (extra / "k.py").write_text(source)
+    return _alias_bindings(_package_files())
 
 
-@pytest.mark.parametrize("line", ["NAME = 'text'\n", "TABLE = {'a': 1}\n", "_f = lambda: 1\n",
-                                  "def _f():\n    pass\n_g = _f\n"])
-def test_the_alias_check_leaves_plain_constants_and_private_bindings_alone(tmp_path, monkeypatch, line):
-    extra = tmp_path / "pkg"
-    extra.mkdir()
-    (extra / "__init__.py").write_text("")
-    (extra / "store.py").write_text(Path(store.__file__).read_text())
-    (extra / "k.py").write_text(line)
-    monkeypatch.setattr(sys.modules[__name__], "_PKG", extra)
-    assert _alias_bindings(_package_files()) == set()
+@pytest.mark.parametrize("form", sorted(_SIDESTEPS))
+def test_the_alias_check_catches_a_sidestep(tmp_path, monkeypatch, form):
+    assert _in_a_copy(tmp_path, monkeypatch, _SIDESTEPS[form]), form
+
+
+@pytest.mark.parametrize("form", sorted(_PLAIN))
+def test_the_alias_check_leaves_plain_code_alone(tmp_path, monkeypatch, form):
+    assert _in_a_copy(tmp_path, monkeypatch, _PLAIN[form]) == set(), form
+
+
+def test_an_allowed_renaming_import_is_not_flagged(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "_ALLOWED_PUBLIC", _ALLOWED_PUBLIC | {("k.py", "d")})
+    assert _in_a_copy(tmp_path, monkeypatch, "from json import dumps as d\n") == set()
 
 
 def _mentions():
