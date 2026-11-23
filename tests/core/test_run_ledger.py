@@ -2024,6 +2024,7 @@ def test_the_wait_returns_at_once_when_nothing_is_open_and_never_sleeps(conn):
 
 def test_the_wait_does_not_wait_before_1025_or_on_a_day_that_is_no_session(conn):
     start(conn, T0655)
+    start(conn, utc(2026, 11, 23, 15, 20), "MANUAL")      # lead: a start still under 10 minutes old at 10:24
     early = Clock(T1024)
     assert rl.deadman_wait(conn, BOOK, early, early.sleep) == [] and early.sleeps == []
     sat = Clock(utc(2026, 11, 28, 16, 0))
@@ -2138,6 +2139,14 @@ def test_each_prior_day_and_trigger_has_its_own_row_in_this_book_only(conn):
         "run:orphan-start-prior:20261120:0630", "run:orphan-start-prior:20261120:0655", "run:orphan-start-prior:20261123:manual"]
     assert len(first) == 4 and rl.deadman_check(conn, BOOK, T_TUE_0725) == []
     assert fault_rows(conn, TUE) and deadman_rows(conn, book="another-book", day=TUE) == []
+
+
+def test_a_prior_orphan_row_in_another_book_does_not_stop_this_books_row(conn):
+    start(conn, utc(2026, 11, 20, 14, 55), book="another-book")
+    start(conn, utc(2026, 11, 20, 14, 55))
+    assert len(rl.deadman_check(conn, "another-book", T_TUE_0725)) >= 1
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert [r["root_cause"] for r in fault_rows(conn, TUE)] == ["run:orphan-start-prior:20261120:0655"]
 
 
 def test_a_prior_orphan_is_not_checked_before_1025_or_on_a_day_that_is_no_session(conn):
