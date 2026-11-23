@@ -506,6 +506,21 @@ EO, PR = "Executive Order", "Proclamation"
     ("Closing of Executive Departments and Agencies after December 24, 2026", None, EO, []),
     ("National Day of Mourning observed from December 5, 2026", None, PR, []),
     ("Closing of Executive Departments and Agencies, due to the death of X, on December 5, 2026", None, EO, []),
+    # not grammatically the closure day, and no word of span, start or death: the anchor alone refuses these
+    ("National Day of Mourning for X, December 5, 2026", None, PR, []),
+    ("National Day of Mourning (December 5, 2026)", None, PR, []),
+    ("December 5, 2026 National Day of Mourning", None, PR, []),
+    ("The nation observes December 5, 2026 as a day of reflection; National Day of Mourning", None, PR, []),
+    ("Closing of Executive Departments and Agencies, December 24, 2026", None, EO, []),
+    ("Closing of Executive Departments and Agencies; see December 24, 2026", None, EO, []),
+    ("Closing of Executive Departments and Agencies of the Federal Government, effective on December 24, 2026", None,
+     EO, []),
+    # anchored, but a word of span, start or death is in the sentence: the word list alone refuses these
+    ("National Day of Mourning", "This proclamation designates January 9, 2025, as a National Day of Mourning "
+                                 "following the death of X.", PR, []),
+    ("Closing of Executive Departments and Agencies on December 24, 2026 after the funeral", None, EO, []),
+    ("National Day of Mourning on December 5, 2026 and flags at half-staff", None, PR, []),
+    ("Closing of Executive Departments and Agencies on December 24, 2026 until further notice", None, EO, []),
     # no trigger at all
     ("Thanksgiving Day, 2026", "Sets November 26, 2026 as a day of thanks.", PR, []),
     ("Announcing the Death of a Former President", "Flags at half-staff through January 9, 2025.", PR, []),
