@@ -6,11 +6,12 @@ Every outside thing is a stand-in: the store is a temporary file, the sender is 
 the clock is given, the git repository of the pre-flight is built here, and nothing real is read."""
 import io
 import json
+import re
 import socket
 import sqlite3
 import subprocess
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -151,7 +152,7 @@ def test_an_insert_with_a_new_explicit_id_goes_in(conn):
 @pytest.mark.parametrize("field,bad", [
     ("kind", "BOGUS"), ("kind", "run_end"), ("kind", None),
     ("trigger", "0600"), ("trigger", "manual"), ("trigger", None),
-    ("outcome", "DONE"), ("outcome", "ok"), ("outcome", None),
+    ("outcome", "DONE"), ("outcome", "ok"), ("outcome", "noop"), ("outcome", None),
     ("book", None), ("book", ""),
     ("fault_count", -1), ("fault_count", "many"), ("fault_count", 1.5), ("fault_count", None),
     ("revision_ok", 2), ("revision_ok", -1), ("revision_ok", "yes"),
@@ -171,7 +172,7 @@ def test_every_enum_and_format_check_refuses_a_bad_value(conn, field, bad):
     ("kind", "PREFLIGHT"), ("kind", "RUN_START"), ("kind", "SKIP"), ("kind", "DEADMAN"),
     ("trigger", "0630"), ("trigger", "0710"), ("trigger", "0725"), ("trigger", "MANUAL"),
     ("outcome", "OK"), ("outcome", "WARN"), ("outcome", "ORDINARY_STOP"), ("outcome", "FAULT"), ("outcome", "CRASH"),
-    ("outcome", "SKIPPED"), ("outcome", "MISSING"),
+    ("outcome", "SKIPPED"), ("outcome", "MISSING"), ("outcome", "NOOP"),
     ("revision_ok", None), ("revision_ok", 0), ("fault_count", 7),
     ("root_cause", "run:status-stopped:send"), ("root_cause", "gate:orderpath-mismatch"), ("root_cause", "x" * 120),
     ("at_utc", "2026-02-28T23:59:59Z"),
@@ -1111,9 +1112,12 @@ def summary(status="done", stage=None, **extra):
     (summary("done"), 0, "COMPLETED", None, 0),
     (summary("done", faults=["reconcile", "cap"]), 0, "COMPLETED", "run:faults:reconcile", 2),
     (summary("stopped", "session", reason="outside the regular session window 09:30 to 16:00 New York time"), 2,
-     "ORDINARY_STOP", "run:ordinary-stop:session", 0),
+     "NOOP", "run:noop:outside-window", 0),
     (summary("stopped", "session", reason="another order step is running on this venue's state file"), 2,
+     "NOOP", "run:noop:lock-held", 0),
+    (summary("stopped", "session", reason="2026-11-22 (Sunday) is not a trading day"), 2,
      "ORDINARY_STOP", "run:ordinary-stop:session", 0),
+    (summary("stopped", "session"), 2, "ORDINARY_STOP", "run:ordinary-stop:session", 0),
     (summary("stopped", "session", reason="the exchange calendar could not be loaded: boom"), 2,
      "FAULT", "run:status-stopped:session", 1),
     (summary("stopped", "send", reason="the venue refused"), 2, "FAULT", "run:status-stopped:send", 1),
@@ -1147,7 +1151,7 @@ def test_only_the_session_stage_is_ordinary():
     for stage in ("after", "baseline", "live", "lock", "reconcile", "send", "state", "targets", "ticket", "unexpected",
                   "prices", "marks", "shortfall"):
         assert rl.map_run(summary("stopped", stage), 2).outcome == "FAULT", stage
-    assert rl.map_run(summary("stopped", "session", reason="outside the regular session window"), 2).outcome == "ORDINARY_STOP"
+    assert rl.map_run(summary("stopped", "session", reason="outside the regular session window"), 2).outcome == "NOOP"
 
 
 def test_the_real_printed_form_with_a_ticket_line_after_it_is_read():
@@ -1196,12 +1200,14 @@ def test_with_a_terminal_row_it_is_ok(conn, kind, trigger, outcome):
 
 @pytest.mark.parametrize("kind,trigger,outcome", [
     ("RUN_START", "0655", "OK"), ("PREFLIGHT", "0630", "WARN"), ("SKIP", "0630", "SKIPPED"), ("SKIP", "MANUAL", "SKIPPED"),
-    ("SKIP", "0725", "SKIPPED"),
+    ("SKIP", "0725", "SKIPPED"), ("RUN_END", "0710", "NOOP"), ("RUN_END", "0655", "NOOP"),
 ])
 def test_a_row_that_is_not_terminal_does_not_count(conn, kind, trigger, outcome):
     add(conn, kind, trigger, outcome, T0655)
     rl.deadman(conn, BOOK, T1025)
-    assert [e["outcome"] for e in rl.events_for(conn, MON, BOOK) if e["kind"] == "DEADMAN"] == ["MISSING"]
+    # (a RUN_START that old is also an orphan; that row is not the no-terminal-row check, which is the one asked here)
+    assert [e["outcome"] for e in rl.events_for(conn, MON, BOOK)
+            if e["kind"] == "DEADMAN" and e["outcome"] in ("OK", "MISSING")] == ["MISSING"]
 
 
 def test_a_terminal_row_of_another_day_or_book_does_not_count(conn):
@@ -1230,6 +1236,337 @@ def test_a_terminal_row_that_arrives_after_the_dead_man_does_not_rewrite_it(conn
     run_end(conn, utc(2026, 11, 23, 16, 0))
     assert rl.deadman(conn, BOOK, utc(2026, 11, 23, 16, 5)) is None
     assert [e["outcome"] for e in rl.events_for(conn, MON, BOOK) if e["kind"] == "DEADMAN"] == ["MISSING"]
+
+
+# ------------------------------------------------------------------------------------------------ no-op stops and orphaned starts (T60)
+
+ORDER_STEP = Path(rl.__file__).resolve().parents[1] / "execution_and_risk" / "order_step.py"
+T0725 = T1025                                          # the dead-man job: 7:25 Pacific is 10:25 New York
+
+
+def order_step_session_reasons():
+    """The literal reasons the order step stops at the `session` stage with, read from its source (never edited here)."""
+    src = ORDER_STEP.read_text()
+    lock = re.search(r'_finish\("stopped", "session", f?"([^"{]*)', src)
+    calendar = re.search(r'_Stop\("session", f"(the exchange calendar could not be loaded[^"{]*)', src)
+    window = re.search(r'_Stop\("session", f"(outside the regular session window[^"{]*)', src)
+    assert lock and calendar and window, "the order step no longer words a session stop the way the ledger reads it"
+    return lock.group(1), calendar.group(1), window.group(1)
+
+
+def test_the_reason_prefixes_the_ledger_reads_are_the_order_steps_exact_words():
+    src = ORDER_STEP.read_text()
+    for prefix in (rl.LOCK_HELD_REASON, rl.OUTSIDE_WINDOW_REASON, rl.CALENDAR_FAULT_REASON):
+        assert f'"{prefix}' in src, f"{prefix!r} is no longer how the order step words a session stop"
+    assert (rl.LOCK_HELD_REASON, rl.OUTSIDE_WINDOW_REASON, rl.CALENDAR_FAULT_REASON) == (
+        "another order step is running", "outside the regular session window", "the exchange calendar could not be loaded")
+
+
+def test_the_order_steps_own_session_reasons_map_as_the_ticket_says():
+    lock, calendar, window = order_step_session_reasons()
+    got = {name: rl.map_run(summary("stopped", "session", reason=text), 2)
+           for name, text in (("lock", lock), ("calendar", calendar + ": boom"), ("window", window + " 09:30 to 15:55 (it is 06:55)"))}
+    assert (got["lock"].outcome, got["lock"].root_cause) == ("NOOP", "run:noop:lock-held")
+    assert (got["window"].outcome, got["window"].root_cause) == ("NOOP", "run:noop:outside-window")
+    assert (got["calendar"].outcome, got["calendar"].root_cause, got["calendar"].fault_count) == ("FAULT", "run:status-stopped:session", 1)
+
+
+@pytest.mark.parametrize("reason,outcome,cause", [
+    ("the market is closed today", "ORDINARY_STOP", "run:ordinary-stop:session"),
+    ("2026-11-28 (Saturday) is not a trading day", "ORDINARY_STOP", "run:ordinary-stop:session"),
+    ("the exchange calendar could not answer for 2026-11-28: boom", "ORDINARY_STOP", "run:ordinary-stop:session"),
+    ("", "ORDINARY_STOP", "run:ordinary-stop:session"),
+    ("Another order step is running", "ORDINARY_STOP", "run:ordinary-stop:session"),               # the words are matched exactly
+    ("then another order step is running", "ORDINARY_STOP", "run:ordinary-stop:session"),          # at the start of the reason only
+    ("a note: outside the regular session window", "ORDINARY_STOP", "run:ordinary-stop:session"),
+    ("another order step is running on this venue's state file", "NOOP", "run:noop:lock-held"),
+    ("another order step is running", "NOOP", "run:noop:lock-held"),
+    ("outside the regular session window 09:30 to 15:55 New York time (it is 06:55)", "NOOP", "run:noop:outside-window"),
+    ("the exchange calendar could not be loaded: boom", "FAULT", "run:status-stopped:session"),
+])
+def test_a_session_stop_maps_by_the_start_of_its_reason(reason, outcome, cause):
+    m = rl.map_run(summary("stopped", "session", reason=reason), 2)
+    assert (m.outcome, m.root_cause) == (outcome, cause)
+
+
+@pytest.mark.parametrize("stage", ["send", "lock", "environment", "unexpected"])
+def test_a_noop_reason_at_another_stage_is_still_a_fault(stage):
+    for reason in ("another order step is running on this venue's state file", "outside the regular session window"):
+        m = rl.map_run(summary("stopped", stage, reason=reason), 2)
+        assert (m.outcome, m.fault_count) == ("FAULT", 1)
+
+
+def test_a_noop_stop_with_the_wrong_exit_code_is_still_a_crash():
+    text = summary("stopped", "session", reason="another order step is running on this venue's state file")
+    assert rl.map_run(text, 1).outcome == "CRASH" and rl.map_run(text, 0).outcome == "CRASH"
+
+
+def test_a_noop_is_p3_and_a_noop_row_sends_nothing(conn):
+    s = FakeSender()
+    run_end(conn, T0710, "NOOP", trigger="0710", root_cause="run:noop:lock-held")
+    run_end(conn, T0710, "NOOP", trigger="0710", root_cause="run:noop:outside-window")
+    assert rl.classify(rl.events_for(conn, MON, BOOK)[0]) == "P3"
+    out = notify(conn, s, T0710)
+    assert s.sent == [] and out["due"] == [] and rl.incidents_for(conn, MON, BOOK) == []
+    assert rl.classify({"kind": "RUN_END", "outcome": "ORDINARY_STOP", "root_cause": None, "fault_count": 0}) == "P3"
+
+
+def test_a_noop_with_a_fault_count_is_still_a_p0(conn):
+    run_end(conn, T0710, "NOOP", trigger="0710", root_cause="run:noop:lock-held", fault_count=1)
+    assert rl.classify(rl.events_for(conn, MON, BOOK)[0]) == "P0"
+
+
+def test_the_noop_outcome_is_in_the_table_check(conn):
+    raw_event(conn, outcome="NOOP", trigger="0710", root_cause="run:noop:lock-held")
+    assert count(conn) == 1
+
+
+def test_a_store_of_the_old_layout_is_refused_not_silently_kept(tmp_path):
+    old = sqlite3.connect(str(tmp_path / "old.sqlite"))
+    old.execute("PRAGMA user_version = 1")
+    old.close()
+    with pytest.raises(sqlite3.DatabaseError, match="layout"):
+        rl.connect(tmp_path / "old.sqlite").close()
+
+
+def start(conn, now, trigger="0655", **kw):
+    return add(conn, "RUN_START", trigger, "OK", now, revision_ok=1, **kw)
+
+
+def noop(conn, now, trigger="0710", cause="run:noop:lock-held"):
+    return add(conn, "RUN_END", trigger, "NOOP", now, root_cause=cause, revision_ok=1)
+
+
+def deadman_rows(conn, book=BOOK, day=MON):
+    return [(e["outcome"], e["root_cause"]) for e in rl.events_for(conn, day, book) if e["kind"] == "DEADMAN"]
+
+
+def day_streak(conn, first, last):
+    count_, per_day = rl.streak(rl.events_between(conn, BOOK, first, last), rl.sessions_between(first, last))
+    return count_, {d["date"]: d for d in per_day}
+
+
+def test_the_orphan_age_is_twenty_minutes():
+    assert rl.ORPHAN_MINUTES == 20
+
+
+def test_a_hung_0655_then_a_0710_lock_held_noop_sends_the_orphan_p0_and_the_no_terminal_row_p1_and_resets(conn):
+    s = FakeSender()
+    clean_start = utc(2026, 11, 20, 14, 55)
+    start(conn, clean_start)
+    run_end(conn, utc(2026, 11, 20, 15, 0))                                         # Friday: clean, count 1
+    start(conn, T0655)                                                              # 6:55: written, never ended
+    start(conn, T0710, "0710")
+    noop(conn, T0710)                                                               # 7:10: the lock is held
+    rl.deadman(conn, BOOK, T0725)
+    assert sorted(deadman_rows(conn)) == [("FAULT", "run:orphan-start:0655"), ("MISSING", "deadman:no-terminal-row")]
+    out = notify(conn, s, T0725)
+    assert out["sent"] == 2 and out["due"] and sorted(o["severity"] for o in out["due"]) == ["P0", "P1"]
+    assert sorted(i["severity"] for i in rl.incidents_for(conn, MON, BOOK)) == ["P0", "P1"]
+    p0 = [t for t in s.sent if t[0].startswith("P0")]
+    assert len(p0) == 1 and "run:orphan-start:0655" in p0[0][1]
+    count_, by = day_streak(conn, "2026-11-20", MON)
+    assert count_ == 0 and by[MON]["status"] == "reset" and by["2026-11-20"]["status"] == "clean"
+
+
+def test_a_completed_0655_then_a_0710_lock_held_noop_sends_nothing_and_adds_one(conn):
+    s = FakeSender()
+    start(conn, utc(2026, 11, 20, 14, 55))
+    run_end(conn, utc(2026, 11, 20, 15, 0))
+    start(conn, T0655)
+    run_end(conn, utc(2026, 11, 23, 15, 0))                                         # 6:55 COMPLETED
+    start(conn, T0710, "0710")
+    noop(conn, T0710)
+    rl.deadman(conn, BOOK, T0725)
+    assert deadman_rows(conn) == [("OK", None)]
+    assert notify(conn, s, T0725)["due"] == [] and s.sent == []
+    count_, by = day_streak(conn, "2026-11-20", MON)
+    assert count_ == 2 and by[MON]["status"] == "clean" and by[MON]["count"] == 2
+
+
+def test_only_a_noop_outside_the_window_is_a_p1_and_a_reset(conn):
+    s = FakeSender()
+    start(conn, T0655)
+    run_end(conn, utc(2026, 11, 23, 14, 56), "NOOP", trigger="0655", root_cause="run:noop:outside-window", revision_ok=1)
+    rl.deadman(conn, BOOK, T0725)
+    assert deadman_rows(conn) == [("MISSING", "deadman:no-terminal-row")]              # its own RUN_END closes the start: no orphan
+    out = notify(conn, s, T0725)
+    assert [o["severity"] for o in out["due"]] == ["P1"] and len(s.sent) == 1
+    count_, by = day_streak(conn, MON, MON)
+    assert count_ == 0 and by[MON]["status"] == "reset"
+
+
+def test_a_day_whose_only_run_end_is_a_noop_resets_with_no_terminal_row():
+    events = [dict(event_id=1, trade_date="2026-11-25", book=BOOK, kind="RUN_END", trigger="0710", outcome="NOOP",
+                   root_cause="run:noop:lock-held", fault_count=0, revision_ok=1, detail=None, at_utc="2026-11-25T15:10:00Z")]
+    count_, per_day = rl.streak(week(**{"2026-11-25": events}), rl.sessions_between("2026-11-24", "2026-12-01"))
+    day = {d["date"]: d for d in per_day}["2026-11-25"]
+    assert (day["status"], day["reason"]) == ("reset", "no terminal row") and count_ == 3
+
+
+def test_a_noop_is_ignored_when_the_day_has_a_real_end():
+    day = "2026-11-25"
+    for rows in ([ev(day), ev(day, outcome="NOOP", trigger="0710", root_cause="run:noop:lock-held")],
+                 [ev(day, outcome="NOOP", trigger="0655", root_cause="run:noop:outside-window", revision_ok=0), ev(day, trigger="0710")],
+                 [ev(day), ev(day, outcome="NOOP", trigger="0710", revision_ok=None)]):          # a NOOP is not "the last end"
+        count_, per_day = rl.streak(week(**{day: rows}), rl.sessions_between("2026-11-24", "2026-12-01"))
+        assert count_ == 5 and {d["date"]: d for d in per_day}[day]["status"] == "clean", rows
+
+
+def test_a_noop_does_not_hide_a_real_failure_on_the_same_day():
+    day = "2026-11-25"
+    rows = [ev(day, outcome="FAULT", fault_count=1, root_cause="run:status-stopped:send"),
+            ev(day, outcome="NOOP", trigger="0710", root_cause="run:noop:lock-held")]
+    count_, per_day = rl.streak(week(**{day: rows}), rl.sessions_between("2026-11-24", "2026-12-01"))
+    assert {d["date"]: d for d in per_day}[day]["reason"] == "fault" and count_ == 3
+
+
+def test_only_an_ordinary_stop_for_a_closed_market_on_a_non_session_day_is_paused_and_silent(conn):
+    s = FakeSender()
+    thanksgiving = utc(2026, 11, 26, 14, 55)
+    start(conn, thanksgiving)
+    run_end(conn, thanksgiving, "ORDINARY_STOP", root_cause="run:ordinary-stop:session")
+    after = utc(2026, 11, 26, 15, 25)
+    assert rl.deadman(conn, BOOK, after) is None and deadman_rows(conn, day="2026-11-26") == []
+    assert notify(conn, s, after)["due"] == [] and s.sent == []
+    count_, by = day_streak(conn, "2026-11-25", "2026-11-27")
+    assert by["2026-11-26"]["status"] == "paused" and by["2026-11-26"]["reason"] == "not a session"
+
+
+def test_a_run_start_ten_minutes_old_is_no_orphan(conn):
+    start(conn, utc(2026, 11, 23, 15, 15))
+    rl.deadman(conn, BOOK, T0725)
+    assert deadman_rows(conn) == [("MISSING", "deadman:no-terminal-row")]
+
+
+@pytest.mark.parametrize("age_seconds,orphan", [(10 * 60, False), (20 * 60, False), (20 * 60 + 1, True), (21 * 60, True), (95 * 60, True)])
+def test_a_start_is_an_orphan_only_when_it_is_older_than_twenty_minutes(conn, age_seconds, orphan):
+    started = utc(2026, 11, 23, 15, 25) - timedelta(seconds=age_seconds)
+    start(conn, started)
+    rl.deadman(conn, BOOK, T0725)
+    assert (("FAULT", "run:orphan-start:0655") in deadman_rows(conn)) is orphan
+
+
+@pytest.mark.parametrize("outcome", ["COMPLETED", "FAULT", "CRASH", "ORDINARY_STOP", "NOOP"])
+def test_a_start_that_gets_its_run_end_is_no_orphan_whatever_the_outcome(conn, outcome):
+    start(conn, T0655)
+    add(conn, "RUN_END", "0655", outcome, utc(2026, 11, 23, 15, 0), revision_ok=1)
+    rl.deadman(conn, BOOK, T0725)
+    assert not [r for r in deadman_rows(conn) if r[1] and r[1].startswith("run:orphan-start")]
+
+
+def test_a_run_end_of_another_trigger_or_from_before_the_start_does_not_close_it(conn):
+    run_end(conn, utc(2026, 11, 23, 14, 50))                                         # 0655, but before the start
+    start(conn, T0655)
+    run_end(conn, utc(2026, 11, 23, 15, 0), trigger="0710")                          # after it, but another trigger
+    rl.deadman(conn, BOOK, T0725)
+    assert ("FAULT", "run:orphan-start:0655") in deadman_rows(conn)
+
+
+def test_each_trigger_that_hangs_has_its_own_orphan_row_and_each_is_written_once(conn):
+    start(conn, T0655, "0655")
+    start(conn, T0655, "MANUAL")
+    start(conn, T0630, "0630")
+    first = rl.deadman_check(conn, BOOK, T0725)
+    again = rl.deadman_check(conn, BOOK, utc(2026, 11, 23, 16, 0))
+    causes = sorted(c for o, c in deadman_rows(conn) if o == "FAULT")
+    assert causes == ["run:orphan-start:0630", "run:orphan-start:0655", "run:orphan-start:manual"]
+    assert len(first) == 4 and again == [] and len(deadman_rows(conn)) == 4          # three orphans and the no-terminal-row
+
+
+def test_an_orphan_and_the_no_terminal_row_check_each_fire_once_over_repeated_checks(conn):
+    start(conn, T0655)
+    for _ in range(3):
+        rl.deadman(conn, BOOK, T0725)
+    assert sorted(deadman_rows(conn)) == [("FAULT", "run:orphan-start:0655"), ("MISSING", "deadman:no-terminal-row")]
+
+
+def test_an_orphan_found_by_a_later_check_is_written_beside_the_day_row_already_there(conn):
+    start(conn, utc(2026, 11, 23, 15, 15))                                           # 10 minutes old at 10:25
+    rl.deadman(conn, BOOK, T0725)
+    assert deadman_rows(conn) == [("MISSING", "deadman:no-terminal-row")]
+    assert rl.deadman(conn, BOOK, utc(2026, 11, 23, 15, 45)) is None                 # the day row is not rewritten
+    assert sorted(deadman_rows(conn)) == [("FAULT", "run:orphan-start:0655"), ("MISSING", "deadman:no-terminal-row")]
+
+
+def test_an_orphan_with_a_real_terminal_row_still_gives_the_p0_but_no_p1(conn):
+    s = FakeSender()
+    start(conn, T0630, "0630")                                                       # hung, but 6:55 ran and ended
+    start(conn, T0655)
+    run_end(conn, utc(2026, 11, 23, 15, 0))
+    rl.deadman(conn, BOOK, T0725)
+    assert sorted(deadman_rows(conn)) == [("FAULT", "run:orphan-start:0630"), ("OK", None)]
+    out = notify(conn, s, T0725)
+    assert [o["severity"] for o in out["due"]] == ["P0"] and len(s.sent) == 1
+    assert day_streak(conn, MON, MON)[1][MON]["reason"] == "fault"
+
+
+def test_the_orphan_p0_is_sent_once_and_never_held_back(conn):
+    s = FakeSender()
+    start(conn, T0655)
+    rl.deadman(conn, BOOK, T0725)
+    assert notify(conn, FakeSender(always=True), T0725)["failed"] >= 1               # a failed send is tried again
+    notify(conn, s, T0725)
+    notify(conn, s, T0725)
+    assert len([t for t in s.sent if t[0].startswith("P0")]) == 1
+
+
+def test_the_orphan_row_is_a_dead_man_fault_of_the_0725_job(conn):
+    start(conn, T0655)
+    rl.deadman(conn, BOOK, T0725)
+    row = [e for e in rl.events_for(conn, MON, BOOK) if e["outcome"] == "FAULT"][0]
+    assert (row["kind"], row["trigger"], row["root_cause"]) == ("DEADMAN", "0725", "run:orphan-start:0655")
+    assert rl.classify(row) == "P0"
+    assert rl.classify({"kind": "DEADMAN", "outcome": "OK", "root_cause": None, "fault_count": 0}) is None
+
+
+def test_an_orphan_is_looked_for_only_today_in_this_book_from_1025_on_a_session_day(conn):
+    start(conn, utc(2026, 11, 20, 14, 55))                                           # Friday's hung start
+    start(conn, T0655, book="another-book")
+    rl.deadman(conn, BOOK, T1024)
+    assert count(conn) == 2                                                          # before 10:25: nothing written
+    rl.deadman(conn, BOOK, T0725)
+    assert [r for r in deadman_rows(conn) if r[0] == "FAULT"] == []
+    start(conn, utc(2026, 11, 28, 14, 55))                                           # a Saturday
+    assert rl.deadman(conn, BOOK, utc(2026, 11, 28, 16, 0)) is None
+    assert deadman_rows(conn, day="2026-11-28") == []
+
+
+def test_cli_deadman_reports_an_orphan_and_exits_one(tmp_path, capsys):
+    cli(["record", "--kind", "RUN_START", "--trigger", "0655", "--outcome", "OK"], tmp_path, now=T0655, capsys=capsys)
+    code, out = cli(["deadman"], tmp_path, now=T0725, capsys=capsys)
+    j = json.loads(out.out)
+    assert code == 1 and j["recorded"] is True and j["outcome"] == "MISSING" and len(j["event_ids"]) == 2
+    assert j["orphans"] == ["run:orphan-start:0655"]
+    code, out = cli(["deadman"], tmp_path, now=T0725, capsys=capsys)
+    assert code == 0 and json.loads(out.out)["recorded"] is False
+
+
+def test_cli_deadman_with_a_terminal_row_and_an_orphan_still_exits_one(tmp_path, capsys):
+    cli(["record", "--kind", "RUN_START", "--trigger", "0630", "--outcome", "OK"], tmp_path, now=T0630, capsys=capsys)
+    cli(["record-run", "--trigger", "0655", "--exit-code", "0", "--revision-ok", "1"], tmp_path, now=T0655, stdin=summary("done"), capsys=capsys)
+    code, out = cli(["deadman"], tmp_path, now=T0725, capsys=capsys)
+    j = json.loads(out.out)
+    assert code == 1 and j["outcome"] == "OK" and j["orphans"] == ["run:orphan-start:0630"]
+
+
+def test_cli_record_run_writes_a_noop_and_exits_zero(tmp_path, capsys):
+    code, out = cli(["record-run", "--trigger", "0710", "--exit-code", "2"], tmp_path, now=T0710, capsys=capsys,
+                    stdin=summary("stopped", "session", reason="another order step is running on this venue's state file"))
+    j = json.loads(out.out)
+    assert code == 0 and (j["outcome"], j["root_cause"]) == ("NOOP", "run:noop:lock-held")
+    c = rl.connect(tmp_path / "cli.sqlite")
+    row = rl.events_for(c, MON, BOOK)[0]
+    c.close()
+    assert (row["kind"], row["outcome"]) == ("RUN_END", "NOOP")
+
+
+def test_cli_a_noop_record_needs_nobody_and_the_notify_after_it_is_quiet(tmp_path, capsys):
+    code, _ = cli(["record", "--kind", "RUN_END", "--trigger", "0710", "--outcome", "NOOP", "--root-cause", "run:noop:lock-held"],
+                  tmp_path, now=T0710, capsys=capsys)
+    assert code == 0
+    code, out = cli(["notify", "--mac"], tmp_path, now=T0710, sender=FakeSender(), capsys=capsys)
+    assert code == 0 and json.loads(out.out)["due"] == []
 
 
 # ------------------------------------------------------------------------------------------------ the command line
