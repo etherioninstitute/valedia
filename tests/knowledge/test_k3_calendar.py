@@ -1408,3 +1408,26 @@ def test_a_revised_fr_document_is_known_at_its_fetch_not_back_at_its_publication
     assert abstract_at("2026-11-05T00:00:00Z") == [None]           # the first version stays PUBLISHED
     assert abstract_at("2026-11-11T00:00:00Z") == [None]           # the edit is not visible before it was fetched
     assert abstract_at("2026-11-12T19:00:00Z") == ["Edited."]
+
+
+@pytest.mark.parametrize("abstract", [
+    "There shall be no National Day of Mourning on December 24, 2025.",
+    "I decline to designate December 24, 2025, as a National Day of Mourning.",
+    "I won't designate December 24, 2025, as a National Day of Mourning.",
+    "I never declared December 24, 2025, as a National Day of Mourning.",
+    "Withdrawing the designation of December 24, 2025, as a National Day of Mourning.",
+    "I hereby designate December 24, 2025, as a National Day of Mourning in the State of Texas.",
+    "In 1963 the President designated November 25, 1963, as a National Day of Mourning.",
+])
+def test_negated_partial_or_historical_mourning_sentences_cast_no_vote(abstract):
+    assert k3.fr_closure_dates("Proclamation text", abstract, "Proclamation") == []
+
+
+def test_a_plain_mourning_designation_still_votes_beside_the_new_void_words():
+    a = "I hereby designate December 24, 2025, as a National Day of Mourning."
+    assert k3.fr_closure_dates("Proclamation text", a, "Proclamation") == ["2025-12-24"]
+
+
+def test_a_nationwide_mourning_designation_with_united_states_still_votes():
+    a = "I hereby declare December 5, 2018, as a National Day of Mourning throughout the United States."
+    assert k3.fr_closure_dates("Proclamation text", a, "Proclamation") == ["2018-12-05"]

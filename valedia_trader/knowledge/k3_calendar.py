@@ -389,7 +389,11 @@ _CLOSING_ANCHORS = (
 _NOT_THE_DAY = re.compile(r"\b(?:through|beginning|begins?|until|died|dies|death|deaths|passed|passing|half-staff|"
                           r"flags?|following|after|since|from|born|anniversary|"
                           r"not|proposed|notice|ending|ends?|only|early|noon|region|area|portion|remembering|"
-                          r"commemorat\w*)\b", re.I)  # lead: negation, partial scope and past dates void the sentence too
+                          r"commemorat\w*|"
+                          r"no|never|none|neither|nor|won't|cannot|decline\w*|withdraw\w*|rescind\w*|revok\w*|cancel\w*|"
+                          r"postpon\w*|in\s+the\s+state\s+of|county|city|in\s+\d{4})\b", re.I)
+# lead: negation, partial scope and past dates void the sentence too (T62 blind check: no/never/decline/withdraw/...,
+# a single state, and "in <year>" history sentences also voided). A voided sentence voids the document: miss, never wrong.
 
 
 def _sentence_dates(sentence: str):
