@@ -586,6 +586,13 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 33 (Carbon response 33, reply 33 sent 2026-11-23): T62 left FR with 0 votes on real mourning days (Proc 9830 +
+  10876: empty FR abstract, undated title; the EOs had been the vote) -> T63 reads raw_text_url body of death
+  proclamations (federalregister.gov only, dates + body_sha256 stored). Carbon's self-void claim WRONG: rule only reads
+  trigger sentences; real bodies give 2018-12-05 / 2025-01-09. Pairing EO+death rejected (Ford died 12-26). Bush FR
+  published 12-06 (late) -> WH feed is the same-day vote. T64: deadman --wait-open (P1 sent, poll 15 s, cap 11 min) +
+  prior-day orphans (7 days, run:orphan-start-prior:<date>:<trigger> P0). No Finnhub 'Mourning' exception. Carbon's
+  progress %s relayed as non-gating estimates. Qs: 11-min job vs launchd; 7-day window.
   Round 32 (Carbon response 32, reply 32 sent 2026-11-23): 7:10 hang after a 6:55 gate SKIP was silent (T60's 20 min
   > 15 min) -> T61: ORPHAN_MINUTES 10 (real runs 1-3 min) + P1 deadman:run-still-open; no order-step timeout, no job move.
   FR closing-agency orders: 15 of 17 since 1998 are Christmas leave with XNYS open (EO 14371 returned 2025-12-24/26) ->
