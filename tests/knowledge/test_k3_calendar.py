@@ -1563,7 +1563,7 @@ def test_a_body_url_on_another_host_is_refused_and_not_requested(conn, url):
     assert payload["closure_dates"] == [] and payload["body_read"] is False
 
 
-def test_a_failed_body_fetch_gives_no_vote_and_error_one(conn):
+def test_a_failed_body_fetch_keeps_only_the_abstracts_own_vote_and_counts_one_error(conn):
     register(conn)
     for i, answer in enumerate((RuntimeError("reset"), b"", b"x" * (k3._MAX_BODY + 1), b"\xff\xfe")):
         number = f"2026-7{i}"
@@ -1572,7 +1572,11 @@ def test_a_failed_body_fetch_gives_no_vote_and_error_one(conn):
         got = k3.refresh(conn, FR, http_get=fake, now=NOW)
         assert got["error"] == 1 and got["stored"] == 1
         payload, _ = fr_payload(conn, number)
-        assert payload["closure_dates"] == [] and payload["body_read"] is False and payload["body_sha256"] is None
+        assert payload["closure_dates"] == ["2026-11-24"] and payload["body_read"] is False and payload["body_sha256"] is None
+    # the two-way check: with an empty abstract, a failed body read leaves no vote at all
+    fake = Fake({FR_URL: fr_body(death_doc("2026-79", abstract=None)), BODY_URL: RuntimeError("reset")})
+    got = k3.refresh(conn, FR, http_get=fake, now=NOW)
+    assert got["error"] == 1 and fr_payload(conn, "2026-79")[0]["closure_dates"] == []
 
 
 def test_the_body_is_read_together_with_the_abstract_and_one_unsure_sentence_voids_all(conn):

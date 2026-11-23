@@ -713,7 +713,7 @@ def _read_death_bodies(facts: list[dict], http_get) -> tuple[list[dict], int]:
     """For each death proclamation among the Federal Register facts, one request for its `raw_text_url` (https on
     www.federalregister.gov only; the same client, user agent and size cap), then the body's mourning sentences are read
     together with the title and abstract. Returns the facts and the number of bodies that could not be read: such a
-    document is stored with no dates (`closure_dates: []`, `body_read: false`), never a guess. Only the body's sha256 is
+    document keeps only the dates its title and abstract give (`body_read: false`), never a guess. Only the body's sha256 is
     kept, never its text. Any other document costs no request."""
     out, errors = [], 0
     headers = {"User-Agent": _UA, "Accept": "text/html, text/plain"}
@@ -735,7 +735,9 @@ def _read_death_bodies(facts: list[dict], http_get) -> tuple[list[dict], int]:
         tail = None if text is None else _scan_text((_plain_text(text),), mourning_only=True)
         if text is None:
             errors += 1
-            payload.update({"closure_dates": [], "body_read": False, "body_sha256": None})
+            keep = [] if head is None or _CHANGE.search(payload["title"] + " " + (payload["abstract"] or "")) else head[0]
+            payload.update({"closure_dates": sorted(set(keep)), "body_read": False, "body_sha256": None})  # lead: an
+            # unreadable body costs only the body's vote; a vote the title or abstract casts by itself is kept
         else:
             unsure = head is None or tail is None or _CHANGE.search(payload["title"] + " " + (payload["abstract"] or ""))
             payload.update({"closure_dates": [] if unsure else sorted(set(head[0]) | set(tail[0])),
