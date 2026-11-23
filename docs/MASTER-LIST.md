@@ -442,6 +442,15 @@ Queued (roadmap):
   a doctor check prints each DB's journal/sync/busy settings, no order-path pragma change before go-live; Rust
   (PyO3) only for a hot loop > 60 s replay or > 5 ms per tick, with a parity test (Kalshi queue simulator first,
   after 12-03).
+  Round 23: 12-03 limit is the collector's phase on this Mac, not Kalshi's budget. Adopted: a phase-aware
+  historical puller (sends only at seconds 32-55, <= 1/s, one connection, 2-minute guard trial, stops on a >= 2 s
+  decision slip); CPI Stage 0, Dominance Stage 0 pulls and Candidate C's tape move BEFORE 12-03. Still tied to
+  12-03: the elephant-1 forward score and the Stage B L2 replay (scripts dry-run now on shuffled outcomes, weight 0).
+  Seal epochs: SEAL_EPOCH_1 = 2025-01-01..2026-12-31, VAULT_EPOCH_2 = 2027+ (blocked from develop and seal), rotate
+  2029-01-01; append-only seal_ledger (hypothesis 26 = row 1), stage-2 hurdle z_seal >= q0.80(max Z) over R_seal,
+  cap 10 unseals per market per epoch, alongside the prediction's own terms. LEAK FOUND: a failed seal writes its
+  regime and check figures as a lesson (gauntlet.py:785-787), searchable by research -> lesson becomes
+  SEAL_FAIL (K_seal = n) only; Epoch-0 lists past failed-seal lessons and flags hypotheses developed after them.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
