@@ -535,6 +535,20 @@ Queued (roadmap):
   sources, cadence, change detection, one as-of store, text-to-rule checks and build order.
   Owner 2026-11-23: one FULL Reply 27 instead (live path first, then pulls, holidays, knowledge feeds); it supersedes the
   first reply 27 and the addendum. Round 28 questions in order: alert ranking, unscheduled closures, knowledge-feed build.
+  Round 28 (reply 28): SRPT pull order adopted (CPI -> Cand C stage 1 -> min/max(Dominance, Cand C stage 2)).
+  CANDIDATE C AMENDMENT (pre-data, not a trial; locks after Carbon's round 29 referee read): entry = passive NO buy at
+  1-p, p in [0.03,0.12] on the YES ASK, only while yes_bid < p (reply 26's YES-bid line was WRONG); stage 1 passes a
+  market if any hourly YES-ask candle in 2-14 d overlaps the band (low <= 0.12, high >= 0.03); event cap (<= 6 per
+  series-quarter) applied before stage 1, market cap after; drop markets the venue marks halted/stayed at t0.
+  ALERTS adopted: one alert_incidents table, P0 fault / P1 dead-man / P2 skip (dedup by root cause; one quiet
+  follow-up when a warned skip happens) / P3 log. CLOSURES: calendar-open + >= 2 non-broker authorities (Finnhub
+  market-status/holiday local, Federal Register proclamation, the exchange's own notice) = ordinary stop (pause);
+  else with Webull failing = fault (reset); check at 6:20 AM. K-FEEDS: Carbon's source list adopted as a start (each
+  terms-read + one measured request; Vaquill unverified; no AGPL/GPL in valedia_trader); bitemporal schema adopted
+  with known_at = proven publication time else fetch time (Carbon's MAX formula would blind every backtest); rule
+  diffs compile to tested rule modules; tax: wash-sale fence across both books, lot periods, DBC K-1, 3-regime event
+  contract shadow ledger (165(d) 90% cap to confirm from statute). Build: K-7 -> K-3/K-4 -> K-1/K-2 (after 12-03) ->
+  K-5/K-6; tax ledger before 12-31 only if a real order happens in 2026.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
