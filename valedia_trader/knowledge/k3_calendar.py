@@ -371,7 +371,9 @@ _ANCHORS = (
 )
 # Words that make a date in a trigger sentence something else: a span, a start, a death, a flag order.
 _NOT_THE_DAY = re.compile(r"\b(?:through|beginning|begins?|until|died|dies|death|deaths|passed|passing|half-staff|"
-                          r"flags?|following|after|since|from|born|anniversary)\b", re.I)
+                          r"flags?|following|after|since|from|born|anniversary|"
+                          r"not|proposed|notice|ending|ends?|only|early|noon|region|area|portion|remembering|"
+                          r"commemorat\w*)\b", re.I)  # lead: negation, partial scope and past dates void the sentence too
 
 
 def _sentence_dates(sentence: str):
