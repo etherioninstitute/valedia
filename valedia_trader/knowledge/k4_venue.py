@@ -14,11 +14,14 @@ with its terms address and licence tag UNSET (`None`): the owner fills them in a
 
 Facts (all in the domain K4_VENUE):
 - A change-log entry: key `<source_id>:<YYYY-MM-DD or TBD>:<16 hex of the sha256 of the lower-cased, normalized
-  title>`; payload `title, date, summary (plain text, at most 2,000 characters), link, scheduled`.
-  An entry dated before the fetch's New York date is PUBLISHED: known at the end of its New York day
+  title>:<n>` (n counts entries with the same date and title in feed order, from 1); payload `title, date, summary
+  (plain text, at most 2,000 characters), link, scheduled`.
+  The FIRST version of an entry dated before the fetch's New York date is PUBLISHED: known at the end of its New York day
   (`k3_calendar.date_only_known_at`). An entry dated on the fetch's own New York day cannot be proven yet (that day has
   not ended), so it is known when fetched, with `scheduled` false. An entry dated later, marked TBD, or with no date is
-  `scheduled` true and known when fetched: a plan is not a publication.
+  `scheduled` true and known when fetched: a plan is not a publication. Any LATER version of an entry (an edit, or a
+  plan that has come due) is known when fetched, never at the end of the entry's old day: a read made between that day
+  and the fetch must still show the old text.
 - A document: key `<source_id>:DOC`; payload `text_sha256, length, excerpt` (the first 500 characters of the normalized
   text, never the page). Always known when fetched. A new `text_sha256` is a new version.
 - A rule-diff flag: key `PENDING_RULE_DIFF:<entity key>`; payload `entity_key, old_fact_version_id (or null),
@@ -30,8 +33,10 @@ Facts (all in the domain K4_VENUE):
   history of a change log is one thing to read, not one flag per old entry. After it, each new or changed entry opens its
   own flag. A read that stopped after storing entries but before the baseline flag is repaired by the next read: one
   baseline flag and no per-entry flags. A DOCUMENT source needs no baseline: its first version opens its own flag.
-  `close_rule_diff` writes a later version with status CLOSED and the `rule_module`. `pending_rule_diffs` lists the open
-  ones as of a time.
+- A version that differs from the one before it only in `scheduled` (the text is the same and the entry has come due) is
+  stored but opens no flag. Any change of text opens one.
+- `close_rule_diff` writes a later version of a flag with status CLOSED and the `rule_module`. `pending_rule_diffs` lists
+  the open ones as of a time.
 
 Normalization (`normalize_text`): tags, scripts, styles, `<head>` (meta tags, build ids, nonces) and comments are
 dropped, entities are decoded and white space is collapsed. So a page that changes only in a script nonce hashes the
@@ -47,7 +52,7 @@ import json
 import re
 import sys
 from xml.etree import ElementTree
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
@@ -183,8 +188,6 @@ class _Collector(HTMLParser):
         self.events: list[tuple[str, str]] = []
 
     def handle_starttag(self, tag, attrs):
-        if tag == "body":
-            self._depth = 0                  # an unclosed <head> must not swallow the page
         if tag in self._skip:
             self._depth += 1
         elif not self._depth:
@@ -195,6 +198,11 @@ class _Collector(HTMLParser):
             self._depth = max(0, self._depth - 1)
         elif not self._depth:
             self.events.append(("end", tag))
+
+    def unclosed(self) -> bool:
+        """True when a skipped element (script, style, head, ...) was opened and never closed: its text would have
+        swallowed the rest of the page."""
+        return self._depth > 0
 
     def handle_data(self, data):
         if self._depth:
@@ -214,6 +222,8 @@ def _events(markup: str, skip) -> list[tuple[str, str]]:
         parser.close()
     except Exception:
         raise K4Error("markup: could not be read") from None
+    if parser.unclosed():
+        raise K4Error("markup: a script, style, head or similar element never closes")
     return parser.events
 
 
@@ -271,19 +281,22 @@ def _title_hash(title: str) -> str:
 
 
 def _entry_facts(source_id: str, entries: list[dict], fetched: str) -> list[dict]:
-    """Facts for parsed entries (`title`, `day` (a date or None), `summary`, `link`). A repeat of the same entry is one
-    fact; two different entries with one key refuse the whole body."""
+    """Facts for parsed entries (`title`, `day` (a date or None), `summary`, `link`). Entries with the same date and the
+    same title are numbered in feed order (`:1`, `:2`, ...) and are separate entities."""
     if not entries:
         raise K4Error(f"{source_id}: the body holds no entries (a change log is never empty, so this is a broken page)")
     today = _ny_date_of(fetched)
-    facts: dict[str, dict] = {}
+    facts: list[dict] = []
+    seen: dict[tuple, int] = {}
     for e in entries:
         day = e["day"]
         iso = day.isoformat() if day is not None else None
         scheduled = day is None or day > today
         payload = {"title": e["title"], "date": iso, "summary": e["summary"][:_SUMMARY_MAX], "link": e["link"],
                    "scheduled": scheduled}
-        key = f"{source_id}:{iso or 'TBD'}:{_title_hash(e['title'])}"
+        group = (iso or "TBD", _title_hash(e["title"]))
+        seen[group] = seen.get(group, 0) + 1
+        key = f"{source_id}:{group[0]}:{group[1]}:{seen[group]}"
         if scheduled:
             fact = _fact(source_id, key, payload, effective_from=_day_start(day) if day else fetched, fetched=fetched)
         else:
@@ -291,10 +304,8 @@ def _entry_facts(source_id: str, entries: list[dict], fetched: str) -> list[dict
             proven = stamp <= fetched           # today's entry: the day has not ended, so it is known when fetched
             fact = _fact(source_id, key, payload, effective_from=_day_start(day), fetched=fetched,
                          published=stamp if proven else None, proven=proven)
-        if key in facts and facts[key]["raw_sha256"] != fact["raw_sha256"]:
-            raise K4Error(f"{source_id}: two different entries share one key {key[:80]!r}")
-        facts[key] = fact
-    return list(facts.values())
+        facts.append(fact)
+    return facts
 
 
 def _check_year(day: date, what: str) -> date:
@@ -507,6 +518,30 @@ def _diff_payload(row: dict) -> dict:
     return p
 
 
+def _only_scheduled_differs(conn, source_id: str, key: str, fetched: str) -> bool:
+    """True when the current version of an entry and the one before it are the same but for `scheduled`."""
+    def at(moment):
+        return [r for r in store.facts_as_of(conn, moment, domain=_DOMAIN, entity_key=key) if r["source_id"] == source_id]
+
+    now_rows = at(fetched)
+    if not now_rows:
+        return False
+    known = datetime.strptime(now_rows[0]["known_at_utc"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+    prev_rows = at(_fmt(known - timedelta(microseconds=1)))
+    if not prev_rows:
+        return False
+
+    def text_of(row):
+        try:
+            body = json.loads(row["payload_json"])
+        except ValueError:
+            return None
+        return None if not isinstance(body, dict) else {k: v for k, v in body.items() if k != "scheduled"}
+
+    mine, theirs = text_of(now_rows[0]), text_of(prev_rows[0])
+    return mine is not None and mine == theirs and now_rows[0]["raw_sha256"] != prev_rows[0]["raw_sha256"]
+
+
 def _store_facts(conn, source_id: str, facts: list[dict]) -> dict:
     """Store parsed facts, and open a rule diff for each new version. Counts: stored (a new version), unchanged (the
     same read again), error, diffs_opened."""
@@ -521,9 +556,10 @@ def _store_facts(conn, source_id: str, facts: list[dict]) -> dict:
         if row["entity_key"].startswith(_DIFF_PREFIX):
             flags[row["entity_key"][len(_DIFF_PREFIX):]] = _diff_payload(row)
         else:
-            before[row["entity_key"]] = row["fact_version_id"]
+            before[row["entity_key"]] = row
     detail = None
-    baseline = SOURCES[source_id]["role"] == "CHANGELOG" and not flags     # a change log with no flag of its own yet
+    changelog = SOURCES[source_id]["role"] == "CHANGELOG"
+    baseline = changelog and not flags     # a change log with no flag of its own yet
     versions = []
     covered = (flags.get(f"{source_id}:BASELINE") or {}).get("new_fact_version_id", 0)
 
@@ -534,12 +570,15 @@ def _store_facts(conn, source_id: str, facts: list[dict]) -> dict:
 
     for f in facts:
         key = f["entity_key"]
+        old_row = before.get(key)
+        if f["published_proven"] and old_row is not None:
+            f = dict(f, published_at_utc=None, published_proven=False)    # only the FIRST version may be back-dated
         try:
             version = store.add_fact(conn, **f)
         except store.StoreError as exc:
             fail(exc)
             continue
-        changed = before.get(key) != version
+        changed = old_row is None or old_row["fact_version_id"] != version
         counts["stored" if changed else "unchanged"] += 1
         versions.append(version)
         if baseline:
@@ -549,7 +588,9 @@ def _store_facts(conn, source_id: str, facts: list[dict]) -> dict:
             continue                                  # a flag already points at this version
         if flag is None and version <= covered:
             continue                                  # the baseline flag covers every entry of the first read
-        old = flag["new_fact_version_id"] if flag is not None else (before.get(key) if changed else None)
+        if changelog and old_row is not None and _only_scheduled_differs(conn, source_id, key, fetched):
+            continue                                  # the plan came due; the text is the same
+        old = flag["new_fact_version_id"] if flag is not None else (old_row["fact_version_id"] if changed and old_row is not None else None)
         body = {"entity_key": key, "old_fact_version_id": old, "new_fact_version_id": version, "status": "OPEN"}
         try:
             store.add_fact(conn, **_fact(source_id, _DIFF_PREFIX + key, body, effective_from=fetched, fetched=fetched))

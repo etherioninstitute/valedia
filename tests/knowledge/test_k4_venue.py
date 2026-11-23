@@ -127,8 +127,8 @@ FEED = rss(
     rss_item(F_TITLE, None, "No date at all."))
 
 
-def key(source, day, title):
-    return f"{source}:{day}:{h16(title)}"
+def key(source, day, title, n=1):
+    return f"{source}:{day}:{h16(title)}:{n}"
 
 
 WEBULL = """<!doctype html><html><head><title>Changelog</title><script>var build="b-1";</script></head><body>
@@ -228,8 +228,42 @@ def test_normalization_keeps_words_of_two_blocks_apart():
     assert k4.normalize_text("<li>a</li><li>b</li>") == "a b"
 
 
-def test_an_unclosed_head_does_not_swallow_the_body():
-    assert k4.normalize_text("<head><title>x</title><body><p>kept</p></body>") == "kept"
+UNCLOSED = {
+    "script": "<p>before</p><script>var a = 1;<p>after the script</p>",
+    "style": "<p>before</p><style>.a{}<p>after the style</p>",
+    "head": "<html><head><title>x</title><body><p>after the head</p></body></html>",
+    "noscript": "<p>before</p><noscript><p>after</p>",
+    "template": "<template><p>after</p>",
+}
+CLOSED = {
+    "script": "<p>before</p><script>var a = 1;</script><p>after the script</p>",
+    "style": "<p>before</p><style>.a{}</style><p>after the style</p>",
+    "head": "<html><head><title>x</title></head><body><p>after the head</p></body></html>",
+    "noscript": "<p>before</p><noscript>x</noscript><p>after</p>",
+    "template": "<template><p>x</p></template><p>after</p>",
+}
+
+
+@pytest.mark.parametrize("name", sorted(UNCLOSED))
+def test_an_unclosed_script_style_or_head_refuses_the_body_whole(name):
+    with pytest.raises(k4.K4Error, match="never closes"):
+        k4.normalize_text(UNCLOSED[name])
+    with pytest.raises(k4.K4Error, match="never closes"):
+        k4.parse_document(UNCLOSED[name].encode(), source_id=FEE, fetched_at_utc=NOW_S)
+    with pytest.raises(k4.K4Error, match="never closes"):
+        k4.parse_webull_changelog(("<h2>2026-11-18 Title</h2>" + UNCLOSED[name]).encode(), fetched_at_utc=NOW_S)
+
+
+@pytest.mark.parametrize("name", sorted(CLOSED))
+def test_a_closed_script_style_or_head_keeps_the_text_after_it(name):
+    text = k4.normalize_text(CLOSED[name])
+    assert text.endswith("after") or text.endswith(f"after the {name}") or "after" in text
+    assert "var a" not in text and ".a{}" not in text
+
+
+def test_an_unclosed_element_in_a_stored_refresh_stores_nothing(reg):
+    got = refresh_doc(reg, FEE, UNCLOSED["script"].encode())
+    assert got["error"] == 1 and got["stored"] == 0 and n_rows(reg) == 0
 
 
 def test_two_pages_that_differ_only_in_a_script_nonce_normalize_and_hash_the_same():
@@ -402,7 +436,7 @@ def test_the_fetch_day_is_the_new_york_day_not_the_utc_day():
 
 def test_the_entity_key_is_source_date_and_16_hex_of_the_normalized_title():
     k = list(parsed(rss(rss_item("  Mixed   CASE  <b>title</b> ", "Mon, 09 Nov 2026 15:00:00 GMT"))))[0]
-    assert k == f"{KR}:2026-11-09:" + hashlib.sha256(b"mixed case title").hexdigest()[:16]
+    assert k == f"{KR}:2026-11-09:" + hashlib.sha256(b"mixed case title").hexdigest()[:16] + ":1"
     other = list(parsed(rss(rss_item("mixed case title", "Mon, 09 Nov 2026 15:00:00 GMT"))))[0]
     assert other == k
     different = list(parsed(rss(rss_item("Another title", "Mon, 09 Nov 2026 15:00:00 GMT"))))[0]
@@ -415,12 +449,36 @@ def test_an_item_with_no_description_or_link_is_fine():
     assert p["summary"] == "" and p["link"] is None
 
 
-def test_the_same_item_twice_is_one_fact_but_two_different_items_with_one_key_refuse_the_body():
-    twice = rss(rss_item("Same"), rss_item("Same"))
-    assert len(parsed(twice)) == 1
-    with pytest.raises(k4.K4Error, match="share one key"):
-        parsed(rss(rss_item("Same", desc="one"), rss_item("Same", desc="two")))
-    assert len(parsed(rss(rss_item("Same", "Mon, 09 Nov 2026 15:00:00 GMT"), rss_item("Same", "Tue, 10 Nov 2026 15:00:00 GMT")))) == 2
+def test_repeats_of_one_date_and_title_are_numbered_in_feed_order_and_all_kept():
+    feed = rss(rss_item("Updates", desc="first"), rss_item("Other"), rss_item("Updates", desc="second"),
+               rss_item("Updates", desc="third"), rss_item("Updates", "Tue, 10 Nov 2026 15:00:00 GMT", desc="next day"))
+    facts = parsed(feed)
+    assert len(facts) == 5
+    assert [json.loads(facts[key(KR, "2026-11-09", "Updates", n)]["payload_json"])["summary"] for n in (1, 2, 3)] == \
+        ["first", "second", "third"]
+    assert key(KR, "2026-11-09", "Other") in facts and key(KR, "2026-11-10", "Updates", 1) in facts
+    assert key(KR, "2026-11-10", "Updates", 2) not in facts
+    assert [k.rsplit(":", 1)[1] for k in parsed(rss(rss_item("Single")))] == ["1"]            # one item: :1
+    twice = parsed(rss(rss_item("Same"), rss_item("Same")))                                     # even identical repeats
+    assert sorted(twice) == [key(KR, "2026-11-09", "Same", 1), key(KR, "2026-11-09", "Same", 2)]
+
+
+def test_two_updates_items_on_one_day_are_both_stored_and_a_re_read_stores_nothing(reg):
+    feed = rss(rss_item("Updates", desc="morning"), rss_item("Updates", desc="evening"))
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: feed}), now=NOW)
+    assert got == {"stored": 2, "unchanged": 0, "error": 0, "diffs_opened": 1}
+    rows = current(reg)
+    assert payload(rows[key(KR, "2026-11-09", "Updates", 1)])["summary"] == "morning"
+    assert payload(rows[key(KR, "2026-11-09", "Updates", 2)])["summary"] == "evening"
+    before = n_rows(reg)
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: feed}), now=at(24))
+    assert got == {"stored": 0, "unchanged": 2, "error": 0, "diffs_opened": 0} and n_rows(reg) == before
+
+
+def test_webull_repeats_are_numbered_too():
+    page_html = "<h2>2026-11-18 Updates</h2><p>one</p><h2>2026-11-18 Updates</h2><p>two</p>"
+    facts = wb(page_html)
+    assert sorted(facts) == [key(WB, "2026-11-18", "Updates", 1), key(WB, "2026-11-18", "Updates", 2)]
 
 
 GOOD = rss_item("Good one")
@@ -713,21 +771,83 @@ def test_a_changed_summary_is_a_new_version_with_a_second_flag_that_points_back(
     assert payload(current(reg)[key(KR, "2026-11-09", "Edited")])["summary"] == "second"
 
 
-def test_a_planned_entry_that_comes_due_is_a_new_published_version(reg):
+def test_a_planned_entry_that_comes_due_is_a_new_version_known_when_fetched_with_no_new_diff(reg):
     plan = rss(rss_item("Plan", "Wed, 25 Nov 2026 15:00:00 GMT", "soon"))
     k4.refresh(reg, KR, http_get=Fake({KR_URL: plan}), now=NOW)
     settle(reg, KR)
     k = key(KR, "2026-11-25", "Plan")
     assert payload(current(reg)[k])["scheduled"] is True
     got = k4.refresh(reg, KR, http_get=Fake({KR_URL: plan}), now=at(27))
+    assert got == {"stored": 1, "unchanged": 0, "error": 0, "diffs_opened": 0}          # V3: the flip alone opens nothing
+    assert k4.pending_rule_diffs(reg, FAR) == []
+    row = current(reg)[k]
+    assert payload(row)["scheduled"] is False
+    assert row["known_at_basis"] == "FETCHED" and row["known_at_utc"] == stamp(at(27)) and row["published_at_utc"] is None
+    # V1: as of the 26th (after its day) it is still the plan; only the fetch of the 27th shows it as due
+    assert payload(current(reg, "2026-11-26T05:00:00Z")[k])["scheduled"] is True
+    assert payload(current(reg, stamp(at(27)))[k])["scheduled"] is False
+    # and the unchanged read afterwards opens nothing either (the flip is not mistaken for an interrupted run)
+    assert k4.refresh(reg, KR, http_get=Fake({KR_URL: plan}), now=at(28))["diffs_opened"] == 0
+    assert k4.pending_rule_diffs(reg, FAR) == []
+
+
+def test_a_text_change_after_a_flip_still_opens_a_diff_and_a_flip_with_a_text_change_too(reg):
+    plan = rss(rss_item("Plan", "Wed, 25 Nov 2026 15:00:00 GMT", "soon"))
+    k4.refresh(reg, KR, http_get=Fake({KR_URL: plan}), now=NOW)
+    settle(reg, KR)
+    k4.refresh(reg, KR, http_get=Fake({KR_URL: plan}), now=at(27))                       # the flip: no diff
+    edited = rss(rss_item("Plan", "Wed, 25 Nov 2026 15:00:00 GMT", "soon, with a change"))
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: edited}), now=at(28))
     assert got["stored"] == 1 and got["diffs_opened"] == 1
-    assert payload(current(reg)[k])["scheduled"] is False
-    assert current(reg)[k]["known_at_basis"] == "PUBLISHED" and current(reg)[k]["known_at_utc"] == "2026-11-26T04:59:59.999999Z"
-    # as of the 24th it was a plan; as of the 26th, after its day, it is a publication
-    assert payload(current(reg, "2026-11-24T00:00:00Z")[k])["scheduled"] is True
-    assert payload(current(reg, "2026-11-26T05:00:00Z")[k])["scheduled"] is False
     (d,) = k4.pending_rule_diffs(reg, FAR)
-    assert d["old_fact_version_id"] != d["new_fact_version_id"] and d["old_fact_version_id"] is not None
+    assert d["entity_key"] == key(KR, "2026-11-25", "Plan") and d["opened_at_utc"] == stamp(at(28))
+    # a plan whose text changes in the same read that it comes due also opens one
+    other = rss(rss_item("Other", "Wed, 25 Nov 2026 15:00:00 GMT", "a"))
+    k4.refresh(reg, KR, http_get=Fake({KR_URL: other}), now=at(23, 19))
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: rss(rss_item("Other", "Wed, 25 Nov 2026 15:00:00 GMT", "b"))}), now=at(27, 19))
+    assert got["stored"] == 1 and got["diffs_opened"] == 1
+
+
+def test_an_interrupted_text_change_of_a_change_log_entry_is_still_repaired(reg):
+    k4.refresh(reg, KR, http_get=Fake({KR_URL: rss(rss_item("Edited", desc="first"))}), now=NOW)
+    settle(reg, KR)
+    (fact,) = k4.fetch(KR, http_get=Fake({KR_URL: rss(rss_item("Edited", desc="second"))}), now=at(24))
+    add_fact(reg, **dict(fact, published_at_utc=None, published_proven=False))          # stored, its flag never written
+    assert k4.pending_rule_diffs(reg, FAR) == []
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: rss(rss_item("Edited", desc="second"))}), now=at(25))
+    assert got == {"stored": 0, "unchanged": 1, "error": 0, "diffs_opened": 1}
+
+
+def test_an_edited_entry_is_known_when_fetched_not_at_the_end_of_its_old_day(reg):
+    def feed(summary):
+        return rss(rss_item("Entry A", "Sun, 01 Nov 2026 15:00:00 GMT", "a"),
+                   rss_item("Entry B", "Mon, 02 Nov 2026 15:00:00 GMT", summary))
+    k = key(KR, "2026-11-02", "Entry B")
+    k4.refresh(reg, KR, http_get=Fake({KR_URL: feed("two")}), now=datetime(2026, 11, 10, 18, 0, tzinfo=timezone.utc))
+    first = current(reg)[k]
+    assert first["known_at_basis"] == "PUBLISHED" and first["known_at_utc"] == "2026-11-03T04:59:59.999999Z"
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: feed("two CHANGED")}),
+                     now=datetime(2026, 11, 12, 18, 0, tzinfo=timezone.utc))
+    assert got["stored"] == 1 and got["diffs_opened"] == 1
+    edited = current(reg)[k]
+    assert edited["known_at_basis"] == "FETCHED" and edited["published_at_utc"] is None
+    assert edited["known_at_utc"] == "2026-11-12T18:00:00.000000Z"
+    for as_of in ("2026-11-03T05:00:00Z", "2026-11-11T12:00:00Z", "2026-11-12T17:59:59Z"):
+        assert payload(current(reg, as_of)[k])["summary"] == "two", as_of            # the old text, not the edit
+    assert payload(current(reg, "2026-11-12T18:00:00Z")[k])["summary"] == "two CHANGED"
+    assert payload(current(reg, "2026-11-12T19:00:00Z")[k])["summary"] == "two CHANGED"
+
+
+def test_only_the_first_version_of_an_entry_may_be_published_at_its_date(reg):
+    # a re-read of the same text keeps the first version as it was; a first sight of a new entry is still PUBLISHED
+    feed = rss(rss_item("Entry A", "Sun, 01 Nov 2026 15:00:00 GMT", "a"))
+    k4.refresh(reg, KR, http_get=Fake({KR_URL: feed}), now=NOW)
+    k4.refresh(reg, KR, http_get=Fake({KR_URL: feed}), now=at(24))
+    row = current(reg)[key(KR, "2026-11-01", "Entry A")]
+    assert row["known_at_basis"] == "PUBLISHED" and row["known_at_utc"] == "2026-11-02T04:59:59.999999Z"
+    k4.refresh(reg, KR, http_get=Fake({KR_URL: rss(rss_item("Entry A", "Sun, 01 Nov 2026 15:00:00 GMT", "a"),
+                                                    rss_item("Entry N", "Mon, 02 Nov 2026 15:00:00 GMT", "n"))}), now=at(25))
+    assert current(reg)[key(KR, "2026-11-02", "Entry N")]["known_at_basis"] == "PUBLISHED"
 
 
 def test_a_refused_body_stores_nothing_even_when_the_first_items_were_good(reg):
