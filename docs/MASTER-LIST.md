@@ -427,6 +427,13 @@ Queued (roadmap):
   m in {5,8,12,20} (measured 4.8% / 4.2% / 3.7% / 3.4%). Shared book: a sale's proceeds settle in her book only
   after its settlement date counted in XNYS sessions that are also settlement days (not Columbus/Veterans Day);
   new rehearsal case: a sale the session before Veterans Day is not spendable on it.
+  Round 21: non-settlement predicate = Columbus Day or Veterans Day as observed by the Fed (weekday Nov 11, or Mon
+  Nov 12 when Nov 11 is a Sunday; a Saturday holiday moves nothing); tests 2026-11-10, 2029-11-09, 2023-11-09.
+  Rule 2 is inception-aware when some earlier n_k > 1.25*n_win: data-bound start with warmup <= max(declared, 260),
+  run_end(win) >= every earlier run_end, n_win >= 10 years, rule 3 unchanged. record_attempt gains run_start,
+  run_end, universe, alignment and sealed_fraction (INSERT-only); legacy rows are rebuilt from spec plus the price
+  store as of recorded_at and must reproduce n_obs exactly, else HOLD_FOR_OWNER_AUDIT; sealed_fraction joins the
+  run signature.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
