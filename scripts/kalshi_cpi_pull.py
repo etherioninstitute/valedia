@@ -2,14 +2,14 @@
 """Pull Kalshi's settled CPI markets and their candles near each release into one sqlite store (read only, no key).
 
     python scripts/kalshi_cpi_pull.py --store PATH [--series KXCPI CPI KXCPIYOY CPIYOY]
-        [--ref-start 2021-12-01 --ref-end 2024-11-30] [--limit-events N] [--listings-only] [--refresh] [--collector-db PATH]
+        [--ref-start 2021-12-01 --ref-end 2024-11-30] [--limit-events N] [--listings-only] [--refresh] [--collector-db PATH] [--sent-mark PATH]
 
 Ticker months are not a safe calendar: Kalshi's tickers up to CPI-22MAR name the RELEASE month, later ones the BLS
 reference month. So each series is listed once over a wide ticker-month range, and the releases pulled are chosen by
 each market's own release date (`release_date`, US-Eastern), never past SEAL_CEILING. Candles are asked for the
 "above k" strikes only (`is_greater`), for 10:00-14:00 US-Eastern on each of the 1st to 6th weekdays before the
 release (`cpi_moments`, `before=4 h`). Plain GETs
-at the quiet-minute pace of `kalshi_data`; nothing is written except the --store file. One JSON line per series, then
+at the quiet-minute pace of `kalshi_data`; nothing is written except the --store file and the --sent-mark file's mtime. One JSON line per series, then
 one of totals.
 """
 from __future__ import annotations
@@ -41,10 +41,26 @@ def _log_closed(reason: str) -> None:
     print(time.strftime("%H:%M:%S %Z", time.localtime()) + " pull held, " + reason, file=sys.stderr, flush=True)
 
 
-def build_client(collector_db=DEFAULT_COLLECTOR_DB) -> kh.HistoryClient:
+DEFAULT_SENT_MARK = Path.home() / "valedia-data" / "kalshi" / "kalshi_pull.sent"
+
+
+class SentMark:
+    """Wraps a pacer: each time it lets a request go, the mark file's mtime is set to now. The lead's guard reads
+    that mtime to tell a pull that is sending from one that is held (a held pull puts no load on the collector)."""
+
+    def __init__(self, inner, path):
+        self.inner, self.path = inner, Path(path)
+
+    def wait(self) -> None:
+        self.inner.wait()
+        self.path.touch()
+
+
+def build_client(collector_db=DEFAULT_COLLECTOR_DB, sent_mark=DEFAULT_SENT_MARK) -> kh.HistoryClient:
     """The client of a real run (tests replace this function). Requests start only in the quiet seconds of a
-    minute AND only while the live collector's database says it is idle; there is no way to turn the gate off."""
-    pacer = cg.GatedPacer(kd.quiet_pacer(), cg.CollectorGate(collector_db), log=_log_closed)
+    minute AND only while the live collector's database says it is idle; there is no way to turn the gate off.
+    Each request that goes touches `sent_mark`."""
+    pacer = SentMark(cg.GatedPacer(kd.quiet_pacer(), cg.CollectorGate(collector_db), log=_log_closed), sent_mark)
     return kh.HistoryClient(fetch=kd.quiet_fetch, pacer=pacer)
 
 
@@ -79,6 +95,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--release-end", type=_date, default=SEAL_CEILING, help="capped at SEAL_CEILING")
     p.add_argument("--limit-events", type=int, default=None, help="pilot: candles for the first N events only")
     p.add_argument("--listings-only", action="store_true", help="list markets, fetch no candles")
+    p.add_argument("--sent-mark", type=Path, default=DEFAULT_SENT_MARK,
+                   help="touched at each request that goes (read by the lead's guard)")
     p.add_argument("--collector-db", type=Path, default=DEFAULT_COLLECTOR_DB,
                    help="the live collector's sqlite file, read only; requests are sent only while it is idle")
     p.add_argument("--refresh", action="store_true", help="list again even where a listing is stored")
@@ -124,7 +142,7 @@ def pull_series(client, store, series: str, args, cutoff_of) -> dict:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    client = build_client(args.collector_db)
+    client = build_client(args.collector_db, args.sent_mark)
     store = kh.HistoryStore(args.store)
     cache: list[float] = []
 

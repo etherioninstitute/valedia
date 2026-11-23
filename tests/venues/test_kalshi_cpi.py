@@ -239,7 +239,7 @@ def run(pull, monkeypatch, tmp_path, capsys, argv, transport=None):
     t = transport or FakeTransport(MARKETS)
     clients = []
 
-    def build(collector_db=None):
+    def build(collector_db=None, sent_mark=None):
         clients.append(client_for(t))
         return clients[-1]
 
@@ -336,8 +336,9 @@ def test_script_handles_each_default_series_and_totals(pull, monkeypatch, tmp_pa
 def test_build_client_is_quiet_and_keyless(pull):
     from valedia_trader.venues import collector_gate as cg
     c = pull.build_client("/nonexistent/collector.sqlite")        # never read here: no wait() is called
-    assert c.fetch is kd.quiet_fetch and isinstance(c.pacer, cg.GatedPacer)
-    assert isinstance(c.pacer.inner, kd.PhasePacer) and isinstance(c.pacer.gate, cg.CollectorGate)
+    g = c.pacer.inner                                              # SentMark wraps the gated pacer
+    assert c.fetch is kd.quiet_fetch and isinstance(c.pacer, pull.SentMark) and isinstance(g, cg.GatedPacer)
+    assert isinstance(g.inner, kd.PhasePacer) and isinstance(g.gate, cg.CollectorGate)
     assert c.requests == 0
 
 
@@ -372,3 +373,26 @@ def test_script_selects_releases_by_release_date_not_ticker_month(pull, monkeypa
     s = lines[0]
     assert (s["markets"], s["greater"], s["releases"], s["sealed"]) == (1, 1, 1, 1)
     assert all("CPI-22JAN" in u for u in t.paths("/candlesticks"))
+
+
+def test_sent_mark_is_touched_only_when_the_inner_pacer_lets_a_request_go(pull, tmp_path):
+    mark = tmp_path / "x.sent"
+    calls = []
+
+    class Inner:
+        def wait(self):
+            calls.append(mark.exists())
+
+    m = pull.SentMark(Inner(), mark)
+    m.wait()
+    assert calls == [False] and mark.exists()      # touched after the inner wait returned, not before
+    import os
+    os.utime(mark, (1, 1))
+    m.wait()
+    assert mark.stat().st_mtime > 1
+
+
+def test_build_client_marks_sends(pull, tmp_path):
+    c = pull.build_client("/nonexistent/collector.sqlite", tmp_path / "m.sent")
+    assert isinstance(c.pacer, pull.SentMark) and c.pacer.path == tmp_path / "m.sent"
+    assert not (tmp_path / "m.sent").exists()      # nothing is touched until a request goes
