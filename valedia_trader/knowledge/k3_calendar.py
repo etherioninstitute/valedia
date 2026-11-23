@@ -709,7 +709,22 @@ def _body_url_ok(url) -> bool:
     return parts.scheme == "https" and parts.netloc == _FR_BODY_HOST
 
 
-def _read_death_bodies(facts: list[dict], http_get) -> tuple[list[dict], int]:
+def _kept_good_read(conn, fact: dict, payload: dict) -> bool:
+    """True when the version of this Federal Register document current at this fetch was a good body read and its title
+    and abstract are the ones just fetched: a failed re-read then stores nothing, so that version (and its vote) stays."""
+    rows = [r for r in store.facts_as_of(conn, fact["fetched_at_utc"], domain=_DOMAIN, entity_key=fact["entity_key"])
+            if r["source_id"] == _FR]
+    if len(rows) != 1:
+        return False
+    try:
+        prior = json.loads(rows[0]["payload_json"])
+    except (TypeError, ValueError):
+        return False
+    return (isinstance(prior, dict) and prior.get("body_read") is True and prior.get("title") == payload["title"]
+            and prior.get("abstract") == payload["abstract"])
+
+
+def _read_death_bodies(conn, facts: list[dict], http_get) -> tuple[list[dict], int]:
     """For each death proclamation among the Federal Register facts, one request for its `raw_text_url` (https on
     www.federalregister.gov only; the same client, user agent and size cap), then the body's mourning sentences are read
     together with the title and abstract. Returns the facts and the number of bodies that could not be read: such a
@@ -735,6 +750,8 @@ def _read_death_bodies(facts: list[dict], http_get) -> tuple[list[dict], int]:
         tail = None if text is None else _scan_text((_plain_text(text),), mourning_only=True)
         if text is None:
             errors += 1
+            if _kept_good_read(conn, fact, payload):
+                continue  # lead: a failed re-read never replaces an earlier good read of the same document
             keep = [] if head is None or _CHANGE.search(payload["title"] + " " + (payload["abstract"] or "")) else head[0]
             payload.update({"closure_dates": sorted(set(keep)), "body_read": False, "body_sha256": None})  # lead: an
             # unreadable body costs only the body's vote; a vote the title or abstract casts by itself is kept
@@ -751,8 +768,8 @@ def _read_death_bodies(facts: list[dict], http_get) -> tuple[list[dict], int]:
 def refresh(conn, source_id, *, http_get=None, now, credentials=None, params=None) -> dict:
     """Fetch, parse and store every fact of one source. A bad argument raises. A failed request, a refused body or a
     fact the store refuses is counted as an error (a refused body stores nothing at all). A Federal Register death
-    proclamation also costs one request for its body text; if that fails the document is stored with no dates and the
-    failure is counted as an error."""
+    proclamation also costs one request for its body text; if that fails the failure is counted as an error, an earlier
+    good read of the same title and abstract stays current, and otherwise only the title's and abstract's own dates are stored."""
     if not isinstance(source_id, str) or source_id not in SOURCES:
         raise K3Error(f"unknown source {str(source_id)[:60]!r}")
     _check_params(source_id, params, _now_text(now))
@@ -765,7 +782,7 @@ def refresh(conn, source_id, *, http_get=None, now, credentials=None, params=Non
         except K3Error as exc:
             return {"stored": 0, "unchanged": 0, "error": 1, "detail": str(exc)[:200]}
     if source_id == _FR:
-        facts, body_errors = _read_death_bodies(facts, http_get)
+        facts, body_errors = _read_death_bodies(conn, facts, http_get)
     if source_id == _H:
         facts = facts + _holiday_tombstones(conn, facts)
     counts = _store_facts(conn, facts)

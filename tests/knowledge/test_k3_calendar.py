@@ -1579,6 +1579,27 @@ def test_a_failed_body_fetch_keeps_only_the_abstracts_own_vote_and_counts_one_er
     assert got["error"] == 1 and fr_payload(conn, "2026-79")[0]["closure_dates"] == []
 
 
+def test_a_failed_re_read_after_a_good_read_keeps_the_good_vote_and_stores_nothing(conn):
+    register(conn)
+    good = Fake({FR_URL: fr_body(death_doc("2026-90", abstract=None)), BODY_URL: MOURNING_BODY.encode()})
+    assert k3.refresh(conn, FR, http_get=good, now=NOW)["stored"] == 1
+    later = NOW + timedelta(hours=1)
+    bad = Fake({FR_URL: fr_body(death_doc("2026-90", abstract=None)), BODY_URL: RuntimeError("timeout")})
+    got = k3.refresh(conn, FR, http_get=bad, now=later)
+    assert got["error"] == 1 and got["stored"] == 0
+    payload, _ = fr_payload(conn, "2026-90")
+    assert payload["closure_dates"] == [TUESDAY] and payload["body_read"] is True
+    n = conn.execute("SELECT COUNT(*) FROM knowledge_facts WHERE entity_key = 'FR:2026-90'").fetchone()[0]
+    assert n == 1
+    # the two-way check: a changed abstract is new information, so the failed read is stored, with only its own dates
+    changed = Fake({FR_URL: fr_body(death_doc("2026-90", abstract="Correction to a proclamation.")),
+                    BODY_URL: RuntimeError("timeout")})
+    got = k3.refresh(conn, FR, http_get=changed, now=later + timedelta(hours=1))
+    assert got["error"] == 1 and got["stored"] == 1
+    payload, _ = fr_payload(conn, "2026-90")
+    assert payload["closure_dates"] == [] and payload["body_read"] is False
+
+
 def test_the_body_is_read_together_with_the_abstract_and_one_unsure_sentence_voids_all(conn):
     register(conn)
     abstract = "This proclamation designates November 24, 2026, as a National Day of Mourning."
