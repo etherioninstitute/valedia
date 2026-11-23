@@ -367,8 +367,9 @@ def decide(events_today: Sequence[dict], incidents_today: Sequence[dict]) -> lis
             told[cause], first_kind[cause] = {"root_cause": cause, "severity": "P1", "followup_sent": 0}, e["kind"]
             if cause.startswith(STILL_OPEN_CAUSE):
                 out.append(_outbound("P1", e, cause, "P1 order step: run still open",
-                                     f"{cause} on {e['trade_date']}: a run started and had not ended at the 10:25 New York check "
-                                     f"(under {ORPHAN_MINUTES} minutes old); it becomes a P0 if it is still open after that"))
+                                     f"{cause} on {e['trade_date']}: a run started and had not ended at the dead-man check "
+                                     f"({ORPHAN_MINUTES} minutes old or less); a later check would make it a P0, but none is "
+                                     f"scheduled today: look at the Live page"))
                 continue
             out.append(_outbound("P1", e, cause, "P1 order step: no run recorded",
                                  f"no terminal row for {e['trade_date']}: nothing ended or was skipped by 10:25 New York"))
