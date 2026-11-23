@@ -549,6 +549,8 @@ Queued (roadmap):
   diffs compile to tested rule modules; tax: wash-sale fence across both books, lot periods, DBC K-1, 3-regime event
   contract shadow ledger (165(d) 90% cap to confirm from statute). Build: K-7 -> K-3/K-4 -> K-1/K-2 (after 12-03) ->
   K-5/K-6; tax ledger before 12-31 only if a real order happens in 2026.
+  Owner 2026-11-23: he plans to ITEMIZE (Valedia keeps the itemizing records: wagering wins/losses by session, fees,
+  deductions; she still shows each year whether itemizing beats the standard deduction). Added to reply 28.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
