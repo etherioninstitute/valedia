@@ -41,7 +41,7 @@ def _log_closed(reason: str) -> None:
     print(time.strftime("%H:%M:%S %Z", time.localtime()) + " pull held, " + reason, file=sys.stderr, flush=True)
 
 
-DEFAULT_SENT_MARK = Path.home() / "valedia-data" / "kalshi" / "kalshi_pull.sent"
+DEFAULT_SENT_MARK = Path.home() / "valedia-data" / "kalshi.noindex" / "kalshi_pull.sent"   # .noindex: Spotlight skips the folder
 
 
 class SentMark:
