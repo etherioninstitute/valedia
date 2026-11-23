@@ -778,10 +778,17 @@ Finnhub-derived sent to an outside model. Order: after the live path (priority 1
   wash sales.
 - **QUEUED** K-6 tax law: federal (IRS) and all 50 states plus DC, re-read each year and on change. It feeds
   section 9.
-- **NOW** (owner yes 2026-11-23 "start now", beside the live path) T56 K-7 the store: builder dispatched on
-  `cand/t56-k7-store` (ticket `.foreman/tickets/T56-K7-knowledge-store.md`); then K-3 and K-4 on top of it.
-- **QUEUED** K-7 one knowledge store with one query path for all her agents. It absorbs the data-source register
-  idea in section 5: each source's terms, cost, measured behaviour and the tests that used it.
+- **DONE** 2026-11-23 T56 K-7 the store, merged 74f6b5a (branch tip 354a8ed; 1045 tests in
+  tests/knowledge/test_store.py). `valedia_trader/knowledge/store.py`: source_registry + append-only
+  knowledge_facts; one read path `facts_as_of(t, domain, entity_key, for_outside_llm)`; a read is current at its
+  fetch time (proven publication -> PUBLISHED row at K plus a FETCHED companion at F when needed; skip only when the
+  hash matches at both K and F); Finnhub never reaches the outside-model read (DB CHECK + Python filter); ids
+  max+1 only, 1..2^62; byte-level NUL-safe checks; connect() checks version, UTF-8, integrity_check (0.14 s per
+  10k facts; quick=True for quick_check) and the exact schema multiset. Seven blind checks (6 FAIL -> repaired).
+  Known limits in the module docstring (text-only read-path scan; invalid UTF-8 storable by raw SQL but reads
+  raise StoreError; temp objects and raw writable_schema between opens). Real store path: decided with K-3.
+- **NEXT** K-3 (calendars/closures) and K-4 (venue rules) tickets on top of K-7. K-3's write helper carries the
+  date-only rule (end of the date in the source's own zone) and each source's zone in the registry.
 
 ## 6. Analytics and decisions
 
