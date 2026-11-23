@@ -521,7 +521,9 @@ Queued (roadmap):
   T60 MERGED 2026-11-23 (08d6439, blind PASS WITH NOTES + lead fixes): session stops lock-held / outside-window = NOOP
   (not terminal, not in streak, P3; with faults P0 + reset); calendar load/answer errors = FAULT; RUN_START > 20 min with
   no paired RUN_END = DEADMAN/FAULT run:orphan-start:<trigger> P0 (ends pair with their own start). Schema v2. Known
-  limit: a hung 7:10 start is only 15 min old at 7:25, caught by the P1 only. Gate still open at 8fb509f.
+  limit (CLOSED by T61): a hung 7:10 start was only 15 min old at 7:25. Gate still open at 8fb509f.
+  T61 MERGED 2026-11-23 (035b118, blind PASS WITH NOTES): ORPHAN_MINUTES 10; an unpaired start <= 10 min old at the
+  dead-man = DEADMAN/MISSING deadman:run-still-open:<trigger> P1 (resets the streak; no later check runs that day).
   QUEUED, live path, in order: (1) check the first live morning; (2) the order step's own entry point so cli.py's imports of desk/panel/research leave the pinned list (full
   blind check); (3) the 'before order #1' gate items. CHECK: cancel_all_open cancels only Valedia's own ids.
   OWNER: replace roadmap 4.2's organic sightings (partial fill, cancel 'not yet') with recorded-answer rehearsals?
