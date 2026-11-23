@@ -713,6 +713,37 @@ dominance Stage 0 from 2026-12-04, (8) Candidate C. The live path (stricter go-l
 - **IDEA** a data-source register: each source with its terms, cost, what was measured about it by a real
   request, and the tests that already used it, so no finished test is proposed twice.
 
+## 5b. Knowledge feeds: the near-omniscient goal (owner, 2026-11-23)
+
+The owner's goal: Valedia stays as close to omniscient as possible about everything that bears on her trading:
+every stock listing, all financial news, every market holiday and closure, each venue's rules, regulations,
+fees and promotions, federal regulation, and federal and all-state tax law. All of it lives in her own stores,
+so any of her agents can query it. Each feed keeps its source, fetch time, licence and a hash, and records changes
+against the previous read. Standing rules apply to every feed: no telemetry, a generic client name, personal-use
+licence terms read first, free paths before paid ones, nothing scraped against a site's terms, and nothing
+Finnhub-derived sent to an outside model. Order: after the live path (priority 1). The rows are not yet sized.
+
+- **QUEUED** K-1 listings: every US-listed stock and fund, plus new listings, delistings, symbol changes, splits
+  and halts. Candidate free sources: the exchanges' published symbol directories and SEC's ticker file. OWNER:
+  SEC's fair-access policy asks automated clients to name a contact in the User-Agent, which conflicts with our
+  generic-name rule. He decides whether to use SEC at all, or how.
+- **QUEUED** K-2 financial news: company news inside the Finnhub plan (kept local), company filings (8-K and
+  similar), the official release calendars (Fed, BLS, BEA, Treasury), and exchange notices. Tagged by symbol and
+  event, so the learning loop can ask what was known at a given time.
+- **QUEUED** K-3 calendars and closures: XNYS holidays and early closes are already read from exchange_calendars
+  (checked 2026-11-23). Add unscheduled closures from the exchange's own notices, trading-status and halt feeds, and
+  each venue's own hours (Kalshi, crypto around the clock). Ties to the pre-flight check.
+- **QUEUED** K-4 venue rules: Webull, Kalshi, Polymarket and every other venue in the registry. Rules, fee
+  schedules, contract terms, API terms and promotions, each with a weekly re-read and a change diff (supersedes
+  3.6). Promotions are only reported: enrolling or accepting terms is always the owner's.
+- **QUEUED** K-5 federal and market regulation: SEC, FINRA and CFTC rule changes (the Federal Register's free
+  API), plus the standing rules that bind us today: Reg T and good-faith violations, pattern day trading, and
+  wash sales.
+- **QUEUED** K-6 tax law: federal (IRS) and all 50 states plus DC, re-read each year and on change. It feeds
+  section 9.
+- **QUEUED** K-7 one knowledge store with one query path for all her agents. It absorbs the data-source register
+  idea in section 5: each source's terms, cost, measured behaviour and the tests that used it.
+
 ## 6. Analytics and decisions
 
 - **QUEUED** forecaster weights from scores (1.5); MiroFish and Scout as forecasters (1.4).
@@ -879,6 +910,19 @@ Lessons so far (each is also a "do not repeat"):
   create wash sales: the owner's and his adviser's to judge); 3.4 answers to tax questions on request; 3.5 day
   trade counts and position limits; 3.6 weekly re-read of rule sources; 3.7 tax-aware choices; 3.8 year-end
   reconciliation against broker forms. Four legal parameters of the tax-lot ledger are unverified (3.1).
+- **QUEUED** (owner, 2026-11-23: "another rabbit hole we will definitely go down") TAX as its own track. Valedia
+  informs on how to save money on taxes. She never files, and every choice is the owner's and his adviser's. To
+  map:
+  - lot selection (specific identification against FIFO), short against long holding periods, and tax-loss
+    harvesting;
+  - wash sales ACROSS THE SHARED ACCOUNT: the owner's hand trades in the same or substantially identical funds
+    can disallow her losses, which ties to the open question of keeping his hand trades out of the 15 fund
+    symbols;
+  - the tax treatment of prediction-market contracts and of crypto;
+  - DBC's K-1 (item 17 in section 13);
+  - state residence rules;
+  - year-end forms against her own ledger (3.8).
+  Its knowledge comes from K-6.
 - **QUEUED** 5.7 no closing kill switch; the daily order cap is the owner's number.
 - **QUEUED** older `src/` scripts still send the owner's addresses to outside services (asked whether to
   change; no answer). The standing rule since: a generic client name only.
