@@ -408,6 +408,13 @@ Queued (roadmap):
   collapse into one trial -> add `describe()`, and audit past merges; R3 draws `r3_shifts` with replacement past
   the number of distinct shifts -> use `timing_exact` when asked for more and print the count; check R4's
   dispersion uses active-Sharpe z. Gate 2 Sharpe at rf = 0; DTB3 excess printed only.
+  Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
+  TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
+  (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
+  Fallback if one scalar only: collision_survivor (A/B) + collision_shadowed (C). Correlated E[max]: singleton rows
+  bypass; coupled block eigen-clipped, rebuilt, unit-diagonal, then Cholesky (unique; permutation test). K_eff*_pre
+  stored as float.hex; Row 10 also locks numpy, BLAS build and Python versions; score refuses on a changed
+  environment, 1e-12 match otherwise. main has no .github/ (no workflows).
   Round 16: Tier-C rows enter R at full unit variance (no discount; PIT argument); Tier 0 = outcome-blind runs,
   weight 0, reason recorded per row; Tier-C correlation blocks only from loss vectors on disk; whole E[max] times
   sigma_z. Manifest = 15 rows: Row 2 adds sha256 of level10_ml_research.py, gauntlet.py, gate_study.py; new Row 9
@@ -932,6 +939,9 @@ run beside MiroFish and Elephant-1):
     `cos-auditor` (no web, Claude subscription). Scout, then Decider, then Auditor, at most one retry on FAILS. No
     private data, trading data, Finnhub data or UGFT work goes in a brief; the team never acts and never judges
     trades. The trader team's profiles are unchanged. Tested end to end. Valedia picks it up in a new session.
+    Same night (owner: "Mini is back on"): Scout and Auditor moved to `splash27` on the Mac mini over LM Link
+    (placement proven: 0 bytes here vs 21 GiB for a local key; loaded at 9:59 PM in the quiet part of the minute);
+    Decider stays on the Claude subscription. Plain fact lookups are Scout only and marked not audited.
 
 ## 13b. Affordable paid options (the owner's to choose; none needed today unless marked)
 
