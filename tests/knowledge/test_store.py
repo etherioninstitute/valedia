@@ -302,7 +302,7 @@ def test_re_register_identical_is_a_no_op_different_is_refused(conn):
 def test_fact_for_unregistered_source_refused_in_code_and_in_database(conn):
     with pytest.raises(StoreError, match="not registered"):
         fact(conn, source_id="example_unknown")
-    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+    with pytest.raises(sqlite3.IntegrityError):
         _raw_insert(conn, source_id="example_unknown")
     assert count(conn) == 0
 
@@ -368,24 +368,119 @@ def test_replace_cannot_overwrite_a_fact_through_raw_sql(conn):
     assert [tuple(r) for r in conn.execute("SELECT * FROM knowledge_facts")] == [tuple(r) for r in before]
 
 
-_BAD_IDS = [-1, 0, -5, 2, 3, 500, 2**62, 9223372036854775807]
+_BAD_IDS = [-1, 0, -5, 2**62, 2**62 + 1, 9223372036854775807]
+_BAD_ROWS = {                      # each one is refused by the database for its own reason
+    "bad sha": dict(raw_sha256="zz"), "null entity_key": dict(entity_key=None),
+    "bad domain": dict(domain="K9_OTHER"), "bad json": dict(payload_json="{nope"),
+    "unregistered source": dict(source_id="example_unknown"), "bad time": dict(fetched_at_utc="2026-13-45T99:99:99.000000Z"),
+}
 
 
-def test_raw_inserts_with_explicit_ids_that_break_the_sequence_are_refused_and_never_wedge_the_store(conn):
-    # Rule: ids are 1, 2, 3, ... with no gaps. An explicit id is allowed only if it is exactly the next one.
+def _values_sql(rows):
+    """One multi-row INSERT ... VALUES (...),(...) statement text and its parameters (ids are automatic)."""
+    cols = list(_raw_row())
+    marks = "(" + ", ".join("?" * len(cols)) + ")"
+    return (f"INTO knowledge_facts ({', '.join(cols)}) VALUES " + ", ".join([marks] * len(rows)),
+            [v for r in rows for v in r.values()])
+
+
+def _raw_row(**over):
+    row = dict(domain="K2_NEWS", entity_key="ABC", effective_from_utc="2026-01-01T00:00:00.000000Z",
+               effective_to_utc=None, published_at_utc="2026-01-01T00:00:00.000000Z",
+               fetched_at_utc="2026-01-02T00:00:00.000000Z", known_at_utc="2026-01-02T00:00:00.000000Z",
+               known_at_basis="FETCHED", source_id="example_public", raw_sha256=sha("a"), payload_json="{}")
+    row.update(over)
+    return row
+
+
+def test_there_is_no_autoincrement_and_no_sequence_table_to_wedge(conn):
+    fact(conn)
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+    assert "sqlite_sequence" not in names
+    assert "AUTOINCREMENT" not in conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'knowledge_facts'").fetchone()[0].upper()
+    with pytest.raises(sqlite3.OperationalError):          # a direct write to the sequence table cannot happen
+        conn.execute("UPDATE sqlite_sequence SET seq = 9223372036854775807")
+    with pytest.raises(sqlite3.OperationalError):
+        conn.execute("INSERT INTO sqlite_sequence VALUES ('knowledge_facts', 9223372036854775807)")
+    assert fact(conn, raw_sha256=sha("b")) == 2
+
+
+def test_raw_inserts_with_explicit_ids_that_are_not_the_next_one_are_refused_and_never_wedge_the_store(conn):
+    # Rule: ids come from SQLite (the highest id plus one). An explicit id is allowed only if it is exactly that.
     fact(conn)                                   # id 1, so the next id is 2
-    seq_before = conn.execute("SELECT * FROM sqlite_sequence").fetchall()
-    for bad in [i for i in _BAD_IDS if i != 2]:
+    for bad in _BAD_IDS + [1, 3, 500]:
         n = count(conn)
         with pytest.raises(sqlite3.IntegrityError):
             _raw_insert(conn, fact_version_id=bad)
         assert count(conn) == n
-        assert [tuple(r) for r in conn.execute("SELECT * FROM sqlite_sequence")] == [tuple(r) for r in seq_before]
-        new = fact(conn, raw_sha256=sha(f"after-{bad}"))      # an auto id still works afterwards
-        assert new == n + 1 and count(conn) == n + 1
-        seq_before = conn.execute("SELECT * FROM sqlite_sequence").fetchall()
-    assert [r[0] for r in conn.execute("SELECT fact_version_id FROM knowledge_facts ORDER BY 1")] == \
-        list(range(1, count(conn) + 1))
+        assert fact(conn, raw_sha256=sha(f"after-{bad}")) == n + 1       # an auto id still works afterwards
+    ids = [r[0] for r in conn.execute("SELECT fact_version_id FROM knowledge_facts ORDER BY 1")]
+    assert ids == list(range(1, len(ids) + 1))
+
+
+def test_explicit_minus_one_is_refused_by_the_check_not_mistaken_for_an_auto_id(conn):
+    # a BEFORE trigger shows -1 for an automatic id, so the table's own CHECK must be what stops an explicit -1
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        _raw_insert(conn, fact_version_id=-1)
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        _raw_insert(conn, verb="INSERT OR REPLACE", fact_version_id=-1)
+    assert count(conn) == 0
+    assert fact(conn) == 1                                  # and the automatic id (-1 inside the trigger) works
+    sql = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'knowledge_facts'").fetchone()[0]
+    assert "BETWEEN 1 AND 4611686018427387904" in sql
+
+
+@pytest.mark.parametrize("reconnect", [False, True])
+@pytest.mark.parametrize("shape", ["single", "good_then_bad", "bad_then_good", "bad_good_bad"])
+@pytest.mark.parametrize("verb", ["INSERT", "INSERT OR IGNORE", "INSERT OR REPLACE", "REPLACE", "INSERT OR FAIL",
+                                  "INSERT OR ROLLBACK"])
+@pytest.mark.parametrize("why", sorted(_BAD_ROWS))
+@pytest.mark.parametrize("seeded", [False, True])
+def test_a_bad_row_under_any_verb_or_shape_never_wedges_add_fact(tmp_path, why, verb, shape, seeded, reconnect):
+    path = tmp_path / "w.db"
+    c = connect(path)
+    src(c)
+    if seeded:
+        fact(c)
+    good, bad = _raw_row(), _raw_row(**_BAD_ROWS[why])
+    rows = {"single": [bad], "good_then_bad": [good, bad], "bad_then_good": [bad, good],
+            "bad_good_bad": [bad, good, bad]}[shape]
+    text, params = _values_sql(rows)
+    before = [tuple(r) for r in c.execute("SELECT * FROM knowledge_facts")]
+    try:
+        c.execute(f"{verb} {text}", params)
+    except sqlite3.IntegrityError:
+        pass
+    after = [tuple(r) for r in c.execute("SELECT * FROM knowledge_facts")]
+    assert after[:len(before)] == before                       # nothing already stored was changed or lost
+    if reconnect:
+        c.close()
+        c = connect(path)
+    top = max([r[0] for r in c.execute("SELECT fact_version_id FROM knowledge_facts")], default=0)
+    new = fact(c, raw_sha256=sha("fresh"), entity_key="NEW")      # add_fact still works
+    assert new == top + 1
+    ids = [r[0] for r in c.execute("SELECT fact_version_id FROM knowledge_facts ORDER BY 1")]
+    assert ids == sorted(set(ids)) and len(ids) == count(c)
+    c.close()
+
+
+def test_bad_rows_under_ignore_leave_a_plain_connection_and_the_next_write_working(tmp_path):
+    path = tmp_path / "plain.db"
+    c = connect(path)
+    src(c)
+    c.close()
+    raw = sqlite3.connect(path, isolation_level=None)             # foreign keys off, nothing of ours
+    for why in sorted(_BAD_ROWS):
+        text, params = _values_sql([_raw_row(**_BAD_ROWS[why])])
+        try:
+            raw.execute(f"INSERT OR IGNORE {text}", params)
+        except sqlite3.IntegrityError:
+            pass
+    assert raw.execute("SELECT count(*) FROM knowledge_facts").fetchone()[0] == 0
+    raw.close()
+    c = connect(path)
+    assert fact(c) == 1
 
 
 def test_the_next_explicit_id_and_auto_ids_are_allowed(conn):
@@ -747,6 +842,281 @@ def test_a_foreign_database_is_refused(tmp_path):
         connect(path)
 
 
+# ---- the duplicate rule looks at both the known_at time and the fetch time ----------------------
+
+def test_note7_variant_a_reread_with_the_same_proven_publication_is_stored_at_its_fetch_time(conn):
+    A, B = sha("a"), sha("b")
+    fact(conn, raw_sha256=A, fetched_at_utc=day(10))
+    first_b = fact(conn, raw_sha256=B, published_at_utc=day(5), published_proven=True, fetched_at_utc=day(20))
+    n = count(conn)
+    again = fact(conn, raw_sha256=B, published_at_utc=day(5), published_proven=True, fetched_at_utc=day(30))
+    assert again != first_b and count(conn) == n + 1
+    row = conn.execute("SELECT * FROM knowledge_facts WHERE fact_version_id = ?", (again,)).fetchone()
+    assert row["known_at_basis"] == "FETCHED" and row["known_at_utc"] == row["fetched_at_utc"]
+    assert row["known_at_utc"].startswith("2026-01-30") and row["published_at_utc"].startswith("2026-01-05")
+    assert _as_of_sha(conn, 31) == B
+    assert _as_of_sha(conn, 7) == B
+    assert _as_of_sha(conn, 12) == A
+
+
+def test_note7_variant_an_identical_reread_after_that_stores_nothing(conn):
+    A, B = sha("a"), sha("b")
+    fact(conn, raw_sha256=A, fetched_at_utc=day(10))
+    fact(conn, raw_sha256=B, published_at_utc=day(5), published_proven=True, fetched_at_utc=day(20))
+    stored = fact(conn, raw_sha256=B, published_at_utc=day(5), published_proven=True, fetched_at_utc=day(30))
+    n = count(conn)
+    assert fact(conn, raw_sha256=B, published_at_utc=day(5), published_proven=True, fetched_at_utc=day(31)) == stored
+    assert fact(conn, raw_sha256=B, fetched_at_utc=day(31)) == stored
+    assert count(conn) == n
+
+
+def test_proven_reread_that_matches_at_both_times_stores_nothing(conn):
+    B = sha("b")
+    first = fact(conn, raw_sha256=B, published_at_utc=day(5), published_proven=True, fetched_at_utc=day(20))
+    assert fact(conn, raw_sha256=B, published_at_utc=day(5), published_proven=True, fetched_at_utc=day(30)) == first
+    assert count(conn) == 1
+
+
+def test_proven_row_that_differs_at_its_known_at_keeps_its_published_basis(conn):
+    row = conn.execute("SELECT * FROM knowledge_facts WHERE fact_version_id = ?",
+                       (fact(conn, raw_sha256=sha("b"), published_at_utc=day(5), published_proven=True,
+                             fetched_at_utc=day(20)),)).fetchone()
+    assert row["known_at_basis"] == "PUBLISHED" and row["known_at_utc"].startswith("2026-01-05")
+
+
+def test_the_duplicate_rule_is_documented_in_the_docstrings():
+    for doc in (store.add_fact.__doc__, store.__doc__):
+        assert "BOTH" in doc and "fetch" in doc and "FETCHED" in doc and "known_at" in doc
+    assert "PUBLISHED" in store.add_fact.__doc__
+
+
+# ---- facts need a registered source even with foreign keys off ----------------------------------
+
+def test_a_fact_with_an_unregistered_source_is_refused_even_on_a_plain_connection(tmp_path):
+    path = tmp_path / "plain2.db"
+    c = connect(path)
+    src(c)
+    c.close()
+    raw = sqlite3.connect(path, isolation_level=None)
+    assert raw.execute("PRAGMA foreign_keys").fetchone()[0] == 0           # nothing of ours is on this connection
+    _raw_insert(raw)                                                       # a registered source goes in (two-way)
+    for verb in ("INSERT", "INSERT OR IGNORE", "INSERT OR REPLACE"):
+        n = raw.execute("SELECT count(*) FROM knowledge_facts").fetchone()[0]
+        try:
+            _raw_insert(raw, verb=verb, source_id="example_unknown")
+            refused = False
+        except sqlite3.IntegrityError as exc:
+            refused = "not registered" in str(exc)
+        assert refused or verb == "INSERT OR IGNORE"
+        assert raw.execute("SELECT count(*) FROM knowledge_facts").fetchone()[0] == n
+    with pytest.raises(sqlite3.IntegrityError, match="not registered"):
+        _raw_insert(raw, source_id="example_unknown")
+    with pytest.raises(sqlite3.IntegrityError):
+        _raw_insert(raw, source_id=None)
+
+
+# ---- every bad input raises StoreError -----------------------------------------------------------
+
+def test_huge_numbers_are_a_store_error_not_an_overflow(conn):
+    for bad in (10**400, -10**400, 10**308 * 10, float("inf")):
+        with pytest.raises(StoreError, match="cost_usd_monthly"):
+            src(conn, "example_big", cost_usd_monthly=bad)
+    src(conn, "example_big", cost_usd_monthly=10**300)     # a huge but finite cost is fine
+    assert count(conn, "source_registry") == 2
+
+
+_SURROGATE = "ab\ud800cd"
+
+
+@pytest.mark.parametrize("field", ["terms_url", "licence_tag", "notes", "ua_policy", "source_id"])
+def test_lone_surrogate_in_a_registry_text_field_is_a_store_error(conn, field):
+    over = {field: _SURROGATE}
+    over.setdefault("source_id", "example_s")
+    with pytest.raises(StoreError):
+        src(conn, **over)
+    assert count(conn, "source_registry") == 1
+
+
+@pytest.mark.parametrize("field", ["entity_key", "source_id", "payload_json", "raw_sha256", "domain",
+                                   "fetched_at_utc", "effective_from_utc", "published_at_utc"])
+def test_lone_surrogate_in_a_fact_text_field_is_a_store_error(conn, field):
+    over = {field: _SURROGATE}
+    if field == "payload_json":
+        over[field] = '{"v": "' + _SURROGATE + '"}'
+    with pytest.raises(StoreError):
+        fact(conn, **over)
+    assert count(conn) == 0
+
+
+@pytest.mark.parametrize("kw", [dict(entity_key=_SURROGATE), dict(domain=_SURROGATE)])
+def test_lone_surrogate_in_a_read_filter_is_a_store_error(conn, kw):
+    with pytest.raises(StoreError):
+        facts_as_of(conn, T3, **kw)
+    with pytest.raises(StoreError):
+        facts_as_of(conn, _SURROGATE)
+
+
+@pytest.mark.parametrize("bad", ['{"v": NaN}', "NaN", "Infinity", "-Infinity", '{"v": [1, -Infinity]}',
+                                 "1e999", "-1e999", '{"v": 1e999}', "[" * 100000 + "]" * 100000, '{"a": 1', "{'a': 1}"])
+def test_json_that_python_or_a_reader_cannot_use_is_a_store_error(conn, bad):
+    with pytest.raises(StoreError, match="payload_json"):
+        fact(conn, payload_json=bad)
+    assert count(conn) == 0
+
+
+def test_ordinary_and_large_finite_json_is_accepted(conn):
+    for i, text in enumerate(['{"v": 1.5}', "1e300", '{"a": [1, 2, {"b": null}]}', "[" * 50 + "]" * 50, '"NaN"',
+                              '{"NaN": 1}']):
+        fact(conn, entity_key=f"J{i}", payload_json=text)
+    assert count(conn) == 6
+
+
+def test_json_nan_is_also_refused_by_the_database(conn):
+    for bad in ("NaN", "Infinity", "-Infinity", '{"v": NaN}'):
+        with pytest.raises(sqlite3.IntegrityError):
+            _raw_insert(conn, payload_json=bad)
+
+
+def test_a_database_refusal_is_a_store_error_in_both_writers(conn):
+    # a trigger refusal inside add_fact's insert and a CHECK refusal in register_source both come out as StoreError
+    conn.execute("CREATE TEMP TRIGGER t_refuse BEFORE INSERT ON knowledge_facts "
+                 "WHEN NEW.entity_key = 'REFUSED' BEGIN SELECT RAISE(ABORT, 'refused by a trigger'); END")
+    with pytest.raises(StoreError, match="refused"):
+        fact(conn, entity_key="REFUSED")
+    assert not conn.in_transaction and count(conn) == 0
+    fact(conn)
+
+
+def test_opening_a_file_that_is_not_a_database_is_a_store_error(tmp_path):
+    bad = tmp_path / "garbage.db"
+    bad.write_bytes(b"this is not a sqlite file at all, just text" * 50)
+    with pytest.raises(StoreError):
+        connect(bad)
+    with pytest.raises(StoreError):
+        connect(tmp_path / "no_such_folder" / "x.db")
+
+
+_WEIRD = [None, "", "x", "\x00", _SURROGATE, 5, -1, 1.5, float("nan"), float("inf"), 10**400, -10**400, b"x", bytearray(b"x"),
+          [], {}, (), True, False, object(), "2026-01-02T00:00:00Z", '{"a": 1}', "é", "A" * 100000, 2**63, -2**63 - 1]
+
+
+def _only_store_errors(call):
+    try:
+        call()
+    except StoreError:
+        pass
+
+
+def test_no_raw_python_or_sqlite_error_escapes_any_public_function(conn):
+    good_src = dict(source_id="example_fz", terms_url="https://example.invalid/t", licence_tag="public",
+                    personal_use_ok=True, allow_external_llm=False, ua_policy="GENERIC_CLIENT",
+                    terms_read_at_utc=T0, cost_usd_monthly=0, notes=None)
+    good_fact = dict(domain="K2_NEWS", entity_key="ABC", source_id="example_public", raw_sha256=sha("a"),
+                     payload_json="{}", effective_from_utc=T0, fetched_at_utc=T1, effective_to_utc=None,
+                     published_at_utc=None, published_proven=False)
+    for key in good_src:
+        for w in _WEIRD:
+            args = dict(good_src, **{key: w})
+            args["source_id"] = args["source_id"] if key == "source_id" else f"example_fz_{abs(hash(repr(w)))}"
+            _only_store_errors(lambda: register_source(conn, **args))
+    for key in good_fact:
+        for w in _WEIRD:
+            _only_store_errors(lambda: add_fact(conn, **dict(good_fact, **{key: w})))
+    for key, default in (("as_of_utc", T3), ("domain", None), ("entity_key", None), ("for_outside_llm", False)):
+        for w in _WEIRD:
+            kw = dict(domain=None, entity_key=None, for_outside_llm=False)
+            as_of = T3
+            if key == "as_of_utc":
+                as_of = w
+            else:
+                kw[key] = w
+            _only_store_errors(lambda: facts_as_of(conn, as_of, **kw))
+    assert not conn.in_transaction
+    assert fact(conn, raw_sha256=sha("still-works"), entity_key="END")      # and the store still works
+
+
+# ---- the schema is verified every time a store is opened ----------------------------------------
+
+_EXPECTED_OBJECTS = {
+    ("table", "source_registry"), ("table", "knowledge_facts"), ("index", "knowledge_facts_lookup"),
+    ("trigger", "source_registry_no_update"), ("trigger", "source_registry_no_delete"),
+    ("trigger", "source_registry_no_replace"), ("trigger", "knowledge_facts_no_update"),
+    ("trigger", "knowledge_facts_no_delete"), ("trigger", "knowledge_facts_ids_from_sqlite"),
+    ("trigger", "knowledge_facts_source_registered"),
+}
+
+
+def test_a_fresh_store_has_exactly_the_expected_schema_objects(tmp_path):
+    c = connect(tmp_path / "s.db")
+    got = {(r[0], r[1]) for r in c.execute("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
+    assert got == _EXPECTED_OBJECTS
+    c.close()
+
+
+@pytest.mark.parametrize("kind,name", sorted(_EXPECTED_OBJECTS - {("table", "knowledge_facts"),
+                                                                   ("table", "source_registry")}))
+def test_a_store_missing_a_trigger_or_index_is_refused_on_open(tmp_path, kind, name):
+    path = tmp_path / "m.db"
+    connect(path).close()
+    raw = sqlite3.connect(path)
+    raw.execute(f"DROP {kind.upper()} {name}")
+    raw.close()
+    with pytest.raises(StoreError, match=name):
+        connect(path)
+
+
+@pytest.mark.parametrize("name", ["knowledge_facts", "source_registry"])
+def test_a_store_missing_a_table_is_refused_on_open(tmp_path, name):
+    path = tmp_path / "t.db"
+    connect(path).close()
+    raw = sqlite3.connect(path)
+    raw.execute("PRAGMA foreign_keys = OFF")
+    raw.execute(f"DROP TABLE {name}")
+    raw.close()
+    with pytest.raises(StoreError, match="missing|differs"):
+        connect(path)
+
+
+def test_a_file_stamped_with_the_current_version_but_no_schema_is_refused(tmp_path):
+    path = tmp_path / "stamped.db"
+    raw = sqlite3.connect(path)
+    raw.execute(f"PRAGMA user_version = {store.SCHEMA_VERSION}")
+    raw.execute("CREATE TABLE unrelated (x)")
+    raw.close()
+    with pytest.raises(StoreError, match="missing"):
+        connect(path)
+    empty = tmp_path / "stamped_empty.db"
+    raw = sqlite3.connect(empty)
+    raw.execute(f"PRAGMA user_version = {store.SCHEMA_VERSION}")
+    raw.execute("CREATE TABLE t (x)")
+    raw.execute("DROP TABLE t")
+    raw.close()
+    with pytest.raises(StoreError, match="missing"):
+        connect(empty)
+
+
+def test_a_store_whose_trigger_was_weakened_is_refused_on_open(tmp_path):
+    path = tmp_path / "weak.db"
+    connect(path).close()
+    raw = sqlite3.connect(path)
+    raw.execute("DROP TRIGGER knowledge_facts_no_update")
+    raw.execute("CREATE TRIGGER knowledge_facts_no_update BEFORE UPDATE ON knowledge_facts BEGIN SELECT 1; END")
+    raw.close()
+    with pytest.raises(StoreError, match="differs"):
+        connect(path)
+
+
+def test_an_untouched_store_reopens_and_keeps_its_rows(tmp_path):
+    path = tmp_path / "ok.db"
+    c = connect(path)
+    src(c)
+    fact(c)
+    c.close()
+    c = connect(path)
+    assert count(c) == 1
+    c.close()
+
+
 # ---- one read path -------------------------------------------------------------------------------
 
 # Public callables of the package, by exact (module path, name). Adding a public function or class fails
@@ -806,11 +1176,10 @@ def _mentions():
     return found
 
 
-def test_the_schema_text_names_the_facts_table_for_reading_only_in_two_guards():
-    matches = [store._SCHEMA[m.start():m.end() + 60] for m in _READS_FACTS.finditer(store._SCHEMA)]
-    assert len(matches) == 2, matches
-    assert matches[0].startswith("FROM knowledge_facts WHERE fact_version_id = NEW.fact_version_id")
-    assert matches[1].startswith("FROM knowledge_facts)")       # the count behind the no-gaps id rule
+def test_the_schema_text_names_the_facts_table_for_reading_only_in_the_id_guard():
+    matches = [store._SCHEMA[m.start():m.end() + 40] for m in _READS_FACTS.finditer(store._SCHEMA)]
+    assert len(matches) == 1, matches
+    assert matches[0].startswith("FROM knowledge_facts)")       # max(fact_version_id), for the next-id rule
 
 
 def test_only_facts_as_of_returns_fact_rows():

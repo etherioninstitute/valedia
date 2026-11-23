@@ -13,8 +13,10 @@ that plain text comparison orders them correctly. The guards live in the databas
 held to the same rules, including REPLACE (a REPLACE would delete without firing a delete trigger, so a
 BEFORE INSERT trigger on each table refuses any insert whose key already exists).
 
-Ids come from SQLite only: the facts table's ids are 1, 2, 3, ... with no gaps, enforced after each insert, so
-no raw insert can skip ahead (-1, 0, a huge id) and wedge the sequence.
+Ids come from SQLite only: there is no AUTOINCREMENT (so no sequence table to corrupt), ids run from 1 to
+2^62, and an explicit id is accepted only if it is exactly the next one. A bad row, under INSERT OR IGNORE,
+REPLACE or a multi-row INSERT, can therefore never wedge later writes. Ids rise with insertion order, which is
+what "ties go to the highest id" relies on.
 
 Text is checked as bytes in the database (LIKE, GLOB, length() and json_valid() stop at a NUL byte, so a NUL
 could hide a Finnhub name, a time's tail or JSON garbage). Every text column is NUL-free.
@@ -23,11 +25,10 @@ The file carries a schema version (PRAGMA user_version). `connect` creates a new
 version and refuses any existing file with a different one, rather than opening a store made with weaker guards.
 
 "Current version at time t" means one thing everywhere: the version with the greatest `known_at_utc` at or
-before t, ties broken by the highest `fact_version_id`. `facts_as_of` returns it, and `add_fact` skips a
-new read only when it matches the version that is current at that read's own `known_at_utc`.
-
-Re-registering a source: identical values do nothing; different values are refused. A change of terms
-means a new source_id (for example "example_public_v2"); the old row stays as the record of the old terms.
+before t, ties broken by the highest `fact_version_id`. `facts_as_of` returns it. `add_fact` skips a new read
+only when it matches that version at BOTH of the read's times: its own `known_at_utc` and its `fetched_at_utc`.
+A read with a proven publication time that matches at the published time but not at the fetch time is stored
+with basis FETCHED at the fetch time (a PUBLISHED copy would change nothing).
 """
 from __future__ import annotations
 
@@ -37,7 +38,7 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 1   # kept in PRAGMA user_version
+SCHEMA_VERSION = 2   # kept in PRAGMA user_version
 DOMAINS = ("K1_LISTING", "K2_NEWS", "K3_CAL", "K4_VENUE", "K5_REG", "K6_TAX")
 UA_POLICIES = ("GENERIC_CLIENT", "SEC_DECLARED_CONTACT")
 
@@ -98,7 +99,7 @@ WHEN EXISTS (SELECT 1 FROM source_registry WHERE source_id = NEW.source_id)
 BEGIN SELECT RAISE(ABORT, 'source_registry is append-only: that source_id exists, use a new one'); END;
 
 CREATE TABLE IF NOT EXISTS knowledge_facts (
-    fact_version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fact_version_id INTEGER PRIMARY KEY CHECK (fact_version_id BETWEEN 1 AND 4611686018427387904),
     domain TEXT NOT NULL CHECK ({_text_ok('domain')} AND domain IN ({_q(DOMAINS)})),
     entity_key TEXT NOT NULL CHECK ({_text_ok('entity_key')} AND length(entity_key) > 0),
     effective_from_utc TEXT NOT NULL CHECK ({_time_ok('effective_from_utc')}),
@@ -121,18 +122,19 @@ CREATE TABLE IF NOT EXISTS knowledge_facts (
 
 CREATE INDEX IF NOT EXISTS knowledge_facts_lookup ON knowledge_facts (domain, entity_key, known_at_utc);
 
--- An id that already exists is refused (this is what stops REPLACE). A BEFORE trigger sees -1 for an
--- automatic id, which never exists, so it does not misfire.
-CREATE TRIGGER IF NOT EXISTS knowledge_facts_no_replace BEFORE INSERT ON knowledge_facts
-WHEN NEW.fact_version_id IS NOT NULL
- AND EXISTS (SELECT 1 FROM knowledge_facts WHERE fact_version_id = NEW.fact_version_id)
-BEGIN SELECT RAISE(ABORT, 'knowledge_facts is append-only: that fact_version_id exists'); END;
+-- Ids come from SQLite only (the highest id plus one; there is no AUTOINCREMENT and so no sequence table
+-- to corrupt). An explicit id is accepted only if it is exactly what SQLite would assign, so an existing id
+-- (REPLACE), a gap, or a huge id near the bound is refused and the store cannot be wedged. A BEFORE trigger
+-- shows -1 for an automatic id; an explicit -1 is then refused by the column's CHECK (1 to 2^62).
+CREATE TRIGGER IF NOT EXISTS knowledge_facts_ids_from_sqlite BEFORE INSERT ON knowledge_facts
+WHEN NEW.fact_version_id IS NOT NULL AND NEW.fact_version_id <> -1
+ AND NEW.fact_version_id <> coalesce((SELECT max(fact_version_id) FROM knowledge_facts), 0) + 1
+BEGIN SELECT RAISE(ABORT, 'knowledge_facts is append-only: ids are assigned by the database, an explicit id must be the next one'); END;
 
--- Ids come from SQLite only: 1, 2, 3, ... with no gaps. After the insert the new row's real id must equal the
--- row count, so an explicit id (-1, 0, a huge one) that would skip ahead or wedge the sequence is refused.
-CREATE TRIGGER IF NOT EXISTS knowledge_facts_ids_dense AFTER INSERT ON knowledge_facts
-WHEN NEW.fact_version_id <> (SELECT count(*) FROM knowledge_facts)
-BEGIN SELECT RAISE(ABORT, 'knowledge_facts ids are assigned by the database: no gaps, no explicit ids'); END;
+-- A fact needs a registered source even on a connection that has foreign keys off.
+CREATE TRIGGER IF NOT EXISTS knowledge_facts_source_registered BEFORE INSERT ON knowledge_facts
+WHEN NOT EXISTS (SELECT 1 FROM source_registry WHERE source_id = NEW.source_id)
+BEGIN SELECT RAISE(ABORT, 'knowledge_facts: source is not registered'); END;
 
 CREATE TRIGGER IF NOT EXISTS knowledge_facts_no_update BEFORE UPDATE ON knowledge_facts
 BEGIN SELECT RAISE(ABORT, 'knowledge_facts is append-only: no updates'); END;
@@ -141,14 +143,44 @@ BEGIN SELECT RAISE(ABORT, 'knowledge_facts is append-only: no deletes'); END;
 """
 
 
+def _objects(conn: sqlite3.Connection) -> dict[str, str]:
+    """name -> SQL text of every table, index and trigger in the file (SQLite's own internal ones left out)."""
+    return {name: sql for name, sql in conn.execute(
+        "SELECT name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
+
+
+def _reference_objects() -> dict[str, str]:
+    """What a correct store holds: the schema built in a throwaway in-memory database."""
+    ref = sqlite3.connect(":memory:")
+    try:
+        ref.executescript(_SCHEMA)
+        return _objects(ref)
+    finally:
+        ref.close()
+
+
+def _verify_schema(conn: sqlite3.Connection, path) -> None:
+    """Every expected table, index and trigger must be present, by name, with the SQL this code would create."""
+    have = _objects(conn)
+    for name, sql in _reference_objects().items():
+        if name not in have:
+            raise StoreError(f"{path}: store is missing {name}; it is not opened silently")
+        if have[name] != sql:
+            raise StoreError(f"{path}: {name} differs from what this code creates; it is not opened silently")
+
+
 def connect(path) -> sqlite3.Connection:
-    """Open (and create if needed) the store at `path`. The one place connections are made."""
-    conn = sqlite3.connect(str(path), isolation_level=None)  # autocommit; writes use explicit BEGIN
+    """Open (and create if needed) the store at `path`. The one place connections are made. A store with a
+    different schema version, or with any expected table, index or trigger missing or changed, is refused."""
+    try:
+        conn = sqlite3.connect(str(path), isolation_level=None)  # autocommit; writes use explicit BEGIN
+    except sqlite3.Error as exc:
+        raise StoreError(f"{path}: cannot open: {exc}") from exc
     conn.row_factory = sqlite3.Row
     try:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        has_tables = conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] > 0
-        if version != SCHEMA_VERSION and (version != 0 or has_tables):
+        has_objects = conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] > 0
+        if version != SCHEMA_VERSION and (version != 0 or has_objects):
             raise StoreError(
                 f"{path}: store schema version is {version}, this code needs {SCHEMA_VERSION}; "
                 "it was made by an older or different build and is not opened silently")
@@ -156,6 +188,13 @@ def connect(path) -> sqlite3.Connection:
         conn.execute("PRAGMA synchronous = FULL")
         if version == 0:   # a brand-new empty file: create everything and stamp the version in one transaction
             conn.executescript(f"BEGIN IMMEDIATE;{_SCHEMA}PRAGMA user_version = {SCHEMA_VERSION};COMMIT;")
+        _verify_schema(conn, path)
+    except StoreError:
+        conn.close()
+        raise
+    except sqlite3.Error as exc:
+        conn.close()
+        raise StoreError(f"{path}: cannot open as a store: {exc}") from exc
     except BaseException:
         conn.close()
         raise
@@ -174,11 +213,41 @@ def _utc(value, name: str) -> str:
     return parsed.strftime("%Y-%m-%dT%H:%M:%S") + "." + frac.ljust(6, "0") + "Z"
 
 
+def _encodable(text: str) -> bool:
+    """False for text with a lone surrogate, which cannot be stored (it cannot be encoded as UTF-8)."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _json_ok(text, name: str) -> None:
+    """The payload must be a str of strict, finite JSON: no NaN, Infinity or -Infinity, no number too large
+    for a float, no NUL byte or lone surrogate, nesting a reader can handle."""
+    if not isinstance(text, str) or "\x00" in text or not _encodable(text):
+        raise StoreError(f"{name}: must be JSON text (a str with no NUL byte or lone surrogate)")
+
+    def no_constant(token):
+        raise ValueError(f"{token} is not allowed")
+
+    def finite_float(token):
+        value = float(token)
+        if not math.isfinite(value):
+            raise ValueError(f"{token} is out of range")
+        return value
+
+    try:
+        json.loads(text, parse_constant=no_constant, parse_float=finite_float)
+    except (ValueError, RecursionError) as exc:
+        raise StoreError(f"{name}: must be valid, finite JSON text") from exc
+
+
 def _text(value, name: str, *, required: bool = True) -> str | None:
     """A text field: a str (never cast from anything else), no NUL byte, and not empty unless optional."""
     if value is None and not required:
         return None
-    if not isinstance(value, str) or (required and not value) or "\x00" in value:
+    if not isinstance(value, str) or (required and not value) or "\x00" in value or not _encodable(value):
         raise StoreError(f"{name}: must be a non-empty str with no NUL byte, got {value!r}"
                          if required else f"{name}: must be a str with no NUL byte, or None, got {value!r}")
     return value
@@ -186,9 +255,14 @@ def _text(value, name: str, *, required: bool = True) -> str | None:
 
 def _cost(value, name: str) -> float:
     """A monthly cost: an int or float (not a bool), finite, not below zero."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
-        raise StoreError(f"{name}: must be a finite number, 0 or more, got {value!r}")
-    return float(value)
+    try:
+        ok = not isinstance(value, bool) and isinstance(value, (int, float))
+        number = float(value) if ok else None          # an int too large for a float raises OverflowError
+    except OverflowError:
+        number = None
+    if number is None or not math.isfinite(number) or number < 0:
+        raise StoreError(f"{name}: must be a finite number, 0 or more, got {str(value)[:40]!r}")
+    return number
 
 
 def _flag(value, name: str) -> int:
@@ -286,11 +360,14 @@ def add_fact(
     published_at_utc: str | None = None,
     published_proven: bool = False,
 ) -> int:
-    """Store a new version and return its id, or, if the hash matches the version that is current at this
-    read's own `known_at`, return that version's id and store nothing.
+    """Store a new version and return its id, or, if the hash matches the version that is current at BOTH of
+    this read's times (its `known_at` and its fetch time), return the id of the one current at the fetch
+    time and store nothing.
 
     `known_at` is the published time only when `published_proven` is true (the source carries an official
-    timestamp proving the fact was public then); otherwise it is the fetch time."""
+    timestamp proving the fact was public then); otherwise it is the fetch time. A proven read that matches at
+    its published time but not at its fetch time is stored with basis FETCHED and `known_at` = the fetch time:
+    a PUBLISHED copy would be redundant, and the fetch is what makes the content current again."""
     if domain not in DOMAINS:
         raise StoreError(f"domain: must be one of {DOMAINS}")
     _text(entity_key, "entity_key")
@@ -298,12 +375,7 @@ def add_fact(
     proven = _flag(published_proven, "published_proven")
     if not isinstance(raw_sha256, str) or not _SHA_RE.fullmatch(raw_sha256):
         raise StoreError("raw_sha256: must be 64 lowercase hex characters")
-    if not isinstance(payload_json, str) or "\x00" in payload_json:
-        raise StoreError("payload_json: must be JSON text (a str with no NUL byte)")
-    try:
-        json.loads(payload_json)
-    except ValueError as exc:
-        raise StoreError("payload_json: must be valid JSON text") from exc
+    _json_ok(payload_json, "payload_json")
     eff_from = _utc(effective_from_utc, "effective_from_utc")
     eff_to = None if effective_to_utc is None else _utc(effective_to_utc, "effective_to_utc")
     fetched = _utc(fetched_at_utc, "fetched_at_utc")
@@ -322,15 +394,23 @@ def add_fact(
     def run():
         if conn.execute("SELECT 1 FROM source_registry WHERE source_id = ?", (source_id,)).fetchone() is None:
             raise StoreError(f"source {source_id!r} is not registered")
-        latest = _latest_fact_for_key(conn, domain, entity_key, source_id, known_at)
-        if latest is not None and latest["raw_sha256"] == raw_sha256:
-            return latest["fact_version_id"]
+        at_known = _latest_fact_for_key(conn, domain, entity_key, source_id, known_at)
+        at_fetch = at_known if known_at == fetched else _latest_fact_for_key(conn, domain, entity_key,
+                                                                             source_id, fetched)
+        same_known = at_known is not None and at_known["raw_sha256"] == raw_sha256
+        same_fetch = at_fetch is not None and at_fetch["raw_sha256"] == raw_sha256
+        if same_known and same_fetch:
+            return at_fetch["fact_version_id"]
+        if same_known:                      # current when it was published, but not by the time it was fetched
+            known, how = fetched, "FETCHED"
+        else:
+            known, how = known_at, basis
         try:
             cur = conn.execute(
                 "INSERT INTO knowledge_facts (domain, entity_key, effective_from_utc, effective_to_utc,"
                 " published_at_utc, fetched_at_utc, known_at_utc, known_at_basis, source_id, raw_sha256,"
                 " payload_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (domain, entity_key, eff_from, eff_to, published, fetched, known_at, basis, source_id,
+                (domain, entity_key, eff_from, eff_to, published, fetched, known, how, source_id,
                  raw_sha256, payload_json),
             )
         except sqlite3.IntegrityError as exc:
@@ -353,6 +433,7 @@ def facts_as_of(
     allow an outside model are left out. This is the only function that returns fact rows."""
     as_of = _utc(as_of_utc, "as_of_utc")
     outside = _flag(for_outside_llm, "for_outside_llm")
+    _text(entity_key, "entity_key", required=False)
     if domain is not None and domain not in DOMAINS:
         raise StoreError(f"domain: must be one of {DOMAINS}")
     sql = (
