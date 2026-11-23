@@ -472,6 +472,13 @@ Queued (roadmap):
   pacer option to skip a minute the collector hasn't decided yet (later); cluster = one underlying release shock
   (agency release+date / asset family+date / category+date); G_venue >= 60 for the 2028 rotation; seal() needs
   G_cand >= 30; multi-week stock-event sleeves stay on the 2029 vault (corrects round 24).
+  CPI pull 2026-11-23: the first full run was stopped by the guard at 12:10 AM PST. The collector had gone busy at
+  12:03 (4 decisions a minute, ending at second 31-35). After the pull started (12:06:55) its cycle slipped each
+  minute (34 -> 35 -> 34 -> 40 -> 54 s) and 1 decision went late; it recovered at once once stopped. 976 candles kept.
+  Fix (commit aa9a823): CollectorGate + GatedPacer, always on in the CPI pull. Sends only while, over the last 10 min,
+  every decision is ok, at most 1 a minute, each done by second 20, with a heartbeat in the last 3 min; one read-only
+  read a minute; any error holds. Past day: idle 27% of the time (mostly evenings and nights). Restarted 12:49 AM
+  under the guard, holding while busy; its first idle-time sending is not yet observed.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
