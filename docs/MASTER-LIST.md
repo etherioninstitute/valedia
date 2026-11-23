@@ -408,6 +408,13 @@ Queued (roadmap):
   collapse into one trial -> add `describe()`, and audit past merges; R3 draws `r3_shifts` with replacement past
   the number of distinct shifts -> use `timing_exact` when asked for more and print the count; check R4's
   dispersion uses active-Sharpe z. Gate 2 Sharpe at rf = 0; DTB3 excess printed only.
+  Round 15: add `expected_max_correlated_normal(R)` in quant_engine (antithetic MC, eigen-clip, fixed seed; R from
+  stored series with >= 60 shared bars, overlap-scaled, LW-shrunk; R = 0 otherwise, which only raises SR0); tests
+  pin the equicorrelation closed form, rho = -1 at sqrt(2/pi), K = 1 -> 0; print K_eff* beside K_raw. Ledger
+  repair = sealed itemized EPOCH_0_LEGACY_BACKFILL from existing files (tiers A series / B scalar / C count-only
+  with z = None), fingerprint collisions un-merged first, genesis_sha256 in manifest row 9. R3: add an explicit
+  UNDERPOWERED label when 1/(S+1) > 0.05/N (p_exact is already Phipson-Smyth); R4 baseline already fixed per
+  strategy. D13 EXPIRED item: a partial-fill-then-expired recorded answer must book the fill first.
   Round 13: replace the Gumbel E[max] in `expected_max_sharpe` with the exact normal-maximum integral (K=1 -> 0;
   Gumbel is negative for K < 1.2836, so fractional K_eff breaks it); unit test pins the table; the exact value is
   slightly lower above K~5, so past decisions are not re-judged. Every lock prints PSR(0), DSR at per-market
@@ -429,7 +436,7 @@ Ideas not committed to:
   completed scored run).
 - **IDEA** TimesFM 3.0 weights are non-commercial; the owner has not ruled on personal use of them.
 
-From the Carbon dialogue (2026-11-22, rounds 1 to 14; replies `~/Valedia_Claude_Reply1..14.md`). Each test is
+From the Carbon dialogue (2026-11-22, rounds 1 to 15; replies `~/Valedia_Claude_Reply1..15.md`). Each test is
 locked in the research loop before any data is read; none has been run yet.
 **Queue order (round 10):** (1) drift-band trial (backtest only; the live buffer goes through the go-live gate
 work with a full blind check), (2) Kalshi fee fix, (3) CPI Stage 0, (4) insider event table from SEC data only,
@@ -908,7 +915,9 @@ run beside MiroFish and Elephant-1):
     `valedia-v2-grok-build` and `master` were left untouched. Remote name `github`. `.git/hooks/post-commit`
     pushes after each commit on main (log `.git/github-sync.log`); `.git/hooks/pre-push` refuses key patterns and
     private files (tested both ways). Carbon reviews this repo from round 15 on. Untracked journal, artifacts and
-    data stores never go there.
+    data stores never go there. 2026-11-22: the owner made the repo PUBLIC for Carbon; Carbon cannot read a link,
+    so the plan is Gemini "Import code" with GitHub sign-in, then back to private (owner's switch). While public,
+    old branches scanned too: only placeholder `sk-` strings, no real keys; commit metadata names the owner.
 
 ## 13b. Affordable paid options (the owner's to choose; none needed today unless marked)
 
