@@ -519,6 +519,9 @@ Queued (roadmap):
   OWNER: keep his hand trades out of the 15 fund symbols? Not adopted: caffeinate (sleep already 0); 'no market orders'
   (would undo build B's fractional legs; the narrow market rule stays). Clock stays 9:55 ET (10:30 ET = IDEA). Carbon's
   crossed round-27 answer on pull order never arrived; asked for a resend.
+  Owner YES 2026-11-23: PRACTICE GATE MOVED to 8fb509f (+ valedia_trader/agents/placement.py, 54 files; backups
+  `.before-placement`); tested both ways (8fb509f passes, 1d60247 refused, 0 uncommitted order-path edits). First shared
+  practice run: Tue 2026-11-24 6:55 AM PST; clean-week streak can start then.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
