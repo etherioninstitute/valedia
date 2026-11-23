@@ -918,6 +918,8 @@ run beside MiroFish and Elephant-1):
     data stores never go there. 2026-11-22: the owner made the repo PUBLIC for Carbon; Carbon cannot read a link,
     so the plan is Gemini "Import code" with GitHub sign-in, then back to private (owner's switch). While public,
     old branches scanned too: only placeholder `sk-` strings, no real keys; commit metadata names the owner.
+    Owner's choice 2026-11-22: KEEP IT PUBLIC. Every commit on main is therefore published; the pre-push scan is
+    the only guard, so nothing private is ever committed.
 
 ## 13b. Affordable paid options (the owner's to choose; none needed today unless marked)
 
