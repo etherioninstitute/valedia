@@ -421,6 +421,12 @@ Queued (roadmap):
   frozenset(label, sha, spec) with the previous run. Permutation test tolerance 4*hypot(se_R, se_perm). Rehearse
   Thanksgiving (Thu 11-26 = session stop, no fault) and Fri 11-27 (13:00 close, 12:45 cutoff); the settled-cash cap
   uses the venue's settled figure, never its own T+1 dates.
+  Round 20: Condition B uses plain annualized Sharpe (no sqrt(n) rescale; z_k only in DSR); siblings must share
+  periods/year, any earlier n_k > 1.25*n_win -> HOLD_FOR_OWNER_AUDIT, only 0.80..1.25*n_win count toward m (print
+  m_comparable and m_total; excluded still count in K, r_true, DSR). Test pins joint false-hold <= 0.055 at
+  m in {5,8,12,20} (measured 4.8% / 4.2% / 3.7% / 3.4%). Shared book: a sale's proceeds settle in her book only
+  after its settlement date counted in XNYS sessions that are also settlement days (not Columbus/Veterans Day);
+  new rehearsal case: a sale the session before Veterans Day is not spendable on it.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
