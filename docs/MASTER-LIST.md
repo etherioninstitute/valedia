@@ -723,6 +723,9 @@ against the previous read. Standing rules apply to every feed: no telemetry, a g
 licence terms read first, free paths before paid ones, nothing scraped against a site's terms, and nothing
 Finnhub-derived sent to an outside model. Order: after the live path (priority 1). The rows are not yet sized.
 
+- **NEXT CARBON REPLY** (owner, 2026-11-23) asks Carbon for the best way to achieve all of 5b and the tax track:
+  sources (free first), refresh cadence, one store and its schema, change detection, and build order. Also the
+  unscheduled-closure question (section 4 note) and round 28's alert-ranking question.
 - **QUEUED** K-1 listings: every US-listed stock and fund, plus new listings, delistings, symbol changes, splits
   and halts. Candidate free sources: the exchanges' published symbol directories and SEC's ticker file. OWNER:
   SEC's fair-access policy asks automated clients to name a contact in the User-Agent, which conflicts with our
