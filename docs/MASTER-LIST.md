@@ -563,7 +563,10 @@ Queued (roadmap):
   choice, late 2025 settlers kept (count printed); can_close_early kept, no split (count printed); DTB3 carry on
   (1-p) fill->settlement charged before cluster means (NEW, stricter). K-7: date-only sources = end of the date in
   the source's own time zone (Carbon's 23:59:59 UTC leaks ~1 h in ET winter); registry records the zone.
-  Round 30 questions: alert ledger row ownership (6:20 vs 6:30 vs dead-man), dated change logs for Kalshi/Webull
+  Round 30 (reply 30, sent 2026-11-23, status reply before Carbon's 30): T57 + K-3 merged, K-4 building, FR lag
+  (sudden closures need Finnhub + exchange notice), Nasdaq out, Finnhub deletion clause. Qs: off-box dead-man; 6:20
+  row key + dead-man owns P1; third closure authority page; Cand C stage-1 floor margin; Finnhub expiry vs rebuildable.
+  Round 30 questions (from reply 29): alert ledger row ownership (6:20 vs 6:30 vs dead-man), dated change logs for Kalshi/Webull
   rules, stage-1 pass floor so stage 2 can reach G >= 50.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
@@ -790,9 +793,11 @@ Finnhub-derived sent to an outside model. Order: after the live path (priority 1
   10k facts; quick=True for quick_check) and the exact schema multiset. Seven blind checks (6 FAIL -> repaired).
   Known limits in the module docstring (text-only read-path scan; invalid UTF-8 storable by raw SQL but reads
   raise StoreError; temp objects and raw writable_schema between opens). Real store path: decided with K-3.
-- **IN PROGRESS** T58 K-3 (cand/t58-k3-calendar 900bb77, 224 + 1110 tests; blind check 1 PASS with notes -> 4 fixes;
-  re-check running). T59 K-4 ticket written (.foreman/tickets/T59-K4-venue-rules.md), dispatch after K-3 merges.
-  Was: K-3 (calendars/closures) and K-4 (venue rules) tickets on top of K-7. K-3's write helper carries the
+- **DONE** 2026-11-23 T58 K-3 merged 66de881 (2 blind checks PASS with notes, all fixed; lead added negation/partial-scope
+  void words). XNYS schedule, Finnhub holiday/status (local; tombstones; empty list refused), FR presdocs (narrow
+  grammatical closure-day rule; multi-page refused). Nasdaq halts RSS dropped (terms bar stored reuse). NEXT: terms
+  read + register + first real refresh (1 measured request each); fix the real store path.
+- **IN PROGRESS** T59 K-4 venue rules (cand/t59-k4-venue from 66de881), builder dispatched. K-3's write helper carries the
   date-only rule (end of the date in the source's own zone) and each source's zone in the registry.
 
 ## 6. Analytics and decisions
