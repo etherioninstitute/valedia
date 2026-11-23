@@ -580,6 +580,13 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 32 (Carbon response 32, reply 32 sent 2026-11-23): 7:10 hang after a 6:55 gate SKIP was silent (T60's 20 min
+  > 15 min) -> T61: ORPHAN_MINUTES 10 (real runs 1-3 min) + P1 deadman:run-still-open; no order-step timeout, no job move.
+  FR closing-agency orders: 15 of 17 since 1998 are Christmas leave with XNYS open (EO 14371 returned 2025-12-24/26) ->
+  T62: only mourning forms vote, closing orders = closing_order_dates log only; votes by authority GROUP (US_PRESIDENT,
+  FINNHUB; self-found: Finnhub's two endpoints were 2 votes). Weather: 1 group + failed quote check stays P0. Cand C:
+  posted rests to fill/T-48h; yes_bid carried forward with yes_ask; all-null window = 0 posted. Qs: still-open P1 with
+  no re-check; Finnhub 'Mourning' holiday name exception. Owner: iCloud Drive over cellular for the phone Shortcut.
   Round 30 questions (from reply 29): alert ledger row ownership (6:20 vs 6:30 vs dead-man), dated change logs for Kalshi/Webull
   rules, stage-1 pass floor so stage 2 can reach G >= 50.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
