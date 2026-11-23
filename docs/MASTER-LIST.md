@@ -568,6 +568,14 @@ Queued (roadmap):
   Round 30 (reply 30, sent 2026-11-23, status reply before Carbon's 30): T57 + K-3 merged, K-4 building, FR lag
   (sudden closures need Finnhub + exchange notice), Nasdaq out, Finnhub deletion clause. Qs: off-box dead-man; 6:20
   row key + dead-man owns P1; third closure authority page; Cand C stage-1 floor margin; Finnhub expiry vs rebuildable.
+  Round 31 (Carbon response 30, reply 31 sent 2026-11-23): lock-held/outside-window session stops = NOOP, not terminal,
+  + orphan RUN_START > 20 min = P0 (T60 building); Cand C null ask bars carry forward last non-null close (all-null
+  window passes); G_posted >= 50 at 1.00x, Guards 1-2 on stage-1 hourly candles; phone dead-man via iCloud receipt +
+  Shortcut (owner sets up), mini layer needs owner yes; 6:20 closure row adopted, dead-man owns P1; no nyse/cboe/
+  nasdaqtrader scrapers; WH Presidential Actions RSS verified (same-day pubDate, public domain) = K-3 authority, FR+WH
+  dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
+  in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
+  posted-then-out-of-band stays posted.
   Round 30 questions (from reply 29): alert ledger row ownership (6:20 vs 6:30 vs dead-man), dated change logs for Kalshi/Webull
   rules, stage-1 pass floor so stage 2 can reach G >= 50.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
