@@ -6,6 +6,7 @@ import json
 import socket
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -1057,7 +1058,7 @@ def test_fetch_federal_register_request_is_the_documented_query():
     assert q["conditions[publication_date][lte]"] == ["2026-11-23"]
     assert q["per_page"] == ["100"] and int(q["per_page"][0]) <= 100
     assert q["fields[]"] == ["document_number", "title", "type", "subtype", "publication_date", "signing_date",
-                             "html_url", "abstract"]
+                             "html_url", "abstract", "raw_text_url"]
     assert TOKEN not in url
 
 
@@ -1431,3 +1432,196 @@ def test_a_plain_mourning_designation_still_votes_beside_the_new_void_words():
 def test_a_nationwide_mourning_designation_with_united_states_still_votes():
     a = "I hereby declare December 5, 2018, as a National Day of Mourning throughout the United States."
     assert k3.fr_closure_dates("Proclamation text", a, "Proclamation") == ["2018-12-05"]
+
+
+# ---- T63: the date of a death proclamation sits in its body
+
+FIXTURES = Path(__file__).parent / "fixtures"
+BODY_9830 = (FIXTURES / "fr_proc_9830.txt").read_text()
+BODY_10876 = (FIXTURES / "fr_proc_10876.txt").read_text()
+BODY_URL = "https://www.federalregister.gov/documents/full_text/text/2025/01/03/2024-31762.txt"
+TUESDAY = "2026-11-24"
+MOURNING_BODY = ("<html><body><pre>It is my solemn duty to announce the death of a President on November 20, 2026. "
+                 "I do further appoint November 24, 2026, as a National Day of Mourning throughout the United States. "
+                 "The flag shall be flown at half-staff until sunset on December 3, 2026.</pre></body></html>")
+
+
+def death_doc(num="2026-31762", url=BODY_URL, title="Announcing the Death of A Former President", pub="2026-11-22",
+              abstract=None, subtype="Proclamation"):
+    doc = fr_doc(num=num, title=title, subtype=subtype, pub=pub, abstract=abstract)
+    if url is not None:
+        doc["raw_text_url"] = url
+    return doc
+
+
+def fr_payload(conn, number):
+    rows = facts_as_of(conn, "2027-06-01T00:00:00Z", domain="K3_CAL")
+    (row,) = [r for r in rows if r["entity_key"] == f"FR:{number}"]
+    return json.loads(row["payload_json"]), row["payload_json"]
+
+
+def test_fr_body_dates_of_the_two_real_proclamations():
+    assert k3.fr_body_closure_dates(BODY_9830) == ["2018-12-05"]
+    assert k3.fr_body_closure_dates(BODY_10876) == ["2025-01-09"]
+
+
+def test_fr_body_dates_strip_tags_and_collapse_whitespace():
+    assert k3.fr_body_closure_dates(MOURNING_BODY) == [TUESDAY]
+    assert k3.fr_body_closure_dates("<p>I appoint\n  November 24, 2026,\n as a <b>National</b>\n Day of Mourning.</p>") == [TUESDAY]
+
+
+@pytest.mark.parametrize("body", [
+    "I do further appoint November 24, 2026, as a National Day of Mourning only for the Capitol region.",
+    "I do not appoint November 24, 2026, as a National Day of Mourning.",
+    "I do further appoint November 24, 2026, as a National Day of Mourning. A National Day of Mourning is not declared "
+    "for December 1, 2026.",                           # one unsure trigger sentence voids the body
+    "I appoint November 24, as a National Day of Mourning.",                  # no year
+    "",
+    "The President died on November 20, 2026. The flag is at half-staff until December 3, 2026.",   # no trigger sentence
+])
+def test_fr_body_dates_are_empty_when_unsure_or_no_trigger(body):
+    assert k3.fr_body_closure_dates(body) == []
+
+
+def test_fr_body_non_trigger_sentences_never_void_or_vote():
+    body = ("The thirty-ninth President died on December 29, 2024, and the flag stays at half-staff through January 9, "
+            "2025. I do further appoint January 9, 2025, as a National Day of Mourning throughout the United States.")
+    assert k3.fr_body_closure_dates(body) == ["2025-01-09"]                      # the death and flag sentences are ignored
+    only_death = "The President died on January 9, 2025. Flags fly at half-staff on January 9, 2025."
+    assert k3.fr_body_closure_dates(only_death) == []                          # ... and they never vote on their own
+
+
+def test_fr_body_dates_treat_control_characters_as_whitespace():
+    assert "\x00" in BODY_9830                                       # the real raw text has them
+    assert k3.fr_body_closure_dates("I appoint\x00November 24, 2026,\x00as a National Day of\x00Mourning.") == [TUESDAY]
+
+
+def test_fr_body_dates_refuse_a_non_text_body():
+    for bad in (None, b"x", 5):
+        with pytest.raises(k3.K3Error):
+            k3.fr_body_closure_dates(bad)
+
+
+def test_the_fr_request_asks_for_the_raw_text_url():
+    fake = Fake({FR_URL: fr_body()})
+    k3.fetch(FR, http_get=fake, now=NOW)
+    assert "raw_text_url" in parse_qs(urlsplit(fake.calls[0][0]).query)["fields[]"]
+
+
+def test_refresh_reads_the_body_of_each_real_death_proclamation(conn):
+    register(conn)
+    fake = Fake({FR_URL: fr_body(
+        death_doc("2018-26612", url=BODY_URL + "?a", title="Announcing the Death of George Herbert Walker Bush", pub="2018-12-03"),
+        death_doc("2024-31762", url=BODY_URL + "?b", title="Announcing the Death of James Earl Carter, Jr.", pub="2025-01-03")),
+        BODY_URL + "?a": BODY_9830.encode(), BODY_URL + "?b": BODY_10876.encode()})
+    assert k3.refresh(conn, FR, http_get=fake, now=NOW) == {"stored": 2, "unchanged": 0, "error": 0}
+    a, _ = fr_payload(conn, "2018-26612")
+    b, _ = fr_payload(conn, "2024-31762")
+    assert a["closure_dates"] == ["2018-12-05"] and b["closure_dates"] == ["2025-01-09"]
+    assert a["body_read"] is True and b["body_sha256"] == hashlib.sha256(BODY_10876.encode()).hexdigest()
+    assert len(fake.calls) == 3                                               # one list request, one body each
+    for url, headers in fake.calls[1:]:
+        assert headers["User-Agent"] == "valedia-client/1.0"
+    assert k3.refresh(conn, FR, http_get=fake, now=NOW + timedelta(hours=1)) == {"stored": 0, "unchanged": 2, "error": 0}
+
+
+def test_a_non_death_proclamation_never_triggers_a_body_fetch(conn):
+    register(conn)
+    docs = (death_doc("2026-1", title="Thanksgiving Day, 2026"),                           # a proclamation, wrong title
+            death_doc("2026-2", title="Announcing the Death of A Former President", subtype="Executive Order"),
+            closing_doc("2026-3", "December 24, 2026", "2026-11-20"))
+    fake = Fake({FR_URL: fr_body(*docs)})
+    assert k3.refresh(conn, FR, http_get=fake, now=NOW) == {"stored": 3, "unchanged": 0, "error": 0}
+    assert [c[0].split("?")[0] for c in fake.calls] == [FR_URL]                   # the list only: no body request
+    for number in ("2026-1", "2026-2", "2026-3"):
+        assert "body_read" not in fr_payload(conn, number)[0]
+    # the two-way check: a death proclamation does trigger one
+    fake2 = Fake({FR_URL: fr_body(death_doc("2026-4")), BODY_URL: MOURNING_BODY.encode()})
+    k3.refresh(conn, FR, http_get=fake2, now=NOW)
+    assert len(fake2.calls) == 2 and fake2.calls[1][0] == BODY_URL
+
+
+def test_a_title_naming_the_day_of_mourning_also_reads_the_body(conn):
+    register(conn)
+    fake = Fake({FR_URL: fr_body(death_doc("2026-5", title="National Day of Mourning for A Former President")),
+                 BODY_URL: MOURNING_BODY.encode()})
+    k3.refresh(conn, FR, http_get=fake, now=NOW)
+    assert fr_payload(conn, "2026-5")[0]["closure_dates"] == [TUESDAY]
+
+
+@pytest.mark.parametrize("url", [
+    "https://example.com/full_text.txt", "http://www.federalregister.gov/full_text.txt",
+    "https://www.federalregister.gov.evil.example/full_text.txt", "https://evil.example@www.federalregister.gov/x",
+    "https://www.federalregister.gov:8443/x", "https://federalregister.gov/x", "ftp://www.federalregister.gov/x", None])
+def test_a_body_url_on_another_host_is_refused_and_not_requested(conn, url):
+    register(conn)
+    fake = Fake({FR_URL: fr_body(death_doc("2026-6", url=url)), "": MOURNING_BODY.encode()})
+    got = k3.refresh(conn, FR, http_get=fake, now=NOW)
+    assert got["error"] == 1 and got["stored"] == 1
+    assert [c[0].split("?")[0] for c in fake.calls] == [FR_URL]                   # the bad address was never fetched
+    payload, _ = fr_payload(conn, "2026-6")
+    assert payload["closure_dates"] == [] and payload["body_read"] is False
+
+
+def test_a_failed_body_fetch_gives_no_vote_and_error_one(conn):
+    register(conn)
+    for i, answer in enumerate((RuntimeError("reset"), b"", b"x" * (k3._MAX_BODY + 1), b"\xff\xfe")):
+        number = f"2026-7{i}"
+        fake = Fake({FR_URL: fr_body(death_doc(number, abstract="This proclamation designates November 24, 2026, "
+                                                                 "as a National Day of Mourning.")), BODY_URL: answer})
+        got = k3.refresh(conn, FR, http_get=fake, now=NOW)
+        assert got["error"] == 1 and got["stored"] == 1
+        payload, _ = fr_payload(conn, number)
+        assert payload["closure_dates"] == [] and payload["body_read"] is False and payload["body_sha256"] is None
+
+
+def test_the_body_is_read_together_with_the_abstract_and_one_unsure_sentence_voids_all(conn):
+    register(conn)
+    abstract = "This proclamation designates November 24, 2026, as a National Day of Mourning."
+    fake = Fake({FR_URL: fr_body(death_doc("2026-8", abstract=abstract)), BODY_URL: MOURNING_BODY.encode()})
+    k3.refresh(conn, FR, http_get=fake, now=NOW)
+    assert fr_payload(conn, "2026-8")[0]["closure_dates"] == [TUESDAY]
+    unsure = MOURNING_BODY.replace("The flag", "A National Day of Mourning is not set for December 1, 2026. The flag")
+    fake = Fake({FR_URL: fr_body(death_doc("2026-9", abstract=abstract)), BODY_URL: unsure.encode()})
+    k3.refresh(conn, FR, http_get=fake, now=NOW)
+    payload, _ = fr_payload(conn, "2026-9")
+    assert payload["closure_dates"] == [] and payload["body_read"] is True           # read, unsure: no vote, no error
+    unsure_abstract = "This proclamation designates November 24, 2026, as a National Day of Mourning, not on a Sunday."
+    fake = Fake({FR_URL: fr_body(death_doc("2026-10", abstract=unsure_abstract)), BODY_URL: MOURNING_BODY.encode()})
+    k3.refresh(conn, FR, http_get=fake, now=NOW)
+    assert fr_payload(conn, "2026-10")[0]["closure_dates"] == []                    # an unsure abstract voids the body's date
+
+
+def test_finnhub_plus_a_death_proclamation_with_an_empty_abstract_is_an_ordinary_stop(conn, tmp_path):
+    register(conn)
+    k3.refresh(conn, X, http_get=None, now=NOW, params={"start": "2026-11-23", "end": "2026-11-26"})
+    holidays = holiday_body(("Surprise Closure", TUESDAY, ""))
+    k3.refresh(conn, H, http_get=Fake({H_URL: holidays}), now=NOW, credentials=creds)
+    fake = Fake({FR_URL: fr_body(death_doc("2026-11", abstract=None)), BODY_URL: MOURNING_BODY.encode()})
+    assert k3.refresh(conn, FR, http_get=fake, now=NOW) == {"stored": 1, "unchanged": 0, "error": 0}
+    v = k3.closure_votes(conn, TUESDAY, "2026-11-24T12:00:00.000000Z")
+    assert v["authorities_closed"] == [G_FIN, G_PRES] and v["ordinary_stop"] is True
+    # the two-way check: with the body unreadable, the Federal Register casts no vote
+    conn2 = connect(tmp_path / "k2.db")
+    try:
+        register(conn2)
+        k3.refresh(conn2, X, http_get=None, now=NOW, params={"start": "2026-11-23", "end": "2026-11-26"})
+        k3.refresh(conn2, H, http_get=Fake({H_URL: holidays}), now=NOW, credentials=creds)
+        broken = Fake({FR_URL: fr_body(death_doc("2026-11", abstract=None)), BODY_URL: RuntimeError("down")})
+        assert k3.refresh(conn2, FR, http_get=broken, now=NOW)["error"] == 1
+        v2 = k3.closure_votes(conn2, TUESDAY, "2026-11-24T12:00:00.000000Z")
+        assert v2["authorities_closed"] == [G_FIN] and v2["ordinary_stop"] is False and v2["suspected"] is True
+    finally:
+        conn2.close()
+
+
+def test_no_body_text_is_stored(conn):
+    register(conn)
+    fake = Fake({FR_URL: fr_body(death_doc("2026-12")), BODY_URL: MOURNING_BODY.encode()})
+    k3.refresh(conn, FR, http_get=fake, now=NOW)
+    payload, text = fr_payload(conn, "2026-12")
+    assert payload["body_sha256"] == hashlib.sha256(MOURNING_BODY.encode()).hexdigest()
+    assert "solemn duty" not in text and "half-staff" not in text and "<pre>" not in text
+    assert max(len(str(v)) for v in payload.values()) < 300                       # no field holds a body
+    dump = "\n".join(str(tuple(r)) for r in conn.execute("SELECT * FROM knowledge_facts"))
+    assert "solemn duty" not in dump and "half-staff" not in dump

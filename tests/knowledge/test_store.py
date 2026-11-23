@@ -1845,7 +1845,7 @@ _ALLOWED_PUBLIC = {("store.py", n) for n in ("connect", "register_source", "add_
 # reader. The scan below still checks that this module never names the facts table.
 _ALLOWED_PUBLIC |= {("k3_calendar.py", n) for n in (
     "K3Error", "register_all", "schedule_facts", "date_only_known_at", "parse_finnhub_holiday", "parse_finnhub_status",
-    "parse_federal_register", "fr_closure_dates", "fetch", "refresh", "closure_votes")}
+    "parse_federal_register", "fr_closure_dates", "fr_body_closure_dates", "fetch", "refresh", "closure_votes")}
 # The K-4 venue feed's public names, all plain `def` and `class` statements. `normalize_text` and the three `parse_*`
 # functions work on a response body (the parsers build fact dicts to hand to `add_fact`); `fetch` returns the same built
 # dicts; `refresh` returns counts; `register_all` returns nothing; `pending_rule_diffs` returns small summary dicts and
