@@ -1797,3 +1797,30 @@ def test_the_module_holds_no_default_store_path():
     src = Path(rl.__file__).read_text()
     for word in ("artifacts/", "memory/", "journal/", "valedia-data", "Path.home", "expanduser"):
         assert word not in src, word
+
+
+# ------------------------------------------------------------------------------------------------ lead fixes after the blind check
+
+def test_a_later_runs_noop_end_does_not_close_an_earlier_hung_start_of_the_same_trigger(conn):
+    start(conn, utc(2026, 11, 23, 14, 0), trigger="MANUAL")                   # 9:00 New York: hangs
+    start(conn, utc(2026, 11, 23, 14, 30), trigger="MANUAL")                  # 9:30: a second run finds the lock held
+    run_end(conn, utc(2026, 11, 23, 14, 30, 5), "NOOP", trigger="MANUAL", root_cause="run:noop:lock-held")
+    rl.deadman(conn, BOOK, T0725)
+    assert ("FAULT", "run:orphan-start:manual") in deadman_rows(conn)
+
+
+def test_each_run_end_closes_its_own_start_so_two_finished_runs_leave_no_orphan(conn):
+    start(conn, utc(2026, 11, 23, 14, 0), trigger="MANUAL")
+    run_end(conn, utc(2026, 11, 23, 14, 5), "COMPLETED", trigger="MANUAL")
+    start(conn, utc(2026, 11, 23, 14, 30), trigger="MANUAL")
+    run_end(conn, utc(2026, 11, 23, 14, 30, 5), "NOOP", trigger="MANUAL", root_cause="run:noop:lock-held")
+    rl.deadman(conn, BOOK, T0725)
+    assert not any((r[1] or "").startswith("run:orphan-start") for r in deadman_rows(conn))
+
+
+def test_a_noop_carrying_faults_resets_the_streak_and_one_without_faults_does_not():
+    days = rl.sessions_between("2026-11-24", "2026-11-24")
+    noisy = [ev("2026-11-24", "RUN_START", "OK"), ev("2026-11-24"), ev("2026-11-24", outcome="NOOP", trigger="0710", fault_count=2)]
+    quiet = [ev("2026-11-24", "RUN_START", "OK"), ev("2026-11-24"), ev("2026-11-24", outcome="NOOP", trigger="0710")]
+    assert rl.streak(noisy, days)[0] == 0
+    assert rl.streak(quiet, days)[0] == 1

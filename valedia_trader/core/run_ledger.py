@@ -456,8 +456,9 @@ def target_met(count: int) -> bool:
 
 
 def _judge(day_events: Sequence[dict]) -> str | None:
-    """None when the day is clean, else the reason it resets the streak. A NOOP row is ignored: the day is judged by the rest."""
-    day_events = [e for e in day_events if e["outcome"] != "NOOP"]
+    """None when the day is clean, else the reason it resets the streak. A NOOP row with no faults is ignored: the day is
+    judged by the rest. A NOOP that carries faults is a P0 when sent, so it resets the streak like any other fault."""
+    day_events = [e for e in day_events if e["outcome"] != "NOOP" or (e.get("fault_count") or 0) > 0]
     if not day_events:
         return "no terminal row"
     if any(e["kind"] == "SKIP" for e in day_events):
@@ -568,14 +569,21 @@ def _has_terminal_row(conn, trade_date: str, book: str) -> bool:
 
 
 def _orphan_triggers(day_events: Sequence[dict], now: datetime) -> list[str]:
-    """The triggers with a RUN_START that is older than ORPHAN_MINUTES and has no RUN_END of the same trigger after it (a NOOP
-    end counts: it closes the start it belongs to), in the order they started. Only today's events are given."""
+    """The triggers with a RUN_START that is older than ORPHAN_MINUTES and never got its own RUN_END, in the order they
+    started. Starts and ends pair per trigger in event order: each RUN_END closes the latest still-open start of its trigger
+    before it (a NOOP end counts). So a later run's end, even a lock-held NOOP, never closes an earlier hung start. Only
+    today's events are given."""
     limit = stamp(now - timedelta(minutes=ORPHAN_MINUTES))                      # stamps sort as text: older is smaller
+    open_starts: dict[str, list[dict]] = {}
+    for e in sorted(day_events, key=lambda x: x["event_id"]):
+        if e["kind"] == "RUN_START":
+            open_starts.setdefault(e["trigger"], []).append(e)
+        elif e["kind"] == "RUN_END" and open_starts.get(e["trigger"]):
+            open_starts[e["trigger"]].pop()
+    left = sorted((e for starts in open_starts.values() for e in starts), key=lambda x: x["event_id"])
     found: list[str] = []
-    for e in day_events:
-        if e["kind"] != "RUN_START" or e["at_utc"] >= limit or e["trigger"] in found:
-            continue
-        if not any(x["kind"] == "RUN_END" and x["trigger"] == e["trigger"] and x["event_id"] > e["event_id"] for x in day_events):
+    for e in left:
+        if e["at_utc"] < limit and e["trigger"] not in found:
             found.append(e["trigger"])
     return found
 
@@ -672,7 +680,7 @@ def map_run(text: str, exit_code: int) -> RunMapping:
     - `stopped` at stage `session` is, by the start of its reason: "another order step is running" NOOP (run:noop:lock-held);
       "outside the regular session window" NOOP (run:noop:outside-window); "the exchange calendar could not be loaded"
       or "... could not answer for" FAULT; any other (the market is closed) ORDINARY_STOP. A NOOP did nothing and says nothing about the day: it is not
-      a terminal row, it is ignored by the streak, and it is never sent;
+      a terminal row; with no faults it is ignored by the streak and never sent (with faults it is a P0 and resets);
     - any other stop is FAULT with cause run:status-stopped:<stage>, its fault count at least 1."""
     summary = _read_summary(text) if isinstance(text, str) else None
     status = summary.get("status") if summary else None
