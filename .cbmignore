@@ -1,0 +1,18 @@
+# codebase-memory-mcp: never index these (data, journals, the owner's working files, secrets).
+# .gitignore already keeps out state/, artifacts/, *.sqlite, *.db, .env*, *.pem, *.key, *.log and /conf/.
+journal/
+backtests/
+research/
+strategies/
+memory/
+artifacts/
+state/
+conf/
+.env
+.env.*
+*.sqlite*
+*.db
+*.pem
+*.key
+*.log
+.venv/
