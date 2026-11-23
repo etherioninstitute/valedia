@@ -576,16 +576,119 @@ def test_the_module_never_names_the_facts_table_itself():
 
 # ---- refresh: entries
 
-def test_refresh_stores_every_entry_and_opens_one_rule_diff_for_each(reg):
+def settle(conn, source, when=NOW + timedelta(minutes=1)):
+    """Close the baseline flag of a change-log source, so the per-entry flags that follow can be counted alone."""
+    return k4.close_rule_diff(conn, f"{source}:BASELINE", "rules.baseline", when)
+
+
+def items(n, start=1):
+    return [rss_item(f"Entry number {i}", f"Mon, {i:02d} Nov 2026 15:00:00 GMT") for i in range(start, start + n)]
+
+
+def test_the_first_read_of_a_change_log_stores_every_entry_and_opens_one_baseline_flag(reg):
     got = k4.refresh(reg, KR, http_get=Fake({KR_URL: FEED}), now=NOW)
-    assert got == {"stored": 6, "unchanged": 0, "error": 0, "diffs_opened": 6}
+    assert got == {"stored": 6, "unchanged": 0, "error": 0, "diffs_opened": 1}
     rows = current(reg)
-    assert len(rows) == 12
+    assert len(rows) == 7 and f"PENDING_RULE_DIFF:{KR}:BASELINE" in rows
+    entities = {k: r for k, r in rows.items() if not k.startswith("PENDING")}
+    assert len(entities) == 6
+    (d,) = k4.pending_rule_diffs(reg, FAR)
+    assert d == {"entity_key": f"{KR}:BASELINE", "source_id": KR, "old_fact_version_id": None,
+                 "new_fact_version_id": max(r["fact_version_id"] for r in entities.values()), "opened_at_utc": NOW_S}
+    flag = rows[f"PENDING_RULE_DIFF:{KR}:BASELINE"]
+    assert payload(flag) == {"entity_key": f"{KR}:BASELINE", "old_fact_version_id": None,
+                             "new_fact_version_id": d["new_fact_version_id"], "status": "OPEN", "entries": 6}
+    assert flag["known_at_basis"] == "FETCHED" and flag["domain"] == "K4_VENUE" and flag["source_id"] == KR
+
+
+def test_a_first_read_of_twelve_items_gives_one_open_flag_and_a_second_read_with_one_more_gives_one_more(reg):
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: rss(*items(12))}), now=NOW)
+    assert got["stored"] == 12 and got["diffs_opened"] == 1
+    assert len(k4.pending_rule_diffs(reg, FAR)) == 1
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: rss(*items(13))}), now=at(24))
+    assert got == {"stored": 1, "unchanged": 12, "error": 0, "diffs_opened": 1}
     diffs = k4.pending_rule_diffs(reg, FAR)
-    assert len(diffs) == 6 and {d["entity_key"] for d in diffs} == {k for k in rows if not k.startswith("PENDING")}
-    d = [d for d in diffs if d["entity_key"] == key(KR, "2026-11-09", A_TITLE)][0]
-    assert d["old_fact_version_id"] is None and d["new_fact_version_id"] == rows[d["entity_key"]]["fact_version_id"]
-    assert d["source_id"] == KR
+    assert sorted(d["entity_key"] for d in diffs) == sorted([f"{KR}:BASELINE", key(KR, "2026-11-13", "Entry number 13")])
+    assert k4.refresh(reg, KR, http_get=Fake({KR_URL: rss(*items(13))}), now=at(25))["diffs_opened"] == 0
+
+
+def test_a_source_with_earlier_facts_never_gets_a_baseline_flag(reg):
+    k4.refresh(reg, KR, http_get=Fake({KR_URL: rss(*items(3))}), now=NOW)
+    settle(reg, KR)
+    for n, day in ((4, 24), (5, 25)):
+        got = k4.refresh(reg, KR, http_get=Fake({KR_URL: rss(*items(n))}), now=at(day))
+        assert got["stored"] == 1 and got["diffs_opened"] == 1
+    assert sorted(d["entity_key"] for d in k4.pending_rule_diffs(reg, FAR)) == sorted(
+        [key(KR, "2026-11-04", "Entry number 4"), key(KR, "2026-11-05", "Entry number 5")])
+    n_baseline = reg.execute("SELECT count(*) FROM knowledge_facts WHERE entity_key LIKE '%:BASELINE'").fetchone()[0]
+    assert n_baseline == 2                                      # the open one and its close: no second baseline
+
+
+def test_a_closed_baseline_is_not_opened_again_by_an_unchanged_read(reg):
+    k4.refresh(reg, KR, http_get=Fake({KR_URL: FEED}), now=NOW)
+    settle(reg, KR)
+    assert k4.pending_rule_diffs(reg, FAR) == []
+    assert k4.refresh(reg, KR, http_get=Fake({KR_URL: FEED}), now=at(24))["diffs_opened"] == 0
+    assert k4.pending_rule_diffs(reg, FAR) == []
+    closed = current(reg)[f"PENDING_RULE_DIFF:{KR}:BASELINE"]
+    assert payload(closed)["status"] == "CLOSED" and payload(closed)["rule_module"] == "rules.baseline"
+    assert payload(closed)["entries"] == 6
+
+
+def test_an_interrupted_first_read_is_repaired_with_one_baseline_flag_and_no_per_entry_flags(reg):
+    facts = k4.fetch(KR, http_get=Fake({KR_URL: FEED}), now=NOW)
+    for f in facts[:4]:
+        add_fact(reg, **f)                                       # the run stopped here: 4 entries stored, no flag
+    assert k4.pending_rule_diffs(reg, FAR) == []
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: FEED}), now=at(24))
+    assert got == {"stored": 2, "unchanged": 4, "error": 0, "diffs_opened": 1}
+    (d,) = k4.pending_rule_diffs(reg, FAR)
+    assert d["entity_key"] == f"{KR}:BASELINE" and d["old_fact_version_id"] is None
+    assert payload(current(reg)[f"PENDING_RULE_DIFF:{KR}:BASELINE"])["entries"] == 6
+    keys = [k for k in current(reg) if k.startswith("PENDING")]
+    assert keys == [f"PENDING_RULE_DIFF:{KR}:BASELINE"]
+    assert k4.refresh(reg, KR, http_get=Fake({KR_URL: FEED}), now=at(25))["diffs_opened"] == 0      # and only once
+
+
+def test_an_interrupted_first_read_with_every_entry_stored_is_repaired_too(reg):
+    for f in k4.fetch(KR, http_get=Fake({KR_URL: FEED}), now=NOW):
+        add_fact(reg, **f)
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: FEED}), now=at(24))
+    assert got == {"stored": 0, "unchanged": 6, "error": 0, "diffs_opened": 1}
+    assert [d["entity_key"] for d in k4.pending_rule_diffs(reg, FAR)] == [f"{KR}:BASELINE"]
+
+
+def test_no_baseline_flag_is_opened_when_a_first_read_had_an_error_and_the_next_read_opens_it(reg, monkeypatch):
+    real = k4.store.add_fact
+    calls = {"n": 0}
+
+    def flaky(conn, **f):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise StoreError("simulated refusal")
+        return real(conn, **f)
+    monkeypatch.setattr(k4.store, "add_fact", flaky)
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: FEED}), now=NOW)
+    assert got["error"] == 1 and got["stored"] == 5 and got["diffs_opened"] == 0
+    assert k4.pending_rule_diffs(reg, FAR) == []
+    monkeypatch.setattr(k4.store, "add_fact", real)
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: FEED}), now=at(24))
+    assert got["error"] == 0 and got["diffs_opened"] == 1 and got["stored"] == 1
+    assert [d["entity_key"] for d in k4.pending_rule_diffs(reg, FAR)] == [f"{KR}:BASELINE"]
+
+
+def test_a_document_source_never_gets_a_baseline_flag(reg):
+    refresh_doc(reg, FEE, page(CLAUSE))
+    assert [d["entity_key"] for d in k4.pending_rule_diffs(reg, FAR)] == [f"{FEE}:DOC"]
+
+
+def test_the_baseline_flag_is_closed_like_any_other(reg):
+    k4.refresh(reg, WB, http_get=Fake({WB_URL: WEBULL.encode()}), now=NOW)
+    new_id = k4.close_rule_diff(reg, f"{WB}:BASELINE", "valedia_trader.rules.webull", at(24))
+    assert isinstance(new_id, int) and k4.pending_rule_diffs(reg, FAR) == []
+    assert [d["entity_key"] for d in k4.pending_rule_diffs(reg, NOW_S)] == [f"{WB}:BASELINE"]
+    with pytest.raises(k4.K4Error, match="already closed"):
+        k4.close_rule_diff(reg, f"{WB}:BASELINE", "rules.x", at(25))
 
 
 def test_an_unchanged_re_read_stores_nothing_and_opens_no_diff(reg):
@@ -594,11 +697,12 @@ def test_an_unchanged_re_read_stores_nothing_and_opens_no_diff(reg):
     got = k4.refresh(reg, KR, http_get=Fake({KR_URL: FEED}), now=at(24))
     assert got == {"stored": 0, "unchanged": 6, "error": 0, "diffs_opened": 0}
     assert n_rows(reg) == before
-    assert len(k4.pending_rule_diffs(reg, FAR)) == 6
+    assert len(k4.pending_rule_diffs(reg, FAR)) == 1
 
 
 def test_a_changed_summary_is_a_new_version_with_a_second_flag_that_points_back(reg):
     k4.refresh(reg, KR, http_get=Fake({KR_URL: rss(rss_item("Edited", desc="first"))}), now=NOW)
+    settle(reg, KR)
     first = current(reg)[key(KR, "2026-11-09", "Edited")]["fact_version_id"]
     got = k4.refresh(reg, KR, http_get=Fake({KR_URL: rss(rss_item("Edited", desc="second"))}), now=at(24))
     assert got["stored"] == 1 and got["diffs_opened"] == 1
@@ -612,6 +716,7 @@ def test_a_changed_summary_is_a_new_version_with_a_second_flag_that_points_back(
 def test_a_planned_entry_that_comes_due_is_a_new_published_version(reg):
     plan = rss(rss_item("Plan", "Wed, 25 Nov 2026 15:00:00 GMT", "soon"))
     k4.refresh(reg, KR, http_get=Fake({KR_URL: plan}), now=NOW)
+    settle(reg, KR)
     k = key(KR, "2026-11-25", "Plan")
     assert payload(current(reg)[k])["scheduled"] is True
     got = k4.refresh(reg, KR, http_get=Fake({KR_URL: plan}), now=at(27))
@@ -638,7 +743,7 @@ def test_a_refused_body_leaves_the_earlier_facts_and_flags_alone(reg):
     k4.refresh(reg, KR, http_get=Fake({KR_URL: FEED}), now=NOW)
     before = n_rows(reg)
     got = k4.refresh(reg, KR, http_get=Fake({KR_URL: b"<html>gateway error</html>"}), now=at(24))
-    assert got["error"] == 1 and n_rows(reg) == before and len(k4.pending_rule_diffs(reg, FAR)) == 6
+    assert got["error"] == 1 and n_rows(reg) == before and len(k4.pending_rule_diffs(reg, FAR)) == 1
 
 
 def test_a_failed_request_is_an_error_not_a_crash_and_says_nothing_about_the_request(reg):
@@ -669,9 +774,9 @@ def test_refresh_arguments_are_checked(reg):
     assert n_rows(reg) == 0
 
 
-def test_refresh_webull_stores_and_opens_diffs(reg):
+def test_refresh_webull_stores_and_opens_one_baseline_flag(reg):
     got = k4.refresh(reg, WB, http_get=Fake({WB_URL: WEBULL.encode()}), now=NOW)
-    assert got == {"stored": 5, "unchanged": 0, "error": 0, "diffs_opened": 5}
+    assert got == {"stored": 5, "unchanged": 0, "error": 0, "diffs_opened": 1}
     assert k4.refresh(reg, WB, http_get=Fake({WB_URL: WEBULL.encode()}), now=at(24))["unchanged"] == 5
 
 
@@ -817,9 +922,9 @@ def test_a_fact_known_after_as_of_never_shows(reg):
     just_before = "2026-11-23T17:59:59Z"
     assert set(current(reg, just_before)) == {key(KR, "2026-11-09", A_TITLE), key(KR, "2026-11-20", B_TITLE)}
     assert k4.pending_rule_diffs(reg, just_before) == []
-    assert len(k4.pending_rule_diffs(reg, NOW_S)) == 6                 # the feed's flags, known at the fetch time
-    assert len(k4.pending_rule_diffs(reg, "2026-11-24T17:59:59Z")) == 6
-    assert len(k4.pending_rule_diffs(reg, "2026-11-24T18:00:00Z")) == 7
+    assert len(k4.pending_rule_diffs(reg, NOW_S)) == 1                 # the feed's baseline flag, known at the fetch time
+    assert len(k4.pending_rule_diffs(reg, "2026-11-24T17:59:59Z")) == 1
+    assert len(k4.pending_rule_diffs(reg, "2026-11-24T18:00:00Z")) == 2
     assert f"{FEE}:DOC" not in current(reg, "2026-11-24T17:59:59Z") and f"{FEE}:DOC" in current(reg, "2026-11-24T18:00:00Z")
 
 
@@ -838,6 +943,7 @@ BROKEN_FLAGS = {
     "entity key differs": '{"entity_key":"x","old_fact_version_id":null,"new_fact_version_id":1,"status":"OPEN"}',
     "unknown status": '{"entity_key":"%s:DOC","old_fact_version_id":null,"new_fact_version_id":1,"status":"MAYBE"}' % RULE,
     "closed with no module": '{"entity_key":"%s:DOC","old_fact_version_id":null,"new_fact_version_id":1,"status":"CLOSED"}' % RULE,
+    "entries is text": '{"entity_key":"%s:DOC","old_fact_version_id":null,"new_fact_version_id":1,"status":"OPEN","entries":"6"}' % RULE,
     "id is text": '{"entity_key":"%s:DOC","old_fact_version_id":null,"new_fact_version_id":"1","status":"OPEN"}' % RULE,
     "old id is a bool": '{"entity_key":"%s:DOC","old_fact_version_id":true,"new_fact_version_id":1,"status":"OPEN"}' % RULE,
 }

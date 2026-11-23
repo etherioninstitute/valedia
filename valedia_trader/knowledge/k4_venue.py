@@ -24,6 +24,12 @@ Facts (all in the domain K4_VENUE):
 - A rule-diff flag: key `PENDING_RULE_DIFF:<entity key>`; payload `entity_key, old_fact_version_id (or null),
   new_fact_version_id, status`. `refresh` opens one (status OPEN) whenever it stores a new version of an entity, and also
   when the current version of an entity has no flag that points at it (a run that stopped between the two writes).
+- The baseline read: the first read of a CHANGELOG source (one with no flag of its own yet) stores every entry but opens
+  ONE flag only, `PENDING_RULE_DIFF:<source_id>:BASELINE`, with `entity_key` `<source_id>:BASELINE`, `old_fact_version_id`
+  null, `new_fact_version_id` the highest version stored in that read, and `entries` the number of entries. The
+  history of a change log is one thing to read, not one flag per old entry. After it, each new or changed entry opens its
+  own flag. A read that stopped after storing entries but before the baseline flag is repaired by the next read: one
+  baseline flag and no per-entry flags. A DOCUMENT source needs no baseline: its first version opens its own flag.
   `close_rule_diff` writes a later version with status CLOSED and the `rule_module`. `pending_rule_diffs` lists the open
   ones as of a time.
 
@@ -491,6 +497,7 @@ def _diff_payload(row: dict) -> dict:
     except ValueError:
         p = None
     ok = (isinstance(p, dict) and set(p) >= {"entity_key", "old_fact_version_id", "new_fact_version_id", "status"}
+          and (p.get("entries") is None or (type(p["entries"]) is int and p["entries"] > 0))
           and p["entity_key"] == key[len(_DIFF_PREFIX):] and p["status"] in ("OPEN", "CLOSED")
           and type(p["new_fact_version_id"]) is int
           and (p["old_fact_version_id"] is None or type(p["old_fact_version_id"]) is int)
@@ -516,6 +523,9 @@ def _store_facts(conn, source_id: str, facts: list[dict]) -> dict:
         else:
             before[row["entity_key"]] = row["fact_version_id"]
     detail = None
+    baseline = SOURCES[source_id]["role"] == "CHANGELOG" and not flags     # a change log with no flag of its own yet
+    versions = []
+    covered = (flags.get(f"{source_id}:BASELINE") or {}).get("new_fact_version_id", 0)
 
     def fail(exc):
         nonlocal detail
@@ -531,9 +541,14 @@ def _store_facts(conn, source_id: str, facts: list[dict]) -> dict:
             continue
         changed = before.get(key) != version
         counts["stored" if changed else "unchanged"] += 1
+        versions.append(version)
+        if baseline:
+            continue                                  # one flag for the whole first read, below
         flag = flags.get(key)
         if flag is not None and flag["new_fact_version_id"] == version:
             continue                                  # a flag already points at this version
+        if flag is None and version <= covered:
+            continue                                  # the baseline flag covers every entry of the first read
         old = flag["new_fact_version_id"] if flag is not None else (before.get(key) if changed else None)
         body = {"entity_key": key, "old_fact_version_id": old, "new_fact_version_id": version, "status": "OPEN"}
         try:
@@ -542,6 +557,15 @@ def _store_facts(conn, source_id: str, facts: list[dict]) -> dict:
             fail(exc)
             continue
         counts["diffs_opened"] += 1
+    if baseline and versions and not counts["error"]:     # after a failed fact, the next read repairs it
+        body = {"entity_key": f"{source_id}:BASELINE", "old_fact_version_id": None,
+                "new_fact_version_id": max(versions), "status": "OPEN", "entries": len(facts)}
+        try:
+            store.add_fact(conn, **_fact(source_id, f"{_DIFF_PREFIX}{source_id}:BASELINE", body,
+                                         effective_from=fetched, fetched=fetched))
+            counts["diffs_opened"] += 1
+        except store.StoreError as exc:
+            fail(exc)
     if detail:
         counts["detail"] = detail
     return counts
