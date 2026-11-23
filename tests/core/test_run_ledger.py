@@ -1348,8 +1348,8 @@ def day_streak(conn, first, last):
     return count_, {d["date"]: d for d in per_day}
 
 
-def test_the_orphan_age_is_twenty_minutes():
-    assert rl.ORPHAN_MINUTES == 20
+def test_the_orphan_age_is_ten_minutes():
+    assert rl.ORPHAN_MINUTES == 10
 
 
 def test_a_hung_0655_then_a_0710_lock_held_noop_sends_the_orphan_p0_and_the_no_terminal_row_p1_and_resets(conn):
@@ -1435,18 +1435,20 @@ def test_only_an_ordinary_stop_for_a_closed_market_on_a_non_session_day_is_pause
     assert by["2026-11-26"]["status"] == "paused" and by["2026-11-26"]["reason"] == "not a session"
 
 
-def test_a_run_start_ten_minutes_old_is_no_orphan(conn):
+def test_a_run_start_ten_minutes_old_is_no_orphan_but_is_still_open(conn):
     start(conn, utc(2026, 11, 23, 15, 15))
     rl.deadman(conn, BOOK, T0725)
-    assert deadman_rows(conn) == [("MISSING", "deadman:no-terminal-row")]
+    assert sorted(deadman_rows(conn)) == [("MISSING", "deadman:no-terminal-row"), ("MISSING", "deadman:run-still-open:0655")]
 
 
-@pytest.mark.parametrize("age_seconds,orphan", [(10 * 60, False), (20 * 60, False), (20 * 60 + 1, True), (21 * 60, True), (95 * 60, True)])
-def test_a_start_is_an_orphan_only_when_it_is_older_than_twenty_minutes(conn, age_seconds, orphan):
+@pytest.mark.parametrize("age_seconds,orphan", [(5 * 60, False), (10 * 60, False), (10 * 60 + 1, True), (11 * 60, True), (20 * 60, True),
+                                                (95 * 60, True)])
+def test_a_start_is_an_orphan_only_when_it_is_older_than_ten_minutes(conn, age_seconds, orphan):
     started = utc(2026, 11, 23, 15, 25) - timedelta(seconds=age_seconds)
     start(conn, started)
     rl.deadman(conn, BOOK, T0725)
     assert (("FAULT", "run:orphan-start:0655") in deadman_rows(conn)) is orphan
+    assert (("MISSING", "deadman:run-still-open:0655") in deadman_rows(conn)) is (not orphan)        # one or the other, never both
 
 
 @pytest.mark.parametrize("outcome", ["COMPLETED", "FAULT", "CRASH", "ORDINARY_STOP", "NOOP"])
@@ -1486,9 +1488,10 @@ def test_an_orphan_and_the_no_terminal_row_check_each_fire_once_over_repeated_ch
 def test_an_orphan_found_by_a_later_check_is_written_beside_the_day_row_already_there(conn):
     start(conn, utc(2026, 11, 23, 15, 15))                                           # 10 minutes old at 10:25
     rl.deadman(conn, BOOK, T0725)
-    assert deadman_rows(conn) == [("MISSING", "deadman:no-terminal-row")]
+    assert sorted(deadman_rows(conn)) == [("MISSING", "deadman:no-terminal-row"), ("MISSING", "deadman:run-still-open:0655")]
     assert rl.deadman(conn, BOOK, utc(2026, 11, 23, 15, 45)) is None                 # the day row is not rewritten
-    assert sorted(deadman_rows(conn)) == [("FAULT", "run:orphan-start:0655"), ("MISSING", "deadman:no-terminal-row")]
+    assert sorted(deadman_rows(conn)) == [("FAULT", "run:orphan-start:0655"), ("MISSING", "deadman:no-terminal-row"),
+                                          ("MISSING", "deadman:run-still-open:0655")]
 
 
 def test_an_orphan_with_a_real_terminal_row_still_gives_the_p0_but_no_p1(conn):
@@ -1824,3 +1827,116 @@ def test_a_noop_carrying_faults_resets_the_streak_and_one_without_faults_does_no
     quiet = [ev("2026-11-24", "RUN_START", "OK"), ev("2026-11-24"), ev("2026-11-24", outcome="NOOP", trigger="0710")]
     assert rl.streak(noisy, days)[0] == 0
     assert rl.streak(quiet, days)[0] == 1
+
+
+# ------------------------------------------------------------------------------------------------ the 7:10 trap (T61)
+
+T0720 = utc(2026, 11, 23, 15, 20)                      # 7:20 Pacific: a start only 5 minutes old at the 7:25 check
+STILL_OPEN_0710 = ("MISSING", "deadman:run-still-open:0710")
+
+
+def gate_skip(conn, now=T0655):
+    return add(conn, "SKIP", "0655", "SKIPPED", now, root_cause="gate:closed", revision_ok=1)
+
+
+def test_a_0655_gate_skip_then_a_hung_0710_start_is_a_p0_orphan_that_is_sent_and_resets_the_streak(conn):
+    s = FakeSender()
+    start(conn, utc(2026, 11, 20, 14, 55))
+    run_end(conn, utc(2026, 11, 20, 15, 0))                                         # Friday: clean, count 1
+    gate_skip(conn)                                                                 # 6:55: a terminal row, so no P1
+    start(conn, T0710, "0710")                                                      # 7:10: the order step starts and hangs
+    rl.deadman(conn, BOOK, T0725)                                                   # 15 minutes old at 7:25
+    assert sorted(deadman_rows(conn)) == [("FAULT", "run:orphan-start:0710"), ("OK", None)]
+    out = notify(conn, s, T0725)
+    assert [o["severity"] for o in out["due"]] == ["P0", "P2"] and out["sent"] == 2         # the orphan, and the gate skip's own P2
+    p0 = [t for t in s.sent if t[0].startswith("P0")]
+    assert len(p0) == 1 and "run:orphan-start:0710" in p0[0][1]
+    assert not [t for t in s.sent if t[0].startswith("P1")]                          # the skip is a terminal row: no dead-man P1
+    count_, by = day_streak(conn, "2026-11-20", MON)
+    assert count_ == 0 and by[MON]["status"] == "reset" and by["2026-11-20"]["status"] == "clean"
+
+
+def test_the_same_day_without_the_hung_0710_start_sends_nothing_but_the_skip(conn):
+    s = FakeSender()
+    gate_skip(conn)
+    rl.deadman(conn, BOOK, T0725)
+    assert deadman_rows(conn) == [("OK", None)]                                     # the control: the start is what the P0 needs
+    assert [o["severity"] for o in notify(conn, s, T0725)["due"]] == ["P2"]
+
+
+def test_a_0720_start_still_open_at_0725_is_a_p1_sent_once_and_not_written_again(conn):
+    s = FakeSender()
+    gate_skip(conn)
+    start(conn, T0720, "0710")
+    first = rl.deadman_check(conn, BOOK, T0725)
+    assert len(first) == 2 and sorted(deadman_rows(conn)) == [STILL_OPEN_0710, ("OK", None)]
+    out = notify(conn, s, T0725)
+    assert [o["severity"] for o in out["due"] if o["severity"] != "P2"] == ["P1"] and out["sent"] == 2     # the P2 skip and the P1
+    p1 = [t for t in s.sent if t[0].startswith("P1")]
+    assert len(p1) == 1 and "deadman:run-still-open:0710" in p1[0][1] and "still open" in p1[0][0]
+    assert rl.deadman_check(conn, BOOK, utc(2026, 11, 23, 15, 26)) == []            # a second check writes nothing
+    assert deadman_rows(conn).count(STILL_OPEN_0710) == 1
+    again = notify(conn, s, utc(2026, 11, 23, 15, 26))
+    assert again["due"] == [] and len(s.sent) == 2                                  # and the P1 is not sent twice
+    assert day_streak(conn, MON, MON)[1][MON]["status"] == "reset"
+
+
+def test_the_still_open_row_is_separate_from_the_days_ok_or_missing_row(conn):
+    start(conn, T0720, "0710")                                                      # no terminal row at all
+    ids = rl.deadman_check(conn, BOOK, T0725)
+    assert len(ids) == 2 and sorted(deadman_rows(conn)) == [("MISSING", "deadman:no-terminal-row"), STILL_OPEN_0710]
+    assert rl.deadman(conn, BOOK, utc(2026, 11, 23, 15, 30)) is None                 # the day row is not written twice either
+    s = FakeSender()
+    notify(conn, s, T0725)
+    assert sorted(t[0] for t in s.sent) == ["P1 order step: no run recorded", "P1 order step: run still open"]
+
+
+def test_deadman_returns_the_day_row_not_the_still_open_row_and_the_cli_names_both(conn, tmp_path, capsys):
+    start(conn, T0720, "0710")
+    i = rl.deadman(conn, BOOK, T0725)
+    assert conn.execute("SELECT root_cause FROM run_events WHERE event_id = ?", (i,)).fetchone()[0] == "deadman:no-terminal-row"
+    cli(["record", "--kind", "RUN_START", "--trigger", "0710", "--outcome", "OK"], tmp_path, now=T0720, capsys=capsys)
+    code, out = cli(["deadman"], tmp_path, now=T0725, capsys=capsys)
+    j = json.loads(out.out)
+    assert code == 1 and j["outcome"] == "MISSING" and len(j["event_ids"]) == 2 and j["orphans"] == []
+    assert j["still_open"] == ["deadman:run-still-open:0710"]
+
+
+def test_a_completed_0710_start_fires_neither_alert(conn):
+    s = FakeSender()
+    start(conn, T0710, "0710")
+    run_end(conn, utc(2026, 11, 23, 15, 11), trigger="0710")                         # 7:10 to 7:11, as every day 11-16 to 11-20
+    rl.deadman(conn, BOOK, T0725)
+    assert deadman_rows(conn) == [("OK", None)]
+    assert notify(conn, s, T0725)["due"] == [] and s.sent == []
+    assert day_streak(conn, MON, MON)[1][MON]["status"] == "clean"
+
+
+def test_a_still_open_start_is_found_for_its_own_trigger_and_a_later_end_of_another_trigger_does_not_close_it(conn):
+    start(conn, T0720, "MANUAL")
+    run_end(conn, utc(2026, 11, 23, 15, 21), trigger="0710")                         # another trigger's end
+    rl.deadman(conn, BOOK, T0725)
+    assert ("MISSING", "deadman:run-still-open:manual") in deadman_rows(conn)
+
+
+def test_a_still_open_start_that_gets_its_end_before_the_check_is_not_flagged_and_one_ended_after_stays_written(conn):
+    start(conn, T0720, "0710")
+    run_end(conn, utc(2026, 11, 23, 15, 22), trigger="0710", outcome="NOOP", root_cause="run:noop:lock-held")
+    rl.deadman(conn, BOOK, T0725)
+    assert not [r for r in deadman_rows(conn) if (r[1] or "").startswith("deadman:run-still-open")]
+    start(conn, utc(2026, 11, 23, 15, 23), "MANUAL")
+    rl.deadman(conn, BOOK, utc(2026, 11, 23, 15, 26))
+    assert ("MISSING", "deadman:run-still-open:manual") in deadman_rows(conn)
+    run_end(conn, utc(2026, 11, 23, 15, 27), trigger="MANUAL")
+    rl.deadman(conn, BOOK, utc(2026, 11, 23, 15, 28))
+    assert deadman_rows(conn).count(("MISSING", "deadman:run-still-open:manual")) == 1       # append-only: the row stays
+
+
+def test_a_still_open_start_is_looked_for_only_today_in_this_book_from_1025_on(conn):
+    start(conn, utc(2026, 11, 20, 15, 20), "0710")                                   # Friday's
+    start(conn, T0720, "0710", book="another-book")
+    rl.deadman(conn, BOOK, T1024)
+    assert count(conn) == 2
+    rl.deadman(conn, BOOK, T0725)
+    assert [r for r in deadman_rows(conn) if "run-still-open" in (r[1] or "")] == []
+    assert [r for r in deadman_rows(conn, book="another-book") if "run-still-open" in (r[1] or "")] == []   # not checked for it
