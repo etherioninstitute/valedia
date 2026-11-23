@@ -1333,35 +1333,42 @@ def test_a_write_inside_the_callers_open_transaction_is_refused(conn):
     assert count(conn) == 1
 
 
-class _FailingCommit:
-    """Wraps a connection and makes the next COMMIT fail, as a full disk or a lock would."""
-
-    def __init__(self, inner):
-        self._inner = inner
-        self.fail = True
+class _FailingCommitConnection(sqlite3.Connection):
+    """A real connection whose next COMMIT fails, as a full disk or a lock would."""
+    fail = True
 
     def execute(self, sql, *args):
         if self.fail and sql.strip().upper() == "COMMIT":
             raise sqlite3.OperationalError("disk I/O error")
-        return self._inner.execute(sql, *args)
+        return super().execute(sql, *args)
 
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
+
+def _failing_commit_connection(path):
+    c = sqlite3.connect(path, isolation_level=None, factory=_FailingCommitConnection)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys = ON")
+    return c
 
 
 @pytest.mark.parametrize("which", ["add_fact", "register_source"])
-def test_a_failed_commit_rolls_back_and_raises_store_error(conn, which):
-    wrapped = _FailingCommit(conn)
+def test_a_failed_commit_rolls_back_and_raises_store_error(tmp_path, which):
+    path = tmp_path / "fc.db"
+    connect(path).close()
+    wrapped = _failing_commit_connection(path)
+    wrapped.fail = False
+    src(wrapped)                                                  # (two-way) works with a healthy commit
+    wrapped.fail = True
     with pytest.raises(StoreError, match="commit"):
         if which == "add_fact":
             fact(wrapped)
         else:
             src(wrapped, "example_c1")
-    assert not conn.in_transaction                                # never left stuck in a transaction
-    assert count(conn) == 0 and count(conn, "source_registry") == 1
+    assert not wrapped.in_transaction                             # never left stuck in a transaction
+    assert count(wrapped) == 0 and count(wrapped, "source_registry") == 1
     wrapped.fail = False
     fact(wrapped)                                                 # and the connection works again
-    assert count(conn) == 1
+    assert count(wrapped) == 1
+    wrapped.close()
 
 
 # ---- escaped lone surrogates inside JSON --------------------------------------------------------
@@ -1378,6 +1385,140 @@ def test_a_proper_escaped_surrogate_pair_and_real_unicode_are_accepted(conn):
     for i, text in enumerate(['"\\ud83d\\ude00"', '{"k": "caf\\u00e9", "\\u00e9": 1}', '"\u00e9"']):
         fact(conn, entity_key=f"U{i}", payload_json=text)
     assert count(conn) == 3
+
+
+# ---- the extra-object check is an exact allowlist, never a name pattern -------------------------
+
+def _poison(name, kind="TRIGGER"):
+    if kind == "TRIGGER":
+        return f"CREATE TRIGGER {name} BEFORE INSERT ON knowledge_facts BEGIN SELECT 1; END;"
+    if kind == "VIEW":
+        return f"CREATE VIEW {name} AS SELECT 1;"
+    return f"CREATE TABLE {name} (x);"
+
+
+@pytest.mark.parametrize("sql,name", [
+    (_poison("sqliteXpoison"), "sqliteXpoison"),
+    (_poison("SQLITEevil"), "SQLITEevil"),
+    (_poison("sqliteYview", "VIEW"), "sqliteYview"),
+    (_poison("sqliteZtbl", "TABLE"), "sqliteZtbl"),
+    (_poison("sqlite"), "sqlite"),
+])
+def test_objects_with_sqlite_lookalike_names_are_refused(tmp_path, sql, name):
+    path = _store_with(tmp_path, sql)
+    with pytest.raises(StoreError, match=name):
+        connect(path)
+
+
+def _write_schema_row(path, kind, name, tbl, sql):
+    """Put a row straight into sqlite_master, the only way to get a reserved sqlite_ name."""
+    raw = sqlite3.connect(path)
+    raw.execute("PRAGMA writable_schema = ON")
+    raw.execute("INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) VALUES (?,?,?,0,?)",
+                (kind, name, tbl, sql))
+    raw.commit()
+    raw.close()
+
+
+@pytest.mark.parametrize("name", ["sqlite_Xfoo", "SQLITE_evil", "sqlite_autoindex_other_1x"])
+def test_a_trigger_with_a_reserved_name_written_into_the_schema_is_refused(tmp_path, name):
+    path = tmp_path / "res.db"
+    connect(path).close()
+    _write_schema_row(path, "trigger", name, "knowledge_facts",
+                      f"CREATE TRIGGER {name} BEFORE INSERT ON knowledge_facts BEGIN SELECT 1; END")
+    with pytest.raises(StoreError, match=name):
+        connect(path)
+
+
+def test_a_fake_statistics_table_is_refused(tmp_path):
+    path = tmp_path / "stat.db"
+    connect(path).close()
+    _write_schema_row(path, "table", "sqlite_stat1", "sqlite_stat1", "CREATE TABLE sqlite_stat1(evil)")
+    with pytest.raises(StoreError, match="sqlite_stat1"):
+        connect(path)
+    path2 = tmp_path / "stat2.db"
+    connect(path2).close()
+    _write_schema_row(path2, "view", "sqlite_stat1", "sqlite_stat1", "CREATE VIEW sqlite_stat1 AS SELECT 1")
+    with pytest.raises(StoreError, match="sqlite_stat1"):
+        connect(path2)
+
+
+@pytest.mark.parametrize("maintenance", [["VACUUM"], ["ANALYZE"], ["ANALYZE", "VACUUM"], ["VACUUM", "ANALYZE"],
+                                         ["PRAGMA optimize"]])
+def test_a_store_still_opens_after_vacuum_and_analyze(tmp_path, maintenance):
+    path = tmp_path / "maint.db"
+    c = connect(path)
+    src(c)
+    fact(c)
+    fact(c, raw_sha256=sha("b"))
+    for stmt in maintenance:
+        c.execute(stmt)
+    names = {r[0] for r in c.execute("SELECT name FROM sqlite_master")}
+    assert ("ANALYZE" not in maintenance) or "sqlite_stat1" in names          # ANALYZE really created it
+    c.close()
+    c = connect(path)                                                          # opens
+    assert count(c) == 2
+    fact(c, raw_sha256=sha("c"))
+    c.close()
+
+
+# ---- the path and connection arguments -----------------------------------------------------------
+
+class _BytesPath:
+    def __fspath__(self):
+        return b"/tmp/never-created.db"
+
+
+@pytest.mark.parametrize("bad", [None, 5, 1.5, b"x.db", bytearray(b"x"), ["x.db"], {}, "", "a\x00b.db",
+                                 "a\ud800b.db", _BytesPath(), object(), True])
+def test_connect_refuses_a_bad_path_and_creates_no_file(tmp_path, monkeypatch, bad):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(StoreError):
+        connect(bad)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_connect_accepts_str_and_pathlike_paths(tmp_path):
+    connect(str(tmp_path / "a.db")).close()
+    connect(tmp_path / "b.db").close()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.db", "b.db"]
+
+
+@pytest.mark.parametrize("bad", [None, "conn", 5, object(), [], b"x", sqlite3])
+def test_functions_refuse_anything_that_is_not_a_sqlite_connection(bad):
+    with pytest.raises(StoreError, match="connection"):
+        register_source(bad, source_id="example_x", terms_url="u", licence_tag="x", personal_use_ok=True,
+                        allow_external_llm=False, ua_policy="GENERIC_CLIENT", terms_read_at_utc=T0)
+    with pytest.raises(StoreError, match="connection"):
+        add_fact(bad, domain="K2_NEWS", entity_key="A", source_id="example_x", raw_sha256=sha("a"),
+                 payload_json="{}", effective_from_utc=T0, fetched_at_utc=T1)
+    with pytest.raises(StoreError, match="connection"):
+        facts_as_of(bad, T3)
+
+
+def test_functions_work_on_a_plain_connection_without_a_row_factory(tmp_path):
+    path = tmp_path / "plain3.db"
+    connect(path).close()
+    plain = sqlite3.connect(path)                       # default row factory (tuples), default isolation level
+    src(plain)
+    first = fact(plain)
+    again = fact(plain)
+    assert again == first
+    rows = facts_as_of(plain, T3)
+    assert [r["fact_version_id"] for r in rows] == [first] and rows[0]["entity_key"] == "ABC"
+    assert not plain.in_transaction
+    plain.close()
+
+
+# ---- the docstring states what connect checks and what it cannot ---------------------------------
+
+def test_the_module_docstring_states_its_limits():
+    doc = " ".join((store.__doc__ or "").split())
+    assert "only the id range, the schema identity and the version" in doc
+    assert "other than out-of-range ids" in doc and "are not detected" in doc
+    assert "text-only" in doc and "built at run time" in doc
+    assert "disables triggers" in doc and "re-creates them verbatim" in doc and "outside what the store can detect" in doc
+    assert "which catches rows written with the checks switched off" not in doc
 
 
 # ---- one read path -------------------------------------------------------------------------------

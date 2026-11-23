@@ -32,15 +32,26 @@ read's hash. `add_fact` stores nothing only when the hash already matches the cu
 read's `known_at_utc` and its fetch time. When a proven publication time would leave an older, different
 version current at the fetch time, a FETCHED row at the fetch time is stored too, in the same transaction.
 
-Known limits of the database-side checks: a raw number such as 1e999 inside payload JSON, and an escaped
-lone surrogate such as "\\ud800" inside a JSON string, are refused by `add_fact` (in code) but not by the
-database itself, which accepts them as valid JSON text. `connect` also refuses any store with unexpected objects or ids
-outside 1..2^62, which catches rows written with the checks switched off.
+What `connect` checks on opening a store: the schema version, that every expected table, index and trigger is
+present with exactly the SQL this code creates, that nothing else is in the file (every entry of the schema
+table is compared against an exact allowlist, never a name pattern; SQLite's own automatic indexes and the
+statistics tables that ANALYZE makes are the only extras allowed), and that the ids lie within 1..2^62. It
+checks only the id range, the schema identity and the version. Rows written with the checks switched off, other
+than out-of-range ids, are not detected.
+
+Known limits:
+- A raw number such as 1e999 inside payload JSON, and an escaped lone surrogate such as "\\ud800" inside a JSON
+  string, are refused by `add_fact` (in code) but not by the database itself, which accepts them as valid JSON.
+- The test that guards the single read path is text-only: it finds the facts table by its name written out in
+  the package's source, so a name built at run time would not be seen.
+- A raw connection that disables triggers, or drops and re-creates them verbatim, is outside what the store
+  can detect.
 """
 from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -151,14 +162,21 @@ BEGIN SELECT RAISE(ABORT, 'knowledge_facts is append-only: no deletes'); END;
 """
 
 
-def _objects(conn: sqlite3.Connection) -> dict[str, str]:
-    """name -> SQL text of every table, index and trigger in the file (SQLite's own internal ones left out)."""
-    return {name: sql for name, sql in conn.execute(
-        "SELECT name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
+_STATS_TABLES = {      # made by ANALYZE; the only tables whose names start with sqlite_ that are allowed
+    "sqlite_stat1": "CREATE TABLE sqlite_stat1(tbl,idx,stat)",
+    "sqlite_stat4": "CREATE TABLE sqlite_stat4(tbl,idx,neq,nlt,ndlt,sample)",
+}
 
 
-def _reference_objects() -> dict[str, str]:
-    """What a correct store holds: the schema built in a throwaway in-memory database."""
+def _objects(conn: sqlite3.Connection) -> dict[str, tuple]:
+    """name -> (type, tbl_name, SQL text) for every entry in the schema table, with no name filtering."""
+    return {row[0]: (row[1], row[2], row[3]) for row in conn.execute(
+        "SELECT name, type, tbl_name, sql FROM sqlite_master")}
+
+
+def _reference_objects() -> dict[str, tuple]:
+    """What a correct store holds: the schema built in a throwaway in-memory database. It includes the
+    automatic indexes SQLite makes for the primary keys, under the exact names SQLite gives them."""
     ref = sqlite3.connect(":memory:")
     try:
         ref.executescript(_SCHEMA)
@@ -168,28 +186,52 @@ def _reference_objects() -> dict[str, str]:
 
 
 def _verify_schema(conn: sqlite3.Connection, path) -> None:
-    """Every expected table, index and trigger must be present, by name, with the SQL this code would create."""
+    """The schema table must hold exactly the expected objects (same type, table and SQL), plus at most the
+    statistics tables ANALYZE makes. Anything else, whatever its name, is refused by name."""
     have = _objects(conn)
     want = _reference_objects()
-    for name, sql in want.items():
+    for name, entry in want.items():
         if name not in have:
             raise StoreError(f"{path}: store is missing {name}; it is not opened silently")
-        if have[name] != sql:
+        if have[name] != entry:
             raise StoreError(f"{path}: {name} differs from what this code creates; it is not opened silently")
-    extra = sorted(set(have) - set(want))
+    extra = []
+    for name, (kind, tbl, sql) in have.items():
+        if name in want:
+            continue
+        if name in _STATS_TABLES and (kind, tbl, sql) == ("table", name, _STATS_TABLES[name]):
+            continue
+        extra.append(name)
     if extra:    # a trigger, view or index nobody asked for could change what a write or a read does
-        raise StoreError(f"{path}: store has unexpected objects {extra}; it is not opened silently")
+        raise StoreError(f"{path}: store has unexpected objects {sorted(extra)}; it is not opened silently")
     low, high = conn.execute("SELECT min(fact_version_id), max(fact_version_id) FROM knowledge_facts").fetchone()
     if low is not None and (low < 1 or high > _MAX_ID):
         raise StoreError(f"{path}: fact_version_id range {low}..{high} is outside 1..{_MAX_ID}; "
                          "rows were written with the checks off")
 
 
+def _path(path) -> str:
+    """A store path: a non-empty str or os.PathLike (giving a str) with no NUL byte or lone surrogate."""
+    try:
+        text = os.fspath(path) if isinstance(path, (str, os.PathLike)) else None
+    except (TypeError, ValueError):
+        text = None
+    if not isinstance(text, str) or not text or "\x00" in text or not _encodable(text):
+        raise StoreError(f"path: must be a non-empty str or path-like with no NUL byte, got {str(path)[:60]!r}")
+    return text
+
+
+def _conn(conn) -> None:
+    if not isinstance(conn, sqlite3.Connection):
+        raise StoreError("conn: must be a sqlite3 connection, normally the one `connect` returns")
+
+
 def connect(path) -> sqlite3.Connection:
     """Open (and create if needed) the store at `path`. The one place connections are made. A store with a
     different schema version, or with any expected table, index or trigger missing or changed, is refused."""
+    path = _path(path)
     try:
-        conn = sqlite3.connect(str(path), isolation_level=None)  # autocommit; writes use explicit BEGIN
+        conn = sqlite3.connect(path, isolation_level=None)  # autocommit; writes use explicit BEGIN
     except sqlite3.Error as exc:
         raise StoreError(f"{path}: cannot open: {exc}") from exc
     conn.row_factory = sqlite3.Row
@@ -353,6 +395,7 @@ def register_source(
     notes: str | None = None,
 ) -> None:
     """Register a source. Same values again: nothing happens. Different values: refused."""
+    _conn(conn)
     _text(source_id, "source_id")
     _text(terms_url, "terms_url")
     _text(licence_tag, "licence_tag")
@@ -392,7 +435,7 @@ def register_source(
 
 def _latest_fact_for_key(conn, domain: str, entity_key: str, source_id: str, known_at: str):
     """The version of one (domain, entity_key, source_id) that is current at `known_at`: greatest known_at_utc
-    at or before it, ties to the highest id. Id and hash only. Internal; the same rule as `facts_as_of`."""
+    at or before it, ties to the highest id. Returns (id, hash) or None. Internal; the same rule as `facts_as_of`."""
     return conn.execute(
         "SELECT fact_version_id, raw_sha256 FROM knowledge_facts"
         " WHERE domain = ? AND entity_key = ? AND source_id = ? AND known_at_utc <= ?"
@@ -427,6 +470,7 @@ def add_fact(
     read that differs is stored as PUBLISHED at its published time, and also as FETCHED at the fetch time
     (same hash, payload and published_at) when an older, different version would otherwise still be current
     at the fetch time. Both rows are written in one transaction."""
+    _conn(conn)
     if domain not in DOMAINS:
         raise StoreError(f"domain: must be one of {DOMAINS}")
     _text(entity_key, "entity_key")
@@ -473,22 +517,22 @@ def add_fact(
 
         at_known = current(known_at)
         at_fetch = at_known if known_at == fetched else current(fetched)
-        same_known = at_known is not None and at_known["raw_sha256"] == raw_sha256
-        same_fetch = at_fetch is not None and at_fetch["raw_sha256"] == raw_sha256
+        same_known = at_known is not None and at_known[1] == raw_sha256
+        same_fetch = at_fetch is not None and at_fetch[1] == raw_sha256
         if same_known and same_fetch:
-            return at_fetch["fact_version_id"]
+            return at_fetch[0]
         if same_known:                      # current when it was published, but not by the time it was fetched
             insert(fetched, "FETCHED")
         else:
             insert(known_at, basis)
             if known_at != fetched:
                 now = current(fetched)
-                if now is None or now["raw_sha256"] != raw_sha256:
+                if now is None or now[1] != raw_sha256:
                     insert(fetched, "FETCHED")   # an older version sits between: it must not win at the fetch time
         final = current(fetched)                 # the invariant, checked before anything is committed
-        if final is None or final["raw_sha256"] != raw_sha256:
+        if final is None or final[1] != raw_sha256:
             raise StoreError("fact was not stored: it cannot be read back as current at its fetch time")
-        return final["fact_version_id"]
+        return final[0]
 
     return _write(conn, run)
 
@@ -504,6 +548,7 @@ def facts_as_of(
     """What she knew at `as_of_utc`: for each (domain, entity_key, source_id), the newest version whose
     `known_at_utc` is at or before that time. With `for_outside_llm=True`, facts from sources that do not
     allow an outside model are left out. This is the only function that returns fact rows."""
+    _conn(conn)
     as_of = _utc(as_of_utc, "as_of_utc")
     outside = _flag(for_outside_llm, "for_outside_llm")
     _text(entity_key, "entity_key", required=False)
@@ -526,7 +571,6 @@ def facts_as_of(
         " FROM knowledge_facts f JOIN source_registry s ON s.source_id = f.source_id" + where + ")"
         " WHERE _rank = 1 ORDER BY domain, entity_key, source_id"
     )
-    rows = [dict(r) for r in conn.execute(sql, args).fetchall()]
-    for r in rows:
-        del r["_rank"]
-    return rows
+    cur = conn.execute(sql, args)
+    names = [d[0] for d in cur.description]                 # works whatever row factory the connection has
+    return [{k: v for k, v in zip(names, row) if k != "_rank"} for row in cur.fetchall()]
