@@ -551,6 +551,17 @@ Queued (roadmap):
   K-5/K-6; tax ledger before 12-31 only if a real order happens in 2026.
   Owner 2026-11-23: he plans to ITEMIZE (Valedia keeps the itemizing records: wagering wins/losses by session, fees,
   deductions; she still shows each year whether itemizing beats the standard deduction). Added to reply 28.
+  Round 29 (reply 29): CANDIDATE C AMENDMENT LOCKED (Carbon's referee read: +0 trials). Final: p = yes_ask(t0),
+  yes_bid(t0) >= 0.01, spread <= 0.05; t0 on an hourly bar-close grid in [T-14d, T-2d], slots (<= 2 per event)
+  filled in time order, each market once, never displaced; stage 1 = any hourly yes_ask low <= 0.12 and high >= 0.03
+  (null yes_ask = pass; one carry-in bar; no hourly bid<ask); NO status filter in backtest (final status is post-t0;
+  voids score refund minus carry), live needs status active at t0; unfilled remainder cancels at T-48h; clock and
+  quarterly grid on expected_expiration_time (fallback close_time), expected > 2024-12-31 ET dropped before event
+  choice, late 2025 settlers kept (count printed); can_close_early kept, no split (count printed); DTB3 carry on
+  (1-p) fill->settlement charged before cluster means (NEW, stricter). K-7: date-only sources = end of the date in
+  the source's own time zone (Carbon's 23:59:59 UTC leaks ~1 h in ET winter); registry records the zone.
+  Round 30 questions: alert ledger row ownership (6:20 vs 6:30 vs dead-man), dated change logs for Kalshi/Webull
+  rules, stage-1 pass floor so stage 2 can reach G >= 50.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
