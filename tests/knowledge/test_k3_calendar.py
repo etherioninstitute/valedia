@@ -21,6 +21,7 @@ H = "finnhub_market_holiday"
 S = "finnhub_market_status"
 FR = "federal_register_presdocs"
 X = "xnys_exchange_calendars"
+G_FIN, G_PRES, G_CAL = "FINNHUB", "US_PRESIDENT", "XNYS_CALENDAR"      # the authority groups
 
 
 @pytest.fixture(autouse=True)
@@ -94,6 +95,15 @@ def closing_doc(num, day_text, pub):
     return fr_doc(num=num, title=CLOSING_TITLE.format(d=day_text), subtype="Executive Order", pub=pub)
 
 
+MOURNING_ABSTRACT = "This proclamation designates {d}, as a National Day of Mourning for the late President."
+
+
+def mourning_doc(num, day_text, pub):
+    """A document that votes: a proclamation making the date a National Day of Mourning."""
+    return fr_doc(num=num, title="National Day of Mourning", subtype="Proclamation", pub=pub,
+                  abstract=MOURNING_ABSTRACT.format(d=day_text))
+
+
 def register(conn, *ids, at=T0):
     k3.register_all(conn, at, only=ids or [X, H, S, FR])
 
@@ -119,6 +129,27 @@ def test_sources_have_the_listed_fields_and_roles():
     assert k3.SOURCES[FR]["terms_url"] == \
         "https://www.federalregister.gov/reader-aids/using-federalregister-gov/developer-resources"
     assert k3.SOURCES[FR]["allow_external_llm"] == 1 and k3.SOURCES[X]["allow_external_llm"] == 1
+
+
+def test_every_source_names_its_authority_group_and_signals_have_none():
+    assert k3.SOURCES[H]["authority_group"] == k3.SOURCES[S]["authority_group"] == G_FIN
+    assert k3.SOURCES[FR]["authority_group"] == G_PRES
+    assert k3.SOURCES[X]["authority_group"] == G_CAL
+    for sid, e in k3.SOURCES.items():
+        if e["role"] == "SIGNAL":
+            assert "authority_group" not in e
+        else:
+            assert isinstance(e["authority_group"], str) and e["authority_group"]
+    assert k3.SOURCES[H]["authority_group"] != k3.SOURCES[FR]["authority_group"]
+
+
+def test_the_group_is_code_only_and_registration_is_unchanged(conn):
+    register(conn)
+    for sid in (X, H, S, FR):
+        cur = conn.execute("SELECT * FROM source_registry WHERE source_id = ?", (sid,))
+        row = cur.fetchone()
+        assert row is not None and "authority_group" not in [d[0] for d in cur.description]
+        assert "authority_group" not in str(tuple(row))
 
 
 def test_the_nasdaq_halts_feed_is_gone_and_the_docstring_says_why():
@@ -387,8 +418,14 @@ def test_federal_register_parser_one_fact_per_document():
     assert a["entity_key"] == "FR:2026-12345" and b["entity_key"] == "FR:2026-12346"
     pa = json.loads(a["payload_json"])
     assert set(pa) == {"document_number", "title", "type", "subtype", "publication_date", "signing_date", "html_url",
-                       "abstract", "closure_dates"}
-    assert pa["closure_dates"] == ["2026-12-24"] and json.loads(b["payload_json"])["closure_dates"] == []
+                       "abstract", "closure_dates", "closing_order_dates"}
+    assert pa["closure_dates"] == [] and pa["closing_order_dates"] == ["2026-12-24"]       # a closing order is a signal
+    pb = json.loads(b["payload_json"])
+    assert pb["closure_dates"] == [] and pb["closing_order_dates"] == []
+    (m,) = parse_fr(fr_body(mourning_doc("2026-12347", "December 24, 2026", "2026-12-20")),
+                    fetched="2026-12-22T00:00:00.000000Z")
+    pm = json.loads(m["payload_json"])
+    assert pm["closure_dates"] == ["2026-12-24"] and pm["closing_order_dates"] == []
     assert a["domain"] == "K3_CAL" and a["source_id"] == FR and a["raw_sha256"] == sha(a["payload_json"])
     # known_at is the publication date, by the date-only rule (a proven stamp)
     assert a["published_proven"] is True
@@ -449,6 +486,7 @@ def test_federal_register_parser_allows_a_null_abstract_and_signing_date_and_sub
     (f,) = parse_fr(fr_body(fr_doc(abstract=None, signing=None, subtype=None)))
     p = json.loads(f["payload_json"])
     assert p["abstract"] is None and p["signing_date"] is None and p["subtype"] is None and p["closure_dates"] == []
+    assert p["closing_order_dates"] == []
 
 
 EO, PR = "Executive Order", "Proclamation"
@@ -456,19 +494,13 @@ EO, PR = "Executive Order", "Proclamation"
 
 @pytest.mark.parametrize("title,abstract,subtype,want", [
     # positives
-    (CLOSING_TITLE.format(d="December 24, 2025"), None, EO, ["2025-12-24"]),
-    (CLOSING_TITLE.format(d="January 9, 2025"), "", EO, ["2025-01-09"]),
-    ("Providing for the closing of executive departments and agencies on January 9, 2025", None, EO, ["2025-01-09"]),
-    ("Closing Executive Departments and Agencies of the Federal Government on December 24, 2026 and December 26, 2026",
-     None, EO, ["2026-12-24", "2026-12-26"]),
-    ("Closing of Executive Departments and Agencies on December 26, 2026, and December 24, 2026", None, EO,
-     ["2026-12-24", "2026-12-26"]),
+    # (a closing order casts no vote: see CLOSING_POSITIVES below, where its dates are kept as a signal)
+    (CLOSING_TITLE.format(d="December 24, 2025"), None, EO, []),
+    (CLOSING_TITLE.format(d="January 9, 2025"), "", EO, []),
     ("National Day of Mourning for Jimmy Carter",
      "This proclamation designates Thursday, January 9, 2025, as a National Day of Mourning for the late President.",
      PR, ["2025-01-09"]),
     ("A National Day of Mourning on January 9, 2025", None, PR, ["2025-01-09"]),
-    ("Executive Order", "The order closes things. It provides for the closing of executive departments and agencies "
-                        "on Friday, December 26, 2025.", EO, ["2025-12-26"]),
     # positives: each accepted grammatical form
     ("Designating a Day", "The President declares Friday, March 6, 2026, to be a National Day of Mourning.", PR,
      ["2026-03-06"]),
@@ -480,7 +512,7 @@ EO, PR = "Executive Order", "Proclamation"
      ["2025-01-09"]),
     ("National Day of Mourning on Thursday, January 9, 2025", None, PR, ["2025-01-09"]),
     ("Order", "An order closing executive departments and agencies of the Federal Government on Friday, "
-              "December 26, 2025.", EO, ["2025-12-26"]),
+              "December 26, 2025.", EO, []),
     # negatives: no date, never guess
     (CLOSING_TITLE.format(d="the Day After Christmas"), None, EO, []),
     ("National Day of Mourning for Jimmy Carter", "Designates a national day of mourning.", PR, []),
@@ -546,6 +578,115 @@ def test_fr_closure_date_rule(title, abstract, subtype, want):
     assert k3.fr_closure_dates(title, abstract, subtype) == want
 
 
+# The same grammar as before, now read for the SIGNAL: a closing order's dates, kept apart and never a vote.
+CLOSING_POSITIVES = [
+    (CLOSING_TITLE.format(d="December 24, 2025"), None, EO, ["2025-12-24"]),
+    (CLOSING_TITLE.format(d="January 9, 2025"), "", EO, ["2025-01-09"]),
+    ("Providing for the closing of executive departments and agencies on January 9, 2025", None, EO, ["2025-01-09"]),
+    ("Closing Executive Departments and Agencies of the Federal Government on December 24, 2026 and December 26, 2026",
+     None, EO, ["2026-12-24", "2026-12-26"]),
+    ("Closing of Executive Departments and Agencies on December 26, 2026, and December 24, 2026", None, EO,
+     ["2026-12-24", "2026-12-26"]),
+    ("Executive Order", "The order closes things. It provides for the closing of executive departments and agencies "
+                        "on Friday, December 26, 2025.", EO, ["2025-12-26"]),
+    ("Order", "An order closing executive departments and agencies of the Federal Government on Friday, "
+              "December 26, 2025.", EO, ["2025-12-26"]),
+    ("Closing of Executive Departments and Agencies on December 26, 2026 and December 24, 2026 and December 24, 2026",
+     None, EO, ["2026-12-24", "2026-12-26"]),
+]
+
+
+@pytest.mark.parametrize("title,abstract,subtype,want", CLOSING_POSITIVES)
+def test_a_closing_orders_dates_are_a_signal_and_never_the_vote(title, abstract, subtype, want):
+    assert k3._fr_closing_order_dates(title, abstract, subtype) == want       # kept for the log
+    assert k3.fr_closure_dates(title, abstract, subtype) == []                # and casting no vote
+    assert k3._fr_closing_order_dates(title, abstract, "Memorandum") == []    # the same document rules apply
+    assert k3._fr_closing_order_dates("Amending the order. " + title, abstract, subtype) == []
+
+
+def test_a_mourning_document_has_vote_dates_and_no_signal_dates():
+    for title, abstract in [("National Day of Mourning", MOURNING_ABSTRACT.format(d="January 9, 2025")),
+                            ("A National Day of Mourning on January 9, 2025", None)]:
+        assert k3.fr_closure_dates(title, abstract, PR) == ["2025-01-09"]
+        assert k3._fr_closing_order_dates(title, abstract, PR) == []
+
+
+def test_a_sentence_that_is_both_a_closing_order_and_a_mourning_day_votes_for_the_mourning_form():
+    title = "Closing of Executive Departments and Agencies on January 9, 2025, as a National Day of Mourning"
+    assert k3.fr_closure_dates(title, None, EO) == ["2025-01-09"]
+    assert k3._fr_closing_order_dates(title, None, EO) == []
+
+
+def test_a_closing_sentence_that_is_unsure_voids_the_mourning_date_beside_it():
+    clean = MOURNING_ABSTRACT.format(d="January 9, 2025")
+    assert k3.fr_closure_dates("National Day of Mourning", clean, PR) == ["2025-01-09"]
+    unsure = "Closing of Executive Departments and Agencies on January 9, 2025 until further notice."
+    assert k3.fr_closure_dates("National Day of Mourning", f"{clean} {unsure}", PR) == []
+    assert k3.fr_closure_dates("National Day of Mourning", f"{unsure} {clean}", PR) == []
+    assert k3._fr_closing_order_dates("National Day of Mourning", f"{clean} {unsure}", PR) == []
+
+
+def test_an_unsure_mourning_sentence_voids_the_closing_order_dates_beside_it():
+    title = "Closing of Executive Departments and Agencies on January 9, 2025"
+    assert k3._fr_closing_order_dates(title, None, EO) == ["2025-01-09"]
+    unsure = "Flags will fly at half-staff through January 12, 2025, for the National Day of Mourning."
+    assert k3._fr_closing_order_dates(title, unsure, EO) == []
+    assert k3.fr_closure_dates(title, unsure, EO) == []
+
+
+# The Federal Register's orders "closing executive departments and agencies", as their titles read (hand-written
+# from the ticket's list; subtype "Executive Order", title only). 15 were Christmas-week leave on days XNYS was open;
+# only the last two (13852, 14133) were real closures, and a separate proclamation made those National Days of Mourning.
+_CLOSE = "Providing for the Closing of Executive Departments and Agencies of the Federal Government on {d}"
+REAL_CLOSING_ORDERS = [
+    ("14371", "December 24, 2025, and December 26, 2025", ["2025-12-24", "2025-12-26"]),
+    ("14129", "December 24, 2024", ["2024-12-24"]),
+    ("13965", "December 24, 2020", ["2020-12-24"]),
+    ("13900", "December 24, 2019", ["2019-12-24"]),
+    ("13854", "Monday, December 24, 2018", ["2018-12-24"]),
+    ("13713", "Thursday, December 24, 2015", ["2015-12-24"]),
+    ("13682", "December 26, 2014", ["2014-12-26"]),
+    ("13633", "Monday, December 24, 2012", ["2012-12-24"]),
+    ("13523", "Thursday, December 24, 2009", ["2009-12-24"]),
+    ("13482", "December 26, 2008", ["2008-12-26"]),
+    ("13453", "Monday, December 24, 2007", ["2007-12-24"]),
+    ("13281", "December 24, 2002", ["2002-12-24"]),
+    ("13109", "Thursday, December 24, 1998", ["1998-12-24"]),
+    ("13852", "December 5, 2018", ["2018-12-05"]),
+    ("14133", "January 9, 2025", ["2025-01-09"]),
+    # titles whose date the grammar does not take: still no vote, and no signal either
+    ("13713", "the Afternoon of December 24, 2015", []),
+    ("13523", "the Last Half of December 24, 2009", []),
+]
+
+
+def test_the_fixtures_cover_every_order_the_ticket_names_by_number():
+    # the ticket says 17 and numbers 15 of them (13 Christmas-week orders and the two mourning ones); the last two rows
+    # are other forms a title can take, under numbers already listed
+    assert len({n for n, _, _ in REAL_CLOSING_ORDERS}) == 15 and len(REAL_CLOSING_ORDERS) == 17
+
+
+@pytest.mark.parametrize("number,day_text,signal", REAL_CLOSING_ORDERS)
+def test_a_real_closing_order_title_casts_no_vote_and_keeps_its_date_as_a_signal(number, day_text, signal):
+    title = _CLOSE.format(d=day_text)
+    assert k3.fr_closure_dates(title, None, EO) == []
+    (f,) = parse_fr(fr_body(fr_doc(num=f"EO-{number}", title=title, subtype=EO, pub="2026-11-20")))
+    payload = json.loads(f["payload_json"])
+    assert payload["closure_dates"] == [] and payload["closing_order_dates"] == signal
+
+
+@pytest.mark.parametrize("number,day_text,signal", [r for r in REAL_CLOSING_ORDERS if r[2]])
+def test_a_real_closing_order_does_not_vote_in_the_quorum(conn, number, day_text, signal):
+    day = signal[0]
+    register(conn)
+    k3.refresh(conn, X, http_get=None, now=NOW, params={"start": "2026-11-23", "end": "2026-11-30"})
+    # the quorum is asked about the order's own date; no schedule fact is needed for the vote to be refused
+    seed_fr(conn, fr_doc(num=f"EO-{number}", title=_CLOSE.format(d=day_text), subtype=EO, pub="2026-11-20"))
+    v = votes(conn, day=day, as_of="2099-01-01T00:00:00Z")
+    assert v["authorities_closed"] == [] and v["sources_closed"] == []
+    assert v["ordinary_stop"] is False and v["suspected"] is False
+
+
 CLEAN = "This proclamation designates January 9, 2025, as a National Day of Mourning."
 UNSURE = "Flags will fly at half-staff through January 12, 2025, for the National Day of Mourning."
 
@@ -554,8 +695,8 @@ UNSURE = "Flags will fly at half-staff through January 12, 2025, for the Nationa
     ("National Day of Mourning", f"{CLEAN} {UNSURE}", "National Day of Mourning", CLEAN),
     ("National Day of Mourning", f"{UNSURE} {CLEAN}", "National Day of Mourning", CLEAN),
     ("National Day of Mourning for X who died on December 5, 2026", CLEAN, "National Day of Mourning for X", CLEAN),
-    ("Closing of Executive Departments and Agencies on January 9, 2025", "National Day of Mourning begins "
-     "January 8, 2025.", "Closing of Executive Departments and Agencies on January 9, 2025", ""),
+    ("National Day of Mourning", f"{CLEAN} National Day of Mourning begins January 8, 2025.", "National Day of Mourning",
+     CLEAN),
 ])
 def test_one_unsure_sentence_voids_the_whole_document(title, abstract, alone_title, alone_abstract):
     for kind in ("Proclamation", "Executive Order"):
@@ -564,8 +705,8 @@ def test_one_unsure_sentence_voids_the_whole_document(title, abstract, alone_tit
 
 
 def test_fr_closure_dates_are_sorted_unique():
-    got = k3.fr_closure_dates("Closing of Executive Departments and Agencies on December 26, 2026 and December 24, "
-                              "2026 and December 24, 2026", None, "Executive Order")
+    got = k3.fr_closure_dates("National Day of Mourning", "This proclamation designates December 26, 2026 and "
+                              "December 24, 2026 and December 24, 2026, as a National Day of Mourning.", PR)
     assert got == ["2026-12-24", "2026-12-26"]
 
 
@@ -615,30 +756,101 @@ def test_quorum_one_authority_is_only_suspected(conn):
     seed(conn)
     seed_holiday(conn, ("Surprise Closure", D, ""))
     v = votes(conn)
-    assert v["authorities_closed"] == [H] and v["suspected"] is True and v["ordinary_stop"] is False
+    assert v["authorities_closed"] == [G_FIN] and v["suspected"] is True and v["ordinary_stop"] is False
 
 
 def test_quorum_two_authorities_is_an_ordinary_stop(conn):
     seed(conn)
     seed_holiday(conn, ("Surprise Closure", D, ""))
-    seed_fr(conn, closing_doc("2026-55555", "November 24, 2026", "2026-11-22"))
+    seed_fr(conn, mourning_doc("2026-55555", "November 24, 2026", "2026-11-22"))
     v = votes(conn)
-    assert v["authorities_closed"] == sorted([H, FR]) and v["ordinary_stop"] is True and v["suspected"] is False
+    assert v["authorities_closed"] == [G_FIN, G_PRES] and v["ordinary_stop"] is True and v["suspected"] is False
 
 
 def test_quorum_three_authorities_stays_an_ordinary_stop(conn):
     seed(conn)
     seed_holiday(conn, ("Surprise Closure", D, ""))
-    seed_fr(conn, closing_doc("2026-55555", "November 24, 2026", "2026-11-22"))
+    seed_fr(conn, mourning_doc("2026-55555", "November 24, 2026", "2026-11-22"))
     seed_status(conn, holiday="Surprise Closure", t=unix(2026, 11, 24, 13, 0), fetched="2026-11-24T13:30:00.000000Z")
     v = votes(conn)
-    assert v["authorities_closed"] == sorted([H, S, FR]) and v["ordinary_stop"] is True
+    assert v["authorities_closed"] == [G_FIN, G_PRES] and v["ordinary_stop"] is True
+
+
+def test_quorum_two_finnhub_endpoints_are_one_group_and_only_suspected(conn):
+    seed(conn)
+    seed_holiday(conn, ("Surprise Closure", D, ""))
+    seed_status(conn, holiday="Surprise Closure", t=unix(2026, 11, 24, 13, 0), fetched="2026-11-24T13:30:00.000000Z")
+    v = votes(conn)
+    assert v["authorities_closed"] == [G_FIN] and v["sources_closed"] == sorted([H, S])
+    assert v["suspected"] is True and v["ordinary_stop"] is False
+
+
+def test_quorum_finnhub_and_a_mourning_document_is_an_ordinary_stop(conn):
+    seed(conn)
+    seed_holiday(conn, ("Surprise Closure", D, ""))
+    seed_fr(conn, mourning_doc("2026-55555", "November 24, 2026", "2026-11-22"))
+    v = votes(conn)
+    assert v["authorities_closed"] == [G_FIN, G_PRES] and v["sources_closed"] == sorted([H, FR])
+    assert v["ordinary_stop"] is True and v["suspected"] is False
+
+
+def test_quorum_both_finnhub_endpoints_and_a_mourning_document_are_two_groups(conn):
+    seed(conn)
+    seed_holiday(conn, ("Surprise Closure", D, ""))
+    seed_status(conn, holiday="Surprise Closure", t=unix(2026, 11, 24, 13, 0), fetched="2026-11-24T13:30:00.000000Z")
+    seed_fr(conn, mourning_doc("2026-55555", "November 24, 2026", "2026-11-22"))
+    v = votes(conn)
+    assert v["authorities_closed"] == [G_FIN, G_PRES] and v["sources_closed"] == sorted([H, S, FR])
+    assert v["ordinary_stop"] is True
+
+
+def test_quorum_two_mourning_documents_for_one_date_are_one_group(conn):
+    seed(conn)
+    seed_fr(conn, mourning_doc("2026-1", "November 24, 2026", "2026-11-21"),
+            fr_doc(num="2026-2", title="A National Day of Mourning on November 24, 2026", pub="2026-11-22",
+                   subtype="Proclamation"))
+    v = votes(conn)
+    assert v["authorities_closed"] == [G_PRES] and v["sources_closed"] == [FR]
+    assert v["suspected"] is True and v["ordinary_stop"] is False
+
+
+def test_quorum_a_closing_order_beside_finnhub_is_still_only_suspected(conn):
+    seed(conn)
+    seed_holiday(conn, ("Surprise Closure", D, ""))
+    seed_fr(conn, closing_doc("2026-55555", "November 24, 2026", "2026-11-22"))
+    v = votes(conn)
+    assert v["authorities_closed"] == [G_FIN] and v["sources_closed"] == [H]
+    assert v["suspected"] is True and v["ordinary_stop"] is False
+
+
+def test_quorum_sources_closed_lists_the_source_ids_sorted_and_empty_when_none(conn):
+    seed(conn)
+    assert votes(conn)["sources_closed"] == []
+    seed_status(conn, holiday="Surprise Closure", t=unix(2026, 11, 24, 13, 0), fetched="2026-11-24T13:30:00.000000Z")
+    assert votes(conn)["sources_closed"] == [S]
+    seed_holiday(conn, ("Surprise Closure", D, ""))
+    assert votes(conn)["sources_closed"] == [H, S] == sorted([S, H])
+
+
+def test_quorum_the_schedule_is_a_group_that_never_votes_closed(conn):
+    seed(conn, days=("2026-11-23", "2026-11-30"))
+    v = votes(conn, day="2026-11-26", as_of="2026-11-26T14:00:00Z")       # Thanksgiving: the calendar says closed
+    assert v["calendar_closed"] is True and v["authorities_closed"] == [] and v["sources_closed"] == []
+
+
+def test_quorum_an_authority_without_a_group_is_a_setup_error(conn, monkeypatch):
+    seed(conn)
+    entry = {k: v for k, v in k3.SOURCES[H].items() if k != "authority_group"}
+    monkeypatch.setitem(k3.SOURCES, H, entry)
+    seed_holiday(conn, ("Surprise Closure", D, ""))
+    with pytest.raises(k3.K3Error):
+        votes(conn)
 
 
 def test_quorum_a_status_with_a_holiday_counts_for_its_own_date_only(conn):
     seed(conn)
     seed_status(conn, holiday="Surprise Closure", t=unix(2026, 11, 24, 13, 0), fetched="2026-11-24T13:30:00.000000Z")
-    assert votes(conn)["authorities_closed"] == [S]
+    assert votes(conn)["authorities_closed"] == [G_FIN]
     assert votes(conn, day="2026-11-25", as_of="2026-11-25T14:00:00Z")["authorities_closed"] == []
 
 
@@ -665,33 +877,33 @@ def test_quorum_a_holiday_row_that_is_a_half_day_is_not_a_closure(conn):
 
 def test_quorum_a_document_naming_another_date_does_not_vote(conn):
     seed(conn)
-    seed_fr(conn, closing_doc("2026-55555", "November 25, 2026", "2026-11-22"))
+    seed_fr(conn, mourning_doc("2026-55555", "November 25, 2026", "2026-11-22"))
     assert votes(conn)["authorities_closed"] == []
-    assert votes(conn, day="2026-11-25")["authorities_closed"] == [FR]
+    assert votes(conn, day="2026-11-25")["authorities_closed"] == [G_PRES]
 
 
 def test_quorum_one_source_with_two_facts_for_the_date_counts_once(conn):
     seed(conn)
-    seed_fr(conn, closing_doc("2026-1", "November 24, 2026", "2026-11-21"),
-            closing_doc("2026-2", "November 24, 2026", "2026-11-22"))
+    seed_fr(conn, mourning_doc("2026-1", "November 24, 2026", "2026-11-21"),
+            mourning_doc("2026-2", "November 24, 2026", "2026-11-22"))
     v = votes(conn)
-    assert v["authorities_closed"] == [FR] and v["suspected"] is True and v["ordinary_stop"] is False
+    assert v["authorities_closed"] == [G_PRES] and v["suspected"] is True and v["ordinary_stop"] is False
 
 
 def test_quorum_a_closed_calendar(conn):
     seed(conn)
     seed_holiday(conn, ("Thanksgiving Day", "2026-11-26", ""))
-    seed_fr(conn, closing_doc("2026-3", "November 26, 2026", "2026-11-22"))
+    seed_fr(conn, mourning_doc("2026-3", "November 26, 2026", "2026-11-22"))
     v = votes(conn, day="2026-11-26", as_of="2026-11-26T14:00:00Z")
     assert v["calendar_open"] is False and v["calendar_closed"] is True
-    assert v["authorities_closed"] == sorted([H, FR])                    # reported, but they are no news
+    assert v["authorities_closed"] == [G_FIN, G_PRES]                    # reported, but they are no news
     assert v["ordinary_stop"] is False and v["suspected"] is False
 
 
 def test_quorum_without_a_schedule_fact_is_unknown_not_open(conn):
     register(conn)
     seed_holiday(conn, ("Surprise Closure", D, ""))
-    seed_fr(conn, closing_doc("2026-55555", "November 24, 2026", "2026-11-22"))
+    seed_fr(conn, mourning_doc("2026-55555", "November 24, 2026", "2026-11-22"))
     v = votes(conn)
     assert v["schedule_known"] is False and v["calendar_open"] is None and v["calendar_closed"] is None
     assert v["ordinary_stop"] is False and v["suspected"] is False
@@ -701,16 +913,16 @@ def test_quorum_a_fact_known_after_as_of_never_counts(conn):
     seed(conn)
     seed_holiday(conn, ("Surprise Closure", D, ""), fetched="2026-11-24T13:00:00.000000Z")
     assert votes(conn, as_of="2026-11-24T12:59:59Z")["authorities_closed"] == []        # backfilled: not yet known
-    assert votes(conn, as_of="2026-11-24T13:00:00Z")["authorities_closed"] == [H]       # and the edge itself counts
+    assert votes(conn, as_of="2026-11-24T13:00:00Z")["authorities_closed"] == [G_FIN]       # and the edge itself counts
 
 
 def test_quorum_a_document_published_that_day_is_known_only_after_the_day_ends(conn):
     seed(conn)
-    doc = closing_doc("2026-9", "November 24, 2026", "2026-11-24")
+    doc = mourning_doc("2026-9", "November 24, 2026", "2026-11-24")
     seed_fr(conn, doc, fetched="2026-11-26T00:00:00.000000Z")               # fetched later: the publication date proves it
     stamp = k3.date_only_known_at("2026-11-24", "America/New_York")         # 2026-11-25T04:59:59.999999Z
     assert votes(conn, as_of="2026-11-24T23:00:00Z")["authorities_closed"] == []
-    assert votes(conn, as_of=stamp)["authorities_closed"] == [FR]
+    assert votes(conn, as_of=stamp)["authorities_closed"] == [G_PRES]
     assert votes(conn, as_of="2026-11-25T04:59:59Z")["authorities_closed"] == []         # one second short
 
 
@@ -724,7 +936,7 @@ def test_quorum_follows_a_changed_holiday_list_by_as_of(conn):
     seed(conn)
     seed_holiday(conn, ("Surprise Closure", D, ""), fetched="2026-11-23T20:00:00.000000Z")
     seed_holiday(conn, ("Surprise Closure", D, "09:30-13:00"), fetched="2026-11-24T10:00:00.000000Z")   # reopened early
-    assert votes(conn, as_of="2026-11-24T09:00:00Z")["authorities_closed"] == [H]
+    assert votes(conn, as_of="2026-11-24T09:00:00Z")["authorities_closed"] == [G_FIN]
     assert votes(conn, as_of="2026-11-24T11:00:00Z")["authorities_closed"] == []
 
 
@@ -732,7 +944,7 @@ def test_quorum_counts_authorities_generically(conn, monkeypatch):
     """A third authority (the exchange's own notice) is a slot: add a source and a rule, nothing else changes."""
     seed(conn)
     entry = dict(k3.SOURCES[H], source_id="exchange_closure_notice", role="AUTHORITY", allow_external_llm=1,
-                 licence_tag="EXCHANGE-NOTICE")
+                 licence_tag="EXCHANGE-NOTICE", authority_group="EXCHANGE")
     monkeypatch.setitem(k3.SOURCES, "exchange_closure_notice", entry)
     monkeypatch.setitem(k3._CLOSURE_RULES, "exchange_closure_notice",
                         lambda entity_key, payload, day: entry_says_closed(entity_key, payload, day))
@@ -742,7 +954,8 @@ def test_quorum_counts_authorities_generically(conn, monkeypatch):
                     fetched_at_utc=LATE, published_at_utc=None, effective_to_utc=None, published_proven=False)])
     seed_holiday(conn, ("Surprise Closure", D, ""))
     v = votes(conn)
-    assert v["authorities_closed"] == sorted([H, "exchange_closure_notice"]) and v["ordinary_stop"] is True
+    assert v["authorities_closed"] == ["EXCHANGE", G_FIN] and v["ordinary_stop"] is True
+    assert v["sources_closed"] == sorted([H, "exchange_closure_notice"])
 
 
 def entry_says_closed(entity_key, payload, day):
@@ -1022,11 +1235,11 @@ TOMBSTONE = {"closed": False, "removed": True, "trading_hours": None, "name": "S
 def test_a_date_removed_inside_the_listed_range_gets_a_tombstone_and_stops_voting(conn):
     seed(conn)
     assert refresh_h(conn, LIST_1, T_A) == {"stored": 4, "unchanged": 0, "error": 0}
-    assert votes(conn, as_of="2026-11-24T09:00:00Z")["authorities_closed"] == [H]
+    assert votes(conn, as_of="2026-11-24T09:00:00Z")["authorities_closed"] == [G_FIN]
     assert refresh_h(conn, LIST_NO_D, T_B) == {"stored": 1, "unchanged": 3, "error": 0}
     assert closure_payload(conn, D) == TOMBSTONE
     assert votes(conn, as_of="2026-11-24T11:00:00Z")["authorities_closed"] == []          # the source no longer counts
-    assert votes(conn, as_of="2026-11-24T09:00:00Z")["authorities_closed"] == [H]          # and the past is unchanged
+    assert votes(conn, as_of="2026-11-24T09:00:00Z")["authorities_closed"] == [G_FIN]          # and the past is unchanged
     assert closure_payload(conn, D, as_of="2026-11-24T09:00:00Z")["closed"] is True
 
 
@@ -1065,7 +1278,7 @@ def test_a_re_added_date_is_closed_again(conn):
     refresh_h(conn, LIST_NO_D, T_B)
     assert refresh_h(conn, LIST_1, T_C) == {"stored": 1, "unchanged": 3, "error": 0}
     assert closure_payload(conn, D) == {"closed": True, "trading_hours": "", "name": "Surprise Closure"}
-    assert votes(conn, as_of="2026-11-24T17:00:00Z")["authorities_closed"] == [H]
+    assert votes(conn, as_of="2026-11-24T17:00:00Z")["authorities_closed"] == [G_FIN]
 
 
 def test_an_empty_list_is_refused_whole_and_old_closures_stay_as_they_were(conn):
@@ -1096,9 +1309,9 @@ def test_a_refused_body_adds_no_tombstones(conn):
 def test_only_the_holiday_source_gets_tombstones(conn):
     seed(conn)
     seed_status(conn, holiday="Surprise Closure", t=unix(2026, 11, 24, 13, 0), fetched="2026-11-24T13:30:00.000000Z")
-    seed_fr(conn, closing_doc("2026-1", "November 24, 2026", "2026-11-21"))
+    seed_fr(conn, mourning_doc("2026-1", "November 24, 2026", "2026-11-21"))
     k3.refresh(conn, FR, http_get=Fake({FR_URL: fr_body()}), now=T_C)          # an empty FR answer removes nothing
-    assert votes(conn, as_of="2026-11-24T17:00:00Z")["authorities_closed"] == sorted([FR, S])
+    assert votes(conn, as_of="2026-11-24T17:00:00Z")["authorities_closed"] == [G_FIN, G_PRES]
 
 
 # ---- the command line

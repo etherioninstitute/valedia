@@ -13,14 +13,15 @@ Sources considered and left out:
   "stored for subsequent use" without written consent, apart from personal viewing, and a store is exactly that.
   There is no entry, parser or entity key for it here.
 - The exchange's own closure notice is a third authority that is NOT built yet. It is a slot: add a source with the
-  role AUTHORITY to SOURCES and one rule to _CLOSURE_RULES, and the quorum counts it with no other change.
+  role AUTHORITY and its own `authority_group` to SOURCES and one rule to _CLOSURE_RULES, and the quorum counts it
+  with no other change.
 
 Removed holidays: when a Finnhub holiday read no longer lists a date that an earlier read listed, and the date is inside
 the range the new list covers (its earliest to its latest date), `refresh` stores a "removed" version for it (closed
 false), so the old closure stops counting. A date outside that range only rolled off the list's edge: it is left alone.
 
-Roles: SCHEDULE (the library, derived), AUTHORITY (a source that can say "closed" and votes), SIGNAL (logged only,
-never votes; no source has this role today).
+Roles: SCHEDULE (the library, derived), AUTHORITY (a source that can say "closed" and votes, through its group),
+SIGNAL (logged only, never votes, has no group; no source has this role today).
 
 Times and dates:
 - A source that gives only a date ("2026-01-15") is known at the END of that date in the source's own zone, in UTC
@@ -42,17 +43,29 @@ these hold, and returns an empty list otherwise (it never guesses):
 4. that same sentence states each date in full ("December 24, 2025": month name, day, year);
 5. the sentence has no half-stated date (a month and day with no year) and, when it has several dates, they are a
    plain list joined by commas or "and". Any other mix (for example a death date and a mourning date) is unsure;
-6. the dates are grammatically the closure day, in one of four forms: "<date>, as a National Day of Mourning";
+6. the dates are grammatically the closure day, in one of the forms: "<date>, as a National Day of Mourning";
    "National Day of Mourning on <date>"; "declare/designate <date> ... National Day of Mourning"; or an order closing
    executive departments and agencies "... on <date>" (letters and spaces only between the order and "on");
 7. the sentence has none of the words through, beginning, until, died, death, passed, half-staff, flag, following,
    after, since, from, born, anniversary (a span, a start or a death is not the closure day).
 One unsure sentence voids the whole document: the result is then an empty list, whatever other sentences say.
 
-Quorum (`closure_votes`): `ordinary_stop` is "the calendar says open and at least two authorities say closed";
-`suspected` is "open and exactly one says closed". A Finnhub status counts only with a non-null `holiday`: before the
-open `isOpen` is false every day, so it is never a vote. One source counts once, however many facts it holds. Facts
-known after `as_of_utc` never count. Everything is read through the store's `facts_as_of`.
+Only the National Day of Mourning forms VOTE. `fr_closure_dates` returns the dates of those forms and nothing else. An
+order "closing executive departments and agencies ... on <date>" casts no vote: the Federal Register lists 17 such
+orders since 1998, and 15 of them were Christmas-week leave on days the exchange was open (only the two mourning days
+were real closures, and a separate proclamation declared each National Day of Mourning). The dates of a closing order
+are kept in the payload field `closing_order_dates`, a signal for the log and never a vote. A document with an unsure
+sentence has neither kind of date.
+
+Quorum (`closure_votes`): `ordinary_stop` is "the calendar says open and at least two authority GROUPS say closed";
+`suspected` is "open and exactly one group says closed". Every source has an `authority_group` (the sources of one
+vendor or one government share a group: both Finnhub endpoints are FINNHUB, the Federal Register and the White House
+are US_PRESIDENT, the XNYS library is XNYS_CALENDAR), and a group counts once however many of its sources, or facts,
+say closed, so one vendor's data error cannot reach the quorum alone. `authorities_closed` is the sorted groups that say
+closed; `sources_closed` is the sorted source ids behind them, for the log. A Finnhub status counts only with a
+non-null `holiday`: before the open `isOpen` is false every day, so it is never a vote. Facts known after `as_of_utc`
+never count. Everything is read through the store's `facts_as_of`. The group is kept in code only: the source registry
+has no column for it, and registration is unchanged.
 """
 from __future__ import annotations
 
@@ -92,27 +105,27 @@ SOURCES = {
         "source_id": "xnys_exchange_calendars", "role": "SCHEDULE", "endpoint": None,
         "terms_url": "https://github.com/gerrymanoim/exchange_calendars/blob/master/LICENSE",
         "licence_tag": "Apache-2.0", "allow_external_llm": 1, "ua_policy": "GENERIC_CLIENT", "cost_usd_monthly": 0,
-        "time_zone": _NY,
+        "time_zone": _NY, "authority_group": "XNYS_CALENDAR",
     },
     "finnhub_market_holiday": {
         "source_id": "finnhub_market_holiday", "role": "AUTHORITY",
         "endpoint": "https://finnhub.io/api/v1/stock/market-holiday?exchange=US",
         "terms_url": "https://finnhub.io/terms-of-service",
         "licence_tag": "FINNHUB-PERSONAL-TOS", "notes": _FINNHUB_TERMS, "allow_external_llm": 0, "ua_policy": "GENERIC_CLIENT", "cost_usd_monthly": 0,
-        "time_zone": _NY,
+        "time_zone": _NY, "authority_group": "FINNHUB",
     },
     "finnhub_market_status": {
         "source_id": "finnhub_market_status", "role": "AUTHORITY",
         "endpoint": "https://finnhub.io/api/v1/stock/market-status?exchange=US",
         "terms_url": "https://finnhub.io/terms-of-service",
         "licence_tag": "FINNHUB-PERSONAL-TOS", "notes": _FINNHUB_TERMS, "allow_external_llm": 0, "ua_policy": "GENERIC_CLIENT", "cost_usd_monthly": 0,
-        "time_zone": _NY,
+        "time_zone": _NY, "authority_group": "FINNHUB",
     },
     "federal_register_presdocs": {
         "source_id": "federal_register_presdocs", "role": "AUTHORITY", "endpoint": _FR_URL,
         "terms_url": "https://www.federalregister.gov/reader-aids/using-federalregister-gov/developer-resources",
         "licence_tag": "US-PUBLIC-DOMAIN", "allow_external_llm": 1, "ua_policy": "GENERIC_CLIENT",
-        "cost_usd_monthly": 0, "time_zone": _NY,
+        "cost_usd_monthly": 0, "time_zone": _NY, "authority_group": "US_PRESIDENT",   # a White House source joins it
     },
 }
 _X, _H, _S, _FR = ("xnys_exchange_calendars", "finnhub_market_holiday", "finnhub_market_status",
@@ -363,11 +376,14 @@ _DATE_LIST = rf"(?P<dl>{_ONE_DATE}(?:(?:\s*,\s+and\s+|\s*,\s*|\s+and\s+){_ONE_DA
 _MOURN = r"(?i:national\s+day\s+of\s+mourning)"
 _CLOSE = r"(?i:clos(?:ing|ure|es|e)\s+(?:of\s+)?(?:the\s+)?executive\s+departments?\s+and\s+agenc(?:y|ies))"
 # The only grammatical forms that make a date the closure day. The date list (`dl`) must be all the dates of the sentence.
-_ANCHORS = (
-    re.compile(rf"{_CLOSE}[A-Za-z ]{{0,100}}?\b(?i:on)\s+{_WEEKDAY}{_DATE_LIST}"),         # closing ... on <date>
+# The mourning forms vote; the closing-order form is only a signal.
+_MOURNING_ANCHORS = (
     re.compile(rf"{_DATE_LIST},?\s+as\s+(?:(?i:a|the)\s+)?{_MOURN}"),                       # <date>, as a National Day of Mourning
     re.compile(rf"{_MOURN}\s+(?i:on)\s+{_WEEKDAY}{_DATE_LIST}"),                             # National Day of Mourning on <date>
     re.compile(rf"(?i:\b(?:declar|designat)\w*)\s+{_WEEKDAY}{_DATE_LIST}[^.;]{{0,60}}?{_MOURN}"),   # designate <date> ... Mourning
+)
+_CLOSING_ANCHORS = (
+    re.compile(rf"{_CLOSE}[A-Za-z ]{{0,100}}?\b(?i:on)\s+{_WEEKDAY}{_DATE_LIST}"),         # closing ... on <date>
 )
 # Words that make a date in a trigger sentence something else: a span, a start, a death, a flag order.
 _NOT_THE_DAY = re.compile(r"\b(?:through|beginning|begins?|until|died|dies|death|deaths|passed|passing|half-staff|"
@@ -377,21 +393,27 @@ _NOT_THE_DAY = re.compile(r"\b(?:through|beginning|begins?|until|died|dies|death
 
 
 def _sentence_dates(sentence: str):
-    """The closure dates a trigger sentence states, as ISO text ([] when it states none); None when the sentence is
-    unsure. A date counts only in one of the four forms of `_ANCHORS`, as the whole of the sentence's dates, with no
-    word of `_NOT_THE_DAY` in the sentence."""
+    """The dates a trigger sentence states, as (mourning dates, closing-order dates), each a list of ISO text (both empty
+    when the sentence states no date); None when the sentence is unsure. A date counts only in one of the forms of
+    `_MOURNING_ANCHORS` or `_CLOSING_ANCHORS`, as the whole of the sentence's dates, with no word of `_NOT_THE_DAY` in
+    the sentence. A sentence that fits a mourning form is a mourning sentence, even if it also fits the closing form."""
     full = list(_FULL_DATE.finditer(sentence))
     if len(_MONTH_DAY.findall(sentence)) != len(full):
         return None                                        # a month and day with no year: not a stated date
     if not full:
-        return []
+        return [], []
     for a, b in zip(full, full[1:]):
         if not _LIST_GAP.fullmatch(sentence[a.end():b.start()]):
             return None                                    # the dates are not a plain list
     if _NOT_THE_DAY.search(sentence):
         return None
     first, last = full[0].start(), full[-1].end()
-    if not any(m.start("dl") == first and m.end("dl") == last for rx in _ANCHORS for m in rx.finditer(sentence)):
+
+    def anchored(anchors) -> bool:
+        return any(m.start("dl") == first and m.end("dl") == last for rx in anchors for m in rx.finditer(sentence))
+
+    is_mourning = anchored(_MOURNING_ANCHORS)
+    if not is_mourning and not anchored(_CLOSING_ANCHORS):
         return None                                        # a date, but not grammatically the closure day
     out = []
     for m in full:
@@ -399,29 +421,43 @@ def _sentence_dates(sentence: str):
             out.append(date(int(m.group(3)), _MONTHS.index(m.group(1)) + 1, int(m.group(2))).isoformat())
         except ValueError:
             return None                                    # not a real date
-    return out
+    return (out, []) if is_mourning else ([], out)
 
 
-def fr_closure_dates(title, abstract, subtype) -> list[str]:
-    """The closure dates a presidential document names, as sorted ISO dates; an empty list when unsure (the rule is in
-    the module docstring). Only an Executive Order or Proclamation counts."""
+def _fr_scan(title, abstract, subtype) -> tuple[list[str], list[str]]:
+    """(mourning dates, closing-order dates) a presidential document names, each sorted and unique. Both empty when the
+    document is the wrong kind, changes or withdraws something, or has one unsure sentence."""
     _text(title, "title", non_empty=False)
     _text(abstract, "abstract", allow_none=True, non_empty=False)
     _text(subtype, "subtype", allow_none=True, non_empty=False)
     if subtype is None or subtype.strip().casefold() not in _FR_KINDS:
-        return []
+        return [], []
     if _CHANGE.search(title + " " + (abstract or "")):
-        return []
-    found = set()
+        return [], []
+    mourning, closing = set(), set()
     for part in (title, abstract or ""):
         for sentence in _SENTENCE.split(part):
             if not (_MOURNING.search(sentence) or _CLOSING.search(sentence)):
                 continue
-            dates = _sentence_dates(sentence)
-            if dates is None:
-                return []
-            found.update(dates)
-    return sorted(found)
+            found = _sentence_dates(sentence)
+            if found is None:
+                return [], []
+            mourning.update(found[0])
+            closing.update(found[1])
+    return sorted(mourning), sorted(closing)
+
+
+def fr_closure_dates(title, abstract, subtype) -> list[str]:
+    """The closure dates a presidential document names, as sorted ISO dates; an empty list when unsure (the rule is in
+    the module docstring). Only an Executive Order or Proclamation counts, and only the National Day of Mourning forms
+    vote: an order closing executive departments and agencies gives no date here (see `_fr_closing_order_dates`)."""
+    return _fr_scan(title, abstract, subtype)[0]
+
+
+def _fr_closing_order_dates(title, abstract, subtype) -> list[str]:
+    """The dates of an order closing executive departments and agencies, as sorted ISO dates: a signal for the log,
+    never a vote. The same document rules as `fr_closure_dates` (kind, change words, one unsure sentence voids all)."""
+    return _fr_scan(title, abstract, subtype)[1]
 
 
 def parse_federal_register(raw, *, fetched_at_utc) -> list[dict]:
@@ -463,9 +499,10 @@ def parse_federal_register(raw, *, fetched_at_utc) -> list[dict]:
         abstract = _text(doc.get("abstract"), "abstract", allow_none=True, non_empty=False)
         stamp = date_only_known_at(pub, _NY)
         proven = stamp <= fetched
+        mourning, closing = _fr_scan(title, abstract, subtype)
         payload = {"document_number": number, "title": title, "type": dtype, "subtype": subtype,
                    "publication_date": pub, "signing_date": signing, "html_url": url, "abstract": abstract,
-                   "closure_dates": fr_closure_dates(title, abstract, subtype)}
+                   "closure_dates": mourning, "closing_order_dates": closing}
         facts.append(_fact(_FR, f"FR:{number}", payload, effective_from=_day_start_utc(pub_day, _NY),
                            effective_to=None, fetched=fetched, published=stamp if proven else None, proven=proven))
     return facts
@@ -646,14 +683,16 @@ _CLOSURE_RULES = {_H: _rule_finnhub_holiday, _S: _rule_finnhub_status, _FR: _rul
 
 
 def closure_votes(conn, trade_date, as_of_utc) -> dict:
-    """What was known at `as_of_utc` about `trade_date`: the calendar's answer and the authorities that say closed.
-    A pure read: no network, and facts known after `as_of_utc` are not seen."""
+    """What was known at `as_of_utc` about `trade_date`: the calendar's answer and the authority GROUPS that say closed
+    (`authorities_closed`), with the source ids behind them (`sources_closed`). A group counts once however many of its
+    sources say closed. A pure read: no network, and facts known after `as_of_utc` are not seen."""
     day = _parse_date(trade_date, "trade_date").isoformat()
     if not isinstance(trade_date, str):
         raise K3Error("trade_date: must be text written YYYY-MM-DD")
     rows = store.facts_as_of(conn, as_of_utc, domain=_DOMAIN)
     open_now = None
-    closed_by = set()
+    closed_by = set()                                  # source ids
+    groups = set()                                     # their authority groups
     for row in rows:
         source_id, key = row["source_id"], row["entity_key"]
         rule = _CLOSURE_RULES.get(source_id)
@@ -673,12 +712,16 @@ def closure_votes(conn, trade_date, as_of_utc) -> dict:
                 raise K3Error(f"a schedule fact has no open flag: {key}")
             open_now = payload["open"]
         elif SOURCES.get(source_id, {}).get("role") == "AUTHORITY" and rule(key, payload, day):
+            group = SOURCES[source_id].get("authority_group")
+            if not isinstance(group, str) or not group:
+                raise K3Error(f"the authority source {source_id[:60]} has no authority_group")
             closed_by.add(source_id)
-    authorities = sorted(closed_by)
+            groups.add(group)
+    authorities = sorted(groups)
     return {
         "trade_date": day, "as_of_utc": as_of_utc, "schedule_known": open_now is not None,
         "calendar_open": open_now, "calendar_closed": None if open_now is None else not open_now,
-        "authorities_closed": authorities,
+        "authorities_closed": authorities, "sources_closed": sorted(closed_by),
         "ordinary_stop": open_now is True and len(authorities) >= 2,
         "suspected": open_now is True and len(authorities) == 1,
     }
