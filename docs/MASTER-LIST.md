@@ -408,6 +408,13 @@ Queued (roadmap):
   collapse into one trial -> add `describe()`, and audit past merges; R3 draws `r3_shifts` with replacement past
   the number of distinct shifts -> use `timing_exact` when asked for more and print the count; check R4's
   dispersion uses active-Sharpe z. Gate 2 Sharpe at rf = 0; DTB3 excess printed only.
+  Round 16: Tier-C rows enter R at full unit variance (no discount; PIT argument); Tier 0 = outcome-blind runs,
+  weight 0, reason recorded per row; Tier-C correlation blocks only from loss vectors on disk; whole E[max] times
+  sigma_z. Manifest = 15 rows: Row 2 adds sha256 of level10_ml_research.py, gauntlet.py, gate_study.py; new Row 9
+  epoch0_genesis_seal (genesis_sha256, tier counts, un-merged collisions, R_pre_sha256); Row 10 locks K_raw pre and
+  post (+2), K_eff* pre, sigma_z pre and the R spec (overlap>=60, LW to I, 25,000 antithetic pairs, seed 0), never
+  K_eff* post (it depends on the new returns); score_locked_trial computes K_eff* post, and refuses if the pre value
+  does not reproduce. Carbon's progress percentages are not cited (estimates).
   Round 15: add `expected_max_correlated_normal(R)` in quant_engine (antithetic MC, eigen-clip, fixed seed; R from
   stored series with >= 60 shared bars, overlap-scaled, LW-shrunk; R = 0 otherwise, which only raises SR0); tests
   pin the equicorrelation closed form, rho = -1 at sqrt(2/pi), K = 1 -> 0; print K_eff* beside K_raw. Ledger
@@ -920,6 +927,11 @@ run beside MiroFish and Elephant-1):
     old branches scanned too: only placeholder `sk-` strings, no real keys; commit metadata names the owner.
     Owner's choice 2026-11-22: KEEP IT PUBLIC. Every commit on main is therefore published; the pre-push scan is
     the only guard, so nothing private is ever committed.
+23. Hermes Chief of Staff team (owner's yes 2026-11-22), done: the `valedia` chat runs three one-shot role
+    profiles through `cos-team`: `cos-scout` (web only, gpt-6-luna on the ChatGPT subscription), `cos-decider` and
+    `cos-auditor` (no web, Claude subscription). Scout, then Decider, then Auditor, at most one retry on FAILS. No
+    private data, trading data, Finnhub data or UGFT work goes in a brief; the team never acts and never judges
+    trades. The trader team's profiles are unchanged. Tested end to end. Valedia picks it up in a new session.
 
 ## 13b. Affordable paid options (the owner's to choose; none needed today unless marked)
 
