@@ -498,6 +498,14 @@ Queued (roadmap):
   Owner 2026-11-23: YES to the Mac mini as arm 2 of that test (that arm only), and YES to excluding the collector's
   store from Spotlight. The exclusion is a System Settings change, so the owner makes it himself (Spotlight -> Search
   Privacy -> add the repo's memory/ folder).
+  Spotlight exclusion CHECKED 2026-11-23 10:17 AM PST: the SSD's exclusion list holds the memory/ folder; 0 hits.
+  2026-11-23 the FIRST SHARED PRACTICE RUN SKIPPED (6:55 and 7:10 AM PST): commit 8fb509f (Hermes placement guard, not
+  trading code) touched 3 order-path files (desk.py, panel.py, research.py); the gate failed closed SILENTLY. OWNER:
+  move the practice gate to 8fb509f (+ placement.py on the file list)? The lead's move was refused by the safety check.
+  QUEUED: a skipped practice run alerts like a fault; a commit touching an order-path file warns which gate it closes.
+  The CPI pull died with its session; relaunched detached 10:31 AM PST under guard 8 (pull6 log); 976 candles, held.
+  Round 26 addendum (reply 26 addendum): round 27 asks Carbon which go-live gate items are needed before the first
+  attended order, how a skipped practice day counts in the clean week (outcome-blind), and what a referee would add.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
