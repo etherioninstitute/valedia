@@ -1846,6 +1846,14 @@ _ALLOWED_PUBLIC = {("store.py", n) for n in ("connect", "register_source", "add_
 _ALLOWED_PUBLIC |= {("k3_calendar.py", n) for n in (
     "K3Error", "register_all", "schedule_facts", "date_only_known_at", "parse_finnhub_holiday", "parse_finnhub_status",
     "parse_federal_register", "fr_closure_dates", "fetch", "refresh", "closure_votes")}
+# The K-4 venue feed's public names, all plain `def` and `class` statements. `normalize_text` and the three `parse_*`
+# functions work on a response body (the parsers build fact dicts to hand to `add_fact`); `fetch` returns the same built
+# dicts; `refresh` returns counts; `register_all` returns nothing; `pending_rule_diffs` returns small summary dicts and
+# `close_rule_diff` one id, both through `facts_as_of` and `add_fact` only. The scan below still checks that this module
+# never names the facts table.
+_ALLOWED_PUBLIC |= {("k4_venue.py", n) for n in (
+    "K4Error", "normalize_text", "register_all", "parse_kalshi_rss", "parse_webull_changelog", "parse_document",
+    "fetch", "refresh", "pending_rule_diffs", "close_rule_diff")}
 # Every place that may name the facts table, as (module path, scope, kind). `_SCHEMA` is the SQL text (its
 # own two lookups are checked separately below); the one insert is in add_fact's inner function.
 _MAY_MENTION_FACTS = {
