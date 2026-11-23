@@ -1462,6 +1462,112 @@ def test_a_store_still_opens_after_vacuum_and_analyze(tmp_path, maintenance):
     c.close()
 
 
+# ---- two objects can share a name (triggers have their own namespace): none may hide behind another --
+
+_PLANT = ("INSERT INTO knowledge_facts (domain, entity_key, effective_from_utc, fetched_at_utc, known_at_utc,"
+          " known_at_basis, source_id, raw_sha256, payload_json) SELECT 'K2_NEWS', 'planted',"
+          " NEW.effective_from_utc, NEW.fetched_at_utc, NEW.fetched_at_utc, 'FETCHED', NEW.source_id,"
+          " NEW.raw_sha256, '{}' WHERE NEW.entity_key <> 'planted';")
+
+
+def _planted_store(tmp_path, which, vacuum_after=False):
+    """A store where a trigger and an index share a name and the later row in the schema table is the one a
+    dictionary keyed by name would keep (the expected object, re-created verbatim)."""
+    path = tmp_path / f"dup_{which}.db"
+    connect(path).close()
+    raw = sqlite3.connect(path, isolation_level=None)
+    if which == "trigger_then_index":              # probe 1
+        raw.execute(f"CREATE TRIGGER knowledge_facts_lookup AFTER INSERT ON knowledge_facts BEGIN {_PLANT} END")
+        sql = raw.execute("SELECT sql FROM sqlite_master WHERE name = 'knowledge_facts_lookup' AND type = 'index'"
+                          ).fetchone()[0]
+        raw.execute("DROP INDEX knowledge_facts_lookup")
+        raw.execute(sql)                           # the real index again, now AFTER the planted trigger
+    else:                                          # probe 2: an extra index, then the real trigger re-created
+        sql = raw.execute("SELECT sql FROM sqlite_master WHERE name = 'knowledge_facts_no_update'").fetchone()[0]
+        raw.execute("DROP TRIGGER knowledge_facts_no_update")
+        raw.execute("CREATE INDEX knowledge_facts_no_update ON knowledge_facts (source_id)")
+        raw.execute(sql)
+    if vacuum_after:
+        raw.execute("VACUUM")
+    raw.close()
+    return path
+
+
+@pytest.mark.parametrize("vacuum", [False, True])
+@pytest.mark.parametrize("which", ["trigger_then_index", "index_then_trigger"])
+def test_an_object_hiding_behind_another_of_the_same_name_is_refused(tmp_path, which, vacuum):
+    path = _planted_store(tmp_path, which, vacuum_after=vacuum)
+    with pytest.raises(StoreError, match="knowledge_facts_"):
+        connect(path)
+    raw = sqlite3.connect(path, isolation_level=None)     # refuse again after a VACUUM of the planted store
+    raw.execute("VACUUM")
+    raw.close()
+    with pytest.raises(StoreError, match="knowledge_facts_"):
+        connect(path)
+
+
+_EXPECTED_NAMES = sorted(n for _, n in _EXPECTED_OBJECTS)
+_KINDS = {
+    "trigger_on_facts": ("TRIGGER", "CREATE TRIGGER {n} BEFORE INSERT ON knowledge_facts BEGIN SELECT 1; END"),
+    "trigger_on_registry": ("TRIGGER", "CREATE TRIGGER {n} BEFORE INSERT ON source_registry BEGIN SELECT 1; END"),
+    "view": ("VIEW", "CREATE VIEW {n} AS SELECT 1"),
+    "table": ("TABLE", "CREATE TABLE {n} (x)"),
+    "index": ("INDEX", "CREATE INDEX {n} ON knowledge_facts (payload_json)"),
+}
+_TYPE_OF = {n: t for t, n in _EXPECTED_OBJECTS}
+
+
+@pytest.mark.parametrize("name", _EXPECTED_NAMES)
+@pytest.mark.parametrize("kind", sorted(_KINDS))
+def test_a_second_object_with_an_expected_name_is_refused_in_every_type_combination(tmp_path, kind, name):
+    path = tmp_path / "pair.db"
+    connect(path).close()
+    raw = sqlite3.connect(path, isolation_level=None)
+    same_namespace = (_KINDS[kind][0] == "TRIGGER") == (_TYPE_OF[name] == "trigger")
+    if same_namespace:                                     # SQLite itself refuses these, and the store stays valid
+        with pytest.raises(sqlite3.OperationalError):
+            raw.execute(_KINDS[kind][1].format(n=name))
+        raw.close()
+        connect(path).close()
+        return
+    raw.execute(_KINDS[kind][1].format(n=name))            # SQLite allows this pair: the store must not
+    raw.close()
+    with pytest.raises(StoreError, match=name):
+        connect(path)
+
+
+@pytest.mark.parametrize("name", _EXPECTED_NAMES)
+@pytest.mark.parametrize("kind", ["trigger", "index", "view", "table"])
+def test_a_duplicate_row_written_into_the_schema_table_is_refused(tmp_path, kind, name):
+    path = tmp_path / "dupw.db"
+    connect(path).close()
+    raw = sqlite3.connect(path)
+    sql = {"trigger": f"CREATE TRIGGER {name} BEFORE INSERT ON knowledge_facts BEGIN SELECT 1; END",
+           "index": f"CREATE INDEX {name} ON knowledge_facts (payload_json)",
+           "view": f"CREATE VIEW {name} AS SELECT 1", "table": f"CREATE TABLE {name} (x)"}[kind]
+    raw.execute("PRAGMA writable_schema = ON")
+    raw.execute("INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) VALUES (?,?,?,0,?)",
+                (kind, name, "knowledge_facts", sql))
+    raw.commit()
+    raw.close()
+    with pytest.raises(StoreError):
+        connect(path)
+
+
+def test_a_planted_trigger_would_really_fire_if_the_store_were_opened(tmp_path):
+    # shows the probe is a real attack: opened without our checks, the planted trigger writes an extra row
+    path = _planted_store(tmp_path, "trigger_then_index")
+    raw = sqlite3.connect(path, isolation_level=None)
+    raw.execute("PRAGMA foreign_keys = ON")
+    cols = _raw_row()
+    raw.execute("INSERT INTO source_registry VALUES ('example_public','u','x',1,1,'GENERIC_CLIENT',0,"
+                "'2026-01-01T00:00:00.000000Z',NULL)")
+    raw.execute(f"INSERT INTO knowledge_facts ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                list(cols.values()))
+    assert raw.execute("SELECT count(*) FROM knowledge_facts WHERE entity_key = 'planted'").fetchone()[0] == 1
+    raw.close()
+
+
 # ---- the path and connection arguments -----------------------------------------------------------
 
 class _BytesPath:
@@ -1516,6 +1622,7 @@ def test_the_module_docstring_states_its_limits():
     doc = " ".join((store.__doc__ or "").split())
     assert "only the id range, the schema identity and the version" in doc
     assert "other than out-of-range ids" in doc and "are not detected" in doc
+    assert "multiset" in doc and "duplicate name" in doc and "whatever its type" in doc
     assert "text-only" in doc and "built at run time" in doc
     assert "disables triggers" in doc and "re-creates them verbatim" in doc and "outside what the store can detect" in doc
     assert "which catches rows written with the checks switched off" not in doc

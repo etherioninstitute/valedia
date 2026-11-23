@@ -33,9 +33,10 @@ read's `known_at_utc` and its fetch time. When a proven publication time would l
 version current at the fetch time, a FETCHED row at the fetch time is stored too, in the same transaction.
 
 What `connect` checks on opening a store: the schema version, that every expected table, index and trigger is
-present with exactly the SQL this code creates, that nothing else is in the file (every entry of the schema
-table is compared against an exact allowlist, never a name pattern; SQLite's own automatic indexes and the
-statistics tables that ANALYZE makes are the only extras allowed), and that the ids lie within 1..2^62. It
+present with exactly the SQL this code creates, that nothing else is in the file (the whole schema table is
+compared as a multiset of (type, name, tbl_name, sql) rows, never by a name pattern and never through a
+dictionary keyed by name; a duplicate name is refused whatever its type; SQLite's own automatic indexes and
+the statistics tables that ANALYZE makes are the only extras allowed), and that the ids lie within 1..2^62. It
 checks only the id range, the schema identity and the version. Rows written with the checks switched off, other
 than out-of-range ids, are not detected.
 
@@ -54,6 +55,7 @@ import math
 import os
 import re
 import sqlite3
+from collections import Counter
 from datetime import datetime, timezone
 
 SCHEMA_VERSION = 2   # kept in PRAGMA user_version
@@ -168,13 +170,14 @@ _STATS_TABLES = {      # made by ANALYZE; the only tables whose names start with
 }
 
 
-def _objects(conn: sqlite3.Connection) -> dict[str, tuple]:
-    """name -> (type, tbl_name, SQL text) for every entry in the schema table, with no name filtering."""
-    return {row[0]: (row[1], row[2], row[3]) for row in conn.execute(
-        "SELECT name, type, tbl_name, sql FROM sqlite_master")}
+def _objects(conn: sqlite3.Connection) -> list[tuple]:
+    """Every row of the schema table as (type, name, tbl_name, sql), sorted, with no name filtering and no
+    dictionary keyed by name (a trigger and an index can share a name, and one must not hide the other)."""
+    return sorted((tuple(row) for row in conn.execute("SELECT type, name, tbl_name, sql FROM sqlite_master")),
+                  key=repr)
 
 
-def _reference_objects() -> dict[str, tuple]:
+def _reference_objects() -> list[tuple]:
     """What a correct store holds: the schema built in a throwaway in-memory database. It includes the
     automatic indexes SQLite makes for the primary keys, under the exact names SQLite gives them."""
     ref = sqlite3.connect(":memory:")
@@ -186,24 +189,26 @@ def _reference_objects() -> dict[str, tuple]:
 
 
 def _verify_schema(conn: sqlite3.Connection, path) -> None:
-    """The schema table must hold exactly the expected objects (same type, table and SQL), plus at most the
-    statistics tables ANALYZE makes. Anything else, whatever its name, is refused by name."""
+    """The whole schema table, as a multiset of (type, name, tbl_name, sql) rows, must equal the expected rows,
+    plus at most the statistics tables ANALYZE makes. No name may appear twice, whatever the types."""
     have = _objects(conn)
-    want = _reference_objects()
-    for name, entry in want.items():
-        if name not in have:
-            raise StoreError(f"{path}: store is missing {name}; it is not opened silently")
-        if have[name] != entry:
+    names = Counter(name for _, name, _, _ in have)
+    twice = sorted(name for name, n in names.items() if n > 1)
+    if twice:    # one object could be hiding behind another of the same name
+        raise StoreError(f"{path}: store has more than one object named {twice}; it is not opened silently")
+    have_rows = Counter(row for row in have
+                        if not (row[1] in _STATS_TABLES and row == ("table", row[1], row[1], _STATS_TABLES[row[1]])))
+    want_rows = Counter(_reference_objects())
+    missing = want_rows - have_rows
+    extra = have_rows - want_rows
+    gone = {name for _, name, _, _ in missing}
+    added = {name for _, name, _, _ in extra}
+    for name in sorted(gone):
+        if name in added:
             raise StoreError(f"{path}: {name} differs from what this code creates; it is not opened silently")
-    extra = []
-    for name, (kind, tbl, sql) in have.items():
-        if name in want:
-            continue
-        if name in _STATS_TABLES and (kind, tbl, sql) == ("table", name, _STATS_TABLES[name]):
-            continue
-        extra.append(name)
-    if extra:    # a trigger, view or index nobody asked for could change what a write or a read does
-        raise StoreError(f"{path}: store has unexpected objects {sorted(extra)}; it is not opened silently")
+        raise StoreError(f"{path}: store is missing {name}; it is not opened silently")
+    if added:    # a trigger, view or index nobody asked for could change what a write or a read does
+        raise StoreError(f"{path}: store has unexpected objects {sorted(added)}; it is not opened silently")
     low, high = conn.execute("SELECT min(fact_version_id), max(fact_version_id) FROM knowledge_facts").fetchone()
     if low is not None and (low < 1 or high > _MAX_ID):
         raise StoreError(f"{path}: fact_version_id range {low}..{high} is outside 1..{_MAX_ID}; "
