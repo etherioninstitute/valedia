@@ -33,13 +33,18 @@ Facts (all in the domain K4_VENUE):
   history of a change log is one thing to read, not one flag per old entry. After it, each new or changed entry opens its
   own flag. A read that stopped after storing entries but before the baseline flag is repaired by the next read: one
   baseline flag and no per-entry flags. A DOCUMENT source needs no baseline: its first version opens its own flag.
+- After the baseline, a NEW entry dated more than one New York day before the fetch is known when fetched, not at the
+  end of its date: a vendor that adds an old-dated entry later is back-dating it, and we cannot prove it was public then.
+  Baseline entries, and new entries dated on the fetch day or the day before, keep the rule above.
 - A version that differs from the one before it only in `scheduled` (the text is the same and the entry has come due) is
-  stored but opens no flag. Any change of text opens one.
+  stored but opens no flag, when the version before it already has a flag pointing at it or is covered by the baseline.
+  Otherwise (an edit whose flag was never written) the flip opens one. Any change of text opens one.
 - `close_rule_diff` writes a later version of a flag with status CLOSED and the `rule_module`. `pending_rule_diffs` lists
   the open ones as of a time.
 
 Normalization (`normalize_text`): tags, scripts, styles, `<head>` (meta tags, build ids, nonces) and comments are
-dropped, entities are decoded and white space is collapsed. So a page that changes only in a script nonce hashes the
+dropped, entities are decoded and white space is collapsed. A script, style or head that never closes refuses an HTML
+page; in a feed's title or description, where a tag is only a word being mentioned, it is just removed as text. So a page that changes only in a script nonce hashes the
 same, and a one-word change of a clause does not.
 
 A body that fails its shape check is refused whole: nothing from it is stored, and the refusal counts as an error.
@@ -213,7 +218,10 @@ class _Collector(HTMLParser):
             self.events.append(("text", data))
 
 
-def _events(markup: str, skip) -> list[tuple[str, str]]:
+def _events(markup: str, skip, strict: bool = True) -> list[tuple[str, str]]:
+    """The events of a page. An element of `skip` that never closes refuses the page when `strict` (an HTML page). When
+    not strict (a feed's title or description, where a tag is only a word being mentioned), the text is read again with
+    nothing skipped, so every tag is just removed and the words around it stay."""
     if not isinstance(markup, str) or not _encodable(markup):
         raise K4Error("markup: must be text")
     parser = _Collector(skip)
@@ -222,8 +230,19 @@ def _events(markup: str, skip) -> list[tuple[str, str]]:
         parser.close()
     except Exception:
         raise K4Error("markup: could not be read") from None
-    if parser.unclosed():
+    if not parser.unclosed():
+        return parser.events
+    if strict:
         raise K4Error("markup: a script, style, head or similar element never closes")
+    # only a mention: take those tags out as text (the parser would hold back everything after an unclosed script)
+    names = "|".join(sorted(skip))
+    plain = re.sub(rf"<\s*/?\s*(?:{names})\b[^>]*>", " ", markup, flags=re.I)
+    parser = _Collector(frozenset())
+    try:
+        parser.feed(plain)
+        parser.close()
+    except Exception:
+        raise K4Error("markup: could not be read") from None
     return parser.events
 
 
@@ -231,13 +250,24 @@ def _collapse(text: str) -> str:
     return " ".join(text.replace("\x00", " ").split())
 
 
-def normalize_text(markup) -> str:
-    """The plain text of a page: tags, scripts, styles, `<head>` and comments dropped, entities decoded, white space
-    collapsed. A block boundary is a space, so words of two paragraphs never join."""
+def _text_of(markup, strict: bool) -> str:
     pieces = []
-    for kind, value in _events(markup, _SKIP_BASE):
+    for kind, value in _events(markup, _SKIP_BASE, strict):
         pieces.append(value if kind == "text" else " ")
     return _collapse("".join(pieces))
+
+
+def normalize_text(markup) -> str:
+    """The plain text of an HTML page: tags, scripts, styles, `<head>` and comments dropped, entities decoded, white
+    space collapsed. A block boundary is a space, so words of two paragraphs never join. A script, style, head or
+    similar element that never closes refuses the page."""
+    return _text_of(markup, True)
+
+
+def _plain_text(markup) -> str:
+    """The same for a feed's title or description: a tag that never closes is only a word being mentioned, so it is
+    removed as text and the page is not refused."""
+    return _text_of(markup, False)
 
 
 # ---- source registration
@@ -369,14 +399,14 @@ def parse_kalshi_rss(raw, *, fetched_at_utc) -> list[dict]:
         raise K4Error("kalshi rss: expected exactly one channel")
     entries = []
     for item in channels[0].findall("item"):
-        title = normalize_text(_child_text(item, "title") or "")
+        title = _plain_text(_child_text(item, "title") or "")
         if not title:
             raise K4Error("kalshi rss: an item has no title")
         link = _collapse(_child_text(item, "link") or "") or None
         if link is not None and not re.fullmatch(r"https?://\S+", link):
             raise K4Error("kalshi rss: an item link is not an http(s) address")
         entries.append({"title": title, "day": _rss_day(_child_text(item, "pubDate")),
-                        "summary": normalize_text(_child_text(item, "description") or ""), "link": link})
+                        "summary": _plain_text(_child_text(item, "description") or ""), "link": link})
     return _entry_facts(_KALSHI_RSS, entries, fetched)
 
 
@@ -518,18 +548,18 @@ def _diff_payload(row: dict) -> dict:
     return p
 
 
-def _only_scheduled_differs(conn, source_id: str, key: str, fetched: str) -> bool:
-    """True when the current version of an entry and the one before it are the same but for `scheduled`."""
+def _flip_only_after(conn, source_id: str, key: str, fetched: str):
+    """The id of the version before the current one when the two are the same but for `scheduled` (None otherwise)."""
     def at(moment):
         return [r for r in store.facts_as_of(conn, moment, domain=_DOMAIN, entity_key=key) if r["source_id"] == source_id]
 
     now_rows = at(fetched)
     if not now_rows:
-        return False
+        return None
     known = datetime.strptime(now_rows[0]["known_at_utc"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
     prev_rows = at(_fmt(known - timedelta(microseconds=1)))
     if not prev_rows:
-        return False
+        return None
 
     def text_of(row):
         try:
@@ -539,7 +569,15 @@ def _only_scheduled_differs(conn, source_id: str, key: str, fetched: str) -> boo
         return None if not isinstance(body, dict) else {k: v for k, v in body.items() if k != "scheduled"}
 
     mine, theirs = text_of(now_rows[0]), text_of(prev_rows[0])
-    return mine is not None and mine == theirs and now_rows[0]["raw_sha256"] != prev_rows[0]["raw_sha256"]
+    same = mine is not None and mine == theirs and now_rows[0]["raw_sha256"] != prev_rows[0]["raw_sha256"]
+    return prev_rows[0]["fact_version_id"] if same else None
+
+
+def _late(fact: dict, today: date) -> bool:
+    """True for a new entry dated more than one New York day before the fetch. After the baseline, a vendor that adds
+    an old-dated entry is back-dating it, and we cannot prove it was public on that date."""
+    day = json.loads(fact["payload_json"]).get("date")
+    return day is not None and (today - date.fromisoformat(day)).days > 1
 
 
 def _store_facts(conn, source_id: str, facts: list[dict]) -> dict:
@@ -558,6 +596,7 @@ def _store_facts(conn, source_id: str, facts: list[dict]) -> dict:
         else:
             before[row["entity_key"]] = row
     detail = None
+    today = _ny_date_of(fetched)
     changelog = SOURCES[source_id]["role"] == "CHANGELOG"
     baseline = changelog and not flags     # a change log with no flag of its own yet
     versions = []
@@ -571,8 +610,8 @@ def _store_facts(conn, source_id: str, facts: list[dict]) -> dict:
     for f in facts:
         key = f["entity_key"]
         old_row = before.get(key)
-        if f["published_proven"] and old_row is not None:
-            f = dict(f, published_at_utc=None, published_proven=False)    # only the FIRST version may be back-dated
+        if f["published_proven"] and (old_row is not None or (changelog and not baseline and _late(f, today))):
+            f = dict(f, published_at_utc=None, published_proven=False)    # only a first version, seen soon, may be back-dated
         try:
             version = store.add_fact(conn, **f)
         except store.StoreError as exc:
@@ -588,8 +627,11 @@ def _store_facts(conn, source_id: str, facts: list[dict]) -> dict:
             continue                                  # a flag already points at this version
         if flag is None and version <= covered:
             continue                                  # the baseline flag covers every entry of the first read
-        if changelog and old_row is not None and _only_scheduled_differs(conn, source_id, key, fetched):
-            continue                                  # the plan came due; the text is the same
+        if changelog and old_row is not None:
+            prev = _flip_only_after(conn, source_id, key, fetched)
+            if prev is not None and ((flag is not None and flag["new_fact_version_id"] == prev)
+                                     or (flag is None and prev <= covered)):
+                continue                              # the plan came due; the text is the same as the flagged version's
         old = flag["new_fact_version_id"] if flag is not None else (old_row["fact_version_id"] if changed and old_row is not None else None)
         body = {"entity_key": key, "old_fact_version_id": old, "new_fact_version_id": version, "status": "OPEN"}
         try:

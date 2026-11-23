@@ -846,8 +846,8 @@ def test_only_the_first_version_of_an_entry_may_be_published_at_its_date(reg):
     row = current(reg)[key(KR, "2026-11-01", "Entry A")]
     assert row["known_at_basis"] == "PUBLISHED" and row["known_at_utc"] == "2026-11-02T04:59:59.999999Z"
     k4.refresh(reg, KR, http_get=Fake({KR_URL: rss(rss_item("Entry A", "Sun, 01 Nov 2026 15:00:00 GMT", "a"),
-                                                    rss_item("Entry N", "Mon, 02 Nov 2026 15:00:00 GMT", "n"))}), now=at(25))
-    assert current(reg)[key(KR, "2026-11-02", "Entry N")]["known_at_basis"] == "PUBLISHED"
+                                                    rss_item("Entry N", "Tue, 24 Nov 2026 15:00:00 GMT", "n"))}), now=at(25))
+    assert current(reg)[key(KR, "2026-11-24", "Entry N")]["known_at_basis"] == "PUBLISHED"
 
 
 def test_a_refused_body_stores_nothing_even_when_the_first_items_were_good(reg):
@@ -1164,3 +1164,122 @@ def test_the_cli_exits_zero_with_nothing_open_and_nothing_wrong(cli, capsys):
     db, _ = cli
     code, out, _ = run(["pending", "--store", db], capsys)
     assert code == 0 and json.loads(out)["open"] == []
+
+
+# ---- round 4: the lost diff, mentioned tags in a feed, entries that appear late
+
+def test_an_edit_whose_flag_write_failed_is_still_flagged_when_the_flip_comes_later(reg, monkeypatch):
+    plan = rss(rss_item("x", "Wed, 25 Nov 2026 15:00:00 GMT", "x"))
+    edited = rss(rss_item("x", "Wed, 25 Nov 2026 15:00:00 GMT", "EDITED"))
+    k4.refresh(reg, KR, http_get=Fake({KR_URL: plan}), now=NOW)
+    settle(reg, KR)                                                  # the baseline is closed
+    real = k4.store.add_fact
+
+    def no_flags(conn, **f):
+        if f["entity_key"].startswith("PENDING_RULE_DIFF:"):
+            raise StoreError("simulated refusal")
+        return real(conn, **f)
+    monkeypatch.setattr(k4.store, "add_fact", no_flags)
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: edited}), now=at(24))
+    assert got["stored"] == 1 and got["error"] == 1 and got["diffs_opened"] == 0      # edit stored, its flag was lost
+    monkeypatch.setattr(k4.store, "add_fact", real)
+    assert k4.pending_rule_diffs(reg, FAR) == []
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: edited}), now=at(27))              # it comes due: only the flip
+    assert got["stored"] == 1 and got["diffs_opened"] == 1
+    (d,) = k4.pending_rule_diffs(reg, FAR)
+    assert d["entity_key"] == key(KR, "2026-11-25", "x")
+    assert d["new_fact_version_id"] == current(reg)[key(KR, "2026-11-25", "x")]["fact_version_id"]
+    assert k4.refresh(reg, KR, http_get=Fake({KR_URL: edited}), now=at(28))["diffs_opened"] == 0      # exactly one
+
+
+def test_a_flip_after_a_flagged_edit_opens_nothing_more(reg):
+    plan = rss(rss_item("x", "Wed, 25 Nov 2026 15:00:00 GMT", "x"))
+    edited = rss(rss_item("x", "Wed, 25 Nov 2026 15:00:00 GMT", "EDITED"))
+    k4.refresh(reg, KR, http_get=Fake({KR_URL: plan}), now=NOW)
+    settle(reg, KR)
+    assert k4.refresh(reg, KR, http_get=Fake({KR_URL: edited}), now=at(24))["diffs_opened"] == 1
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: edited}), now=at(27))
+    assert got == {"stored": 1, "unchanged": 0, "error": 0, "diffs_opened": 0}
+    assert len(k4.pending_rule_diffs(reg, FAR)) == 1
+    assert k4.refresh(reg, KR, http_get=Fake({KR_URL: edited}), now=at(28))["diffs_opened"] == 0
+    assert len(k4.pending_rule_diffs(reg, FAR)) == 1
+
+
+MENTIONS = {
+    "escaped script": "&lt;script&gt;x",
+    "cdata head": "<![CDATA[use <head> here]]>",
+    "escaped template": "&lt;template&gt; tag",
+    "escaped style": "&lt;style&gt;.a{}",
+}
+
+
+@pytest.mark.parametrize("name", sorted(MENTIONS))
+def test_a_tag_mentioned_in_a_feed_is_plain_text_and_the_feed_is_stored(reg, name):
+    feed = rss(rss_item("Item " + name, desc=MENTIONS[name]), rss_item("Other item"))
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: feed}), now=NOW)
+    assert got["error"] == 0 and got["stored"] == 2, name
+    summary = payload(current(reg)[key(KR, "2026-11-09", "Item " + name)])["summary"]
+    assert "<" not in summary and ">" not in summary
+    assert summary == {"escaped script": "x", "cdata head": "use here", "escaped template": "tag",
+                       "escaped style": ".a{}"}[name]
+
+
+def test_a_tag_mentioned_in_a_feed_title_is_plain_text_too():
+    facts = parsed(rss(rss_item("Using &lt;script&gt; tags", desc="d")))
+    assert json.loads(list(facts.values())[0]["payload_json"])["title"] == "Using tags"
+
+
+def test_a_closed_script_in_a_feed_description_is_still_dropped():
+    f = list(parsed(rss(rss_item("Item", desc="a &lt;script&gt;secret()&lt;/script&gt; b"))).values())[0]
+    assert json.loads(f["payload_json"])["summary"] == "a b"
+
+
+def test_an_unclosed_script_on_a_page_is_still_refused_where_a_feed_would_keep_it(reg):
+    bad = b"<p>rule</p><script>x"
+    assert k4.refresh(reg, FEE, http_get=Fake({DOC_URL[FEE]: bad}), now=NOW)["error"] == 1
+    assert k4.refresh(reg, WB, http_get=Fake({WB_URL: b"<h2>2026-11-18 T</h2><script>x"}), now=NOW)["error"] == 1
+    assert n_rows(reg) == 0
+
+
+def test_an_entry_that_appears_late_with_an_old_date_is_known_when_fetched(reg):
+    def feed(*pubs):
+        return rss(*[rss_item("Updates", p, desc=f"item {i}") for i, p in enumerate(pubs)])
+    nov2, nov14 = "Mon, 02 Nov 2026 15:00:00 GMT", "Sat, 14 Nov 2026 15:00:00 GMT"
+    day10, day15 = datetime(2026, 11, 10, 18, 0, tzinfo=timezone.utc), datetime(2026, 11, 15, 18, 0, tzinfo=timezone.utc)
+    k4.refresh(reg, KR, http_get=Fake({KR_URL: feed(nov2, nov2)}), now=day10)               # the baseline
+    first = current(reg)[key(KR, "2026-11-02", "Updates", 1)]
+    assert first["known_at_basis"] == "PUBLISHED" and first["known_at_utc"] == "2026-11-03T04:59:59.999999Z"
+    late = key(KR, "2026-11-02", "Updates", 3)
+    got = k4.refresh(reg, KR, http_get=Fake({KR_URL: feed(nov2, nov2, nov2)}), now=day15)    # a third item, dated 11-02
+    assert got["stored"] == 1
+    row = current(reg)[late]
+    assert row["known_at_basis"] == "FETCHED" and row["published_at_utc"] is None and row["known_at_utc"] == stamp(day15)
+    assert late not in current(reg, "2026-11-14T23:59:59Z")                                   # invisible at 11-14
+    assert late in current(reg, stamp(day15))
+    assert key(KR, "2026-11-02", "Updates", 2) in current(reg, "2026-11-14T23:59:59Z")        # the baseline ones stay
+
+
+def test_an_entry_dated_the_day_before_the_fetch_is_published_at_the_end_of_that_day(reg):
+    feed = lambda *pubs: rss(*[rss_item(f"N{i}", p) for i, p in enumerate(pubs)])
+    nov2, nov13, nov14 = "Mon, 02 Nov 2026 15:00:00 GMT", "Fri, 13 Nov 2026 15:00:00 GMT", "Sat, 14 Nov 2026 15:00:00 GMT"
+    k4.refresh(reg, KR, http_get=Fake({KR_URL: feed(nov2)}), now=datetime(2026, 11, 10, 18, 0, tzinfo=timezone.utc))
+    day15 = datetime(2026, 11, 15, 18, 0, tzinfo=timezone.utc)
+    k4.refresh(reg, KR, http_get=Fake({KR_URL: rss(rss_item("N0", nov2), rss_item("Two days", nov13),
+                                                    rss_item("One day", nov14))}), now=day15)
+    one = current(reg)[key(KR, "2026-11-14", "One day")]
+    assert one["known_at_basis"] == "PUBLISHED" and one["known_at_utc"] == "2026-11-15T04:59:59.999999Z"
+    assert key(KR, "2026-11-14", "One day") not in current(reg, "2026-11-15T04:59:59.999998Z")
+    assert key(KR, "2026-11-14", "One day") in current(reg, "2026-11-15T05:00:00Z")
+    two = current(reg)[key(KR, "2026-11-13", "Two days")]                                      # two days back: too late to prove
+    assert two["known_at_basis"] == "FETCHED" and two["known_at_utc"] == stamp(day15)
+
+
+def test_the_baseline_read_keeps_the_published_rule_for_old_entries_even_when_it_is_repaired(reg):
+    facts = k4.fetch(KR, http_get=Fake({KR_URL: FEED}), now=NOW)
+    for f in facts[:2]:
+        add_fact(reg, **f)                                       # an interrupted first read: two of the six stored
+    k4.refresh(reg, KR, http_get=Fake({KR_URL: FEED}), now=at(30))
+    rows = current(reg)
+    assert rows[key(KR, "2026-11-09", A_TITLE)]["known_at_basis"] == "PUBLISHED"
+    assert rows[key(KR, "2026-11-20", B_TITLE)]["known_at_basis"] == "PUBLISHED"
+    assert [d["entity_key"] for d in k4.pending_rule_diffs(reg, FAR)] == [f"{KR}:BASELINE"]
