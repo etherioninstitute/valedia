@@ -1179,3 +1179,19 @@ def test_cli_never_prints_the_token(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(k3, "_urllib_get", Fake({H_URL: RuntimeError(f"failed with {TOKEN}")}))
     code, out, err = run(["refresh", "--store", db, "--source", H], capsys)
     assert code == 1 and TOKEN not in out and TOKEN not in err
+
+
+def test_a_revised_fr_document_is_known_at_its_fetch_not_back_at_its_publication(conn):
+    """Lead fix: only an entity's first version may be PUBLISHED; a later edit is FETCHED (no lookahead)."""
+    register(conn)
+    first = datetime(2026, 11, 10, 18, 0, 0, tzinfo=timezone.utc)
+    second = datetime(2026, 11, 12, 18, 0, 0, tzinfo=timezone.utc)
+    k3.refresh(conn, FR, http_get=Fake({FR_URL: fr_body(fr_doc(num="2026-8", pub="2026-11-02"))}), now=first)
+    k3.refresh(conn, FR, http_get=Fake({FR_URL: fr_body(fr_doc(num="2026-8", pub="2026-11-02", abstract="Edited."))}),
+               now=second)
+    def abstract_at(t):
+        rows = [r for r in facts_as_of(conn, t, domain="K3_CAL") if r["entity_key"] == "FR:2026-8"]
+        return [json.loads(r["payload_json"])["abstract"] for r in rows]
+    assert abstract_at("2026-11-05T00:00:00Z") == [None]           # the first version stays PUBLISHED
+    assert abstract_at("2026-11-11T00:00:00Z") == [None]           # the edit is not visible before it was fetched
+    assert abstract_at("2026-11-12T19:00:00Z") == ["Edited."]
