@@ -408,6 +408,12 @@ Queued (roadmap):
   collapse into one trial -> add `describe()`, and audit past merges; R3 draws `r3_shifts` with replacement past
   the number of distinct shifts -> use `timing_exact` when asked for more and print the count; check R4's
   dispersion uses active-Sharpe z. Gate 2 Sharpe at rf = 0; DTB3 excess printed only.
+  Round 18: practice path scores plumbing only, profit only by the locked gate; Carbon's rehearsal cases (EXPIRED
+  partial, settled-cash cap, spread gate, idempotent halving) join the go-live checklist. Permutation test uses
+  <= 4*se_mc (bitwise only for repeat calls in ledger order); rho = 1 floor sqrt(eps/pi) = 5.64e-6, atol 1e-5.
+  Epoch-0 r_true: a run counts +1 if new version OR same version with a changed variant spec (guard miss); r_true>5
+  dev-only pass -> RETRO_CAP_FAIL; sealed pass -> GRANDFATHERED_POST_SEAL only if sibling-adjusted dev DSR clears
+  and siblings plateau, else HOLD_FOR_OWNER_AUDIT (hypothesis 26 = go-live item, shown first).
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
@@ -942,6 +948,9 @@ run beside MiroFish and Elephant-1):
     Same night (owner: "Mini is back on"): Scout and Auditor moved to `splash27` on the Mac mini over LM Link
     (placement proven: 0 bytes here vs 21 GiB for a local key; loaded at 9:59 PM in the quiet part of the minute);
     Decider stays on the Claude subscription. Plain fact lookups are Scout only and marked not audited.
+    `cos-team` checks placement before each local call (`lms ps --json`): if `splash27` is not loaded on another
+    device it runs that bot on gpt-6-luna instead and says so, so nothing ever loads beside the collector. Tested
+    in every state (remote, unloaded, local, bad output, lms failing) and one real fallback run.
 
 ## 13b. Affordable paid options (the owner's to choose; none needed today unless marked)
 
