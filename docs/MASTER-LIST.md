@@ -522,6 +522,12 @@ Queued (roadmap):
   (not terminal, not in streak, P3; with faults P0 + reset); calendar load/answer errors = FAULT; RUN_START > 20 min with
   no paired RUN_END = DEADMAN/FAULT run:orphan-start:<trigger> P0 (ends pair with their own start). Schema v2. Known
   limit (CLOSED by T61): a hung 7:10 start was only 15 min old at 7:25. Gate still open at 8fb509f.
+  T63 MERGED 2026-11-23 (bf20128, K-3, blind PASS WITH NOTES + 2 lead fixes; 322 K-3 tests): FR death proclamations
+  (Proclamation + "Announcing the Death of"/"National Day of Mourning") get one body read from raw_text_url (https
+  www.federalregister.gov only); mourning sentences vote; only body_sha256 stored. Failed read: title/abstract's own vote
+  kept; a failed RE-read after a good read with the same title/abstract stores nothing (the good vote stays). Live check:
+  Proc 9830 -> 2018-12-05, 10876 -> 2025-01-09. Known LOW: a body quoting a past mourning date votes it too (harmless
+  as_of); naive tag strip; "Deaths of X and Y" not read.
   T62 MERGED 2026-11-23 (K-3, blind PASS WITH NOTES + lead fix): closure_votes counts authority GROUPS (FINNHUB,
   US_PRESIDENT, XNYS_CALENDAR; sources_closed for the log); closing-agency orders never vote (closing_order_dates log
   only; 16 real FR titles checked); void words + no/never/decline/withdraw/rescind/cancel, 'in the State of', 'in <year>'.
