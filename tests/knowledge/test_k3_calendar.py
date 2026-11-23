@@ -1,0 +1,1004 @@
+"""Tests for the K-3 calendar and closure feed. No network: every fetch goes through a fake `http_get`, and a
+socket guard makes any real connection fail the test. Every guard is tested both ways."""
+import hashlib
+import inspect
+import json
+import socket
+import sqlite3
+from datetime import date, datetime, timedelta, timezone
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
+
+from valedia_trader.knowledge import k3_calendar as k3
+from valedia_trader.knowledge.store import StoreError, add_fact, connect, facts_as_of
+
+T0 = "2026-01-01T00:00:00Z"
+NOW = datetime(2026, 11, 23, 18, 0, 0, tzinfo=timezone.utc)
+NOW_S = "2026-11-23T18:00:00.000000Z"
+TOKEN = "tok_ABCDEF0123456789"
+H = "finnhub_market_holiday"
+S = "finnhub_market_status"
+FR = "federal_register_presdocs"
+X = "xnys_exchange_calendars"
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    def refuse(*a, **k):
+        raise AssertionError("a test tried to open a network connection")
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket, "create_connection", refuse)
+
+
+@pytest.fixture
+def conn(tmp_path):
+    c = connect(tmp_path / "k.db")
+    yield c
+    c.close()
+
+
+def sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def raw(obj):
+    return json.dumps(obj).encode()
+
+
+def put(conn, facts):
+    """Store parsed fact dicts the way `refresh` does, straight through add_fact."""
+    for f in facts:
+        add_fact(conn, **f)
+
+
+def unix(y, m, d, hh=0, mm=0):
+    return int(datetime(y, m, d, hh, mm, tzinfo=timezone.utc).timestamp())
+
+
+# ---- fixtures: the shapes the ticket describes
+
+def holiday_body(*items):
+    return {"exchange": "US", "timezone": "America/New_York", "data": [
+        {"eventName": n, "atDate": d, "tradingHour": th} for n, d, th in items]}
+
+
+HOLIDAYS = holiday_body(("Thanksgiving Day", "2026-11-26", ""),
+                        ("Day After Thanksgiving", "2026-11-27", "09:30-13:00"),
+                        ("Christmas Day", "2026-12-25", ""))
+
+
+def status_body(**over):
+    body = {"exchange": "US", "holiday": None, "isOpen": False, "session": "pre-market",
+            "timezone": "America/New_York", "t": unix(2026, 11, 24, 13, 0)}
+    body.update(over)
+    return body
+
+
+def fr_doc(num="2026-99001", title="Some Proclamation", subtype="Proclamation", pub="2026-11-20", abstract=None,
+           signing="2026-11-19"):
+    return {"document_number": num, "title": title, "type": "Presidential Document", "subtype": subtype,
+            "publication_date": pub, "signing_date": signing, "html_url": f"https://example.invalid/{num}",
+            "abstract": abstract}
+
+
+def fr_body(*docs):
+    """The real shape: extra top-level keys (description, total_pages) come with the results."""
+    return {"description": "", "count": len(docs), "total_pages": 1, "results": list(docs)}
+
+
+CLOSING_TITLE = "Providing for the Closing of Executive Departments and Agencies of the Federal Government on {d}"
+
+
+def closing_doc(num, day_text, pub):
+    return fr_doc(num=num, title=CLOSING_TITLE.format(d=day_text), subtype="Executive Order", pub=pub)
+
+
+def register(conn, *ids, at=T0):
+    k3.register_all(conn, at, only=ids or [X, H, S, FR])
+
+
+# ---- SOURCES and registration
+
+def test_sources_have_the_listed_fields_and_roles():
+    assert set(k3.SOURCES) == {X, H, S, FR}
+    for sid, e in k3.SOURCES.items():
+        assert e["source_id"] == sid
+        assert e["ua_policy"] == "GENERIC_CLIENT" and e["cost_usd_monthly"] == 0
+        assert e["role"] in ("SCHEDULE", "AUTHORITY", "SIGNAL")
+        assert e["terms_url"].startswith("https://") and e["licence_tag"]
+        assert e["allow_external_llm"] in (0, 1)
+    assert k3.SOURCES[X]["role"] == "SCHEDULE" and k3.SOURCES[X]["licence_tag"] == "Apache-2.0"
+    assert k3.SOURCES[H]["role"] == k3.SOURCES[S]["role"] == k3.SOURCES[FR]["role"] == "AUTHORITY"
+    assert k3.SOURCES[FR]["licence_tag"] == "US-PUBLIC-DOMAIN" and k3.SOURCES[FR]["time_zone"] == "America/New_York"
+    for sid in (H, S):
+        assert k3.SOURCES[sid]["allow_external_llm"] == 0
+    assert k3.SOURCES[FR]["allow_external_llm"] == 1 and k3.SOURCES[X]["allow_external_llm"] == 1
+
+
+def test_the_nasdaq_halts_feed_is_gone_and_the_docstring_says_why():
+    assert "nasdaq_trade_halts_rss" not in k3.SOURCES
+    doc = k3.__doc__.lower()
+    assert "nasdaq" in doc and "excluded" in doc and "terms" in doc
+    assert not hasattr(k3, "parse_halts_rss")
+    assert "HALT:" not in inspect.getsource(k3)
+
+
+def test_register_all_registers_only_the_named_sources(conn):
+    k3.register_all(conn, T0, only=[H, X])
+    ids = {r[0] for r in conn.execute("SELECT source_id FROM source_registry")}
+    assert ids == {H, X}
+    row = conn.execute("SELECT * FROM source_registry WHERE source_id = ?", (H,)).fetchone()
+    assert row["allow_external_llm"] == 0 and row["ua_policy"] == "GENERIC_CLIENT" and row["personal_use_ok"] == 1
+    assert row["cost_usd_monthly"] == 0 and row["terms_read_at_utc"] == "2026-01-01T00:00:00.000000Z"
+    k3.register_all(conn, T0, only=[H, X])                        # same values again: nothing happens
+    k3.register_all(conn, T0, only=[FR])
+    assert {r[0] for r in conn.execute("SELECT source_id FROM source_registry")} == {H, X, FR}
+
+
+@pytest.mark.parametrize("only", [[], ["no_such_source"], [X, "no_such_source"], None, "finnhub_market_holiday"])
+def test_register_all_refuses_an_unknown_empty_or_malformed_list(conn, only):
+    with pytest.raises(k3.K3Error):
+        k3.register_all(conn, T0, only=only)
+    assert conn.execute("SELECT count(*) FROM source_registry").fetchone()[0] == 0     # nothing half-registered
+
+
+def test_register_all_accepts_a_comma_free_tuple(conn):
+    k3.register_all(conn, T0, only=(X,))
+    assert conn.execute("SELECT count(*) FROM source_registry").fetchone()[0] == 1
+
+
+# ---- the date-only rule
+
+@pytest.mark.parametrize("day,zone,want", [
+    ("2026-01-15", "America/New_York", "2026-01-16T04:59:59.999999Z"),       # winter: EST, UTC-5
+    ("2026-07-15", "America/New_York", "2026-07-16T03:59:59.999999Z"),       # summer: EDT, UTC-4
+    ("2026-03-08", "America/New_York", "2026-03-09T03:59:59.999999Z"),       # spring-forward day ends in EDT
+    ("2026-11-01", "America/New_York", "2026-11-02T04:59:59.999999Z"),       # fall-back day ends in EST
+    ("2026-01-15", "Asia/Tokyo", "2026-01-15T14:59:59.999999Z"),             # a zone east of UTC
+    ("2026-01-15", "UTC", "2026-01-15T23:59:59.999999Z"),
+])
+def test_date_only_known_at_is_the_end_of_the_local_date(day, zone, want):
+    assert k3.date_only_known_at(day, zone) == want
+
+
+def test_date_only_known_at_never_uses_23_59_59_utc_in_new_york_winter():
+    got = k3.date_only_known_at("2026-01-15", "America/New_York")
+    assert got != "2026-01-15T23:59:59Z" and got > "2026-01-15T23:59:59.999999Z"      # the draft rule leaked ~5 h
+
+
+def test_date_only_known_at_output_is_the_stores_format():
+    got = k3.date_only_known_at("2026-01-15", "America/New_York")
+    assert len(got) == 27 and got.endswith("Z")
+
+
+@pytest.mark.parametrize("zone", [None, "", "   ", "Not/AZone", 5, b"UTC"])
+def test_date_only_known_at_refuses_a_missing_or_bad_zone(zone):
+    with pytest.raises(k3.K3Error):
+        k3.date_only_known_at("2026-01-15", zone)
+
+
+@pytest.mark.parametrize("day", ["2026-1-5", "2026-02-30", "20260115", "2026-01-15T00:00:00", "", None, 20260115,
+                                 "2026-13-01", " 2026-01-15", "2026-01-15\n"])
+def test_date_only_known_at_refuses_a_bad_date(day):
+    with pytest.raises(k3.K3Error):
+        k3.date_only_known_at(day, "America/New_York")
+
+
+def test_a_proven_date_only_stamp_is_accepted_by_the_store(conn):
+    register(conn, FR)
+    stamp = k3.date_only_known_at("2026-01-15", "America/New_York")
+    rid = add_fact(conn, domain="K3_CAL", entity_key="FR:1", source_id=FR, raw_sha256=sha("x"), payload_json="{}",
+                   effective_from_utc=T0, fetched_at_utc="2026-02-01T00:00:00Z", published_at_utc=stamp,
+                   published_proven=True)
+    row = facts_as_of(conn, "2026-02-01T00:00:00Z")[0]
+    assert row["fact_version_id"] == rid and row["known_at_utc"] == stamp and row["known_at_basis"] == "PUBLISHED"
+
+
+# ---- schedule facts
+
+HOLIDAYS_2026 = {"2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19", "2026-07-03",
+                 "2026-09-07", "2026-11-26", "2026-12-25"}
+EARLY_2026 = {"2026-11-27", "2026-12-24"}
+HOLIDAYS_2027 = {"2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18", "2027-07-05",
+                 "2027-09-06", "2027-11-25", "2027-12-24"}
+EARLY_2027 = {"2027-11-26"}
+
+
+def sched(start, end):
+    return {f["entity_key"].rsplit(":", 1)[1]: json.loads(f["payload_json"]) for f in
+            k3.schedule_facts(start, end, now=NOW)}
+
+
+def test_schedule_2026_matches_xnys_every_holiday_and_early_close():
+    days = sched("2026-01-01", "2026-12-31")
+    assert len(days) == 365
+    weekday_closed = {d for d, p in days.items() if not p["open"] and date.fromisoformat(d).weekday() < 5}
+    assert weekday_closed == HOLIDAYS_2026
+    assert {d for d, p in days.items() if p["open"] and p["close_et"] == "13:00"} == EARLY_2026
+    assert all(p["close_et"] == "16:00" for d, p in days.items() if p["open"] and d not in EARLY_2026)
+    assert days["2026-11-26"] == {"open": False, "close_et": None}
+    assert days["2026-11-27"] == {"open": True, "close_et": "13:00"}
+    assert days["2026-11-24"] == {"open": True, "close_et": "16:00"}
+    assert all(not days[d]["open"] for d in days if date.fromisoformat(d).weekday() >= 5)
+
+
+def test_schedule_2027_matches_xnys_every_holiday_and_early_close():
+    days = sched("2027-01-01", "2027-12-31")
+    weekday_closed = {d for d, p in days.items() if not p["open"] and date.fromisoformat(d).weekday() < 5}
+    assert weekday_closed == HOLIDAYS_2027
+    assert {d for d, p in days.items() if p["open"] and p["close_et"] == "13:00"} == EARLY_2027
+
+
+def test_a_special_closure_is_a_closed_session():
+    assert sched("2025-01-09", "2025-01-09")["2025-01-09"] == {"open": False, "close_et": None}      # a day of mourning
+
+
+def test_schedule_fact_shape():
+    facts = k3.schedule_facts(date(2026, 11, 26), date(2026, 11, 27), now=NOW)
+    assert [f["entity_key"] for f in facts] == ["XNYS:SESSION:2026-11-26", "XNYS:SESSION:2026-11-27"]
+    f = facts[1]
+    assert f["domain"] == "K3_CAL" and f["source_id"] == X and f["published_proven"] is False
+    assert f["payload_json"] == '{"close_et":"13:00","open":true}'                 # sorted keys, no whitespace
+    assert f["raw_sha256"] == sha(f["payload_json"])
+    assert f["fetched_at_utc"] == NOW_S and f["published_at_utc"] is None
+    assert f["effective_from_utc"] == "2026-11-27T05:00:00.000000Z"                # local midnight, UTC-5
+    assert f["effective_to_utc"] == "2026-11-28T04:59:59.999999Z"                   # the date-only rule's end
+
+
+def test_schedule_refuses_a_bad_range():
+    for a, b in [("2026-12-31", "2026-01-01"), ("2026-01-01", "2026-13-01"), ("x", "y"), (None, "2026-01-01")]:
+        with pytest.raises(k3.K3Error):
+            k3.schedule_facts(a, b, now=NOW)
+    with pytest.raises(k3.K3Error):
+        k3.schedule_facts("2000-01-01", "2026-01-01", now=NOW)                      # more than the allowed span
+
+
+def test_schedule_facts_store_and_a_second_store_changes_nothing(conn):
+    register(conn, X)
+    first = k3.refresh(conn, X, http_get=None, now=NOW, params={"start": "2026-11-23", "end": "2026-11-30"})
+    assert first == {"stored": 8, "unchanged": 0, "error": 0}
+    again = k3.refresh(conn, X, http_get=None, now=NOW + timedelta(hours=1),
+                       params={"start": "2026-11-23", "end": "2026-11-30"})
+    assert again == {"stored": 0, "unchanged": 8, "error": 0}
+
+
+# ---- Finnhub holiday parser
+
+def parse_h(body, fetched=NOW_S):
+    return k3.parse_finnhub_holiday(body if isinstance(body, bytes) else raw(body), fetched_at_utc=fetched)
+
+
+def test_finnhub_holiday_parser_makes_one_fact_per_date():
+    facts = parse_h(HOLIDAYS)
+    assert [f["entity_key"] for f in facts] == ["XNYS:CLOSURE:2026-11-26", "XNYS:CLOSURE:2026-11-27",
+                                                "XNYS:CLOSURE:2026-12-25"]
+    p = [json.loads(f["payload_json"]) for f in facts]
+    assert p[0] == {"closed": True, "trading_hours": "", "name": "Thanksgiving Day"}
+    assert p[1] == {"closed": False, "trading_hours": "09:30-13:00", "name": "Day After Thanksgiving"}
+    for f in facts:
+        assert f["domain"] == "K3_CAL" and f["source_id"] == H
+        assert f["published_proven"] is False and f["published_at_utc"] is None      # no publication time: FETCHED
+        assert f["fetched_at_utc"] == NOW_S
+        assert f["raw_sha256"] == sha(f["payload_json"])
+        assert f["payload_json"] == json.dumps(json.loads(f["payload_json"]), sort_keys=True, separators=(",", ":"))
+
+
+BAD_HOLIDAYS = {
+    "not json": b"<html>",
+    "json but a list": raw([1]),
+    "wrong exchange": raw({**HOLIDAYS, "exchange": "NASDAQ"}),
+    "wrong timezone": raw({**HOLIDAYS, "timezone": "UTC"}),
+    "no data": raw({"exchange": "US", "timezone": "America/New_York"}),
+    "data not a list": raw({**HOLIDAYS, "data": {}}),
+    "item not an object": raw({**HOLIDAYS, "data": ["x"]}),
+    "item missing atDate": raw({**HOLIDAYS, "data": [{"eventName": "a", "tradingHour": ""}]}),
+    "item missing tradingHour": raw({**HOLIDAYS, "data": [{"eventName": "a", "atDate": "2026-11-26"}]}),
+    "item missing eventName": raw({**HOLIDAYS, "data": [{"atDate": "2026-11-26", "tradingHour": ""}]}),
+    "bad date": raw(holiday_body(("a", "2026-02-30", ""))),
+    "date with time": raw(holiday_body(("a", "2026-11-26T00:00:00", ""))),
+    "tradingHour not text": raw({**HOLIDAYS, "data": [{"eventName": "a", "atDate": "2026-11-26", "tradingHour": None}]}),
+    "name not text": raw({**HOLIDAYS, "data": [{"eventName": 5, "atDate": "2026-11-26", "tradingHour": ""}]}),
+    "duplicate date": raw(holiday_body(("a", "2026-11-26", ""), ("b", "2026-11-26", "09:30-13:00"))),
+    "good then bad": raw(holiday_body(("a", "2026-11-26", ""), ("b", "nope", ""))),
+    "not bytes": "a string",
+    "empty bytes": b"",
+}
+
+
+@pytest.mark.parametrize("name", sorted(BAD_HOLIDAYS))
+def test_finnhub_holiday_parser_refuses_anything_unexpected_whole(name):
+    with pytest.raises(k3.K3Error):
+        k3.parse_finnhub_holiday(BAD_HOLIDAYS[name], fetched_at_utc=NOW_S)
+
+
+def test_finnhub_holiday_parser_accepts_an_empty_list():
+    assert parse_h(holiday_body()) == []
+
+
+def test_finnhub_holiday_parser_refuses_a_bad_fetch_time():
+    with pytest.raises(k3.K3Error):
+        parse_h(HOLIDAYS, fetched="2026-11-23 18:00")
+
+
+# ---- Finnhub status parser
+
+def parse_s(body, fetched=NOW_S):
+    return k3.parse_finnhub_status(body if isinstance(body, bytes) else raw(body), fetched_at_utc=fetched)
+
+
+def test_finnhub_status_parser_keys_on_the_new_york_date_of_t():
+    (f,) = parse_s(status_body(t=unix(2026, 11, 27, 3, 0)))         # 03:00 UTC is 22:00 on the 26th in New York
+    assert f["entity_key"] == "XNYS:STATUS:2026-11-26"
+    assert json.loads(f["payload_json"]) == {"holiday": None, "session": "pre-market", "is_open": False}
+    assert f["source_id"] == S and f["published_proven"] is False and f["raw_sha256"] == sha(f["payload_json"])
+    (g,) = parse_s(status_body(t=unix(2026, 11, 27, 5, 30)))        # 05:30 UTC is 00:30 on the 27th
+    assert g["entity_key"] == "XNYS:STATUS:2026-11-27"
+
+
+def test_finnhub_status_parser_keeps_a_holiday_name():
+    (f,) = parse_s(status_body(holiday="Thanksgiving Day", session="closed"))
+    assert json.loads(f["payload_json"])["holiday"] == "Thanksgiving Day"
+
+
+BAD_STATUS = {
+    "not json": b"{",
+    "wrong exchange": raw(status_body(exchange="X")),
+    "wrong timezone": raw(status_body(timezone="UTC")),
+    "isOpen text": raw(status_body(isOpen="true")),
+    "isOpen missing": raw({k: v for k, v in status_body().items() if k != "isOpen"}),
+    "t is a bool": raw(status_body(t=True)),
+    "t is text": raw(status_body(t="1")),
+    "t is a float": raw(status_body(t=1.5)),
+    "t negative": raw(status_body(t=-1)),
+    "t absurd": raw(status_body(t=10 ** 15)),
+    "holiday a number": raw(status_body(holiday=5)),
+    "session missing": raw({k: v for k, v in status_body().items() if k != "session"}),
+    "session a number": raw(status_body(session=1)),
+    "a list": raw([status_body()]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(BAD_STATUS))
+def test_finnhub_status_parser_refuses_anything_unexpected(name):
+    with pytest.raises(k3.K3Error):
+        k3.parse_finnhub_status(BAD_STATUS[name], fetched_at_utc=NOW_S)
+
+
+# ---- Federal Register parser and the closure-date rule
+
+def parse_fr(body, fetched=NOW_S):
+    return k3.parse_federal_register(body if isinstance(body, bytes) else raw(body), fetched_at_utc=fetched)
+
+
+def test_federal_register_parser_one_fact_per_document():
+    body = fr_body(closing_doc("2026-12345", "December 24, 2026", "2026-12-20"),
+                   fr_doc(num="2026-12346", title="Thanksgiving Day, 2026", pub="2026-11-20"))
+    a, b = parse_fr(body, fetched="2026-12-22T00:00:00.000000Z")
+    assert a["entity_key"] == "FR:2026-12345" and b["entity_key"] == "FR:2026-12346"
+    pa = json.loads(a["payload_json"])
+    assert set(pa) == {"document_number", "title", "type", "subtype", "publication_date", "signing_date", "html_url",
+                       "abstract", "closure_dates"}
+    assert pa["closure_dates"] == ["2026-12-24"] and json.loads(b["payload_json"])["closure_dates"] == []
+    assert a["domain"] == "K3_CAL" and a["source_id"] == FR and a["raw_sha256"] == sha(a["payload_json"])
+    # known_at is the publication date, by the date-only rule (a proven stamp)
+    assert a["published_proven"] is True
+    assert a["published_at_utc"] == k3.date_only_known_at("2026-12-20", "America/New_York") == "2026-12-21T04:59:59.999999Z"
+
+
+def test_federal_register_parser_accepts_the_real_extra_top_level_keys():
+    body = {**fr_body(fr_doc()), "description": "Documents", "total_pages": 1}
+    assert len(parse_fr(body)) == 1
+    body["next_page_url"] = None                                  # null (or absent) means this is the last page
+    assert len(parse_fr(body)) == 1
+
+
+def test_known_at_is_the_publication_date_never_the_signing_date():
+    (f,) = parse_fr(fr_body(fr_doc(pub="2026-11-16", signing="2026-11-10")), fetched="2026-11-20T00:00:00.000000Z")
+    assert f["published_at_utc"] == "2026-11-17T04:59:59.999999Z"
+    assert f["published_at_utc"] > "2026-11-11T00:00:00Z"                 # not the earlier signing date
+
+
+def test_a_document_fetched_on_its_publication_day_is_not_proven_known_yet():
+    # the end of the publication day is later than the fetch: the store would refuse a proven stamp, and it
+    # would be false anyway, so the fact is known when it was fetched.
+    (f,) = parse_fr(fr_body(fr_doc(pub="2026-11-23")), fetched="2026-11-23T18:00:00.000000Z")
+    assert f["published_proven"] is False
+    (g,) = parse_fr(fr_body(fr_doc(pub="2026-11-22")), fetched="2026-11-23T18:00:00.000000Z")
+    assert g["published_proven"] is True
+
+
+BAD_FR = {
+    "not json": b"nope",
+    "a list": raw([]),
+    "no count": raw({"results": []}),
+    "no results": raw({"count": 0}),
+    "count not an int": raw({"count": "1", "results": [fr_doc()]}),
+    "count says more than the page": raw({"count": 2, "results": [fr_doc()]}),
+    "results not a list": raw({"count": 0, "results": {}}),
+    "missing document_number": raw(fr_body({k: v for k, v in fr_doc().items() if k != "document_number"})),
+    "missing title": raw(fr_body({k: v for k, v in fr_doc().items() if k != "title"})),
+    "missing publication_date": raw(fr_body({k: v for k, v in fr_doc().items() if k != "publication_date"})),
+    "title not text": raw(fr_body(fr_doc(title=5))),
+    "bad publication date": raw(fr_body(fr_doc(pub="2026-02-30"))),
+    "bad signing date": raw(fr_body(fr_doc(signing="soon"))),
+    "abstract a number": raw(fr_body(fr_doc(abstract=5))),
+    "document number with a slash": raw(fr_body(fr_doc(num="a/b"))),
+    "duplicate documents": raw(fr_body(fr_doc(num="1"), fr_doc(num="1"))),
+    "good then bad": raw(fr_body(fr_doc(num="1"), fr_doc(num="2", pub="x"))),
+    "more pages follow": raw({**fr_body(fr_doc()), "total_pages": 2, "next_page_url": "https://example.invalid/p2"}),
+}
+
+
+@pytest.mark.parametrize("name", sorted(BAD_FR))
+def test_federal_register_parser_refuses_anything_unexpected_whole(name):
+    with pytest.raises(k3.K3Error):
+        k3.parse_federal_register(BAD_FR[name], fetched_at_utc=NOW_S)
+
+
+def test_federal_register_parser_allows_a_null_abstract_and_signing_date_and_subtype():
+    (f,) = parse_fr(fr_body(fr_doc(abstract=None, signing=None, subtype=None)))
+    p = json.loads(f["payload_json"])
+    assert p["abstract"] is None and p["signing_date"] is None and p["subtype"] is None and p["closure_dates"] == []
+
+
+EO, PR = "Executive Order", "Proclamation"
+
+
+@pytest.mark.parametrize("title,abstract,subtype,want", [
+    # positives
+    (CLOSING_TITLE.format(d="December 24, 2025"), None, EO, ["2025-12-24"]),
+    (CLOSING_TITLE.format(d="January 9, 2025"), "", EO, ["2025-01-09"]),
+    ("Providing for the closing of executive departments and agencies on January 9, 2025", None, EO, ["2025-01-09"]),
+    ("Closing Executive Departments and Agencies of the Federal Government on December 24, 2026 and December 26, 2026",
+     None, EO, ["2026-12-24", "2026-12-26"]),
+    ("Closing of Executive Departments and Agencies on December 26, 2026, and December 24, 2026", None, EO,
+     ["2026-12-24", "2026-12-26"]),
+    ("National Day of Mourning for Jimmy Carter",
+     "This proclamation designates Thursday, January 9, 2025, as a National Day of Mourning for the late President.",
+     PR, ["2025-01-09"]),
+    ("A National Day of Mourning on January 9, 2025", None, PR, ["2025-01-09"]),
+    ("Executive Order", "The order closes things. It provides for the closing of executive departments and agencies "
+                        "on Friday, December 26, 2025.", EO, ["2025-12-26"]),
+    # negatives: no date, never guess
+    (CLOSING_TITLE.format(d="the Day After Christmas"), None, EO, []),
+    ("National Day of Mourning for Jimmy Carter", "Designates a national day of mourning.", PR, []),
+    # a date with no year is not a date
+    ("Closing of Executive Departments and Agencies on December 24", None, EO, []),
+    ("Closing of Executive Departments and Agencies on December 24 and 26, 2025", None, EO, ["2025-12-26"][:0]),
+    # not a real date
+    ("Closing of Executive Departments and Agencies on February 30, 2026", None, EO, []),
+    # a date in another sentence from the trigger
+    ("National Day of Mourning for X", "The death occurred on December 29, 2024. It was a sad week.", PR, []),
+    ("Closing of Executive Departments and Agencies", "Signed. Applies on January 9, 2025.", EO, []),
+    # two dates that are not a plain list: unsure, so none
+    ("National Day of Mourning for X", "President X died on December 29, 2024; the national day of mourning is "
+                                       "January 9, 2025.", PR, []),
+    # no trigger at all
+    ("Thanksgiving Day, 2026", "Sets November 26, 2026 as a day of thanks.", PR, []),
+    ("Announcing the Death of a Former President", "Flags at half-staff through January 9, 2025.", PR, []),
+    ("Day of National Mourning Observed", "On January 9, 2025.", PR, []),
+    # the wrong kind of document
+    (CLOSING_TITLE.format(d="December 24, 2025"), None, "Memorandum", []),
+    (CLOSING_TITLE.format(d="December 24, 2025"), None, None, []),
+    # a change or withdrawal is not a closure
+    ("Amending the Order Closing Executive Departments and Agencies on December 24, 2025", None, EO, []),
+    ("Revocation of the Closing of Executive Departments and Agencies on December 24, 2025", None, EO, []),
+    ("Closing of Executive Departments and Agencies on December 24, 2025", "This order is rescinded.", EO, []),
+])
+def test_fr_closure_date_rule(title, abstract, subtype, want):
+    assert k3.fr_closure_dates(title, abstract, subtype) == want
+
+
+def test_fr_closure_dates_are_sorted_unique():
+    got = k3.fr_closure_dates("Closing of Executive Departments and Agencies on December 26, 2026 and December 24, "
+                              "2026 and December 24, 2026", None, "Executive Order")
+    assert got == ["2026-12-24", "2026-12-26"]
+
+
+def test_fr_closure_rule_refuses_non_text_input():
+    for args in [(None, None, EO), (5, None, EO), ("t", 5, EO), ("t", None, 5)]:
+        with pytest.raises(k3.K3Error):
+            k3.fr_closure_dates(*args)
+
+
+# ---- the quorum
+
+D = "2026-11-24"              # a Tuesday, an open day
+AS_OF = "2026-11-24T14:00:00Z"
+LATE = "2026-11-23T20:00:00.000000Z"
+
+
+def votes(conn, day=D, as_of=AS_OF):
+    return k3.closure_votes(conn, day, as_of)
+
+
+def seed(conn, days=("2026-11-23", "2026-11-30"), now=NOW):
+    register(conn)
+    k3.refresh(conn, X, http_get=None, now=now, params={"start": days[0], "end": days[1]})
+
+
+def seed_holiday(conn, *items, fetched=LATE):
+    put(conn, parse_h(holiday_body(*items), fetched=fetched))
+
+
+def seed_status(conn, fetched=LATE, **over):
+    put(conn, parse_s(status_body(**over), fetched=fetched))
+
+
+def seed_fr(conn, *docs, fetched=LATE):
+    put(conn, parse_fr(fr_body(*docs), fetched=fetched))
+
+
+def test_quorum_open_calendar_with_no_authority(conn):
+    seed(conn)
+    v = votes(conn)
+    assert v["calendar_open"] is True and v["calendar_closed"] is False
+    assert v["authorities_closed"] == [] and v["ordinary_stop"] is False and v["suspected"] is False
+    assert v["trade_date"] == D and v["schedule_known"] is True
+
+
+def test_quorum_one_authority_is_only_suspected(conn):
+    seed(conn)
+    seed_holiday(conn, ("Surprise Closure", D, ""))
+    v = votes(conn)
+    assert v["authorities_closed"] == [H] and v["suspected"] is True and v["ordinary_stop"] is False
+
+
+def test_quorum_two_authorities_is_an_ordinary_stop(conn):
+    seed(conn)
+    seed_holiday(conn, ("Surprise Closure", D, ""))
+    seed_fr(conn, closing_doc("2026-55555", "November 24, 2026", "2026-11-22"))
+    v = votes(conn)
+    assert v["authorities_closed"] == sorted([H, FR]) and v["ordinary_stop"] is True and v["suspected"] is False
+
+
+def test_quorum_three_authorities_stays_an_ordinary_stop(conn):
+    seed(conn)
+    seed_holiday(conn, ("Surprise Closure", D, ""))
+    seed_fr(conn, closing_doc("2026-55555", "November 24, 2026", "2026-11-22"))
+    seed_status(conn, holiday="Surprise Closure", t=unix(2026, 11, 24, 13, 0), fetched="2026-11-24T13:30:00.000000Z")
+    v = votes(conn)
+    assert v["authorities_closed"] == sorted([H, S, FR]) and v["ordinary_stop"] is True
+
+
+def test_quorum_a_status_with_a_holiday_counts_for_its_own_date_only(conn):
+    seed(conn)
+    seed_status(conn, holiday="Surprise Closure", t=unix(2026, 11, 24, 13, 0), fetched="2026-11-24T13:30:00.000000Z")
+    assert votes(conn)["authorities_closed"] == [S]
+    assert votes(conn, day="2026-11-25", as_of="2026-11-25T14:00:00Z")["authorities_closed"] == []
+
+
+def test_quorum_a_status_before_the_open_with_isopen_false_and_no_holiday_does_not_vote(conn):
+    seed(conn)
+    seed_status(conn, holiday=None, isOpen=False, session="pre-market", t=unix(2026, 11, 24, 13, 0),
+                fetched="2026-11-24T13:30:00.000000Z")
+    v = votes(conn)
+    assert v["authorities_closed"] == [] and v["suspected"] is False and v["ordinary_stop"] is False
+
+
+def test_quorum_a_status_that_says_closed_session_without_a_holiday_does_not_vote(conn):
+    seed(conn)
+    seed_status(conn, holiday=None, isOpen=False, session="closed", t=unix(2026, 11, 24, 23, 0),
+                fetched="2026-11-24T23:30:00.000000Z")
+    assert votes(conn, as_of="2026-11-25T00:00:00Z")["authorities_closed"] == []
+
+
+def test_quorum_a_holiday_row_that_is_a_half_day_is_not_a_closure(conn):
+    seed(conn)
+    seed_holiday(conn, ("Half day", D, "09:30-13:00"))
+    assert votes(conn)["authorities_closed"] == []
+
+
+def test_quorum_a_document_naming_another_date_does_not_vote(conn):
+    seed(conn)
+    seed_fr(conn, closing_doc("2026-55555", "November 25, 2026", "2026-11-22"))
+    assert votes(conn)["authorities_closed"] == []
+    assert votes(conn, day="2026-11-25")["authorities_closed"] == [FR]
+
+
+def test_quorum_one_source_with_two_facts_for_the_date_counts_once(conn):
+    seed(conn)
+    seed_fr(conn, closing_doc("2026-1", "November 24, 2026", "2026-11-21"),
+            closing_doc("2026-2", "November 24, 2026", "2026-11-22"))
+    v = votes(conn)
+    assert v["authorities_closed"] == [FR] and v["suspected"] is True and v["ordinary_stop"] is False
+
+
+def test_quorum_a_closed_calendar(conn):
+    seed(conn)
+    seed_holiday(conn, ("Thanksgiving Day", "2026-11-26", ""))
+    seed_fr(conn, closing_doc("2026-3", "November 26, 2026", "2026-11-22"))
+    v = votes(conn, day="2026-11-26", as_of="2026-11-26T14:00:00Z")
+    assert v["calendar_open"] is False and v["calendar_closed"] is True
+    assert v["authorities_closed"] == sorted([H, FR])                    # reported, but they are no news
+    assert v["ordinary_stop"] is False and v["suspected"] is False
+
+
+def test_quorum_without_a_schedule_fact_is_unknown_not_open(conn):
+    register(conn)
+    seed_holiday(conn, ("Surprise Closure", D, ""))
+    seed_fr(conn, closing_doc("2026-55555", "November 24, 2026", "2026-11-22"))
+    v = votes(conn)
+    assert v["schedule_known"] is False and v["calendar_open"] is None and v["calendar_closed"] is None
+    assert v["ordinary_stop"] is False and v["suspected"] is False
+
+
+def test_quorum_a_fact_known_after_as_of_never_counts(conn):
+    seed(conn)
+    seed_holiday(conn, ("Surprise Closure", D, ""), fetched="2026-11-24T13:00:00.000000Z")
+    assert votes(conn, as_of="2026-11-24T12:59:59Z")["authorities_closed"] == []        # backfilled: not yet known
+    assert votes(conn, as_of="2026-11-24T13:00:00Z")["authorities_closed"] == [H]       # and the edge itself counts
+
+
+def test_quorum_a_document_published_that_day_is_known_only_after_the_day_ends(conn):
+    seed(conn)
+    doc = closing_doc("2026-9", "November 24, 2026", "2026-11-24")
+    seed_fr(conn, doc, fetched="2026-11-26T00:00:00.000000Z")               # fetched later: the publication date proves it
+    stamp = k3.date_only_known_at("2026-11-24", "America/New_York")         # 2026-11-25T04:59:59.999999Z
+    assert votes(conn, as_of="2026-11-24T23:00:00Z")["authorities_closed"] == []
+    assert votes(conn, as_of=stamp)["authorities_closed"] == [FR]
+    assert votes(conn, as_of="2026-11-25T04:59:59Z")["authorities_closed"] == []         # one second short
+
+
+def test_quorum_the_schedule_fact_known_after_as_of_is_not_used(conn):
+    seed(conn, now=datetime(2026, 11, 25, tzinfo=timezone.utc))
+    assert votes(conn, as_of="2026-11-24T14:00:00Z")["schedule_known"] is False
+    assert votes(conn, as_of="2026-11-25T00:00:00Z")["schedule_known"] is True
+
+
+def test_quorum_follows_a_changed_holiday_list_by_as_of(conn):
+    seed(conn)
+    seed_holiday(conn, ("Surprise Closure", D, ""), fetched="2026-11-23T20:00:00.000000Z")
+    seed_holiday(conn, ("Surprise Closure", D, "09:30-13:00"), fetched="2026-11-24T10:00:00.000000Z")   # reopened early
+    assert votes(conn, as_of="2026-11-24T09:00:00Z")["authorities_closed"] == [H]
+    assert votes(conn, as_of="2026-11-24T11:00:00Z")["authorities_closed"] == []
+
+
+def test_quorum_counts_authorities_generically(conn, monkeypatch):
+    """A third authority (the exchange's own notice) is a slot: add a source and a rule, nothing else changes."""
+    seed(conn)
+    entry = dict(k3.SOURCES[H], source_id="exchange_closure_notice", role="AUTHORITY", allow_external_llm=1,
+                 licence_tag="EXCHANGE-NOTICE")
+    monkeypatch.setitem(k3.SOURCES, "exchange_closure_notice", entry)
+    monkeypatch.setitem(k3._CLOSURE_RULES, "exchange_closure_notice",
+                        lambda entity_key, payload, day: entry_says_closed(entity_key, payload, day))
+    k3.register_all(conn, T0, only=["exchange_closure_notice"])
+    put(conn, [dict(domain="K3_CAL", entity_key=f"NOTICE:{D}", source_id="exchange_closure_notice",
+                    raw_sha256=sha("n"), payload_json='{"closed":true}', effective_from_utc=T0,
+                    fetched_at_utc=LATE, published_at_utc=None, effective_to_utc=None, published_proven=False)])
+    seed_holiday(conn, ("Surprise Closure", D, ""))
+    v = votes(conn)
+    assert v["authorities_closed"] == sorted([H, "exchange_closure_notice"]) and v["ordinary_stop"] is True
+
+
+def entry_says_closed(entity_key, payload, day):
+    return entity_key == f"NOTICE:{day}" and payload.get("closed") is True
+
+
+def test_every_authority_has_a_rule_and_no_other_source_votes():
+    authorities = {sid for sid, e in k3.SOURCES.items() if e["role"] == "AUTHORITY"}
+    assert authorities == {H, S, FR} and set(k3._CLOSURE_RULES) == authorities
+
+
+def test_quorum_checks_its_inputs(conn):
+    seed(conn)
+    for day in ["2026-11-31", "11/24/2026", None, "2026-11-24T00:00:00"]:
+        with pytest.raises(k3.K3Error):
+            votes(conn, day=day)
+    for as_of in ["2026-11-24 14:00", None, "2026-11-24T14:00:00+00:00"]:
+        with pytest.raises((k3.K3Error, StoreError)):
+            votes(conn, as_of=as_of)
+
+
+def test_quorum_is_a_pure_read_and_stores_nothing(conn):
+    seed(conn)
+    seed_holiday(conn, ("Surprise Closure", D, ""))
+    before = facts_as_of(conn, "2027-01-01T00:00:00Z")
+    votes(conn)
+    votes(conn)
+    assert facts_as_of(conn, "2027-01-01T00:00:00Z") == before
+
+
+def test_the_module_never_names_the_facts_table_itself():
+    text = inspect.getsource(k3)
+    assert "knowledge_facts" not in text.lower() and "facts_as_of" in text
+
+
+# ---- fetch and refresh
+
+class Fake:
+    """An injected http_get that records every request and answers from a map of url prefix to bytes."""
+
+    def __init__(self, answers):
+        self.answers, self.calls = answers, []
+
+    def __call__(self, url, headers):
+        self.calls.append((url, dict(headers)))
+        for prefix, body in self.answers.items():
+            if url.startswith(prefix):
+                if isinstance(body, Exception):
+                    raise body
+                return body if isinstance(body, bytes) else raw(body)
+        raise AssertionError(f"unexpected url {url}")
+
+
+def creds(name):
+    assert name == "FINNHUB_API_KEY"
+    return TOKEN
+
+
+H_URL = "https://finnhub.io/api/v1/stock/market-holiday?exchange=US"
+S_URL = "https://finnhub.io/api/v1/stock/market-status?exchange=US"
+FR_URL = "https://www.federalregister.gov/api/v1/documents.json"
+
+
+def test_fetch_finnhub_holiday_request_and_facts():
+    fake = Fake({H_URL: HOLIDAYS})
+    facts = k3.fetch(H, http_get=fake, now=NOW, credentials=creds)
+    assert len(facts) == 3 and fake.calls[0][0] == H_URL
+    headers = fake.calls[0][1]
+    assert headers["X-Finnhub-Token"] == TOKEN and headers["User-Agent"] == "valedia-client/1.0"
+    assert TOKEN not in fake.calls[0][0]
+    assert all(f["fetched_at_utc"] == NOW_S for f in facts)
+
+
+def test_fetch_finnhub_status_request():
+    fake = Fake({S_URL: status_body()})
+    (f,) = k3.fetch(S, http_get=fake, now=NOW, credentials=creds)
+    assert fake.calls[0][0] == S_URL and fake.calls[0][1]["X-Finnhub-Token"] == TOKEN and f["source_id"] == S
+
+
+def test_fetch_user_agent_is_generic():
+    fake = Fake({FR_URL: fr_body()})
+    k3.fetch(FR, http_get=fake, now=NOW)
+    ua = fake.calls[0][1]["User-Agent"]
+    assert ua == "valedia-client/1.0" and "@" not in ua
+    assert not any("X-Finnhub-Token" == h for h in fake.calls[0][1])           # no key goes to a keyless source
+
+
+def test_fetch_federal_register_request_is_the_documented_query():
+    fake = Fake({FR_URL: fr_body()})
+    k3.fetch(FR, http_get=fake, now=NOW, params={"start": "2026-11-01", "end": "2026-11-23"})
+    url = fake.calls[0][0]
+    parts = urlsplit(url)
+    assert f"{parts.scheme}://{parts.netloc}{parts.path}" == FR_URL
+    q = parse_qs(parts.query)
+    assert q["conditions[type][]"] == ["PRESDOCU"]
+    assert q["conditions[presidential_document_type][]"] == ["proclamation", "executive_order"]    # both kinds
+    assert q["order"] == ["newest"]
+    assert q["conditions[publication_date][gte]"] == ["2026-11-01"]
+    assert q["conditions[publication_date][lte]"] == ["2026-11-23"]
+    assert q["per_page"] == ["100"] and int(q["per_page"][0]) <= 100
+    assert q["fields[]"] == ["document_number", "title", "type", "subtype", "publication_date", "signing_date",
+                             "html_url", "abstract"]
+    assert TOKEN not in url
+
+
+def test_fetch_federal_register_default_window_is_thirty_days_ending_on_the_new_york_date_of_now():
+    fake = Fake({FR_URL: fr_body()})
+    k3.fetch(FR, http_get=fake, now=NOW)
+    q = parse_qs(urlsplit(fake.calls[0][0]).query)
+    assert q["conditions[publication_date][lte]"] == ["2026-11-23"] and q["conditions[publication_date][gte]"] == ["2026-10-24"]
+
+
+@pytest.mark.parametrize("params", [{"start": "2026-11-23", "end": "2026-11-01"}, {"start": "x", "end": "2026-11-01"},
+                                    {"bogus": 1}, {"start": "2026-01-01", "end": "2026-11-01"}, "text"])
+def test_fetch_federal_register_refuses_bad_params(params):
+    fake = Fake({FR_URL: fr_body()})
+    with pytest.raises(k3.K3Error):
+        k3.fetch(FR, http_get=fake, now=NOW, params=params)
+    assert fake.calls == []
+
+
+def test_fetch_refuses_params_for_finnhub_and_unknown_source_and_no_client():
+    with pytest.raises(k3.K3Error):
+        k3.fetch(H, http_get=Fake({}), now=NOW, credentials=creds, params={"x": 1})
+    with pytest.raises(k3.K3Error):
+        k3.fetch("no_such", http_get=Fake({}), now=NOW)
+    with pytest.raises(k3.K3Error):
+        k3.fetch(FR, http_get=None, now=NOW)                    # there is no default network client
+    with pytest.raises(k3.K3Error):
+        k3.fetch(H, http_get=Fake({H_URL: HOLIDAYS}), now=datetime(2026, 11, 23))        # a naive time
+    assert "urllib" not in inspect.getsource(k3.fetch) and "urllib" not in inspect.getsource(k3.refresh)
+
+
+def test_the_only_network_client_is_built_by_the_cli():
+    src = inspect.getsource(k3)
+    assert src.count("urllib.request") >= 1 and "def _urllib_get" in src
+    for name in ("fetch", "refresh", "closure_votes", "schedule_facts"):
+        assert "urllib.request" not in inspect.getsource(getattr(k3, name))
+
+
+@pytest.mark.parametrize("bad", ["", "has space", "x" * 300, "tab\tkey", "naïve", 5, None])
+def test_fetch_refuses_a_key_that_cannot_be_a_header_without_echoing_it(bad):
+    fake = Fake({H_URL: HOLIDAYS})
+    with pytest.raises(k3.K3Error) as err:
+        k3.fetch(H, http_get=fake, now=NOW, credentials=lambda name: bad)
+    assert fake.calls == [] and (not isinstance(bad, str) or not bad or bad not in str(err.value))
+
+
+def test_fetch_missing_credentials_error_has_no_secret_text():
+    def boom(name):
+        raise RuntimeError(f"the key {TOKEN} is wrong")
+    fake = Fake({H_URL: HOLIDAYS})
+    with pytest.raises(k3.K3Error) as err:
+        k3.fetch(H, http_get=fake, now=NOW, credentials=boom)
+    assert TOKEN not in str(err.value) and fake.calls == []
+
+
+def test_default_credentials_read_finnhub_api_key_through_core_secrets(monkeypatch):
+    from valedia_trader.core import secrets
+    seen = []
+    monkeypatch.setattr(secrets, "secret", lambda name, *a, **k: seen.append(name) or TOKEN)
+    fake = Fake({H_URL: HOLIDAYS})
+    k3.fetch(H, http_get=fake, now=NOW)
+    assert seen == ["FINNHUB_API_KEY"] and fake.calls[0][1]["X-Finnhub-Token"] == TOKEN
+
+
+def test_default_credentials_without_a_secret_fail_closed():
+    fake = Fake({H_URL: HOLIDAYS})
+    with pytest.raises(k3.K3Error):
+        k3.fetch(H, http_get=fake, now=NOW)                    # the suite points the secrets file at nothing
+    assert fake.calls == []
+
+
+def test_http_get_must_return_bytes():
+    with pytest.raises(k3.K3Error):
+        k3.fetch(FR, http_get=lambda url, headers: "text", now=NOW)
+
+
+def test_refresh_stores_then_rereads_unchanged_then_stores_a_changed_version(conn):
+    register(conn)
+    fake = Fake({H_URL: HOLIDAYS})
+    assert k3.refresh(conn, H, http_get=fake, now=NOW, credentials=creds) == {"stored": 3, "unchanged": 0, "error": 0}
+    assert k3.refresh(conn, H, http_get=fake, now=NOW + timedelta(hours=1), credentials=creds) == \
+        {"stored": 0, "unchanged": 3, "error": 0}
+    changed = holiday_body(("Thanksgiving Day", "2026-11-26", ""), ("Day After Thanksgiving", "2026-11-27", "09:30-14:00"),
+                           ("Christmas Day", "2026-12-25", ""), ("New Year's Day", "2027-01-01", ""))
+    fake2 = Fake({H_URL: changed})
+    got = k3.refresh(conn, H, http_get=fake2, now=NOW + timedelta(days=1), credentials=creds)
+    assert got == {"stored": 2, "unchanged": 2, "error": 0}                   # one changed date, one new date
+    rows = {r["entity_key"]: json.loads(r["payload_json"]) for r in facts_as_of(conn, "2027-06-01T00:00:00Z", domain="K3_CAL")}
+    assert rows["XNYS:CLOSURE:2026-11-27"]["trading_hours"] == "09:30-14:00" and "XNYS:CLOSURE:2027-01-01" in rows
+    old = {r["entity_key"]: json.loads(r["payload_json"]) for r in facts_as_of(conn, "2026-11-23T19:00:00Z", domain="K3_CAL")}
+    assert old["XNYS:CLOSURE:2026-11-27"]["trading_hours"] == "09:30-13:00"            # the old version is still readable
+
+
+def test_refresh_returns_counts_only_and_a_failed_fetch_is_an_error_not_a_crash(conn):
+    register(conn)
+    boom = Fake({H_URL: RuntimeError(f"connection reset for {TOKEN}")})
+    got = k3.refresh(conn, H, http_get=boom, now=NOW, credentials=creds)
+    assert got["error"] == 1 and got["stored"] == 0 and got["unchanged"] == 0
+    assert TOKEN not in json.dumps(got) and TOKEN not in str(got.get("detail", ""))
+
+
+def test_refresh_never_stores_half_a_parsed_body(conn):
+    register(conn)
+    body = holiday_body(("a", "2026-11-26", ""), ("b", "nope", ""))
+    got = k3.refresh(conn, H, http_get=Fake({H_URL: body}), now=NOW, credentials=creds)
+    assert got["error"] == 1 and got["stored"] == 0
+    assert facts_as_of(conn, "2027-01-01T00:00:00Z") == []
+
+
+def test_refresh_with_an_unregistered_source_stores_nothing_and_reports_an_error(conn):
+    got = k3.refresh(conn, H, http_get=Fake({H_URL: HOLIDAYS}), now=NOW, credentials=creds)
+    assert got["error"] >= 1 and got["stored"] == 0
+    assert facts_as_of(conn, "2027-01-01T00:00:00Z") == []
+
+
+def test_refresh_federal_register_and_status(conn):
+    register(conn)
+    fr = Fake({FR_URL: fr_body(closing_doc("2026-7", "December 24, 2026", "2026-11-20"))})
+    assert k3.refresh(conn, FR, http_get=fr, now=NOW) == {"stored": 1, "unchanged": 0, "error": 0}
+    assert k3.refresh(conn, FR, http_get=fr, now=NOW + timedelta(hours=1)) == {"stored": 0, "unchanged": 1, "error": 0}
+    st = Fake({S_URL: status_body()})
+    assert k3.refresh(conn, S, http_get=st, now=NOW, credentials=creds)["stored"] == 1
+    st2 = Fake({S_URL: status_body(session="regular", isOpen=True)})
+    assert k3.refresh(conn, S, http_get=st2, now=NOW + timedelta(hours=1), credentials=creds)["stored"] == 1
+
+
+def test_finnhub_facts_never_reach_an_outside_model(conn):
+    register(conn)
+    k3.refresh(conn, H, http_get=Fake({H_URL: HOLIDAYS}), now=NOW, credentials=creds)
+    k3.refresh(conn, S, http_get=Fake({S_URL: status_body()}), now=NOW, credentials=creds)
+    k3.refresh(conn, FR, http_get=Fake({FR_URL: fr_body(fr_doc())}), now=NOW)
+    k3.refresh(conn, X, http_get=None, now=NOW, params={"start": "2026-11-23", "end": "2026-11-24"})
+    inside = facts_as_of(conn, "2027-01-01T00:00:00Z")
+    outside = facts_as_of(conn, "2027-01-01T00:00:00Z", for_outside_llm=True)
+    assert {r["source_id"] for r in inside} == {H, S, FR, X}                       # the two-way check: they do exist
+    assert {r["source_id"] for r in outside} == {FR, X}
+    assert not any("finnhub" in r["source_id"] for r in outside)
+
+
+def test_the_token_is_never_in_a_url_header_of_other_sources_or_a_stored_payload(conn):
+    register(conn)
+    fakes = [Fake({H_URL: HOLIDAYS}), Fake({S_URL: status_body()}), Fake({FR_URL: fr_body(fr_doc())})]
+    for sid, fake in zip((H, S, FR), fakes):
+        k3.refresh(conn, sid, http_get=fake, now=NOW, credentials=creds)
+    for fake in fakes:
+        for url, headers in fake.calls:
+            assert TOKEN not in url
+            assert all(TOKEN not in v for h, v in headers.items() if h != "X-Finnhub-Token")
+    rows = facts_as_of(conn, "2027-01-01T00:00:00Z")
+    assert rows and not any(TOKEN in json.dumps(dict(r)) for r in rows)
+
+
+# ---- the command line
+
+def run(args, capsys):
+    code = k3._main(list(args))
+    out = capsys.readouterr()
+    return code, out.out, out.err
+
+
+def test_cli_register_schedule_votes_end_to_end(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    code, out, _ = run(["register", "--store", db, "--only", f"{X},{H}", "--terms-read-at", T0], capsys)
+    assert code == 0
+    code, out, _ = run(["schedule", "--store", db, "--from", "2026-11-23", "--to", "2026-11-30"], capsys)
+    assert code == 0 and json.loads(out)["stored"] == 8
+    code, out, _ = run(["votes", "--store", db, "--date", "2026-11-24", "--as-of", "2099-01-01T00:00:00Z"], capsys)
+    v = json.loads(out)
+    assert code == 0 and v["calendar_open"] is True and v["authorities_closed"] == []
+    code, out, _ = run(["votes", "--store", db, "--date", "2026-11-26", "--as-of", "2099-01-01T00:00:00Z"], capsys)
+    assert code == 0 and json.loads(out)["calendar_closed"] is True
+
+
+def test_cli_votes_exit_one_when_a_closure_is_suspected(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    run(["register", "--store", db, "--only", f"{X},{H}", "--terms-read-at", T0], capsys)
+    run(["schedule", "--store", db, "--from", "2026-11-23", "--to", "2026-11-30"], capsys)
+    c = connect(db)
+    try:
+        seed_holiday(c, ("Surprise Closure", D, ""))
+    finally:
+        c.close()
+    code, out, _ = run(["votes", "--store", db, "--date", D, "--as-of", "2099-01-01T00:00:00Z"], capsys)
+    assert code == 1 and json.loads(out)["suspected"] is True
+
+
+def test_cli_votes_exit_one_when_the_schedule_is_missing(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    run(["register", "--store", db, "--only", X, "--terms-read-at", T0], capsys)
+    code, out, _ = run(["votes", "--store", db, "--date", D, "--as-of", "2099-01-01T00:00:00Z"], capsys)
+    assert code == 1 and json.loads(out)["schedule_known"] is False
+
+
+def test_cli_exit_two_when_the_command_failed(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    assert run(["register", "--store", db, "--only", "no_such", "--terms-read-at", T0], capsys)[0] == 2
+    assert run(["schedule", "--store", db, "--from", "2026-12-01", "--to", "2026-01-01"], capsys)[0] == 2
+    assert run(["votes", "--store", db, "--date", "not-a-date"], capsys)[0] == 2
+    assert run(["refresh", "--store", db, "--source", "no_such"], capsys)[0] == 2
+    bad = tmp_path / "notastore.db"
+    bad.write_bytes(b"this is not a database at all" * 100)
+    assert run(["votes", "--store", str(bad), "--date", D], capsys)[0] == 2
+
+
+def test_cli_refresh_uses_the_clis_own_client_and_reports_counts(tmp_path, capsys, monkeypatch):
+    db = str(tmp_path / "cli.db")
+    run(["register", "--store", db, "--only", FR, "--terms-read-at", T0], capsys)
+    monkeypatch.setattr(k3, "_urllib_get", Fake({FR_URL: fr_body(fr_doc())}))
+    code, out, _ = run(["refresh", "--store", db, "--source", FR], capsys)
+    assert code == 0 and json.loads(out) == {"stored": 1, "unchanged": 0, "error": 0}
+    code, out, _ = run(["refresh", "--store", db, "--source", FR], capsys)
+    assert code == 0 and json.loads(out)["unchanged"] == 1
+
+
+def test_cli_refresh_exits_one_when_a_body_is_refused(tmp_path, capsys, monkeypatch):
+    db = str(tmp_path / "cli.db")
+    run(["register", "--store", db, "--only", FR, "--terms-read-at", T0], capsys)
+    monkeypatch.setattr(k3, "_urllib_get", Fake({FR_URL: b"<html>gateway error</html>"}))
+    code, out, _ = run(["refresh", "--store", db, "--source", FR], capsys)
+    assert code == 1 and json.loads(out)["error"] == 1
+
+
+def test_cli_never_prints_the_token(tmp_path, capsys, monkeypatch):
+    from valedia_trader.core import secrets
+    monkeypatch.setattr(secrets, "secret", lambda name, *a, **k: TOKEN)
+    db = str(tmp_path / "cli.db")
+    run(["register", "--store", db, "--only", H, "--terms-read-at", T0], capsys)
+    monkeypatch.setattr(k3, "_urllib_get", Fake({H_URL: RuntimeError(f"failed with {TOKEN}")}))
+    code, out, err = run(["refresh", "--store", db, "--source", H], capsys)
+    assert code == 1 and TOKEN not in out and TOKEN not in err
