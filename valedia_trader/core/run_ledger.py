@@ -18,11 +18,15 @@ The store is a sqlite file whose path is always given; this module has no defaul
                   tried at most NOTIFY_MAX_TRIES (5) times in all, the rule core.alerts has.
 
 What reaches the owner (`decide`, a pure function of the day's rows):
-  P0  a run that ended in a fault or a crash, or any row with a fault count. Sent every time, never held back.
+  P0  a run that ended in a fault or a crash, or any row with a fault count; a run that started and never ended (an
+      orphaned start, written by the dead-man check). Sent every time, never held back.
   P1  the dead-man: no run ended and none was skipped on purpose by 10:25 New York. Once a day.
   P2  a skip, or a pre-flight warning. Once for each cause in a day. A 6:55 skip with the cause of a warning already
       sent adds one quiet follow-up; a 7:10 skip of that cause is not sent.
-  P3  an ordinary stop (a holiday, a closed market). Written down, never sent.
+  P3  an ordinary stop (a holiday, a closed market) or a no-op (another step held the lock; a run outside the session
+      window). Written down, never sent.
+A NOOP run end is not a terminal row: it does not satisfy the dead-man and the streak ignores it. A run that did nothing
+because another run held the lock must not hide the run that hung holding it.
 Any cause that is new, and any P0, is sent. Sending is a sender object with `send(title, text)`; `MacSender` wraps
 core.alerts.MacNotifier for it. A send is made before it is written down, so a crash between the two sends it again
 rather than never.
@@ -52,17 +56,27 @@ from valedia_trader.core.secrets import child_env
 NEW_YORK = ZoneInfo("America/New_York")
 KINDS = ("PREFLIGHT", "RUN_START", "RUN_END", "SKIP", "DEADMAN")
 TRIGGERS = ("0630", "0655", "0710", "0725", "MANUAL")                 # the Pacific time the job is set for
-OUTCOMES = ("OK", "WARN", "COMPLETED", "ORDINARY_STOP", "FAULT", "CRASH", "SKIPPED", "MISSING")
+OUTCOMES = ("OK", "WARN", "COMPLETED", "ORDINARY_STOP", "FAULT", "CRASH", "SKIPPED", "MISSING", "NOOP")
 SEVERITIES = ("P0", "P1", "P2", "P3")
 TERMINAL_SKIP_TRIGGERS = ("0655", "0710")                             # a skip at these times ends the day's run
 DEADMAN_CUTOFF = time(10, 25)                                         # New York: 7:25 AM Pacific
 CLEAN_SESSIONS_NEEDED = 5
 HOLIDAY = "calendar:holiday"
 DEADMAN_CAUSE = "deadman:no-terminal-row"
+ORPHAN_MINUTES = 20                                                   # a RUN_START with no RUN_END after this long is an orphan
+ORPHAN_CAUSE = "run:orphan-start:"                                    # + the trigger, lower case
+NOOP_LOCK_HELD = "run:noop:lock-held"
+NOOP_OUTSIDE_WINDOW = "run:noop:outside-window"
+# How the order step words a stop at its `session` stage. tests/core/test_run_ledger.py reads the order step's source for
+# these exact words, so a change to its wording fails a test here rather than quietly changing what a stop maps to.
+LOCK_HELD_REASON = "another order step is running"
+OUTSIDE_WINDOW_REASON = "outside the regular session window"
+CALENDAR_FAULT_REASON = "the exchange calendar could not be loaded"
+CALENDAR_ANSWER_REASON = "the exchange calendar could not answer for"   # market_window: a calendar error, not a closed market
 MIN_FILES = 10                                                        # a files list shorter than this is not the order path
 MAX_SUMMARY_BYTES = 16 * 1024 * 1024
 GIT_SECONDS = 60
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2                                                    # 2: the NOOP outcome (a layout-1 store would refuse it)
 
 _STAMP = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z"
 _DAY = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]"
@@ -294,11 +308,12 @@ class Outbound:
 def classify(event: dict) -> str | None:
     """The severity one event carries on its own: P0, P1, P2, P3, or None when it needs no word at all."""
     kind, outcome, cause = event["kind"], event["outcome"], event.get("root_cause")
-    if (event.get("fault_count") or 0) > 0 or (kind == "RUN_END" and outcome in ("FAULT", "CRASH")):
+    if ((event.get("fault_count") or 0) > 0 or (kind == "RUN_END" and outcome in ("FAULT", "CRASH"))
+            or (kind == "DEADMAN" and outcome == "FAULT")):                    # the last: an orphaned run start
         return "P0"
     if kind == "DEADMAN":
         return "P1" if outcome == "MISSING" else None
-    if cause == HOLIDAY or outcome == "ORDINARY_STOP":
+    if cause == HOLIDAY or outcome in ("ORDINARY_STOP", "NOOP"):
         return "P3"
     if kind == "SKIP" or (kind == "PREFLIGHT" and outcome == "WARN"):
         return "P2"
@@ -335,6 +350,11 @@ def decide(events_today: Sequence[dict], incidents_today: Sequence[dict]) -> lis
             if e["event_id"] in shown_ids:
                 continue                                                        # this very fault was told already
             cause = cause or f"run:{str(e['outcome']).lower()}"
+            if e["kind"] == "DEADMAN":
+                out.append(_outbound("P0", e, cause, "P0 order step: a run started and never ended",
+                                     f"{cause} on {e['trade_date']}: a run started and no run end followed it within "
+                                     f"{ORPHAN_MINUTES} minutes; it may still hold the order step's lock"))
+                continue
             out.append(_outbound("P0", e, cause, f"P0 order step {e['outcome']}",
                                  f"{e['outcome']} at {_RUN_NAMES.get(e['trigger'], e['trigger'])} on {e['trade_date']}: {cause}"
                                  + (f" ({e['fault_count']} fault(s))" if e.get("fault_count") else "")))
@@ -436,7 +456,9 @@ def target_met(count: int) -> bool:
 
 
 def _judge(day_events: Sequence[dict]) -> str | None:
-    """None when the day is clean, else the reason it resets the streak."""
+    """None when the day is clean, else the reason it resets the streak. A NOOP row with no faults is ignored: the day is
+    judged by the rest. A NOOP that carries faults is a P0 when sent, so it resets the streak like any other fault."""
+    day_events = [e for e in day_events if e["outcome"] != "NOOP" or (e.get("fault_count") or 0) > 0]
     if not day_events:
         return "no terminal row"
     if any(e["kind"] == "SKIP" for e in day_events):
@@ -464,7 +486,7 @@ def streak(events: Iterable[dict], sessions: Iterable) -> tuple[int, list[dict]]
     """The clean-week streak over the given XNYS session days (dates or `YYYY-MM-DD`), in date order.
 
     A session day adds 1 when its runs used the accepted revision, had no fault, and its last RUN_END is COMPLETED or
-    ORDINARY_STOP; it resets the count to 0 on a skip, a crash, a fault, a revision that did not match or is not known,
+    ORDINARY_STOP (a NOOP run end is ignored, as if it were not there); it resets the count to 0 on a skip, a crash, a fault, a revision that did not match or is not known,
     or no terminal row. A weekday between the first and last session that is not a session (an exchange holiday) pauses:
     the count is kept. Weekends are not shown. Returns (count, per_day) with per_day = [{date, status, count, reason}]
     and status "clean", "reset" or "paused". Rows of days that are not sessions are ignored."""
@@ -541,26 +563,74 @@ def preflight(repo, accepted_commit_file, files_file, venv_python, now: datetime
 
 def _has_terminal_row(conn, trade_date: str, book: str) -> bool:
     return conn.execute(
-        'SELECT 1 FROM run_events WHERE trade_date = ? AND book = ? AND (kind = \'RUN_END\' OR (kind = \'SKIP\' AND "trigger" IN (\'0655\', \'0710\'))) LIMIT 1',
+        'SELECT 1 FROM run_events WHERE trade_date = ? AND book = ? AND ((kind = \'RUN_END\' AND outcome != \'NOOP\') '
+        'OR (kind = \'SKIP\' AND "trigger" IN (\'0655\', \'0710\'))) LIMIT 1',
         (trade_date, book)).fetchone() is not None
 
 
-def deadman(conn, book: str, now: datetime) -> int | None:
-    """On a session day from 10:25 New York on, write DEADMAN/MISSING when no run ended and none was skipped at 6:55 or 7:10,
-    else DEADMAN/OK. Returns the new event's id; None (nothing written) before 10:25, on a day that is not a session, or when
-    the day already has its dead-man row."""
+def _orphan_triggers(day_events: Sequence[dict], now: datetime) -> list[str]:
+    """The triggers with a RUN_START that is older than ORPHAN_MINUTES and never got its own RUN_END, in the order they
+    started. Starts and ends pair per trigger in event order: each RUN_END closes the latest still-open start of its trigger
+    before it (a NOOP end counts). So a later run's end, even a lock-held NOOP, never closes an earlier hung start. Only
+    today's events are given."""
+    limit = stamp(now - timedelta(minutes=ORPHAN_MINUTES))                      # stamps sort as text: older is smaller
+    open_starts: dict[str, list[dict]] = {}
+    for e in sorted(day_events, key=lambda x: x["event_id"]):
+        if e["kind"] == "RUN_START":
+            open_starts.setdefault(e["trigger"], []).append(e)
+        elif e["kind"] == "RUN_END" and open_starts.get(e["trigger"]):
+            open_starts[e["trigger"]].pop()
+    left = sorted((e for starts in open_starts.values() for e in starts), key=lambda x: x["event_id"])
+    found: list[str] = []
+    for e in left:
+        if e["at_utc"] < limit and e["trigger"] not in found:
+            found.append(e["trigger"])
+    return found
+
+
+def deadman_check(conn, book: str, now: datetime) -> list[int]:
+    """The dead-man check of the 7:25 job: on a session day from 10:25 New York on, write what is due and return the new ids.
+
+    - an orphaned run start (see `_orphan_triggers`) writes DEADMAN/FAULT with cause run:orphan-start:<trigger> (lower case),
+      once for each (day, trigger): a P0 that always reaches the owner;
+    - the day's dead-man row: DEADMAN/MISSING when no run ended (a NOOP end is not a run end) and none was skipped at 6:55 or
+      7:10, else DEADMAN/OK; once a day.
+    The two are separate rows, so both can be there on one day. Nothing is written before 10:25 or on a day that is not a
+    session; a check that finds both already written writes nothing. Orphan rows come first in the result."""
     ny = _utc(now).astimezone(NEW_YORK)
     day = ny.date().isoformat()
     if ny.time() < DEADMAN_CUTOFF or not is_session(day):
-        return None
+        return []
+    written: list[int] = []
     with _tx(conn):
-        if conn.execute("SELECT 1 FROM run_events WHERE trade_date = ? AND book = ? AND kind = 'DEADMAN' LIMIT 1", (day, book)).fetchone():
-            return None
-        if _has_terminal_row(conn, day, book):
-            return _insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="OK", now=now, trade_date=day,
-                                 detail="a terminal row is there")
-        return _insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="MISSING", now=now, trade_date=day,
-                             root_cause=DEADMAN_CAUSE, detail="no run ended and none was skipped by 10:25 New York")
+        have = [r[0] for r in conn.execute("SELECT root_cause FROM run_events WHERE trade_date = ? AND book = ? AND kind = 'DEADMAN' "
+                                           "AND outcome = 'FAULT'", (day, book))]
+        for trigger in _orphan_triggers(events_for(conn, day, book), now):
+            cause = ORPHAN_CAUSE + trigger.lower()
+            if cause not in have:
+                written.append(_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="FAULT", now=now, trade_date=day,
+                                             root_cause=cause, detail=f"the {_RUN_NAMES.get(trigger, trigger)} run started and did not end "
+                                                                      f"within {ORPHAN_MINUTES} minutes"))
+        if not conn.execute("SELECT 1 FROM run_events WHERE trade_date = ? AND book = ? AND kind = 'DEADMAN' "
+                            "AND outcome IN ('OK', 'MISSING') LIMIT 1", (day, book)).fetchone():
+            if _has_terminal_row(conn, day, book):
+                written.append(_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="OK", now=now, trade_date=day,
+                                             detail="a terminal row is there"))
+            else:
+                written.append(_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="MISSING", now=now, trade_date=day,
+                                             root_cause=DEADMAN_CAUSE, detail="no run ended and none was skipped by 10:25 New York"))
+    return written
+
+
+def deadman(conn, book: str, now: datetime) -> int | None:
+    """`deadman_check`, returning the id of the day's DEADMAN/OK or DEADMAN/MISSING row if this call wrote it. None: nothing
+    written (before 10:25, on a day that is not a session, or the day already has its dead-man row; an orphan row may still
+    have been written, and `deadman_check` says so)."""
+    ids = deadman_check(conn, book, now)
+    for i in ids:
+        if conn.execute("SELECT outcome FROM run_events WHERE event_id = ?", (i,)).fetchone()[0] in ("OK", "MISSING"):
+            return i
+    return None
 
 
 # ------------------------------------------------------------------------------------------------ the order step's summary
@@ -607,8 +677,10 @@ def map_run(text: str, exit_code: int) -> RunMapping:
     - not a readable summary, or an exit code that its status does not explain, is CRASH. The order step itself exits 0 when
       its status is `done` and 2 when it is `stopped`, so 2 with a `stopped` summary is the step speaking, not a crash;
     - `done` with exit 0 is COMPLETED (its `faults`, if any, are the fault count and the first one the cause);
-    - `stopped` at stage `session` is ORDINARY_STOP (a closed market, a run outside the window, another step running), unless
-      the reason says the exchange calendar could not be loaded, which is a FAULT;
+    - `stopped` at stage `session` is, by the start of its reason: "another order step is running" NOOP (run:noop:lock-held);
+      "outside the regular session window" NOOP (run:noop:outside-window); "the exchange calendar could not be loaded"
+      or "... could not answer for" FAULT; any other (the market is closed) ORDINARY_STOP. A NOOP did nothing and says nothing about the day: it is not
+      a terminal row; with no faults it is ignored by the streak and never sent (with faults it is a P0 and resets);
     - any other stop is FAULT with cause run:status-stopped:<stage>, its fault count at least 1."""
     summary = _read_summary(text) if isinstance(text, str) else None
     status = summary.get("status") if summary else None
@@ -630,7 +702,11 @@ def map_run(text: str, exit_code: int) -> RunMapping:
     stage = stage if isinstance(stage, str) and _STAGE_RE.fullmatch(stage) else "unknown"
     reason = clean(summary.get("reason") or "", 200)
     detail = clean(f"stopped at {stage}" + (f": {reason}" if reason else ""), 300)
-    if stage == "session" and not reason.startswith("the exchange calendar could not be loaded"):
+    if stage == "session" and not reason.startswith((CALENDAR_FAULT_REASON, CALENDAR_ANSWER_REASON)):
+        if reason.startswith(LOCK_HELD_REASON):
+            return RunMapping("NOOP", NOOP_LOCK_HELD, len(faults), detail)
+        if reason.startswith(OUTSIDE_WINDOW_REASON):
+            return RunMapping("NOOP", NOOP_OUTSIDE_WINDOW, len(faults), detail)
         return RunMapping("ORDINARY_STOP", "run:ordinary-stop:session", len(faults), detail)
     return RunMapping("FAULT", f"run:status-stopped:{stage}", max(1, len(faults)), detail)
 
@@ -703,13 +779,16 @@ def _run(args, now: datetime, stdin, sender) -> int:
             _print({"event_id": i, "outcome": r.outcome, "root_cause": r.root_cause})
             return 1 if _needs_owner(conn, i) else 0
         if args.cmd == "deadman":
-            i = deadman(conn, args.book, now)
-            if i is None:
+            ids = deadman_check(conn, args.book, now)
+            if not ids:
                 _print({"recorded": False})
                 return 0
-            outcome = conn.execute("SELECT outcome FROM run_events WHERE event_id = ?", (i,)).fetchone()[0]
-            _print({"recorded": True, "event_id": i, "outcome": outcome})
-            return 1 if outcome == "MISSING" else 0
+            rows = [dict(conn.execute("SELECT event_id, outcome, root_cause FROM run_events WHERE event_id = ?", (i,)).fetchone())
+                    for i in ids]
+            main = next((r for r in rows if r["outcome"] in ("OK", "MISSING")), rows[0])
+            _print({"recorded": True, "event_id": main["event_id"], "outcome": main["outcome"], "event_ids": ids,
+                    "orphans": [r["root_cause"] for r in rows if r["outcome"] == "FAULT"]})
+            return 1 if any(r["outcome"] in ("MISSING", "FAULT") for r in rows) else 0
         if args.cmd == "notify":
             use = (sender if sender is not None else MacSender()) if args.mac else None
             result = notify(conn, args.book, use, now)
