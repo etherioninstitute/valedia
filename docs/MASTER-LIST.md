@@ -797,7 +797,15 @@ Finnhub-derived sent to an outside model. Order: after the live path (priority 1
   void words). XNYS schedule, Finnhub holiday/status (local; tombstones; empty list refused), FR presdocs (narrow
   grammatical closure-day rule; multi-page refused). Nasdaq halts RSS dropped (terms bar stored reuse). NEXT: terms
   read + register + first real refresh (1 measured request each); fix the real store path.
-- **IN PROGRESS** T59 K-4 venue rules (cand/t59-k4-venue from 66de881), builder dispatched. K-3's write helper carries the
+- **DONE** 2026-11-23 lead K-3 fix 6850557: a revised FR document is FETCHED, never back-dated (no lookahead).
+- **DONE** 2026-11-23 T59 K-4 merged 050533d (177 tests; 4 blind checks PASS with notes, 3 fix rounds).
+  `knowledge/k4_venue.py`: Kalshi changelog RSS + Webull OpenAPI changelog (dated), Kalshi fee schedule / rulebook +
+  Webull pricing (DOCUMENT: hash + 500-char excerpt only). Only an entity's first version may be PUBLISHED; edits and
+  late-appearing old-dated entries are FETCHED. One BASELINE diff on a source's first read, then one
+  PENDING_RULE_DIFF per change; close_rule_diff names the rule module. SOURCES ship UNFILLED (terms_url, licence,
+  document URLs): register_all refuses until the lead reads terms. Known limits: a late entry inside an interrupted
+  baseline-repair read is back-dated; a closed script/head mention in RSS text drops its contents; Webull page shape
+  (dated headings) unconfirmed. NEXT: read terms, fill SOURCES, first real refresh. K-3's write helper carries the
   date-only rule (end of the date in the source's own zone) and each source's zone in the registry.
 
 ## 6. Analytics and decisions
