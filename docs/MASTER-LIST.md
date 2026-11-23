@@ -495,6 +495,9 @@ Queued (roadmap):
   T-5 and T-2 with Holm (min p < 0.025); YoY (G <= 25) secondary only, +1 trial in K if pursued alone; SA/NSA to be
   confirmed from the full rules text. After 12-03: 4-arm crossover for mechanism (arm 1 not sec.gov: its UA policy
   conflicts with our generic UA; arm 2 on the Mac mini needs the owner's yes).
+  Owner 2026-11-23: YES to the Mac mini as arm 2 of that test (that arm only), and YES to excluding the collector's
+  store from Spotlight. The exclusion is a System Settings change, so the owner makes it himself (Spotlight -> Search
+  Privacy -> add the repo's memory/ folder).
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
