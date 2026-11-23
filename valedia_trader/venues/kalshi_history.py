@@ -25,21 +25,24 @@ import json
 import re
 import sqlite3
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from zoneinfo import ZoneInfo
 
 from valedia_trader.venues import kalshi_data as kd
 
 __all__ = ["SERIES", "HistoryClient", "HistoryStore", "KalshiHistoryError", "event_date", "team_code", "iso_ts",
-           "cutoff_ts", "fetch_settled", "fetch_candles", "windows"]
+           "cutoff_ts", "fetch_settled", "fetch_candles", "windows", "cpi_ref_month", "release_date", "cpi_moments"]
 
 UTC = timezone.utc
+EASTERN = ZoneInfo("America/New_York")
 SERIES = {"NFL": "KXNFLGAME", "NBA": "KXNBAGAME", "NHL": "KXNHLGAME", "NCAAF": "KXNCAAFGAME",
           "NCAAMB": "KXNCAAMBGAME"}
 MONTHS = {m: i + 1 for i, m in enumerate(("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT",
                                           "NOV", "DEC"))}
 _DATE = re.compile(r"^[A-Z0-9]+-(\d{2})([A-Z]{3})(\d{2})")
+_CPI = re.compile(r"^(?:KX)?CPI(?:YOY)?-(\d{2})([A-Z]{3})(?:-|\Z)")
 SETTLE_DAYS = 3            # a game's markets settle within this many days of its date (close_time placeholder: 2 d)
 
 
@@ -57,6 +60,43 @@ def event_date(ticker: str) -> date | None:
         return date(2000 + int(m.group(1)), MONTHS[m.group(2)], int(m.group(3)))
     except ValueError:
         return None
+
+
+def cpi_ref_month(ticker: str) -> date | None:
+    """First day of the BLS reference month in a Kalshi CPI ticker (KXCPI-24NOV-T0.3 -> 2024-11-01). Covers KXCPI,
+    KXCPIYOY and the legacy CPI and CPIYOY prefixes; any other series (KXCPICORE-...), a bad month or junk gives None."""
+    m = _CPI.match(ticker or "")
+    if not m or m.group(2) not in MONTHS:
+        return None
+    return date(2000 + int(m.group(1)), MONTHS[m.group(2)], 1)
+
+
+def release_date(market: dict) -> date | None:
+    """The US-Eastern calendar date of the market's `expected_expiration_time`, else its `close_time`; None when
+    neither is a readable ISO time."""
+    for key in ("expected_expiration_time", "close_time"):
+        text = market.get(key)
+        if not text:
+            continue
+        try:
+            return datetime.fromtimestamp(iso_ts(text), UTC).astimezone(EASTERN).date()
+        except (ValueError, OverflowError, OSError):
+            continue
+    return None
+
+
+def cpi_moments(release: date, days_back: Iterable[int] = (2, 3, 4, 5, 6)) -> list[float]:
+    """For each n in `days_back`, the unix time of 14:00 America/New_York on the n-th weekday (Mon-Fri) before
+    `release`. Holidays are not removed."""
+    out = []
+    for n in days_back:
+        d, left = release, n
+        while left > 0:
+            d -= timedelta(days=1)
+            if d.weekday() < 5:
+                left -= 1
+        out.append(datetime.combine(d, dtime(14, 0), tzinfo=EASTERN).timestamp())
+    return out
 
 
 def team_code(market_ticker: str) -> str:
@@ -257,8 +297,10 @@ def _day_start(d: date) -> float:
 
 
 def fetch_settled(client: HistoryClient, store: HistoryStore, series: str, start: date, end: date,
-                  cutoff: float | None = None, refresh: bool = False) -> dict:
-    """Store every settled market of `series` whose game date (from the ticker) is in [start, end]. The historical
+                  cutoff: float | None = None, refresh: bool = False, *,
+                  date_of: Callable[[dict], date | None] | None = None) -> dict:
+    """Store every settled market of `series` whose game date (from the ticker; `date_of(row)` when given, e.g. the
+    CPI reference month) is in [start, end]. The historical
     tier is read when the period starts before the cutoff, the live tier when its games can settle after it. A
     period already listed is not asked again (not even the cutoff) unless `refresh`."""
     if not refresh and store.listed_any(series, start, end):
@@ -282,7 +324,7 @@ def fetch_settled(client: HistoryClient, store: HistoryStore, series: str, start
         counts["listed"] += len(rows)
         n = 0
         for row in rows:
-            d = event_date(row.get("ticker", ""))
+            d = date_of(row) if date_of is not None else event_date(row.get("ticker", ""))
             if d is None or not (start <= d <= end) or row.get("status") not in ("finalized", "settled"):
                 continue
             n += 1
@@ -310,8 +352,9 @@ def windows(moments: Iterable[float], before: int = 3600) -> list[tuple[int, int
 
 
 def fetch_candles(client: HistoryClient, store: HistoryStore, market: dict, moments: Iterable[float],
-                  cutoff: float) -> dict:
-    """One-minute candles of one market around each moment (see `windows`), each window asked once."""
+                  cutoff: float, before: int = 3600) -> dict:
+    """One-minute candles of one market around each moment (see `windows`, `before` seconds back), each window asked
+    once."""
     ticker = market["ticker"]
     series = market.get("series") or ticker.split("-", 1)[0]
     settled = market.get("settlement_ts") or market.get("close_time")
@@ -319,7 +362,7 @@ def fetch_candles(client: HistoryClient, store: HistoryStore, market: dict, mome
     paths = {"historical": "/historical/markets/%s/candlesticks" % ticker,
              "live": "/series/%s/markets/%s/candlesticks" % (series, ticker)}
     out = {"windows_fetched": 0, "windows_cached": 0, "windows_empty": 0, "candles_stored": 0}
-    for start, end in windows(moments):
+    for start, end in windows(moments, before):
         if store.covered(ticker, start, end):
             out["windows_cached"] += 1
             continue
