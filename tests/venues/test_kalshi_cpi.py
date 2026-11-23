@@ -239,7 +239,7 @@ def run(pull, monkeypatch, tmp_path, capsys, argv, transport=None):
     t = transport or FakeTransport(MARKETS)
     clients = []
 
-    def build():
+    def build(collector_db=None):
         clients.append(client_for(t))
         return clients[-1]
 
@@ -334,8 +334,10 @@ def test_script_handles_each_default_series_and_totals(pull, monkeypatch, tmp_pa
 
 
 def test_build_client_is_quiet_and_keyless(pull):
-    c = pull.build_client()
-    assert c.fetch is kd.quiet_fetch and isinstance(c.pacer, kd.PhasePacer)
+    from valedia_trader.venues import collector_gate as cg
+    c = pull.build_client("/nonexistent/collector.sqlite")        # never read here: no wait() is called
+    assert c.fetch is kd.quiet_fetch and isinstance(c.pacer, cg.GatedPacer)
+    assert isinstance(c.pacer.inner, kd.PhasePacer) and isinstance(c.pacer.gate, cg.CollectorGate)
     assert c.requests == 0
 
 

@@ -2,7 +2,7 @@
 """Pull Kalshi's settled CPI markets and their candles near each release into one sqlite store (read only, no key).
 
     python scripts/kalshi_cpi_pull.py --store PATH [--series KXCPI CPI KXCPIYOY CPIYOY]
-        [--ref-start 2021-12-01 --ref-end 2024-11-30] [--limit-events N] [--listings-only] [--refresh]
+        [--ref-start 2021-12-01 --ref-end 2024-11-30] [--limit-events N] [--listings-only] [--refresh] [--collector-db PATH]
 
 Ticker months are not a safe calendar: Kalshi's tickers up to CPI-22MAR name the RELEASE month, later ones the BLS
 reference month. So each series is listed once over a wide ticker-month range, and the releases pulled are chosen by
@@ -17,11 +17,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from valedia_trader.venues import collector_gate as cg  # noqa: E402
 from valedia_trader.venues import kalshi_data as kd  # noqa: E402
 from valedia_trader.venues import kalshi_history as kh  # noqa: E402
 
@@ -32,9 +34,18 @@ DAYS_BACK = (1, 2, 3, 4, 5, 6)    # weekdays before the release; the study maps 
 SUM_KEYS = ("windows_fetched", "windows_cached", "windows_empty", "candles_stored")
 
 
-def build_client() -> kh.HistoryClient:
-    """The client of a real run; tests replace this function."""
-    return kh.HistoryClient(fetch=kd.quiet_fetch, pacer=kd.quiet_pacer())
+DEFAULT_COLLECTOR_DB = Path(__file__).resolve().parent.parent / "memory" / "orderbook_loop.sqlite"
+
+
+def _log_closed(reason: str) -> None:
+    print(time.strftime("%H:%M:%S %Z", time.localtime()) + " pull held, " + reason, file=sys.stderr, flush=True)
+
+
+def build_client(collector_db=DEFAULT_COLLECTOR_DB) -> kh.HistoryClient:
+    """The client of a real run (tests replace this function). Requests start only in the quiet seconds of a
+    minute AND only while the live collector's database says it is idle; there is no way to turn the gate off."""
+    pacer = cg.GatedPacer(kd.quiet_pacer(), cg.CollectorGate(collector_db), log=_log_closed)
+    return kh.HistoryClient(fetch=kd.quiet_fetch, pacer=pacer)
 
 
 def _date(text: str) -> date:
@@ -68,6 +79,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--release-end", type=_date, default=SEAL_CEILING, help="capped at SEAL_CEILING")
     p.add_argument("--limit-events", type=int, default=None, help="pilot: candles for the first N events only")
     p.add_argument("--listings-only", action="store_true", help="list markets, fetch no candles")
+    p.add_argument("--collector-db", type=Path, default=DEFAULT_COLLECTOR_DB,
+                   help="the live collector's sqlite file, read only; requests are sent only while it is idle")
     p.add_argument("--refresh", action="store_true", help="list again even where a listing is stored")
     return p.parse_args(argv)
 
@@ -111,7 +124,7 @@ def pull_series(client, store, series: str, args, cutoff_of) -> dict:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    client = build_client()
+    client = build_client(args.collector_db)
     store = kh.HistoryStore(args.store)
     cache: list[float] = []
 
