@@ -533,6 +533,8 @@ Queued (roadmap):
   Reply 27 addendum SENT 2026-11-23 11:05 AM PST: the gate move, SEC allowed (contact kept out of the repo), the holiday
   check + the unscheduled-closure question, and the near-omniscient goal (K-1..K-7 + the tax track) asking Carbon for
   sources, cadence, change detection, one as-of store, text-to-rule checks and build order.
+  Owner 2026-11-23: one FULL Reply 27 instead (live path first, then pulls, holidays, knowledge feeds); it supersedes the
+  first reply 27 and the addendum. Round 28 questions in order: alert ranking, unscheduled closures, knowledge-feed build.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
