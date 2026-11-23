@@ -25,10 +25,17 @@ The file carries a schema version (PRAGMA user_version). `connect` creates a new
 version and refuses any existing file with a different one, rather than opening a store made with weaker guards.
 
 "Current version at time t" means one thing everywhere: the version with the greatest `known_at_utc` at or
-before t, ties broken by the highest `fact_version_id`. `facts_as_of` returns it. `add_fact` skips a new read
-only when it matches that version at BOTH of the read's times: its own `known_at_utc` and its `fetched_at_utc`.
-A read with a proven publication time that matches at the published time but not at the fetch time is stored
-with basis FETCHED at the fetch time (a PUBLISHED copy would change nothing).
+before t, ties broken by the highest `fact_version_id`. `facts_as_of` returns it.
+
+A read is always current at its own fetch time: after `add_fact`, `facts_as_of` at the fetch time returns that
+read's hash. `add_fact` stores nothing only when the hash already matches the current version at BOTH the
+read's `known_at_utc` and its fetch time. When a proven publication time would leave an older, different
+version current at the fetch time, a FETCHED row at the fetch time is stored too, in the same transaction.
+
+Known limits of the database-side checks: a raw number such as 1e999 inside payload JSON, and an escaped
+lone surrogate such as "\\ud800" inside a JSON string, are refused by `add_fact` (in code) but not by the
+database itself, which accepts them as valid JSON text. `connect` also refuses any store with unexpected objects or ids
+outside 1..2^62, which catches rows written with the checks switched off.
 """
 from __future__ import annotations
 
@@ -46,6 +53,7 @@ _TIME_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 # The same shape, as a database check on the stored (fixed-width) form.
 _TIME_GLOB = "'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'"
+_MAX_ID = 4611686018427387904   # 2**62, the same bound as the id CHECK
 _TIME_BYTES = 27   # len("2026-01-02T03:04:05.000000Z")
 
 
@@ -162,11 +170,19 @@ def _reference_objects() -> dict[str, str]:
 def _verify_schema(conn: sqlite3.Connection, path) -> None:
     """Every expected table, index and trigger must be present, by name, with the SQL this code would create."""
     have = _objects(conn)
-    for name, sql in _reference_objects().items():
+    want = _reference_objects()
+    for name, sql in want.items():
         if name not in have:
             raise StoreError(f"{path}: store is missing {name}; it is not opened silently")
         if have[name] != sql:
             raise StoreError(f"{path}: {name} differs from what this code creates; it is not opened silently")
+    extra = sorted(set(have) - set(want))
+    if extra:    # a trigger, view or index nobody asked for could change what a write or a read does
+        raise StoreError(f"{path}: store has unexpected objects {extra}; it is not opened silently")
+    low, high = conn.execute("SELECT min(fact_version_id), max(fact_version_id) FROM knowledge_facts").fetchone()
+    if low is not None and (low < 1 or high > _MAX_ID):
+        raise StoreError(f"{path}: fact_version_id range {low}..{high} is outside 1..{_MAX_ID}; "
+                         "rows were written with the checks off")
 
 
 def connect(path) -> sqlite3.Connection:
@@ -186,6 +202,7 @@ def connect(path) -> sqlite3.Connection:
                 "it was made by an older or different build and is not opened silently")
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA synchronous = FULL")
+        conn.execute("PRAGMA ignore_check_constraints = OFF")
         if version == 0:   # a brand-new empty file: create everything and stamp the version in one transaction
             conn.executescript(f"BEGIN IMMEDIATE;{_SCHEMA}PRAGMA user_version = {SCHEMA_VERSION};COMMIT;")
         _verify_schema(conn, path)
@@ -238,9 +255,22 @@ def _json_ok(text, name: str) -> None:
         return value
 
     try:
-        json.loads(text, parse_constant=no_constant, parse_float=finite_float)
+        parsed = json.loads(text, parse_constant=no_constant, parse_float=finite_float)
     except (ValueError, RecursionError) as exc:
         raise StoreError(f"{name}: must be valid, finite JSON text") from exc
+    pending = [parsed]                      # an escaped lone surrogate ("\\ud800") only shows up after parsing
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            if not _encodable(item):
+                raise StoreError(f"{name}: contains a lone surrogate escape")
+        elif isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, dict):
+            for key, value in item.items():
+                if not _encodable(key):
+                    raise StoreError(f"{name}: contains a lone surrogate escape in a key")
+                pending.append(value)
 
 
 def _text(value, name: str, *, required: bool = True) -> str | None:
@@ -273,14 +303,39 @@ def _flag(value, name: str) -> int:
 
 
 def _write(conn: sqlite3.Connection, fn):
-    """Run `fn` inside one immediate transaction."""
-    conn.execute("BEGIN IMMEDIATE")
+    """Run `fn` inside one immediate transaction of our own. Refused if the caller already has a transaction
+    open. Any failure, including a failed COMMIT, rolls back and surfaces as StoreError (or the StoreError
+    `fn` raised), so the connection is never left stuck in a transaction."""
+    if conn.in_transaction:
+        raise StoreError("a transaction is already open on this connection; the store writes in its own")
+
+    def rollback():
+        try:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.Error as exc:
+        raise StoreError(f"cannot start a write transaction: {exc}") from exc
     try:
         result = fn()
-    except BaseException:
-        conn.execute("ROLLBACK")
+    except StoreError:
+        rollback()
         raise
-    conn.execute("COMMIT")
+    except sqlite3.Error as exc:
+        rollback()
+        raise StoreError(f"write failed: {exc}") from exc
+    except BaseException:
+        rollback()
+        raise
+    try:
+        conn.execute("COMMIT")
+    except sqlite3.Error as exc:
+        rollback()
+        raise StoreError(f"commit failed, nothing was written: {exc}") from exc
     return result
 
 
@@ -360,14 +415,18 @@ def add_fact(
     published_at_utc: str | None = None,
     published_proven: bool = False,
 ) -> int:
-    """Store a new version and return its id, or, if the hash matches the version that is current at BOTH of
-    this read's times (its `known_at` and its fetch time), return the id of the one current at the fetch
-    time and store nothing.
+    """Store this read and return the id of the version that `facts_as_of` returns for it at its fetch time.
 
     `known_at` is the published time only when `published_proven` is true (the source carries an official
-    timestamp proving the fact was public then); otherwise it is the fetch time. A proven read that matches at
-    its published time but not at its fetch time is stored with basis FETCHED and `known_at` = the fetch time:
-    a PUBLISHED copy would be redundant, and the fetch is what makes the content current again."""
+    timestamp proving the fact was public then); otherwise it is the fetch time.
+
+    Invariant: after any call, `facts_as_of` at the fetch time, for this (domain, entity_key, source_id),
+    returns this read's hash. Nothing is stored (and the existing id is returned) only when the hash already
+    matches the current version at BOTH the read's `known_at` and its fetch time. A proven read that matches
+    at its published time but not at its fetch time is stored with basis FETCHED at the fetch time. A proven
+    read that differs is stored as PUBLISHED at its published time, and also as FETCHED at the fetch time
+    (same hash, payload and published_at) when an older, different version would otherwise still be current
+    at the fetch time. Both rows are written in one transaction."""
     if domain not in DOMAINS:
         raise StoreError(f"domain: must be one of {DOMAINS}")
     _text(entity_key, "entity_key")
@@ -394,28 +453,42 @@ def add_fact(
     def run():
         if conn.execute("SELECT 1 FROM source_registry WHERE source_id = ?", (source_id,)).fetchone() is None:
             raise StoreError(f"source {source_id!r} is not registered")
-        at_known = _latest_fact_for_key(conn, domain, entity_key, source_id, known_at)
-        at_fetch = at_known if known_at == fetched else _latest_fact_for_key(conn, domain, entity_key,
-                                                                             source_id, fetched)
+
+        def current(at):
+            return _latest_fact_for_key(conn, domain, entity_key, source_id, at)
+
+        def insert(known, how):
+            try:
+                cur = conn.execute(
+                    "INSERT INTO knowledge_facts (domain, entity_key, effective_from_utc, effective_to_utc,"
+                    " published_at_utc, fetched_at_utc, known_at_utc, known_at_basis, source_id, raw_sha256,"
+                    " payload_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (domain, entity_key, eff_from, eff_to, published, fetched, known, how, source_id,
+                     raw_sha256, payload_json),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise StoreError(f"fact refused by the database: {exc}") from exc
+            if cur.rowcount != 1:                  # e.g. a trigger that quietly ignores the insert
+                raise StoreError("fact was not stored: the database ignored the insert")
+
+        at_known = current(known_at)
+        at_fetch = at_known if known_at == fetched else current(fetched)
         same_known = at_known is not None and at_known["raw_sha256"] == raw_sha256
         same_fetch = at_fetch is not None and at_fetch["raw_sha256"] == raw_sha256
         if same_known and same_fetch:
             return at_fetch["fact_version_id"]
         if same_known:                      # current when it was published, but not by the time it was fetched
-            known, how = fetched, "FETCHED"
+            insert(fetched, "FETCHED")
         else:
-            known, how = known_at, basis
-        try:
-            cur = conn.execute(
-                "INSERT INTO knowledge_facts (domain, entity_key, effective_from_utc, effective_to_utc,"
-                " published_at_utc, fetched_at_utc, known_at_utc, known_at_basis, source_id, raw_sha256,"
-                " payload_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (domain, entity_key, eff_from, eff_to, published, fetched, known, how, source_id,
-                 raw_sha256, payload_json),
-            )
-        except sqlite3.IntegrityError as exc:
-            raise StoreError(f"fact refused by the database: {exc}") from exc
-        return cur.lastrowid
+            insert(known_at, basis)
+            if known_at != fetched:
+                now = current(fetched)
+                if now is None or now["raw_sha256"] != raw_sha256:
+                    insert(fetched, "FETCHED")   # an older version sits between: it must not win at the fetch time
+        final = current(fetched)                 # the invariant, checked before anything is committed
+        if final is None or final["raw_sha256"] != raw_sha256:
+            raise StoreError("fact was not stored: it cannot be read back as current at its fetch time")
+        return final["fact_version_id"]
 
     return _write(conn, run)
 
@@ -436,21 +509,24 @@ def facts_as_of(
     _text(entity_key, "entity_key", required=False)
     if domain is not None and domain not in DOMAINS:
         raise StoreError(f"domain: must be one of {DOMAINS}")
-    sql = (
-        "SELECT f.* FROM knowledge_facts f JOIN source_registry s ON s.source_id = f.source_id"
-        " WHERE f.known_at_utc <= ?"
-        " AND f.fact_version_id = (SELECT g.fact_version_id FROM knowledge_facts g"
-        "   WHERE g.domain = f.domain AND g.entity_key = f.entity_key AND g.source_id = f.source_id"
-        "   AND g.known_at_utc <= ? ORDER BY g.known_at_utc DESC, g.fact_version_id DESC LIMIT 1)"
-    )
-    args: list = [as_of, as_of]
+    where = " WHERE f.known_at_utc <= ?"
+    args: list = [as_of]
     if domain is not None:
-        sql += " AND f.domain = ?"
+        where += " AND f.domain = ?"
         args.append(domain)
     if entity_key is not None:
-        sql += " AND f.entity_key = ?"
+        where += " AND f.entity_key = ?"
         args.append(entity_key)
     if outside:
-        sql += " AND s.allow_external_llm = 1"
-    sql += " ORDER BY f.domain, f.entity_key, f.source_id"
-    return [dict(r) for r in conn.execute(sql, args).fetchall()]
+        where += " AND s.allow_external_llm = 1"
+    # one pass: number each (domain, entity_key, source_id) group newest first, keep number 1
+    sql = (
+        "SELECT * FROM (SELECT f.*, row_number() OVER (PARTITION BY f.domain, f.entity_key, f.source_id"
+        " ORDER BY f.known_at_utc DESC, f.fact_version_id DESC) AS _rank"
+        " FROM knowledge_facts f JOIN source_registry s ON s.source_id = f.source_id" + where + ")"
+        " WHERE _rank = 1 ORDER BY domain, entity_key, source_id"
+    )
+    rows = [dict(r) for r in conn.execute(sql, args).fetchall()]
+    for r in rows:
+        del r["_rank"]
+    return rows

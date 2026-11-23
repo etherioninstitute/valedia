@@ -530,16 +530,34 @@ def _as_of_sha(conn, n):
     return rows[0]["raw_sha256"] if rows else None
 
 
-def test_late_read_after_a_proven_published_version_is_stored(conn):
+def test_late_read_after_a_proven_published_version_case_a(conn):
     A, B = sha("a"), sha("b")
     fact(conn, raw_sha256=A, fetched_at_utc=day(10))
     fact(conn, raw_sha256=B, published_at_utc=day(5), published_proven=True, fetched_at_utc=day(20))
+    assert [_as_of_sha(conn, d) for d in (7, 12, 20, 25)] == [B, A, B, B]      # B was fetched on day 20
     n = count(conn)
-    fact(conn, raw_sha256=B, fetched_at_utc=day(30))   # at day 30 the current version is A, so this is new
-    assert count(conn) == n + 1
-    assert _as_of_sha(conn, 31) == B
-    assert _as_of_sha(conn, 7) == B
-    assert _as_of_sha(conn, 12) == A
+    fact(conn, raw_sha256=B, fetched_at_utc=day(30))        # B is already current at day 30: nothing to store
+    assert count(conn) == n
+    assert [_as_of_sha(conn, d) for d in (7, 12, 20, 25, 31)] == [B, A, B, B, B]
+
+
+def test_a_proven_read_under_an_older_version_stores_a_published_row_and_a_fetched_row(conn):
+    A, B = sha("a"), sha("b")
+    fact(conn, raw_sha256=A, fetched_at_utc=day(10))
+    got = fact(conn, raw_sha256=B, published_at_utc=day(5), published_proven=True, fetched_at_utc=day(20),
+               payload_json='{"v": "b"}')
+    rows = conn.execute("SELECT * FROM knowledge_facts WHERE raw_sha256 = ? ORDER BY fact_version_id", (B,)).fetchall()
+    assert [r["known_at_basis"] for r in rows] == ["PUBLISHED", "FETCHED"]
+    assert rows[0]["known_at_utc"].startswith("2026-01-05") and rows[1]["known_at_utc"].startswith("2026-01-20")
+    assert rows[0]["payload_json"] == rows[1]["payload_json"] == '{"v": "b"}'
+    assert rows[0]["published_at_utc"] == rows[1]["published_at_utc"] and rows[1]["published_at_utc"].startswith("2026-01-05")
+    assert got == rows[1]["fact_version_id"]                  # the id of the version current at the fetch time
+
+
+def test_a_proven_read_with_nothing_between_its_times_stores_one_row(conn):
+    got = fact(conn, raw_sha256=sha("b"), published_at_utc=day(5), published_proven=True, fetched_at_utc=day(20))
+    assert count(conn) == 1 and got == 1
+    assert _as_of_sha(conn, 20) == sha("b")
 
 
 def test_backfilled_older_version_then_a_later_read(conn):
@@ -844,22 +862,30 @@ def test_a_foreign_database_is_refused(tmp_path):
 
 # ---- the duplicate rule looks at both the known_at time and the fetch time ----------------------
 
-def test_note7_variant_a_reread_with_the_same_proven_publication_is_stored_at_its_fetch_time(conn):
+def test_case_a_variant_a_reread_with_the_same_proven_publication_stores_nothing(conn):
     A, B = sha("a"), sha("b")
     fact(conn, raw_sha256=A, fetched_at_utc=day(10))
-    first_b = fact(conn, raw_sha256=B, published_at_utc=day(5), published_proven=True, fetched_at_utc=day(20))
+    fact(conn, raw_sha256=B, published_at_utc=day(5), published_proven=True, fetched_at_utc=day(20))
+    n = count(conn)
+    fact(conn, raw_sha256=B, published_at_utc=day(5), published_proven=True, fetched_at_utc=day(30))
+    assert count(conn) == n
+    assert [_as_of_sha(conn, d) for d in (7, 12, 20, 25, 31)] == [B, A, B, B, B]
+
+
+def test_a_proven_reread_that_matches_at_its_published_time_but_not_at_its_fetch_time_is_stored_as_fetched(conn):
+    A, B = sha("a"), sha("b")
+    first_b = fact(conn, raw_sha256=B, published_at_utc=day(5), published_proven=True, fetched_at_utc=day(6))
+    fact(conn, raw_sha256=A, fetched_at_utc=day(10))        # a different version arrives later
     n = count(conn)
     again = fact(conn, raw_sha256=B, published_at_utc=day(5), published_proven=True, fetched_at_utc=day(30))
     assert again != first_b and count(conn) == n + 1
     row = conn.execute("SELECT * FROM knowledge_facts WHERE fact_version_id = ?", (again,)).fetchone()
     assert row["known_at_basis"] == "FETCHED" and row["known_at_utc"] == row["fetched_at_utc"]
     assert row["known_at_utc"].startswith("2026-01-30") and row["published_at_utc"].startswith("2026-01-05")
-    assert _as_of_sha(conn, 31) == B
-    assert _as_of_sha(conn, 7) == B
-    assert _as_of_sha(conn, 12) == A
+    assert [_as_of_sha(conn, d) for d in (7, 12, 29, 31)] == [B, A, A, B]
 
 
-def test_note7_variant_an_identical_reread_after_that_stores_nothing(conn):
+def test_an_identical_reread_after_that_stores_nothing(conn):
     A, B = sha("a"), sha("b")
     fact(conn, raw_sha256=A, fetched_at_utc=day(10))
     fact(conn, raw_sha256=B, published_at_utc=day(5), published_proven=True, fetched_at_utc=day(20))
@@ -888,6 +914,10 @@ def test_the_duplicate_rule_is_documented_in_the_docstrings():
     for doc in (store.add_fact.__doc__, store.__doc__):
         assert "BOTH" in doc and "fetch" in doc and "FETCHED" in doc and "known_at" in doc
     assert "PUBLISHED" in store.add_fact.__doc__
+    for doc in (store.add_fact.__doc__, store.__doc__):
+        assert "at the fetch time" in doc and "facts_as_of" in doc
+    for note in ("1e999", "lone surrogate"):
+        assert note in store.__doc__, note
 
 
 # ---- facts need a registered source even with foreign keys off ----------------------------------
@@ -1117,6 +1147,239 @@ def test_an_untouched_store_reopens_and_keeps_its_rows(tmp_path):
     c.close()
 
 
+# ---- property test: after any write, the store answers with this read at its fetch time ----------
+
+SEED = 56007
+WRITES = 2500
+
+
+def hour(n):
+    return f"2026-02-{1 + n // 24:02d}T{n % 24:02d}:00:00Z"
+
+
+def _rows_for(conn, key, after_id=0):
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM knowledge_facts WHERE domain = 'K2_NEWS' AND entity_key = ? AND source_id = 'example_public'"
+        " AND fact_version_id > ? ORDER BY fact_version_id", (key, after_id))]
+
+
+def _oracle_current(rows, t):
+    """An independent version of 'current at t': greatest known_at at or before t, ties to the highest id."""
+    ok = [r for r in rows if r["known_at_utc"] <= t.replace("Z", ".000000Z")]
+    return max(ok, key=lambda r: (r["known_at_utc"], r["fact_version_id"])) if ok else None
+
+
+def test_property_random_writes_keep_the_fetch_time_invariant_and_the_skip_rule(conn):
+    import random
+    conn.execute("PRAGMA synchronous = OFF")        # this test is about logic; skipping thousands of disk syncs
+    rng = random.Random(SEED)
+    hashes = [sha(f"h{i}") for i in range(4)]
+    stats = dict(skipped=0, single=0, double=0, fetched_only=0, proven=0)
+    seen = {"P1": [], "P2": []}          # rows already read, per key (the table is append-only; re-read in full below)
+    for step in range(WRITES):
+        key = rng.choice(["P1", "P2"])
+        i = rng.randrange(len(hashes))
+        h = hashes[i]
+        f_n = rng.randrange(0, 600)
+        F = hour(f_n)
+        proven = rng.random() < 0.5
+        args = dict(entity_key=key, raw_sha256=h, payload_json=f'{{"h": {i}}}', fetched_at_utc=F)
+        K = F
+        if proven:
+            K = hour(rng.randrange(0, f_n + 1))
+            args.update(published_at_utc=K, published_proven=True)
+            stats["proven"] += 1
+        before = list(seen[key])
+        at_k, at_f = _oracle_current(before, K), _oracle_current(before, F)
+        same_k = at_k is not None and at_k["raw_sha256"] == h
+        same_f = at_f is not None and at_f["raw_sha256"] == h
+        got = fact(conn, **args)
+        added = _rows_for(conn, key, before[-1]["fact_version_id"] if before else 0)
+        after = before + added
+        seen[key] = after
+        if step % 250 == 0:
+            assert _rows_for(conn, key)[:len(before)] == before, step       # append-only: nothing earlier changed
+        if same_k and same_f:                                                # the R12 skip rule
+            assert added == [] and got == at_f["fact_version_id"], step
+            stats["skipped"] += 1
+        else:
+            assert 1 <= len(added) <= 2, step
+            stats["single" if len(added) == 1 else "double"] += 1
+            if same_k:                                                       # matched at K, not at F
+                assert len(added) == 1 and added[0]["known_at_basis"] == "FETCHED", step
+                stats["fetched_only"] += 1
+            if len(added) == 2:
+                first, second = added
+                assert first["known_at_basis"] == "PUBLISHED" and second["known_at_basis"] == "FETCHED", step
+                assert second["known_at_utc"] == second["fetched_at_utc"] and K != F, step
+                for col in ("raw_sha256", "payload_json", "published_at_utc", "fetched_at_utc"):
+                    assert first[col] == second[col], (step, col)
+        # the invariant: as of the fetch time, the store answers with this read
+        cur = _oracle_current(after, F)
+        assert cur["raw_sha256"] == h and cur["fact_version_id"] == got, step
+        mine = [r for r in facts_as_of(conn, F, domain="K2_NEWS", entity_key=key) if r["source_id"] == "example_public"]
+        assert [r["fact_version_id"] for r in mine] == [got] and mine[0]["raw_sha256"] == h, step
+        # and the read path agrees with the independent oracle at a random time
+        for _ in range(1):
+            t = hour(rng.randrange(0, 620))
+            want = _oracle_current(after, t)
+            have = [r for r in facts_as_of(conn, t, domain="K2_NEWS", entity_key=key)]
+            assert [r["fact_version_id"] for r in have] == ([want["fact_version_id"]] if want else []), (step, t)
+    assert all(v >= 20 for v in stats.values()), stats                       # every branch was exercised
+
+
+# ---- unexpected objects, a silently ignoring trigger, constraints switched off -------------------
+
+def _store_with(tmp_path, sql, name="x.db"):
+    path = tmp_path / name
+    connect(path).close()
+    raw = sqlite3.connect(path)
+    raw.executescript(sql)
+    raw.close()
+    return path
+
+
+@pytest.mark.parametrize("sql", [
+    "CREATE TRIGGER sneaky BEFORE INSERT ON knowledge_facts BEGIN SELECT RAISE(IGNORE); END;",
+    "CREATE TRIGGER sneaky AFTER INSERT ON source_registry BEGIN SELECT 1; END;",
+    "CREATE INDEX sneaky ON knowledge_facts (payload_json);",
+    "CREATE VIEW sneaky AS SELECT * FROM knowledge_facts;",
+    "CREATE TABLE sneaky (x);",
+])
+def test_a_store_with_an_unexpected_object_is_refused_on_open(tmp_path, sql):
+    path = _store_with(tmp_path, sql)
+    with pytest.raises(StoreError, match="sneaky"):
+        connect(path)
+
+
+def test_add_fact_never_reports_success_for_an_insert_that_was_silently_ignored(conn):
+    conn.execute("CREATE TEMP TRIGGER t_ignore BEFORE INSERT ON main.knowledge_facts "
+                 "BEGIN SELECT RAISE(IGNORE); END")
+    with pytest.raises(StoreError):
+        fact(conn)
+    assert not conn.in_transaction and count(conn) == 0
+    conn.execute("DROP TRIGGER t_ignore")
+    assert fact(conn) == 1                                   # two-way: without the trigger it is stored
+
+
+def test_connect_sets_check_constraints_on_explicitly(tmp_path):
+    c = connect(tmp_path / "c.db")
+    assert c.execute("PRAGMA ignore_check_constraints").fetchone()[0] == 0
+    c.close()
+
+
+def _raw_unchecked(path):
+    raw = sqlite3.connect(path, isolation_level=None)
+    raw.execute("PRAGMA ignore_check_constraints = ON")              # a writer that switched the checks off
+    return raw
+
+
+def _force_id(path, old, new):
+    """Change a row's id with the checks off and the update trigger briefly dropped, then restore the trigger."""
+    raw = _raw_unchecked(path)
+    raw.execute("DROP TRIGGER knowledge_facts_no_update")
+    raw.execute("UPDATE knowledge_facts SET fact_version_id = ? WHERE fact_version_id = ?", (new, old))
+    raw.executescript(store._SCHEMA)                                 # puts the dropped trigger back
+    raw.close()
+
+
+def test_a_store_with_a_minus_one_inserted_while_checks_were_off_is_refused_and_left_untouched(tmp_path):
+    path = tmp_path / "neg.db"
+    c = connect(path)
+    src(c)
+    fact(c)
+    c.close()
+    raw = _raw_unchecked(path)
+    cols = _raw_row()
+    raw.execute(f"INSERT INTO knowledge_facts (fact_version_id, {', '.join(cols)}) VALUES (-1, "
+                f"{', '.join('?' * len(cols))})", list(cols.values()))
+    assert raw.execute("SELECT min(fact_version_id) FROM knowledge_facts").fetchone()[0] == -1   # it went in
+    raw.close()
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(StoreError, match="fact_version_id"):
+        connect(path)
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+
+
+@pytest.mark.parametrize("bad_id", [0, -7, 4611686018427387905, 9223372036854775807])
+def test_a_store_with_an_id_outside_the_bound_is_refused_and_a_clean_one_opens(tmp_path, bad_id):
+    path = tmp_path / "ids.db"
+    c = connect(path)
+    src(c)
+    fact(c)
+    c.close()
+    connect(path).close()                                            # clean: opens
+    _force_id(path, 1, bad_id)
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(StoreError, match="fact_version_id"):
+        connect(path)
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+    _force_id(path, bad_id, 1)
+    connect(path).close()                                            # and clean again: opens
+
+
+# ---- transactions --------------------------------------------------------------------------------
+
+def test_a_write_inside_the_callers_open_transaction_is_refused(conn):
+    conn.execute("BEGIN")
+    with pytest.raises(StoreError, match="transaction"):
+        fact(conn)
+    with pytest.raises(StoreError, match="transaction"):
+        src(conn, "example_tx")
+    assert conn.in_transaction                                    # the caller's own transaction is left alone
+    conn.execute("ROLLBACK")
+    fact(conn)
+    src(conn, "example_tx")                                       # two-way: fine outside a transaction
+    assert count(conn) == 1
+
+
+class _FailingCommit:
+    """Wraps a connection and makes the next COMMIT fail, as a full disk or a lock would."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.fail = True
+
+    def execute(self, sql, *args):
+        if self.fail and sql.strip().upper() == "COMMIT":
+            raise sqlite3.OperationalError("disk I/O error")
+        return self._inner.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+@pytest.mark.parametrize("which", ["add_fact", "register_source"])
+def test_a_failed_commit_rolls_back_and_raises_store_error(conn, which):
+    wrapped = _FailingCommit(conn)
+    with pytest.raises(StoreError, match="commit"):
+        if which == "add_fact":
+            fact(wrapped)
+        else:
+            src(wrapped, "example_c1")
+    assert not conn.in_transaction                                # never left stuck in a transaction
+    assert count(conn) == 0 and count(conn, "source_registry") == 1
+    wrapped.fail = False
+    fact(wrapped)                                                 # and the connection works again
+    assert count(conn) == 1
+
+
+# ---- escaped lone surrogates inside JSON --------------------------------------------------------
+
+@pytest.mark.parametrize("bad", ['"\\ud800"', '{"k": "a\\udc00b"}', '{"\\ud800": 1}', '[1, {"x": ["\\udfff"]}]',
+                                 '{"a": {"b": {"\\ud83d": "ok"}}}'])
+def test_escaped_lone_surrogates_anywhere_in_parsed_json_are_refused(conn, bad):
+    with pytest.raises(StoreError, match="payload_json"):
+        fact(conn, payload_json=bad)
+    assert count(conn) == 0
+
+
+def test_a_proper_escaped_surrogate_pair_and_real_unicode_are_accepted(conn):
+    for i, text in enumerate(['"\\ud83d\\ude00"', '{"k": "caf\\u00e9", "\\u00e9": 1}', '"\u00e9"']):
+        fact(conn, entity_key=f"U{i}", payload_json=text)
+    assert count(conn) == 3
+
+
 # ---- one read path -------------------------------------------------------------------------------
 
 # Public callables of the package, by exact (module path, name). Adding a public function or class fails
@@ -1126,7 +1389,8 @@ _ALLOWED_PUBLIC = {("store.py", n) for n in ("connect", "register_source", "add_
 # own two lookups are checked separately below); the one insert is in add_fact's inner function.
 _MAY_MENTION_FACTS = {
     ("store.py", "facts_as_of", "other"), ("store.py", "_latest_fact_for_key", "other"),
-    ("store.py", "_SCHEMA", "other"), ("store.py", "run", "insert"),
+    ("store.py", "_SCHEMA", "other"), ("store.py", "insert", "insert"),
+    ("store.py", "_verify_schema", "other"),     # only min/max of the id, checked below
 }
 _PKG = Path(store.__file__).parent
 _MENTION = re.compile(r"knowledge_facts", re.IGNORECASE)     # catches "x", [x], `x`, main.x, main."x" alike
@@ -1183,9 +1447,16 @@ def test_the_schema_text_names_the_facts_table_for_reading_only_in_the_id_guard(
 
 
 def test_only_facts_as_of_returns_fact_rows():
+    """Known limit: the scan finds the facts table by its name written out as one token (in any quoting).
+    A name built at run time, such as "knowledge_" + "facts", or SQL that reaches the table through another
+    object, would not be seen. The exact public-name test and the guards in the database are what back it up."""
     # (1) in every file of the package, in any spelling of the table name, the only code that names the facts
     # table is facts_as_of, one private helper that returns only an id and a hash, the SQL text, and the insert
     assert _mentions() == _MAY_MENTION_FACTS
+    # (1b) the open-time check reads nothing but the lowest and highest id
+    verify = inspect.getsource(store._verify_schema)
+    assert re.findall(r"(?i)select[^\n]*knowledge_facts", verify) == [
+        'SELECT min(fact_version_id), max(fact_version_id) FROM knowledge_facts']
     # (2) the private helper never selects the payload or the other columns
     helper = inspect.getsource(store._latest_fact_for_key)
     assert "SELECT fact_version_id, raw_sha256 FROM knowledge_facts" in helper and "*" not in helper
