@@ -1260,6 +1260,8 @@ def test_the_reason_prefixes_the_ledger_reads_are_the_order_steps_exact_words():
         assert f'"{prefix}' in src, f"{prefix!r} is no longer how the order step words a session stop"
     assert (rl.LOCK_HELD_REASON, rl.OUTSIDE_WINDOW_REASON, rl.CALENDAR_FAULT_REASON) == (
         "another order step is running", "outside the regular session window", "the exchange calendar could not be loaded")
+    assert f'f"{rl.CALENDAR_ANSWER_REASON} {{day}}' in src, "market_window's calendar-error wording changed"
+    assert rl.CALENDAR_ANSWER_REASON == "the exchange calendar could not answer for"
 
 
 def test_the_order_steps_own_session_reasons_map_as_the_ticket_says():
@@ -1274,7 +1276,7 @@ def test_the_order_steps_own_session_reasons_map_as_the_ticket_says():
 @pytest.mark.parametrize("reason,outcome,cause", [
     ("the market is closed today", "ORDINARY_STOP", "run:ordinary-stop:session"),
     ("2026-11-28 (Saturday) is not a trading day", "ORDINARY_STOP", "run:ordinary-stop:session"),
-    ("the exchange calendar could not answer for 2026-11-28: boom", "ORDINARY_STOP", "run:ordinary-stop:session"),
+    ("the exchange calendar could not answer for 2026-11-28: boom", "FAULT", "run:status-stopped:session"),
     ("", "ORDINARY_STOP", "run:ordinary-stop:session"),
     ("Another order step is running", "ORDINARY_STOP", "run:ordinary-stop:session"),               # the words are matched exactly
     ("then another order step is running", "ORDINARY_STOP", "run:ordinary-stop:session"),          # at the start of the reason only

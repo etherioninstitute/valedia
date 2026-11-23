@@ -72,6 +72,7 @@ NOOP_OUTSIDE_WINDOW = "run:noop:outside-window"
 LOCK_HELD_REASON = "another order step is running"
 OUTSIDE_WINDOW_REASON = "outside the regular session window"
 CALENDAR_FAULT_REASON = "the exchange calendar could not be loaded"
+CALENDAR_ANSWER_REASON = "the exchange calendar could not answer for"   # market_window: a calendar error, not a closed market
 MIN_FILES = 10                                                        # a files list shorter than this is not the order path
 MAX_SUMMARY_BYTES = 16 * 1024 * 1024
 GIT_SECONDS = 60
@@ -670,7 +671,7 @@ def map_run(text: str, exit_code: int) -> RunMapping:
     - `done` with exit 0 is COMPLETED (its `faults`, if any, are the fault count and the first one the cause);
     - `stopped` at stage `session` is, by the start of its reason: "another order step is running" NOOP (run:noop:lock-held);
       "outside the regular session window" NOOP (run:noop:outside-window); "the exchange calendar could not be loaded"
-      FAULT; any other (the market is closed) ORDINARY_STOP. A NOOP did nothing and says nothing about the day: it is not
+      or "... could not answer for" FAULT; any other (the market is closed) ORDINARY_STOP. A NOOP did nothing and says nothing about the day: it is not
       a terminal row, it is ignored by the streak, and it is never sent;
     - any other stop is FAULT with cause run:status-stopped:<stage>, its fault count at least 1."""
     summary = _read_summary(text) if isinstance(text, str) else None
@@ -693,7 +694,7 @@ def map_run(text: str, exit_code: int) -> RunMapping:
     stage = stage if isinstance(stage, str) and _STAGE_RE.fullmatch(stage) else "unknown"
     reason = clean(summary.get("reason") or "", 200)
     detail = clean(f"stopped at {stage}" + (f": {reason}" if reason else ""), 300)
-    if stage == "session" and not reason.startswith(CALENDAR_FAULT_REASON):
+    if stage == "session" and not reason.startswith((CALENDAR_FAULT_REASON, CALENDAR_ANSWER_REASON)):
         if reason.startswith(LOCK_HELD_REASON):
             return RunMapping("NOOP", NOOP_LOCK_HELD, len(faults), detail)
         if reason.startswith(OUTSIDE_WINDOW_REASON):
