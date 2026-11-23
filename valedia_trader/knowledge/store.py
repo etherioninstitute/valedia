@@ -10,7 +10,12 @@ Rules, in plain words:
 Times are UTC, ISO-8601 with a Z suffix ("2026-01-02T03:04:05Z", fractions allowed). Anything else is
 refused. Accepted times are stored in one fixed shape (microseconds, "2026-01-02T03:04:05.000000Z") so
 that plain text comparison orders them correctly. The guards live in the database too, so raw SQL is
-held to the same rules.
+held to the same rules, including REPLACE (a REPLACE would delete without firing a delete trigger, so a
+BEFORE INSERT trigger on each table refuses any insert whose key already exists).
+
+"Current version at time t" means one thing everywhere: the version with the greatest `known_at_utc` at or
+before t, ties broken by the highest `fact_version_id`. `facts_as_of` returns it, and `add_fact` skips a
+new read only when it matches the version that is current at that read's own `known_at_utc`.
 
 Re-registering a source: identical values do nothing; different values are refused. A change of terms
 means a new source_id (for example "example_public_v2"); the old row stays as the record of the old terms.
@@ -25,14 +30,21 @@ from datetime import datetime, timezone
 DOMAINS = ("K1_LISTING", "K2_NEWS", "K3_CAL", "K4_VENUE", "K5_REG", "K6_TAX")
 UA_POLICIES = ("GENERIC_CLIENT", "SEC_DECLARED_CONTACT")
 
-_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$")
-_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+_TIME_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?Z")
+_SHA_RE = re.compile(r"[0-9a-f]{64}")
 # The same shape, as a database check on the stored (fixed-width) form.
 _TIME_GLOB = "'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'"
 
 
 class StoreError(ValueError):
     """A write or read was refused by the store's rules."""
+
+
+def _time_ok(col: str, nullable: bool = False) -> str:
+    """Database check: fixed shape, and a real date and time (a round trip through strftime must not move it)."""
+    check = (f"({col} GLOB {_TIME_GLOB} AND substr({col}, 12, 2) <= '23' AND "
+             f"strftime('%Y-%m-%dT%H:%M:%S', substr({col}, 1, 19)) IS substr({col}, 1, 19))")
+    return f"({col} IS NULL OR {check})" if nullable else check
 
 
 def _q(items: tuple[str, ...]) -> str:
@@ -44,11 +56,11 @@ CREATE TABLE IF NOT EXISTS source_registry (
     source_id TEXT PRIMARY KEY CHECK (length(source_id) > 0),
     terms_url TEXT NOT NULL CHECK (length(terms_url) > 0),
     licence_tag TEXT NOT NULL CHECK (length(licence_tag) > 0),
-    personal_use_ok INTEGER NOT NULL CHECK (personal_use_ok = 1),
-    allow_external_llm INTEGER NOT NULL CHECK (allow_external_llm IN (0, 1)),
+    personal_use_ok INTEGER NOT NULL CHECK (typeof(personal_use_ok) = 'integer' AND personal_use_ok = 1),
+    allow_external_llm INTEGER NOT NULL CHECK (typeof(allow_external_llm) = 'integer' AND allow_external_llm IN (0, 1)),
     ua_policy TEXT NOT NULL CHECK (ua_policy IN ({_q(UA_POLICIES)})),
     cost_usd_monthly REAL NOT NULL DEFAULT 0 CHECK (cost_usd_monthly >= 0),
-    terms_read_at_utc TEXT NOT NULL CHECK (terms_read_at_utc GLOB {_TIME_GLOB}),
+    terms_read_at_utc TEXT NOT NULL CHECK ({_time_ok('terms_read_at_utc')}),
     notes TEXT,
     CHECK (NOT (lower(source_id) LIKE '%finnhub%' AND allow_external_llm = 1))
 );
@@ -58,19 +70,24 @@ BEGIN SELECT RAISE(ABORT, 'source_registry is append-only: use a new source_id')
 CREATE TRIGGER IF NOT EXISTS source_registry_no_delete BEFORE DELETE ON source_registry
 BEGIN SELECT RAISE(ABORT, 'source_registry is append-only: use a new source_id'); END;
 
+-- REPLACE deletes the old row without firing delete triggers, so a key that already exists cannot be inserted.
+CREATE TRIGGER IF NOT EXISTS source_registry_no_replace BEFORE INSERT ON source_registry
+WHEN EXISTS (SELECT 1 FROM source_registry WHERE source_id = NEW.source_id)
+BEGIN SELECT RAISE(ABORT, 'source_registry is append-only: that source_id exists, use a new one'); END;
+
 CREATE TABLE IF NOT EXISTS knowledge_facts (
     fact_version_id INTEGER PRIMARY KEY AUTOINCREMENT,
     domain TEXT NOT NULL CHECK (domain IN ({_q(DOMAINS)})),
     entity_key TEXT NOT NULL CHECK (length(entity_key) > 0),
-    effective_from_utc TEXT NOT NULL CHECK (effective_from_utc GLOB {_TIME_GLOB}),
-    effective_to_utc TEXT CHECK (effective_to_utc IS NULL OR effective_to_utc GLOB {_TIME_GLOB}),
-    published_at_utc TEXT CHECK (published_at_utc IS NULL OR published_at_utc GLOB {_TIME_GLOB}),
-    fetched_at_utc TEXT NOT NULL CHECK (fetched_at_utc GLOB {_TIME_GLOB}),
-    known_at_utc TEXT NOT NULL CHECK (known_at_utc GLOB {_TIME_GLOB}),
+    effective_from_utc TEXT NOT NULL CHECK ({_time_ok('effective_from_utc')}),
+    effective_to_utc TEXT CHECK ({_time_ok('effective_to_utc', True)}),
+    published_at_utc TEXT CHECK ({_time_ok('published_at_utc', True)}),
+    fetched_at_utc TEXT NOT NULL CHECK ({_time_ok('fetched_at_utc')}),
+    known_at_utc TEXT NOT NULL CHECK ({_time_ok('known_at_utc')}),
     known_at_basis TEXT NOT NULL CHECK (known_at_basis IN ('PUBLISHED', 'FETCHED')),
     source_id TEXT NOT NULL REFERENCES source_registry(source_id),
     raw_sha256 TEXT NOT NULL CHECK (length(raw_sha256) = 64 AND raw_sha256 NOT GLOB '*[^0-9a-f]*'),
-    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    payload_json TEXT NOT NULL CHECK (typeof(payload_json) = 'text' AND json_valid(payload_json)),
     CHECK (effective_to_utc IS NULL OR effective_to_utc >= effective_from_utc),
     CHECK (
         (known_at_basis = 'PUBLISHED' AND published_at_utc IS NOT NULL
@@ -80,6 +97,11 @@ CREATE TABLE IF NOT EXISTS knowledge_facts (
 );
 
 CREATE INDEX IF NOT EXISTS knowledge_facts_lookup ON knowledge_facts (domain, entity_key, known_at_utc);
+
+CREATE TRIGGER IF NOT EXISTS knowledge_facts_no_replace BEFORE INSERT ON knowledge_facts
+WHEN NEW.fact_version_id IS NOT NULL
+ AND EXISTS (SELECT 1 FROM knowledge_facts WHERE fact_version_id = NEW.fact_version_id)
+BEGIN SELECT RAISE(ABORT, 'knowledge_facts is append-only: that fact_version_id exists'); END;
 
 CREATE TRIGGER IF NOT EXISTS knowledge_facts_no_update BEFORE UPDATE ON knowledge_facts
 BEGIN SELECT RAISE(ABORT, 'knowledge_facts is append-only: no updates'); END;
@@ -100,7 +122,7 @@ def connect(path) -> sqlite3.Connection:
 
 def _utc(value, name: str) -> str:
     """Check a UTC time with a Z suffix and return its fixed-width stored form."""
-    if not isinstance(value, str) or not _TIME_RE.match(value):
+    if not isinstance(value, str) or not _TIME_RE.fullmatch(value):
         raise StoreError(f"{name}: must be UTC ISO-8601 ending in Z, got {value!r}")
     try:
         parsed = datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
@@ -108,6 +130,13 @@ def _utc(value, name: str) -> str:
         raise StoreError(f"{name}: not a real time: {value!r}") from exc
     frac = value[20:-1] if "." in value else ""
     return parsed.strftime("%Y-%m-%dT%H:%M:%S") + "." + frac.ljust(6, "0") + "Z"
+
+
+def _flag(value, name: str) -> int:
+    """A yes/no setting: a bool, or the int 0 or 1. Anything else (a string like "no", 1.0, None) is refused."""
+    if isinstance(value, bool) or (isinstance(value, int) and value in (0, 1)):
+        return int(value)
+    raise StoreError(f"{name}: must be a bool or the int 0 or 1, got {value!r}")
 
 
 def _write(conn: sqlite3.Connection, fn):
@@ -138,14 +167,16 @@ def register_source(
     """Register a source. Same values again: nothing happens. Different values: refused."""
     if not isinstance(source_id, str) or not source_id:
         raise StoreError("source_id: required")
-    if not personal_use_ok:
+    personal = _flag(personal_use_ok, "personal_use_ok")
+    external = _flag(allow_external_llm, "allow_external_llm")
+    if not personal:
         raise StoreError("personal_use_ok must be true: a source we may not use is not registered")
-    if allow_external_llm and "finnhub" in source_id.lower():
+    if external and "finnhub" in source_id.lower():
         raise StoreError("a Finnhub source may never be allowed to reach an outside model")
     if ua_policy not in UA_POLICIES:
         raise StoreError(f"ua_policy: must be one of {UA_POLICIES}")
     row = (
-        source_id, terms_url, licence_tag, 1, 1 if allow_external_llm else 0, ua_policy,
+        source_id, terms_url, licence_tag, 1, external, ua_policy,
         float(cost_usd_monthly), _utc(terms_read_at_utc, "terms_read_at_utc"), notes,
     )
 
@@ -168,12 +199,14 @@ def register_source(
     _write(conn, run)
 
 
-def _latest_fact_for_key(conn, domain: str, entity_key: str, source_id: str):
-    """Newest stored version for one (domain, entity_key, source_id): id and hash only. Internal."""
+def _latest_fact_for_key(conn, domain: str, entity_key: str, source_id: str, known_at: str):
+    """The version of one (domain, entity_key, source_id) that is current at `known_at`: greatest known_at_utc
+    at or before it, ties to the highest id. Id and hash only. Internal; the same rule as `facts_as_of`."""
     return conn.execute(
         "SELECT fact_version_id, raw_sha256 FROM knowledge_facts"
-        " WHERE domain = ? AND entity_key = ? AND source_id = ? ORDER BY fact_version_id DESC LIMIT 1",
-        (domain, entity_key, source_id),
+        " WHERE domain = ? AND entity_key = ? AND source_id = ? AND known_at_utc <= ?"
+        " ORDER BY known_at_utc DESC, fact_version_id DESC LIMIT 1",
+        (domain, entity_key, source_id, known_at),
     ).fetchone()
 
 
@@ -191,8 +224,8 @@ def add_fact(
     published_at_utc: str | None = None,
     published_proven: bool = False,
 ) -> int:
-    """Store a new version and return its id, or return the id of the existing newest version if the
-    hash is unchanged (nothing is stored then).
+    """Store a new version and return its id, or, if the hash matches the version that is current at this
+    read's own `known_at`, return that version's id and store nothing.
 
     `known_at` is the published time only when `published_proven` is true (the source carries an official
     timestamp proving the fact was public then); otherwise it is the fetch time."""
@@ -202,9 +235,11 @@ def add_fact(
         raise StoreError("entity_key: required")
     if not isinstance(raw_sha256, str) or not _SHA_RE.match(raw_sha256):
         raise StoreError("raw_sha256: must be 64 lowercase hex characters")
+    if not isinstance(payload_json, str):
+        raise StoreError("payload_json: must be JSON text (a str)")
     try:
         json.loads(payload_json)
-    except (TypeError, ValueError) as exc:
+    except ValueError as exc:
         raise StoreError("payload_json: must be valid JSON text") from exc
     eff_from = _utc(effective_from_utc, "effective_from_utc")
     eff_to = None if effective_to_utc is None else _utc(effective_to_utc, "effective_to_utc")
@@ -224,7 +259,7 @@ def add_fact(
     def run():
         if conn.execute("SELECT 1 FROM source_registry WHERE source_id = ?", (source_id,)).fetchone() is None:
             raise StoreError(f"source {source_id!r} is not registered")
-        latest = _latest_fact_for_key(conn, domain, entity_key, source_id)
+        latest = _latest_fact_for_key(conn, domain, entity_key, source_id, known_at)
         if latest is not None and latest["raw_sha256"] == raw_sha256:
             return latest["fact_version_id"]
         try:

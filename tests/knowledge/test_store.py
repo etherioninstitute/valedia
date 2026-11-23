@@ -6,6 +6,8 @@ import inspect
 import json
 import re
 import sqlite3
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -137,7 +139,7 @@ def test_proven_without_published_time_is_refused(conn):
         fact(conn, published_proven=True)
 
 
-def _raw_insert(conn, **over):
+def _raw_insert(conn, verb="INSERT", **over):
     cols = dict(domain="K2_NEWS", entity_key="ABC", effective_from_utc="2026-01-01T00:00:00.000000Z",
                 effective_to_utc=None, published_at_utc="2026-01-01T00:00:00.000000Z",
                 fetched_at_utc="2026-01-02T00:00:00.000000Z", known_at_utc="2026-01-02T00:00:00.000000Z",
@@ -145,7 +147,7 @@ def _raw_insert(conn, **over):
                 payload_json="{}")
     cols.update(over)
     names = ", ".join(cols)
-    conn.execute(f"INSERT INTO knowledge_facts ({names}) VALUES ({', '.join('?' * len(cols))})",
+    conn.execute(f"{verb} INTO knowledge_facts ({names}) VALUES ({', '.join('?' * len(cols))})",
                  list(cols.values()))
 
 
@@ -171,6 +173,8 @@ def test_database_enforces_known_at_rule_even_through_raw_sql(conn):
     "2026-01-02T00:00:00", "2026-01-02 00:00:00Z", "2026-01-02T00:00:00+00:00", "2026-01-02T01:00:00+01:00",
     "2026-01-02", "2026-13-02T00:00:00Z", "2026-02-30T00:00:00Z", "2026-01-02T24:00:00Z", "",
     "2026-01-02T00:00:00.1234567Z", None,
+    "2026-01-02T00:00:00Z\n", "\u0662\u0660\u0662\u0666-\u0660\u0661-\u0660\u0662T00:00:00Z",
+    "2026-01-02T\u0660\u0660:00:00Z", " 2026-01-02T00:00:00Z",
 ])
 def test_naive_or_offset_times_are_refused(conn, bad):
     with pytest.raises(StoreError):
@@ -348,45 +352,229 @@ def test_refused_write_leaves_no_open_transaction(conn):
     fact(conn)  # and the connection still works
 
 
+# ---- REPLACE cannot get past append-only ---------------------------------------------------------
+
+_REG_ROW = ("example_public", "https://example.invalid/OTHER", "x", 1, 1, "GENERIC_CLIENT", 0,
+            "2026-01-01T00:00:00.000000Z", None)
+
+
+def test_replace_cannot_overwrite_a_fact_through_raw_sql(conn):
+    fid = fact(conn)
+    before = conn.execute("SELECT * FROM knowledge_facts").fetchall()
+    for verb in ("REPLACE", "INSERT OR REPLACE", "INSERT", "INSERT OR IGNORE"):
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            _raw_insert(conn, verb=verb.replace("REPLACE INTO", "REPLACE"), fact_version_id=fid,
+                        payload_json='{"v": 99}')
+    assert [tuple(r) for r in conn.execute("SELECT * FROM knowledge_facts")] == [tuple(r) for r in before]
+
+
+def test_a_fresh_explicit_fact_id_is_still_allowed(conn):
+    fact(conn)
+    _raw_insert(conn, fact_version_id=500)
+    assert count(conn) == 2
+
+
+def test_replace_cannot_rewrite_a_source_through_raw_sql(conn):
+    before = tuple(conn.execute("SELECT * FROM source_registry").fetchone())
+    for verb in ("REPLACE", "INSERT OR REPLACE", "INSERT"):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(f"{verb} INTO source_registry VALUES (?,?,?,?,?,?,?,?,?)", _REG_ROW)
+    assert tuple(conn.execute("SELECT * FROM source_registry").fetchone()) == before
+    conn.execute("INSERT INTO source_registry VALUES (?,?,?,?,?,?,?,?,?)", ("example_new",) + _REG_ROW[1:])
+    assert count(conn, "source_registry") == 2
+
+
+# ---- one definition of "current version" ---------------------------------------------------------
+
+def day(n):
+    return f"2026-01-{n:02d}T00:00:00Z"
+
+
+def _as_of_sha(conn, n):
+    rows = facts_as_of(conn, day(n))
+    assert len(rows) <= 1
+    return rows[0]["raw_sha256"] if rows else None
+
+
+def test_late_read_after_a_proven_published_version_is_stored(conn):
+    A, B = sha("a"), sha("b")
+    fact(conn, raw_sha256=A, fetched_at_utc=day(10))
+    fact(conn, raw_sha256=B, published_at_utc=day(5), published_proven=True, fetched_at_utc=day(20))
+    n = count(conn)
+    fact(conn, raw_sha256=B, fetched_at_utc=day(30))   # at day 30 the current version is A, so this is new
+    assert count(conn) == n + 1
+    assert _as_of_sha(conn, 31) == B
+    assert _as_of_sha(conn, 7) == B
+    assert _as_of_sha(conn, 12) == A
+
+
+def test_backfilled_older_version_then_a_later_read(conn):
+    A, B = sha("a"), sha("b")
+    fact(conn, raw_sha256=A, fetched_at_utc=day(20))
+    fact(conn, raw_sha256=B, fetched_at_utc=day(10))   # backfill: older known_at, stored later
+    fact(conn, raw_sha256=B, fetched_at_utc=day(30))
+    assert _as_of_sha(conn, 15) == B
+    assert _as_of_sha(conn, 25) == A
+    assert _as_of_sha(conn, 31) == B
+    assert count(conn) == 3
+
+
+def test_unchanged_content_at_a_later_time_stores_nothing_even_after_a_backfill(conn):
+    A, B = sha("a"), sha("b")
+    first = fact(conn, raw_sha256=A, fetched_at_utc=day(20))
+    fact(conn, raw_sha256=B, fetched_at_utc=day(10))
+    assert fact(conn, raw_sha256=A, fetched_at_utc=day(25)) == first   # current at day 25 is A
+    assert count(conn) == 2
+
+
+def test_same_known_at_ties_go_to_the_highest_id(conn):
+    A, B = sha("a"), sha("b")
+    fact(conn, raw_sha256=A, fetched_at_utc=day(10))
+    second = fact(conn, raw_sha256=B, fetched_at_utc=day(10))
+    assert [r["fact_version_id"] for r in facts_as_of(conn, day(10))] == [second]
+    assert fact(conn, raw_sha256=B, fetched_at_utc=day(10)) == second
+
+
+# ---- impossible dates, types ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", ["2026-13-45T99:99:99.000000Z", "2026-02-30T00:00:00.000000Z",
+                                 "2026-02-29T00:00:00.000000Z", "2026-01-02T24:00:00.000000Z",
+                                 "2026-01-02T00:00:60.000000Z", "2026-00-10T00:00:00.000000Z"])
+def test_database_refuses_impossible_dates_through_raw_sql(conn, bad):
+    for col in ("effective_from_utc", "published_at_utc"):
+        with pytest.raises(sqlite3.IntegrityError):
+            _raw_insert(conn, **{col: bad})
+    with pytest.raises(sqlite3.IntegrityError):
+        _raw_insert(conn, fetched_at_utc=bad, known_at_utc=bad)
+    with pytest.raises(sqlite3.IntegrityError):
+        _raw_insert(conn, effective_to_utc=bad)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO source_registry VALUES (?,?,?,?,?,?,?,?,?)",
+                     ("example_d", "u", "x", 1, 0, "GENERIC_CLIENT", 0, bad, None))
+    assert count(conn) == 0 and count(conn, "source_registry") == 1
+
+
+def test_a_real_leap_day_is_accepted_by_code_and_database(conn):
+    _raw_insert(conn, effective_from_utc="2028-02-29T00:00:00.000000Z")
+    fact(conn, raw_sha256=sha("z"), effective_from_utc="2028-02-29T00:00:00Z", fetched_at_utc="2028-03-01T00:00:00Z")
+    assert count(conn) == 2
+
+
+@pytest.mark.parametrize("field", ["personal_use_ok", "allow_external_llm"])
+@pytest.mark.parametrize("bad", ["no", "yes", "1", "", 2, -1, 1.0, None, [1], b"1"])
+def test_flags_must_be_bool_or_int_zero_or_one(conn, field, bad):
+    with pytest.raises(StoreError, match=field):
+        src(conn, "example_flag", **{field: bad})
+    assert count(conn, "source_registry") == 1
+
+
+def test_flags_accept_bool_and_int(conn):
+    src(conn, "example_f1", personal_use_ok=1, allow_external_llm=0)
+    src(conn, "example_f2", personal_use_ok=True, allow_external_llm=False)
+    src(conn, "example_f3", personal_use_ok=True, allow_external_llm=1)
+    assert [r[0] for r in conn.execute("SELECT allow_external_llm FROM source_registry WHERE source_id LIKE 'example_f%'"
+                                       " ORDER BY source_id")] == [0, 0, 1]
+    with pytest.raises(StoreError, match="personal_use_ok"):
+        src(conn, "example_f4", personal_use_ok=0)
+
+
+@pytest.mark.parametrize("bad", [b'{"v": 1}', bytearray(b"{}"), {"v": 1}, [1], 3, None])
+def test_payload_must_be_text(conn, bad):
+    with pytest.raises(StoreError, match="payload_json"):
+        fact(conn, payload_json=bad)
+    assert count(conn) == 0
+
+
+@pytest.mark.parametrize("bad", [b'{"v": 1}', b"{}", b"3"])   # (a number is stored as text by column affinity)
+def test_database_refuses_non_text_payload_through_raw_sql(conn, bad):
+    with pytest.raises(sqlite3.IntegrityError):
+        _raw_insert(conn, payload_json=bad)
+    assert count(conn) == 0
+
+
 # ---- one read path -------------------------------------------------------------------------------
 
-# Public callables of the module, by exact name. Adding a public function fails this test on purpose:
-# the author must then show it cannot return fact rows, and add it here.
-_ALLOWED_PUBLIC = {"connect", "register_source", "add_fact", "facts_as_of", "StoreError"}
-_MAY_SELECT_FACTS = {"facts_as_of", "_latest_fact_for_key"}  # the only functions that read the facts table
+# Public callables of the package, by exact (module file, name). Adding a public function or class fails
+# this test on purpose: the author must then show it cannot return fact rows, and add it here.
+_ALLOWED_PUBLIC = {("store.py", n) for n in ("connect", "register_source", "add_fact", "facts_as_of", "StoreError")}
+# The only functions allowed to read the facts table.
+# (_SCHEMA is the SQL text; its one match is the duplicate-id guard, checked separately below.)
+_MAY_SELECT_FACTS = {("store.py", "facts_as_of"), ("store.py", "_latest_fact_for_key"), ("store.py", "_SCHEMA")}
+_PKG = Path(store.__file__).parent
+_READS_FACTS = re.compile(r"(?i)\b(from|join)\s+knowledge_facts\b")
 
 
-def _module_functions():
-    tree = ast.parse(inspect.getsource(store))
-    return [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+def _package_files():
+    files = sorted(_PKG.glob("*.py"))
+    assert {f.name for f in files} >= {"__init__.py", "store.py"}
+    return files
 
 
 def test_public_surface_is_exactly_the_allowed_names():
-    public = {name for name, obj in vars(store).items()
-              if not name.startswith("_") and getattr(obj, "__module__", None) == store.__name__
-              and (inspect.isfunction(obj) or inspect.isclass(obj))}
+    public = set()
+    for f in _package_files():
+        for node in ast.parse(f.read_text()).body:       # module-level defs only
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not node.name.startswith("_"):
+                public.add((f.name, node.name))
     assert public == _ALLOWED_PUBLIC
+    live = {name for name, obj in vars(store).items()
+            if not name.startswith("_") and getattr(obj, "__module__", None) == store.__name__
+            and (inspect.isfunction(obj) or inspect.isclass(obj))}
+    assert live == {n for _, n in _ALLOWED_PUBLIC}
+
+
+def _readers():
+    """(file, innermost function or '<module>') for every place any package file reads the facts table."""
+    found = set()
+    for f in _package_files():
+        text = f.read_text()
+        tree = ast.parse(text)
+        funcs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        consts = [n for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)]
+        for m in _READS_FACTS.finditer(text):
+            line = text.count("\n", 0, m.start()) + 1
+            inner = [fn for fn in funcs if fn.lineno <= line <= fn.end_lineno]
+            if inner:
+                found.add((f.name, min(inner, key=lambda fn: fn.end_lineno - fn.lineno).name))
+                continue
+            top = [c.targets[0].id for c in consts if c.lineno <= line <= c.end_lineno]
+            found.add((f.name, top[0] if top else "<module>"))
+    return found
+
+
+def test_the_schema_text_reads_the_facts_table_only_to_check_for_an_existing_id():
+    matches = [m.start() for m in _READS_FACTS.finditer(store._SCHEMA)]
+    assert len(matches) == 1
+    assert store._SCHEMA[matches[0] - 9:].startswith("SELECT 1 FROM knowledge_facts WHERE fact_version_id = NEW.fact_version_id")
 
 
 def test_only_facts_as_of_returns_fact_rows():
-    # (1) the only code that reads the facts table is facts_as_of and one private, id-and-hash-only helper
-    reading = set()
-    for fn in _module_functions():
-        body = ast.get_source_segment(inspect.getsource(store), fn)
-        if re.search(r"(?i)\b(from|join)\s+knowledge_facts\b", body):
-            reading.add(fn.name)
-    assert reading == _MAY_SELECT_FACTS
+    # (1) in every file of the package, the only code that reads the facts table is facts_as_of and one
+    # private helper that returns only an id and a hash
+    assert _readers() == _MAY_SELECT_FACTS
     # (2) the private helper never selects the payload or the other columns
     helper = inspect.getsource(store._latest_fact_for_key)
     assert "SELECT fact_version_id, raw_sha256 FROM knowledge_facts" in helper and "*" not in helper
-    # (3) no public function other than facts_as_of is annotated as returning rows or a connection cursor
-    for name in _ALLOWED_PUBLIC - {"facts_as_of", "StoreError"}:
+    # (3) no public function other than facts_as_of is annotated as returning rows
+    for name in {n for _, n in _ALLOWED_PUBLIC} - {"facts_as_of", "StoreError"}:
         ret = str(inspect.signature(getattr(store, name)).return_annotation)
         assert "dict" not in ret and "Row" not in ret and "list" not in ret, name
     assert "list[dict]" in str(inspect.signature(store.facts_as_of).return_annotation)
 
 
+def test_the_scan_catches_a_reader_hidden_in_another_module(tmp_path, monkeypatch):
+    extra = tmp_path / "pkg"
+    extra.mkdir()
+    (extra / "__init__.py").write_text("")
+    (extra / "store.py").write_text(Path(store.__file__).read_text())
+    (extra / "sneaky.py").write_text('def all_rows(c):\n    return c.execute("SELECT * FROM knowledge_facts")\n')
+    monkeypatch.setattr(sys.modules[__name__], "_PKG", extra)
+    assert ("sneaky.py", "all_rows") in _readers()
+    assert _readers() != _MAY_SELECT_FACTS
+    assert ("sneaky.py", "all_rows") in {(f.name, n.name) for f in _package_files()
+                                         for n in ast.parse(f.read_text()).body if isinstance(n, ast.FunctionDef)}
+
+
 def test_write_functions_return_no_rows(conn):
     assert register_source.__annotations__["return"] == "None"
     assert isinstance(fact(conn), int)
-
