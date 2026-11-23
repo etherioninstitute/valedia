@@ -903,6 +903,12 @@ run beside MiroFish and Elephant-1):
     `- curl -sS *` makes the localhost-only curl lines meaningless, and `allow_private_urls: true` (others are
     false). DONE 2026-11-22 (owner's yes): wildcard deleted, flag false; backup `config.yaml.bak-2026-11-22`
     beside it; takes effect in a new CTO session.
+22. GitHub mirror (owner, 2026-11-22: "sync it to Github ... and keep it synced"): local `main` pushed to
+    `etherioninstitute/valedia` (private) branch `main`, now the default branch; the old branches
+    `valedia-v2-grok-build` and `master` were left untouched. Remote name `github`. `.git/hooks/post-commit`
+    pushes after each commit on main (log `.git/github-sync.log`); `.git/hooks/pre-push` refuses key patterns and
+    private files (tested both ways). Carbon reviews this repo from round 15 on. Untracked journal, artifacts and
+    data stores never go there.
 
 ## 13b. Affordable paid options (the owner's to choose; none needed today unless marked)
 
