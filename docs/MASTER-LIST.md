@@ -451,6 +451,17 @@ Queued (roadmap):
   cap 10 unseals per market per epoch, alongside the prediction's own terms. LEAK FOUND: a failed seal writes its
   regime and check figures as a lesson (gauntlet.py:785-787), searchable by research -> lesson becomes
   SEAL_FAIL (K_seal = n) only; Epoch-0 lists past failed-seal lessons and flags hypotheses developed after them.
+  QUIET KALSHI PULLER BUILT 2026-11-22 (caa6a4e, 490ff6b): PhasePacer starts requests only at seconds 42-55,
+  <= 1/s; quiet_fetch abandons a request after 3 s (every request ends by second 58); optional on both read-only
+  clients, defaults unchanged; blind-verified. Guard trials 11:37 and 11:39 PM: 13 then 46 requests, 0 outside the
+  window; collector cycle steady at seconds 19.7-20.3, 0 failed reads, no stop. Quiet night only: the first
+  daytime pull is watched live. CPI pull needs its own ticker-date parser (event_date reads sports dates; trial
+  stored 0). Round 24: no early close on K_seal; atomic retirement of a scored seal window; rules chosen on <= 2024
+  data, locked estimators update causally through seal and live; event arenas (Kalshi, stock events) rotate
+  2028-01-01 if Tier 0 counts >= 60 clusters in 2027, the fund book 2029-01-01; outcome-blind 2025+ metadata is
+  Tier 0. Failed-seal lessons hidden by a read filter in get()/search (raw rows kept for the owner's logged read);
+  once the owner reads a failed seal, that family's later seal on EPOCH_1 -> HOLD_FOR_OWNER_AUDIT. Mac mini = a
+  fallback puller only with the owner's yes.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
