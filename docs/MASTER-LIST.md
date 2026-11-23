@@ -485,6 +485,16 @@ Queued (roadmap):
   before it is ignored, any fault after a send counts, strict restarts on resuming after >= 300 s held; two-way
   checked incl. the real 1:06 replay. Restarted 1:21 AM. Carbon: reply 25 addendum sent (busy-collector stop, the
   gate, the question of a randomized on/off load test after 12-03).
+  Round 26 (reply 26): zero-packet hazard test on the collector record since 11-19: 207 unexposed busy 4-min windows,
+  0 drifted >= 15 s (1 non-ok = the 1:06 blip, no drift); tonight's exposed window +20 s -> Fisher p ~= 0.005: load
+  beside a busy collector very likely causes the slip; the idle gate stays. Pull store + sent mark moved to
+  ~/valedia-data/kalshi.noindex/ (Spotlight skips it; a79fc7b); the collector's own store is the owner's. Candidate C
+  pre-filter: hourly candles first, tape only where the YES BID entered 3-12c with 2-14 d left (the spec's variable,
+  not yes_ask). CPI: <= 1 federal holiday in the 6 weekdays before any of the 35 releases (checked). CPI Stage 0 locked:
+  headline MoM primary (G <= 35), d_g = equal-weight mean Brier difference over filtered "above k" strikes, Wilcoxon at
+  T-5 and T-2 with Holm (min p < 0.025); YoY (G <= 25) secondary only, +1 trial in K if pursued alone; SA/NSA to be
+  confirmed from the full rules text. After 12-03: 4-arm crossover for mechanism (arm 1 not sec.gov: its UA policy
+  conflicts with our generic UA; arm 2 on the Mac mini needs the owner's yes).
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
