@@ -132,7 +132,7 @@ def test_full_minute_window_is_allowed():
 
 def test_quiet_pacer_factory():
     p = kd.quiet_pacer()
-    assert isinstance(p, kd.PhasePacer) and p.spacing == 1.0 and p.window == (42.0, 57.0)
+    assert isinstance(p, kd.PhasePacer) and p.spacing == 1.0 and p.window == (42.0, 55.0)
     assert kd.quiet_pacer((10.0, 20.0)).window == (10.0, 20.0)
 
 
@@ -176,3 +176,15 @@ def test_nan_spacing_is_refused():
     from valedia_trader.venues.kalshi_data import PhasePacer
     with pytest.raises(ValueError):
         PhasePacer(spacing=math.nan)
+
+
+def test_a_quiet_request_always_ends_before_second_58():
+    lo, hi = kd.QUIET_WINDOW
+    assert hi + kd.QUIET_TIMEOUT <= 58.0
+
+
+def test_quiet_fetch_uses_the_short_timeout(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(kd, "urllib_get_dated", lambda url, timeout: (seen.setdefault("t", timeout), None) and (b"{}", None))
+    kd.quiet_fetch("https://example.invalid/x")
+    assert seen["t"] == kd.QUIET_TIMEOUT

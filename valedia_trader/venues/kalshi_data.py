@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
-__all__ = ["BASE_URL", "HttpError", "KalshiDataError", "Pacer", "PhasePacer", "quiet_pacer", "urllib_get", "normalize_market", "normalize_candle",
+__all__ = ["BASE_URL", "HttpError", "KalshiDataError", "Pacer", "PhasePacer", "quiet_pacer", "quiet_fetch", "QUIET_WINDOW", "QUIET_TIMEOUT", "urllib_get", "normalize_market", "normalize_candle",
            "KalshiData", "normalize_levels", "best_quote", "normalize_trade", "iso_to_ts"]
 
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
@@ -101,9 +101,18 @@ class PhasePacer:
         self.last = self.clock()
 
 
-def quiet_pacer(window: tuple[float, float] = (42.0, 57.0)) -> PhasePacer:
+QUIET_WINDOW = (42.0, 55.0)      # request starts; with QUIET_TIMEOUT every request ends by second 58
+QUIET_TIMEOUT = 3.0              # seconds a quiet request may take before it is abandoned
+
+
+def quiet_pacer(window: tuple[float, float] = QUIET_WINDOW) -> PhasePacer:
     """A `PhasePacer` at one request a second inside `window` of each wall-clock minute."""
     return PhasePacer(1.0, window)
+
+
+def quiet_fetch(url: str) -> bytes:
+    """`urllib_get` with QUIET_TIMEOUT, so a stalled study request cannot run into the next minute."""
+    return urllib_get(url, QUIET_TIMEOUT)
 
 
 def urllib_get(url: str, timeout: float = 60.0) -> bytes:
