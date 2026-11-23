@@ -767,6 +767,8 @@ Finnhub-derived sent to an outside model. Order: after the live path (priority 1
   wash sales.
 - **QUEUED** K-6 tax law: federal (IRS) and all 50 states plus DC, re-read each year and on change. It feeds
   section 9.
+- **NOW** (owner yes 2026-11-23 "start now", beside the live path) T56 K-7 the store: builder dispatched on
+  `cand/t56-k7-store` (ticket `.foreman/tickets/T56-K7-knowledge-store.md`); then K-3 and K-4 on top of it.
 - **QUEUED** K-7 one knowledge store with one query path for all her agents. It absorbs the data-source register
   idea in section 5: each source's terms, cost, measured behaviour and the tests that used it.
 
