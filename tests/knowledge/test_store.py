@@ -1825,8 +1825,8 @@ def test_functions_work_on_a_plain_connection_without_a_row_factory(tmp_path):
 
 def test_the_module_docstring_states_its_limits():
     doc = " ".join((store.__doc__ or "").split())
-    assert "only the id range, the schema identity and the version" in doc
-    assert "other than out-of-range ids" in doc and "are not detected" in doc
+    assert "integrity check" in doc and "refuses rows that break a CHECK constraint" in doc
+    assert "are not detected" not in doc
     assert "multiset" in doc and "duplicate name" in doc and "whatever its type" in doc
     assert "text-only" in doc and "built at run time" in doc
     assert "disables triggers" in doc and "re-creates them verbatim" in doc and "outside what the store can detect" in doc

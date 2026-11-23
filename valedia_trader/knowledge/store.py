@@ -36,9 +36,9 @@ What `connect` checks on opening a store: the schema version, that every expecte
 present with exactly the SQL this code creates, that nothing else is in the file (the whole schema table is
 compared as a multiset of (type, name, tbl_name, sql) rows, never by a name pattern and never through a
 dictionary keyed by name; a duplicate name is refused whatever its type; SQLite's own automatic indexes and
-the statistics tables that ANALYZE makes are the only extras allowed), and that the ids lie within 1..2^62. It
-checks only the id range, the schema identity and the version. Rows written with the checks switched off, other
-than out-of-range ids, are not detected.
+the statistics tables that ANALYZE makes are the only extras allowed), and that the ids lie within 1..2^62. On an
+existing store it first runs SQLite's integrity check (`quick_check` with `quick=True`), which also refuses rows
+that break a CHECK constraint, such as rows written with the checks switched off.
 
 Known limits:
 - SQLite cannot check UTF-8 validity in a CHECK constraint (no function does it, and a CHECK may not contain a
