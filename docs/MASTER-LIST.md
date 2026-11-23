@@ -901,7 +901,8 @@ run beside MiroFish and Elephant-1):
     Sharadar SEP ($199-299 a year) only later, if the 2018+ test passes or the ranker is next.
 21. Hermes CTO profile (`~/.hermes/profiles/valedia-cto/config.yaml`:220, 223, found by Carbon round 14):
     `- curl -sS *` makes the localhost-only curl lines meaningless, and `allow_private_urls: true` (others are
-    false). Proposed: delete the wildcard line, set the flag false; takes effect in a new session.
+    false). DONE 2026-11-22 (owner's yes): wildcard deleted, flag false; backup `config.yaml.bak-2026-11-22`
+    beside it; takes effect in a new CTO session.
 
 ## 13b. Affordable paid options (the owner's to choose; none needed today unless marked)
 
