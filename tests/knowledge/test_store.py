@@ -368,10 +368,49 @@ def test_replace_cannot_overwrite_a_fact_through_raw_sql(conn):
     assert [tuple(r) for r in conn.execute("SELECT * FROM knowledge_facts")] == [tuple(r) for r in before]
 
 
-def test_a_fresh_explicit_fact_id_is_still_allowed(conn):
+_BAD_IDS = [-1, 0, -5, 2, 3, 500, 2**62, 9223372036854775807]
+
+
+def test_raw_inserts_with_explicit_ids_that_break_the_sequence_are_refused_and_never_wedge_the_store(conn):
+    # Rule: ids are 1, 2, 3, ... with no gaps. An explicit id is allowed only if it is exactly the next one.
+    fact(conn)                                   # id 1, so the next id is 2
+    seq_before = conn.execute("SELECT * FROM sqlite_sequence").fetchall()
+    for bad in [i for i in _BAD_IDS if i != 2]:
+        n = count(conn)
+        with pytest.raises(sqlite3.IntegrityError):
+            _raw_insert(conn, fact_version_id=bad)
+        assert count(conn) == n
+        assert [tuple(r) for r in conn.execute("SELECT * FROM sqlite_sequence")] == [tuple(r) for r in seq_before]
+        new = fact(conn, raw_sha256=sha(f"after-{bad}"))      # an auto id still works afterwards
+        assert new == n + 1 and count(conn) == n + 1
+        seq_before = conn.execute("SELECT * FROM sqlite_sequence").fetchall()
+    assert [r[0] for r in conn.execute("SELECT fact_version_id FROM knowledge_facts ORDER BY 1")] == \
+        list(range(1, count(conn) + 1))
+
+
+def test_the_next_explicit_id_and_auto_ids_are_allowed(conn):
     fact(conn)
-    _raw_insert(conn, fact_version_id=500)
-    assert count(conn) == 2
+    _raw_insert(conn, fact_version_id=2)        # exactly the next id
+    _raw_insert(conn)                           # auto id (SQLite shows a trigger -1 for this; it must not misfire)
+    assert fact(conn, raw_sha256=sha("z")) == 4
+    assert [r[0] for r in conn.execute("SELECT fact_version_id FROM knowledge_facts ORDER BY 1")] == [1, 2, 3, 4]
+
+
+def test_an_explicit_id_of_the_first_row_must_be_one(conn):
+    for bad in (-1, 0, 2, 9223372036854775807):
+        with pytest.raises(sqlite3.IntegrityError):
+            _raw_insert(conn, fact_version_id=bad)
+    assert count(conn) == 0 and fact(conn) == 1
+
+
+def test_replace_of_the_last_row_is_still_refused(conn):
+    fact(conn)
+    last = fact(conn, raw_sha256=sha("b"), payload_json='{"v": 2}')
+    for verb in ("REPLACE", "INSERT OR REPLACE"):
+        with pytest.raises(sqlite3.IntegrityError):
+            _raw_insert(conn, verb=verb, fact_version_id=last, payload_json='{"v": 99}')
+    assert conn.execute("SELECT payload_json FROM knowledge_facts WHERE fact_version_id = ?",
+                        (last,)).fetchone()[0] == '{"v": 2}'
 
 
 def test_replace_cannot_rewrite_a_source_through_raw_sql(conn):
@@ -492,21 +531,242 @@ def test_database_refuses_non_text_payload_through_raw_sql(conn, bad):
     assert count(conn) == 0
 
 
+# ---- every flag goes through one check -----------------------------------------------------------
+
+_BAD_FLAGS = ["no", "False", "True", "0", "1", 2, -1, 1.0, 0.0, None, "", [], b"\x01"]
+
+
+@pytest.mark.parametrize("bad", _BAD_FLAGS)
+def test_published_proven_must_be_bool_or_int_zero_or_one(conn, bad):
+    with pytest.raises(StoreError, match="published_proven"):
+        fact(conn, published_at_utc=T0, published_proven=bad)
+    assert count(conn) == 0
+
+
+@pytest.mark.parametrize("good,basis", [(True, "PUBLISHED"), (1, "PUBLISHED"), (False, "FETCHED"), (0, "FETCHED")])
+def test_published_proven_accepts_bool_and_zero_one(conn, good, basis):
+    fid = fact(conn, published_at_utc=T0, published_proven=good, fetched_at_utc=T2)
+    assert conn.execute("SELECT known_at_basis FROM knowledge_facts WHERE fact_version_id = ?",
+                        (fid,)).fetchone()[0] == basis
+
+
+@pytest.mark.parametrize("bad", _BAD_FLAGS)
+def test_for_outside_llm_must_be_bool_or_int_zero_or_one(conn, bad):
+    fact(conn)
+    with pytest.raises(StoreError, match="for_outside_llm"):
+        facts_as_of(conn, T3, for_outside_llm=bad)
+
+
+@pytest.mark.parametrize("good", [True, 1, False, 0])
+def test_for_outside_llm_accepts_bool_and_zero_one(conn, good):
+    src(conn, "example_closed", allow_external_llm=False)
+    fact(conn)
+    fact(conn, source_id="example_closed")
+    assert len(facts_as_of(conn, T3, for_outside_llm=good)) == (1 if good else 2)
+
+
+def test_no_function_in_the_module_takes_a_flag_without_the_flag_check():
+    # every bool-like parameter of the public functions is named here; adding one without a check fails
+    flags = {"personal_use_ok", "allow_external_llm", "published_proven", "for_outside_llm"}
+    seen = set()
+    for name in ("register_source", "add_fact", "facts_as_of"):
+        for p in inspect.signature(getattr(store, name)).parameters.values():
+            if p.default is True or p.default is False or "bool" in str(p.annotation) or p.name in flags:
+                seen.add(p.name)
+    assert seen == flags
+    src_text = inspect.getsource(store)
+    for f in flags:
+        assert f'_flag({f}, "{f}")' in src_text, f
+
+
+# ---- NUL bytes and exact lengths -----------------------------------------------------------------
+
+NUL_TIME = "2026-01-02T00:00:00.000000Z"
+
+
+def test_database_refuses_nul_tricks_through_raw_sql(conn):
+    reg = ("example_ok", "https://example.invalid/t", "x", 1, 1, "GENERIC_CLIENT", 0, NUL_TIME, None)
+    sql = "INSERT INTO source_registry VALUES (?,?,?,?,?,?,?,?,?)"
+    conn.execute(sql, reg)                                   # the clean row goes in (two-way)
+    # a name that hides "finnhub" behind a NUL, with outside-model access on
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(sql, ("x\x00finnhub",) + reg[1:])
+    for i, v in [(0, "ok\x00tail"), (1, "u\x00tail"), (2, "x\x00tail"), (5, "GENERIC_CLIENT\x00"),
+                 (7, NUL_TIME + "\x00junk"), (8, "note\x00tail")]:
+        row = list(reg)
+        row[0] = "example_nul"
+        row[i] = v
+        if i == 0:
+            row[0] = v
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(sql, row)
+    assert count(conn, "source_registry") == 2              # the fixture's row and the clean row
+    _raw_insert(conn, source_id="example_ok")               # facts: clean row in
+    for col, v in [("fetched_at_utc", NUL_TIME + "\x00junk"), ("effective_from_utc", NUL_TIME + "\x00junk"),
+                   ("effective_to_utc", NUL_TIME + "\x00junk"), ("published_at_utc", NUL_TIME + "\x00junk"),
+                   ("payload_json", "{}\x00garbage"), ("entity_key", "ABC\x00x"),
+                   ("raw_sha256", sha("a")[:63] + "\x00"), ("raw_sha256", sha("a") + "\x00"),
+                   ("domain", "K2_NEWS\x00"), ("known_at_basis", "FETCHED\x00"),
+                   ("raw_sha256", sha("a").encode())]:       # the last one is a BLOB
+        over = {col: v}
+        if col == "fetched_at_utc":
+            over["known_at_utc"] = v
+        with pytest.raises(sqlite3.IntegrityError):
+            _raw_insert(conn, **over)
+    assert count(conn) == 1
+
+
+def test_database_refuses_year_zero_and_code_does_too(conn):
+    for bad in ("0000-01-01T00:00:00.000000Z",):
+        with pytest.raises(sqlite3.IntegrityError):
+            _raw_insert(conn, effective_from_utc=bad)
+        with pytest.raises(sqlite3.IntegrityError):
+            _raw_insert(conn, fetched_at_utc=bad, known_at_utc=bad)
+    with pytest.raises(StoreError):
+        fact(conn, effective_from_utc="0000-01-01T00:00:00Z")
+    with pytest.raises(StoreError):
+        facts_as_of(conn, "0000-01-01T00:00:00Z")
+    _raw_insert(conn, effective_from_utc="0001-01-01T00:00:00.000000Z")   # the first real year is fine
+    assert count(conn) == 1
+
+
+@pytest.mark.parametrize("bad", [sha("a")[:63] + "\x00", sha("a") + "\x00", "\x00" + sha("a")[1:], sha("a") + "\n"])
+def test_add_fact_refuses_nul_or_newline_tailed_sha(conn, bad):
+    with pytest.raises(StoreError, match="64 lowercase hex"):      # the code's own message, not the database's
+        fact(conn, raw_sha256=bad)
+    assert count(conn) == 0
+
+
+@pytest.mark.parametrize("field", ["entity_key"])
+def test_add_fact_refuses_nul_in_text_fields(conn, field):
+    with pytest.raises(StoreError, match=field):
+        fact(conn, **{field: "ABC\x00x"})
+    with pytest.raises(StoreError, match="payload_json"):
+        fact(conn, payload_json="{}\x00garbage")
+    assert count(conn) == 0
+
+
+# ---- register_source checks types ----------------------------------------------------------------
+
+@pytest.mark.parametrize("field", ["terms_url", "licence_tag", "source_id", "notes"])
+@pytest.mark.parametrize("bad", [5, b"x", 1.5, ["x"], True])
+def test_register_source_text_fields_must_be_str(conn, field, bad):
+    over = {field: bad}
+    over.setdefault("source_id", "example_t")
+    with pytest.raises(StoreError, match=field):
+        src(conn, **over)
+    assert count(conn, "source_registry") == 1
+
+
+def test_register_source_text_fields_refuse_empty_and_nul_and_accept_notes_none(conn):
+    for field in ("terms_url", "licence_tag"):
+        with pytest.raises(StoreError, match=field):
+            src(conn, "example_t", **{field: ""})
+        with pytest.raises(StoreError, match=field):
+            src(conn, "example_t", **{field: "a\x00b"})
+    with pytest.raises(StoreError, match="source_id"):
+        src(conn, "a\x00b")
+    with pytest.raises(StoreError, match="notes"):
+        src(conn, "example_t", notes="a\x00b")
+    src(conn, "example_t", notes=None)
+    src(conn, "example_t2", notes="plain note")
+    assert count(conn, "source_registry") == 3
+
+
+def test_terms_url_is_stored_as_given_never_cast(conn):
+    with pytest.raises(StoreError, match="terms_url"):
+        src(conn, "example_t", terms_url=5)
+    assert conn.execute("SELECT count(*) FROM source_registry WHERE source_id = 'example_t'").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan"), -1, -0.01, "1", None, True, b"1"])
+def test_register_source_cost_must_be_a_finite_real_not_below_zero(conn, bad):
+    with pytest.raises(StoreError, match="cost_usd_monthly"):
+        src(conn, "example_c", cost_usd_monthly=bad)
+    assert count(conn, "source_registry") == 1
+
+
+@pytest.mark.parametrize("good", [0, 0.0, 12.5, 3, 1e6])
+def test_register_source_cost_accepts_finite_non_negative(conn, good):
+    src(conn, "example_c", cost_usd_monthly=good)
+    assert conn.execute("SELECT cost_usd_monthly FROM source_registry WHERE source_id = 'example_c'"
+                        ).fetchone()[0] == good
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan"), -1.0])
+def test_database_refuses_bad_cost_through_raw_sql(conn, bad):
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO source_registry VALUES (?,?,?,?,?,?,?,?,?)",
+                     ("example_c", "u", "x", 1, 0, "GENERIC_CLIENT", bad, NUL_TIME, None))
+    assert count(conn, "source_registry") == 1
+
+
+# ---- schema version ------------------------------------------------------------------------------
+
+def test_new_file_gets_the_current_version_and_reopens(tmp_path):
+    path = tmp_path / "new.db"
+    c = connect(path)
+    assert c.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION >= 1
+    c.close()
+    connect(path).close()                                       # an up-to-date store opens again
+
+
+def test_old_store_without_a_version_is_refused_and_left_untouched(tmp_path):
+    path = tmp_path / "old.db"
+    raw = sqlite3.connect(path)       # what an early build made: the tables, fewer checks, no version
+    raw.executescript("CREATE TABLE source_registry (source_id TEXT PRIMARY KEY);"
+                      "CREATE TABLE knowledge_facts (fact_version_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                      " payload_json TEXT);")
+    raw.close()
+    with pytest.raises(StoreError, match="version"):
+        connect(path)
+    raw = sqlite3.connect(path)
+    names = {r[0] for r in raw.execute("SELECT name FROM sqlite_master")}
+    assert not any(n.startswith(("knowledge_facts_no", "source_registry_no")) for n in names)
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == 0
+    raw.close()
+
+
+@pytest.mark.parametrize("version", [store.SCHEMA_VERSION + 1, store.SCHEMA_VERSION + 100, 1000000])
+def test_store_with_a_different_version_is_refused(tmp_path, version):
+    path = tmp_path / "other.db"
+    connect(path).close()
+    raw = sqlite3.connect(path)
+    raw.execute(f"PRAGMA user_version = {version}")
+    raw.close()
+    with pytest.raises(StoreError, match="version"):
+        connect(path)
+
+
+def test_a_foreign_database_is_refused(tmp_path):
+    path = tmp_path / "foreign.db"
+    raw = sqlite3.connect(path)
+    raw.execute("CREATE TABLE something_else (x)")
+    raw.close()
+    with pytest.raises(StoreError, match="version"):
+        connect(path)
+
+
 # ---- one read path -------------------------------------------------------------------------------
 
-# Public callables of the package, by exact (module file, name). Adding a public function or class fails
+# Public callables of the package, by exact (module path, name). Adding a public function or class fails
 # this test on purpose: the author must then show it cannot return fact rows, and add it here.
 _ALLOWED_PUBLIC = {("store.py", n) for n in ("connect", "register_source", "add_fact", "facts_as_of", "StoreError")}
-# The only functions allowed to read the facts table.
-# (_SCHEMA is the SQL text; its one match is the duplicate-id guard, checked separately below.)
-_MAY_SELECT_FACTS = {("store.py", "facts_as_of"), ("store.py", "_latest_fact_for_key"), ("store.py", "_SCHEMA")}
+# Every place that may name the facts table, as (module path, scope, kind). `_SCHEMA` is the SQL text (its
+# own two lookups are checked separately below); the one insert is in add_fact's inner function.
+_MAY_MENTION_FACTS = {
+    ("store.py", "facts_as_of", "other"), ("store.py", "_latest_fact_for_key", "other"),
+    ("store.py", "_SCHEMA", "other"), ("store.py", "run", "insert"),
+}
 _PKG = Path(store.__file__).parent
+_MENTION = re.compile(r"knowledge_facts", re.IGNORECASE)     # catches "x", [x], `x`, main.x, main."x" alike
+_INSERT_BEFORE = re.compile(r"(?i)\binto\s+(main\s*\.\s*)?[\"'`\[]*$")
 _READS_FACTS = re.compile(r"(?i)\b(from|join)\s+knowledge_facts\b")
 
 
 def _package_files():
-    files = sorted(_PKG.glob("*.py"))
-    assert {f.name for f in files} >= {"__init__.py", "store.py"}
+    files = sorted(_PKG.rglob("*.py"))              # the whole package, subpackages included
+    assert {f.relative_to(_PKG).as_posix() for f in files} >= {"__init__.py", "store.py"}
     return files
 
 
@@ -515,7 +775,7 @@ def test_public_surface_is_exactly_the_allowed_names():
     for f in _package_files():
         for node in ast.parse(f.read_text()).body:       # module-level defs only
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not node.name.startswith("_"):
-                public.add((f.name, node.name))
+                public.add((f.relative_to(_PKG).as_posix(), node.name))
     assert public == _ALLOWED_PUBLIC
     live = {name for name, obj in vars(store).items()
             if not name.startswith("_") and getattr(obj, "__module__", None) == store.__name__
@@ -523,35 +783,40 @@ def test_public_surface_is_exactly_the_allowed_names():
     assert live == {n for _, n in _ALLOWED_PUBLIC}
 
 
-def _readers():
-    """(file, innermost function or '<module>') for every place any package file reads the facts table."""
+def _mentions():
+    """(file, innermost function or constant or '<module>', 'insert' or 'other') for every place any file of
+    the package names the facts table in any spelling."""
     found = set()
     for f in _package_files():
         text = f.read_text()
+        rel = f.relative_to(_PKG).as_posix()
         tree = ast.parse(text)
         funcs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
         consts = [n for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)]
-        for m in _READS_FACTS.finditer(text):
+        for m in _MENTION.finditer(text):
             line = text.count("\n", 0, m.start()) + 1
+            kind = "insert" if _INSERT_BEFORE.search(text[max(0, m.start() - 40):m.start()]) else "other"
             inner = [fn for fn in funcs if fn.lineno <= line <= fn.end_lineno]
             if inner:
-                found.add((f.name, min(inner, key=lambda fn: fn.end_lineno - fn.lineno).name))
-                continue
-            top = [c.targets[0].id for c in consts if c.lineno <= line <= c.end_lineno]
-            found.add((f.name, top[0] if top else "<module>"))
+                scope = min(inner, key=lambda fn: fn.end_lineno - fn.lineno).name
+            else:
+                top = [c.targets[0].id for c in consts if c.lineno <= line <= c.end_lineno]
+                scope = top[0] if top else "<module>"
+            found.add((rel, scope, kind))
     return found
 
 
-def test_the_schema_text_reads_the_facts_table_only_to_check_for_an_existing_id():
-    matches = [m.start() for m in _READS_FACTS.finditer(store._SCHEMA)]
-    assert len(matches) == 1
-    assert store._SCHEMA[matches[0] - 9:].startswith("SELECT 1 FROM knowledge_facts WHERE fact_version_id = NEW.fact_version_id")
+def test_the_schema_text_names_the_facts_table_for_reading_only_in_two_guards():
+    matches = [store._SCHEMA[m.start():m.end() + 60] for m in _READS_FACTS.finditer(store._SCHEMA)]
+    assert len(matches) == 2, matches
+    assert matches[0].startswith("FROM knowledge_facts WHERE fact_version_id = NEW.fact_version_id")
+    assert matches[1].startswith("FROM knowledge_facts)")       # the count behind the no-gaps id rule
 
 
 def test_only_facts_as_of_returns_fact_rows():
-    # (1) in every file of the package, the only code that reads the facts table is facts_as_of and one
-    # private helper that returns only an id and a hash
-    assert _readers() == _MAY_SELECT_FACTS
+    # (1) in every file of the package, in any spelling of the table name, the only code that names the facts
+    # table is facts_as_of, one private helper that returns only an id and a hash, the SQL text, and the insert
+    assert _mentions() == _MAY_MENTION_FACTS
     # (2) the private helper never selects the payload or the other columns
     helper = inspect.getsource(store._latest_fact_for_key)
     assert "SELECT fact_version_id, raw_sha256 FROM knowledge_facts" in helper and "*" not in helper
@@ -562,17 +827,30 @@ def test_only_facts_as_of_returns_fact_rows():
     assert "list[dict]" in str(inspect.signature(store.facts_as_of).return_annotation)
 
 
-def test_the_scan_catches_a_reader_hidden_in_another_module(tmp_path, monkeypatch):
+_SPELLINGS = ["FROM knowledge_facts", 'FROM "knowledge_facts"', "FROM [knowledge_facts]", "FROM `knowledge_facts`",
+              "FROM main.knowledge_facts", 'FROM main."knowledge_facts"', "FROM source_registry, knowledge_facts",
+              "FROM KNOWLEDGE_FACTS", "JOIN main.[knowledge_facts] k"]
+
+
+@pytest.mark.parametrize("where", ["sneaky.py", "sub/deep.py", "sub/more/deeper.py", "__init__.py"])
+@pytest.mark.parametrize("spelling", _SPELLINGS)
+def test_the_scan_catches_a_reader_hidden_anywhere_in_the_package(tmp_path, monkeypatch, spelling, where):
     extra = tmp_path / "pkg"
-    extra.mkdir()
+    (extra / "sub" / "more").mkdir(parents=True)
     (extra / "__init__.py").write_text("")
     (extra / "store.py").write_text(Path(store.__file__).read_text())
-    (extra / "sneaky.py").write_text('def all_rows(c):\n    return c.execute("SELECT * FROM knowledge_facts")\n')
-    monkeypatch.setattr(sys.modules[__name__], "_PKG", extra)
-    assert ("sneaky.py", "all_rows") in _readers()
-    assert _readers() != _MAY_SELECT_FACTS
-    assert ("sneaky.py", "all_rows") in {(f.name, n.name) for f in _package_files()
-                                         for n in ast.parse(f.read_text()).body if isinstance(n, ast.FunctionDef)}
+    assert _mentions_in(monkeypatch, extra) == _MAY_MENTION_FACTS          # the clean copy matches
+    target = extra / where
+    target.write_text(target.read_text() if target.exists() else "")
+    with target.open("a") as fh:
+        fh.write(f"def all_rows(c):\n    return c.execute({('SELECT * ' + spelling)!r})\n")
+    got = _mentions_in(monkeypatch, extra)
+    assert got != _MAY_MENTION_FACTS and (where, "all_rows", "other") in got
+
+
+def _mentions_in(monkeypatch, pkg):
+    monkeypatch.setattr(sys.modules[__name__], "_PKG", pkg)
+    return _mentions()
 
 
 def test_write_functions_return_no_rows(conn):

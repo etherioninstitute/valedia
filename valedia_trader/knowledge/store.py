@@ -13,6 +13,15 @@ that plain text comparison orders them correctly. The guards live in the databas
 held to the same rules, including REPLACE (a REPLACE would delete without firing a delete trigger, so a
 BEFORE INSERT trigger on each table refuses any insert whose key already exists).
 
+Ids come from SQLite only: the facts table's ids are 1, 2, 3, ... with no gaps, enforced after each insert, so
+no raw insert can skip ahead (-1, 0, a huge id) and wedge the sequence.
+
+Text is checked as bytes in the database (LIKE, GLOB, length() and json_valid() stop at a NUL byte, so a NUL
+could hide a Finnhub name, a time's tail or JSON garbage). Every text column is NUL-free.
+
+The file carries a schema version (PRAGMA user_version). `connect` creates a new empty file at the current
+version and refuses any existing file with a different one, rather than opening a store made with weaker guards.
+
 "Current version at time t" means one thing everywhere: the version with the greatest `known_at_utc` at or
 before t, ties broken by the highest `fact_version_id`. `facts_as_of` returns it, and `add_fact` skips a
 new read only when it matches the version that is current at that read's own `known_at_utc`.
@@ -23,10 +32,12 @@ means a new source_id (for example "example_public_v2"); the old row stays as th
 from __future__ import annotations
 
 import json
+import math
 import re
 import sqlite3
 from datetime import datetime, timezone
 
+SCHEMA_VERSION = 1   # kept in PRAGMA user_version
 DOMAINS = ("K1_LISTING", "K2_NEWS", "K3_CAL", "K4_VENUE", "K5_REG", "K6_TAX")
 UA_POLICIES = ("GENERIC_CLIENT", "SEC_DECLARED_CONTACT")
 
@@ -34,15 +45,25 @@ _TIME_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 # The same shape, as a database check on the stored (fixed-width) form.
 _TIME_GLOB = "'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'"
+_TIME_BYTES = 27   # len("2026-01-02T03:04:05.000000Z")
 
 
 class StoreError(ValueError):
     """A write or read was refused by the store's rules."""
 
 
+def _text_ok(col: str, nullable: bool = False) -> str:
+    """Database check: real TEXT with no NUL byte. LIKE, GLOB, length() and json_valid() all stop reading at
+    a NUL, so a NUL could hide anything behind it; looking at the value as bytes sees all of it."""
+    check = f"(typeof({col}) = 'text' AND instr(CAST({col} AS BLOB), x'00') = 0)"
+    return f"({col} IS NULL OR {check})" if nullable else check
+
+
 def _time_ok(col: str, nullable: bool = False) -> str:
-    """Database check: fixed shape, and a real date and time (a round trip through strftime must not move it)."""
-    check = (f"({col} GLOB {_TIME_GLOB} AND substr({col}, 12, 2) <= '23' AND "
+    """Database check: exact byte length, fixed shape, year 0001 or later, and a real date and time (a round
+    trip through strftime must not move it)."""
+    check = (f"({_text_ok(col)} AND length(CAST({col} AS BLOB)) = {_TIME_BYTES} AND {col} GLOB {_TIME_GLOB}"
+             f" AND substr({col}, 1, 4) >= '0001' AND substr({col}, 12, 2) <= '23' AND "
              f"strftime('%Y-%m-%dT%H:%M:%S', substr({col}, 1, 19)) IS substr({col}, 1, 19))")
     return f"({col} IS NULL OR {check})" if nullable else check
 
@@ -53,15 +74,16 @@ def _q(items: tuple[str, ...]) -> str:
 
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS source_registry (
-    source_id TEXT PRIMARY KEY CHECK (length(source_id) > 0),
-    terms_url TEXT NOT NULL CHECK (length(terms_url) > 0),
-    licence_tag TEXT NOT NULL CHECK (length(licence_tag) > 0),
+    source_id TEXT PRIMARY KEY CHECK ({_text_ok('source_id')} AND length(source_id) > 0),
+    terms_url TEXT NOT NULL CHECK ({_text_ok('terms_url')} AND length(terms_url) > 0),
+    licence_tag TEXT NOT NULL CHECK ({_text_ok('licence_tag')} AND length(licence_tag) > 0),
     personal_use_ok INTEGER NOT NULL CHECK (typeof(personal_use_ok) = 'integer' AND personal_use_ok = 1),
     allow_external_llm INTEGER NOT NULL CHECK (typeof(allow_external_llm) = 'integer' AND allow_external_llm IN (0, 1)),
-    ua_policy TEXT NOT NULL CHECK (ua_policy IN ({_q(UA_POLICIES)})),
-    cost_usd_monthly REAL NOT NULL DEFAULT 0 CHECK (cost_usd_monthly >= 0),
+    ua_policy TEXT NOT NULL CHECK ({_text_ok('ua_policy')} AND ua_policy IN ({_q(UA_POLICIES)})),
+    cost_usd_monthly REAL NOT NULL DEFAULT 0
+        CHECK (typeof(cost_usd_monthly) = 'real' AND cost_usd_monthly BETWEEN 0 AND 1.7976931348623157e308),
     terms_read_at_utc TEXT NOT NULL CHECK ({_time_ok('terms_read_at_utc')}),
-    notes TEXT,
+    notes TEXT CHECK ({_text_ok('notes', True)}),
     CHECK (NOT (lower(source_id) LIKE '%finnhub%' AND allow_external_llm = 1))
 );
 
@@ -77,17 +99,18 @@ BEGIN SELECT RAISE(ABORT, 'source_registry is append-only: that source_id exists
 
 CREATE TABLE IF NOT EXISTS knowledge_facts (
     fact_version_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    domain TEXT NOT NULL CHECK (domain IN ({_q(DOMAINS)})),
-    entity_key TEXT NOT NULL CHECK (length(entity_key) > 0),
+    domain TEXT NOT NULL CHECK ({_text_ok('domain')} AND domain IN ({_q(DOMAINS)})),
+    entity_key TEXT NOT NULL CHECK ({_text_ok('entity_key')} AND length(entity_key) > 0),
     effective_from_utc TEXT NOT NULL CHECK ({_time_ok('effective_from_utc')}),
     effective_to_utc TEXT CHECK ({_time_ok('effective_to_utc', True)}),
     published_at_utc TEXT CHECK ({_time_ok('published_at_utc', True)}),
     fetched_at_utc TEXT NOT NULL CHECK ({_time_ok('fetched_at_utc')}),
     known_at_utc TEXT NOT NULL CHECK ({_time_ok('known_at_utc')}),
-    known_at_basis TEXT NOT NULL CHECK (known_at_basis IN ('PUBLISHED', 'FETCHED')),
-    source_id TEXT NOT NULL REFERENCES source_registry(source_id),
-    raw_sha256 TEXT NOT NULL CHECK (length(raw_sha256) = 64 AND raw_sha256 NOT GLOB '*[^0-9a-f]*'),
-    payload_json TEXT NOT NULL CHECK (typeof(payload_json) = 'text' AND json_valid(payload_json)),
+    known_at_basis TEXT NOT NULL CHECK ({_text_ok('known_at_basis')} AND known_at_basis IN ('PUBLISHED', 'FETCHED')),
+    source_id TEXT NOT NULL CHECK ({_text_ok('source_id')}) REFERENCES source_registry(source_id),
+    raw_sha256 TEXT NOT NULL CHECK ({_text_ok('raw_sha256')} AND length(CAST(raw_sha256 AS BLOB)) = 64
+        AND raw_sha256 NOT GLOB '*[^0-9a-f]*'),
+    payload_json TEXT NOT NULL CHECK ({_text_ok('payload_json')} AND json_valid(payload_json)),
     CHECK (effective_to_utc IS NULL OR effective_to_utc >= effective_from_utc),
     CHECK (
         (known_at_basis = 'PUBLISHED' AND published_at_utc IS NOT NULL
@@ -98,10 +121,18 @@ CREATE TABLE IF NOT EXISTS knowledge_facts (
 
 CREATE INDEX IF NOT EXISTS knowledge_facts_lookup ON knowledge_facts (domain, entity_key, known_at_utc);
 
+-- An id that already exists is refused (this is what stops REPLACE). A BEFORE trigger sees -1 for an
+-- automatic id, which never exists, so it does not misfire.
 CREATE TRIGGER IF NOT EXISTS knowledge_facts_no_replace BEFORE INSERT ON knowledge_facts
 WHEN NEW.fact_version_id IS NOT NULL
  AND EXISTS (SELECT 1 FROM knowledge_facts WHERE fact_version_id = NEW.fact_version_id)
 BEGIN SELECT RAISE(ABORT, 'knowledge_facts is append-only: that fact_version_id exists'); END;
+
+-- Ids come from SQLite only: 1, 2, 3, ... with no gaps. After the insert the new row's real id must equal the
+-- row count, so an explicit id (-1, 0, a huge one) that would skip ahead or wedge the sequence is refused.
+CREATE TRIGGER IF NOT EXISTS knowledge_facts_ids_dense AFTER INSERT ON knowledge_facts
+WHEN NEW.fact_version_id <> (SELECT count(*) FROM knowledge_facts)
+BEGIN SELECT RAISE(ABORT, 'knowledge_facts ids are assigned by the database: no gaps, no explicit ids'); END;
 
 CREATE TRIGGER IF NOT EXISTS knowledge_facts_no_update BEFORE UPDATE ON knowledge_facts
 BEGIN SELECT RAISE(ABORT, 'knowledge_facts is append-only: no updates'); END;
@@ -114,9 +145,20 @@ def connect(path) -> sqlite3.Connection:
     """Open (and create if needed) the store at `path`. The one place connections are made."""
     conn = sqlite3.connect(str(path), isolation_level=None)  # autocommit; writes use explicit BEGIN
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA synchronous = FULL")
-    conn.executescript(_SCHEMA)
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        has_tables = conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] > 0
+        if version != SCHEMA_VERSION and (version != 0 or has_tables):
+            raise StoreError(
+                f"{path}: store schema version is {version}, this code needs {SCHEMA_VERSION}; "
+                "it was made by an older or different build and is not opened silently")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA synchronous = FULL")
+        if version == 0:   # a brand-new empty file: create everything and stamp the version in one transaction
+            conn.executescript(f"BEGIN IMMEDIATE;{_SCHEMA}PRAGMA user_version = {SCHEMA_VERSION};COMMIT;")
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -130,6 +172,23 @@ def _utc(value, name: str) -> str:
         raise StoreError(f"{name}: not a real time: {value!r}") from exc
     frac = value[20:-1] if "." in value else ""
     return parsed.strftime("%Y-%m-%dT%H:%M:%S") + "." + frac.ljust(6, "0") + "Z"
+
+
+def _text(value, name: str, *, required: bool = True) -> str | None:
+    """A text field: a str (never cast from anything else), no NUL byte, and not empty unless optional."""
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or (required and not value) or "\x00" in value:
+        raise StoreError(f"{name}: must be a non-empty str with no NUL byte, got {value!r}"
+                         if required else f"{name}: must be a str with no NUL byte, or None, got {value!r}")
+    return value
+
+
+def _cost(value, name: str) -> float:
+    """A monthly cost: an int or float (not a bool), finite, not below zero."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise StoreError(f"{name}: must be a finite number, 0 or more, got {value!r}")
+    return float(value)
 
 
 def _flag(value, name: str) -> int:
@@ -165,19 +224,22 @@ def register_source(
     notes: str | None = None,
 ) -> None:
     """Register a source. Same values again: nothing happens. Different values: refused."""
-    if not isinstance(source_id, str) or not source_id:
-        raise StoreError("source_id: required")
+    _text(source_id, "source_id")
+    _text(terms_url, "terms_url")
+    _text(licence_tag, "licence_tag")
+    _text(notes, "notes", required=False)
+    cost = _cost(cost_usd_monthly, "cost_usd_monthly")
     personal = _flag(personal_use_ok, "personal_use_ok")
     external = _flag(allow_external_llm, "allow_external_llm")
     if not personal:
         raise StoreError("personal_use_ok must be true: a source we may not use is not registered")
     if external and "finnhub" in source_id.lower():
         raise StoreError("a Finnhub source may never be allowed to reach an outside model")
-    if ua_policy not in UA_POLICIES:
+    if not isinstance(ua_policy, str) or ua_policy not in UA_POLICIES:
         raise StoreError(f"ua_policy: must be one of {UA_POLICIES}")
     row = (
         source_id, terms_url, licence_tag, 1, external, ua_policy,
-        float(cost_usd_monthly), _utc(terms_read_at_utc, "terms_read_at_utc"), notes,
+        cost, _utc(terms_read_at_utc, "terms_read_at_utc"), notes,
     )
 
     def run():
@@ -231,12 +293,13 @@ def add_fact(
     timestamp proving the fact was public then); otherwise it is the fetch time."""
     if domain not in DOMAINS:
         raise StoreError(f"domain: must be one of {DOMAINS}")
-    if not isinstance(entity_key, str) or not entity_key:
-        raise StoreError("entity_key: required")
-    if not isinstance(raw_sha256, str) or not _SHA_RE.match(raw_sha256):
+    _text(entity_key, "entity_key")
+    _text(source_id, "source_id")
+    proven = _flag(published_proven, "published_proven")
+    if not isinstance(raw_sha256, str) or not _SHA_RE.fullmatch(raw_sha256):
         raise StoreError("raw_sha256: must be 64 lowercase hex characters")
-    if not isinstance(payload_json, str):
-        raise StoreError("payload_json: must be JSON text (a str)")
+    if not isinstance(payload_json, str) or "\x00" in payload_json:
+        raise StoreError("payload_json: must be JSON text (a str with no NUL byte)")
     try:
         json.loads(payload_json)
     except ValueError as exc:
@@ -247,7 +310,7 @@ def add_fact(
     published = None if published_at_utc is None else _utc(published_at_utc, "published_at_utc")
     if eff_to is not None and eff_to < eff_from:
         raise StoreError("effective_to_utc is before effective_from_utc")
-    if published_proven:
+    if proven:
         if published is None:
             raise StoreError("published_proven needs published_at_utc")
         if published > fetched:
@@ -289,6 +352,7 @@ def facts_as_of(
     `known_at_utc` is at or before that time. With `for_outside_llm=True`, facts from sources that do not
     allow an outside model are left out. This is the only function that returns fact rows."""
     as_of = _utc(as_of_utc, "as_of_utc")
+    outside = _flag(for_outside_llm, "for_outside_llm")
     if domain is not None and domain not in DOMAINS:
         raise StoreError(f"domain: must be one of {DOMAINS}")
     sql = (
@@ -305,7 +369,7 @@ def facts_as_of(
     if entity_key is not None:
         sql += " AND f.entity_key = ?"
         args.append(entity_key)
-    if for_outside_llm:
+    if outside:
         sql += " AND s.allow_external_llm = 1"
     sql += " ORDER BY f.domain, f.entity_key, f.source_id"
     return [dict(r) for r in conn.execute(sql, args).fetchall()]
