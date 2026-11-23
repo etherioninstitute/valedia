@@ -1525,8 +1525,8 @@ def test_the_orphan_row_is_a_dead_man_fault_of_the_0725_job(conn):
     assert rl.classify({"kind": "DEADMAN", "outcome": "OK", "root_cause": None, "fault_count": 0}) is None
 
 
-def test_an_orphan_is_looked_for_only_today_in_this_book_from_1025_on_a_session_day(conn):
-    start(conn, utc(2026, 11, 20, 14, 55))                                           # Friday's hung start
+def test_an_orphan_is_looked_for_only_in_this_book_from_1025_on_a_session_day_and_not_before_the_prior_week(conn):
+    start(conn, utc(2026, 11, 13, 14, 55))                                           # a hung start from 10 days ago (T64: 7 are looked at)
     start(conn, T0655, book="another-book")
     rl.deadman(conn, BOOK, T1024)
     assert count(conn) == 2                                                          # before 10:25: nothing written
@@ -1940,3 +1940,250 @@ def test_a_still_open_start_is_looked_for_only_today_in_this_book_from_1025_on(c
     rl.deadman(conn, BOOK, T0725)
     assert [r for r in deadman_rows(conn) if "run-still-open" in (r[1] or "")] == []
     assert [r for r in deadman_rows(conn, book="another-book") if "run-still-open" in (r[1] or "")] == []   # not checked for it
+
+
+# ------------------------------------------------------------------------------------------------ waiting for an open run, prior-day orphans (T64)
+
+TUE = "2026-11-24"
+T_TUE_0725 = utc(2026, 11, 24, 15, 25)                # 10:25 New York on the Tuesday
+
+
+class Clock:
+    """A fake clock: `sleep` moves it (or not, with advance=False), logs the sleep, and may run a hook at the new time."""
+
+    def __init__(self, now, on_sleep=None, advance=True):
+        self.now, self.sleeps, self.on_sleep, self.advance = now, [], on_sleep, advance
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        if self.advance:
+            self.now += timedelta(seconds=seconds)
+        if self.on_sleep:
+            self.on_sleep(self.now)
+
+
+def fault_rows(conn, day=MON):
+    return [r for r in rl.events_for(conn, day, BOOK) if r["kind"] == "DEADMAN" and r["outcome"] == "FAULT"]
+
+
+def late_wake(conn):
+    """A run launchd fired at 7:23 (15:23 UTC); the dead-man check at 7:25 finds it open, writes the P1, and notify sends it."""
+    start(conn, utc(2026, 11, 23, 15, 23))
+    ids = rl.deadman_check(conn, BOOK, T1025)
+    assert ("MISSING", "deadman:run-still-open:0655") in deadman_rows(conn) and len(ids) == 2
+    s = FakeSender()
+    notify(conn, s, T1025)
+    assert any(t.startswith("P1 order step: run still open") for t in titles(s))
+
+
+def test_a_late_run_that_ends_while_the_dead_man_waits_gets_no_p0(conn):
+    late_wake(conn)
+    ended = []
+
+    def end_at_0727(now):
+        if now >= utc(2026, 11, 23, 15, 27) and not ended:
+            ended.append(run_end(conn, now))
+
+    clock = Clock(T1025, end_at_0727)
+    assert rl.deadman_wait(conn, BOOK, clock, clock.sleep) == []
+    assert ended and fault_rows(conn) == []
+    assert clock.now == utc(2026, 11, 23, 15, 27) and clock.sleeps == [15] * 8              # it came back as soon as the end was there
+
+
+def test_a_late_run_that_never_ends_gets_the_orphan_p0_once_when_it_is_over_ten_minutes_old_and_the_wait_returns(conn):
+    late_wake(conn)
+    clock = Clock(T1025)
+    written = rl.deadman_wait(conn, BOOK, clock, clock.sleep)
+    rows = fault_rows(conn)
+    assert [r["root_cause"] for r in rows] == ["run:orphan-start:0655"] and written == [rows[0]["event_id"]]
+    assert rows[0]["at_utc"] == "2026-11-23T15:33:15Z"                                      # first poll after the start passed 10:00
+    assert sum(clock.sleeps) == 8 * 60 + 15 and clock.now == utc(2026, 11, 23, 15, 33, 15)
+    s = FakeSender()
+    out = notify(conn, s, clock.now)
+    assert [t for t in titles(s) if t.startswith("P0")] == ["P0 order step: a run started and never ended"] and out["sent"] == 1
+    assert rl.deadman_wait(conn, BOOK, clock, clock.sleep) == [] and len(fault_rows(conn)) == 1       # nothing open now: no wait
+
+
+def test_the_wait_never_runs_longer_than_the_cap_even_when_the_clock_does_not_move(conn):
+    late_wake(conn)
+    clock = Clock(T1025, advance=False)
+    assert rl.deadman_wait(conn, BOOK, clock, clock.sleep) == []
+    assert sum(clock.sleeps) == (rl.ORPHAN_MINUTES + 1) * 60 and max(clock.sleeps) == 15 and fault_rows(conn) == []
+
+
+def test_the_wait_returns_at_once_when_nothing_is_open_and_never_sleeps(conn):
+    clock = Clock(T1025)
+    assert rl.deadman_wait(conn, BOOK, clock, clock.sleep) == [] and clock.sleeps == []
+    start(conn, T0655)
+    run_end(conn, utc(2026, 11, 23, 14, 58))
+    assert rl.deadman_wait(conn, BOOK, clock, clock.sleep) == [] and clock.sleeps == []     # a paired start is not open
+
+
+def test_the_wait_does_not_wait_before_1025_or_on_a_day_that_is_no_session(conn):
+    start(conn, T0655)
+    start(conn, utc(2026, 11, 23, 15, 20), "MANUAL")      # lead: a start still under 10 minutes old at 10:24
+    early = Clock(T1024)
+    assert rl.deadman_wait(conn, BOOK, early, early.sleep) == [] and early.sleeps == []
+    sat = Clock(utc(2026, 11, 28, 16, 0))
+    start(conn, utc(2026, 11, 28, 15, 55))
+    assert rl.deadman_wait(conn, BOOK, sat, sat.sleep) == [] and sat.sleeps == []
+
+
+def test_the_wait_polls_every_poll_s_and_clamps_the_last_sleep(conn):
+    late_wake(conn)
+    clock = Clock(T1025, advance=False)
+    rl.deadman_wait(conn, BOOK, clock, clock.sleep, poll_s=50)
+    assert clock.sleeps == [50] * 13 + [10]
+
+
+def test_cli_deadman_wait_open_runs_the_check_then_the_wait_and_prints_what_it_wrote(tmp_path, capsys):
+    cli(["record", "--kind", "RUN_START", "--trigger", "0655", "--outcome", "OK"], tmp_path, now=utc(2026, 11, 23, 15, 23), capsys=capsys)
+    slept = []
+    code = rl.main(["deadman", "--store", str(tmp_path / "cli.sqlite"), "--book", BOOK, "--wait-open"], now=T1025,
+                   stdin=io.StringIO(""), sleep=slept.append)
+    j = json.loads(capsys.readouterr().out)
+    assert code == 1 and j["recorded"] is True and len(j["event_ids"]) == 3 and j["orphans"] == ["run:orphan-start:0655"]
+    assert len(j["still_open"]) == 1 and sum(slept) == 8 * 60 + 15                           # the P1 from the check, then the P0 from the wait
+    before = len(slept)
+    code = rl.main(["deadman", "--store", str(tmp_path / "cli.sqlite"), "--book", BOOK, "--wait-open"], now=utc(2026, 11, 23, 15, 40),
+                   stdin=io.StringIO(""), sleep=slept.append)
+    assert code == 0 and json.loads(capsys.readouterr().out)["recorded"] is False and len(slept) == before     # nothing open: no wait
+
+
+def test_cli_deadman_without_wait_open_never_sleeps(tmp_path, capsys):
+    cli(["record", "--kind", "RUN_START", "--trigger", "0655", "--outcome", "OK"], tmp_path, now=utc(2026, 11, 23, 15, 23), capsys=capsys)
+    slept = []
+    rl.main(["deadman", "--store", str(tmp_path / "cli.sqlite"), "--book", BOOK], now=T1025, stdin=io.StringIO(""), sleep=slept.append)
+    capsys.readouterr()
+    assert slept == []
+
+
+def yesterdays_hung_start(conn, trigger="0655"):
+    start(conn, utc(2026, 11, 23, 14, 55), trigger)                                           # Monday: started, never ended, holds the lock
+
+
+def lock_held_tuesday(conn):
+    for trig, at in (("0655", utc(2026, 11, 24, 14, 55)), ("0710", utc(2026, 11, 24, 15, 10))):
+        start(conn, at, trig)
+        noop(conn, at + timedelta(seconds=2), trig)
+
+
+def test_yesterdays_hung_start_with_two_lock_held_noops_today_gives_the_prior_p0_and_the_days_p1(conn):
+    s = FakeSender()
+    yesterdays_hung_start(conn)
+    lock_held_tuesday(conn)
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert sorted(deadman_rows(conn, day=TUE)) == [("FAULT", "run:orphan-start-prior:20261123:0655"), ("MISSING", "deadman:no-terminal-row")]
+    out = notify(conn, s, T_TUE_0725)
+    assert sorted(o["severity"] for o in out["due"]) == ["P0", "P1"] and out["sent"] == 2
+    p0 = [x for t, x in s.sent if t.startswith("P0")]
+    assert len(p0) == 1 and "run:orphan-start-prior:20261123:0655" in p0[0]
+    assert day_streak(conn, "2026-11-23", TUE)[1][TUE]["status"] == "reset"
+    assert day_streak(conn, "2026-11-23", TUE)[1][TUE]["reason"] == "fault"
+
+
+def test_the_prior_orphan_is_written_on_today_and_never_on_the_start_day(conn):
+    yesterdays_hung_start(conn)
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert deadman_rows(conn, day=MON) == []
+    row = fault_rows(conn, TUE)[0]
+    assert (row["kind"], row["trigger"], row["outcome"]) == ("DEADMAN", "0725", "FAULT") and rl.classify(row) == "P0"
+
+
+def test_a_second_check_writes_nothing_and_neither_does_a_later_days(conn):
+    yesterdays_hung_start(conn)
+    lock_held_tuesday(conn)
+    first = rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert len(first) == 2 and rl.deadman_check(conn, BOOK, T_TUE_0725) == []
+    wed = utc(2026, 11, 25, 15, 25)                                                           # the start is 2 days old now
+    rl.deadman_check(conn, BOOK, wed)
+    assert [r for r in deadman_rows(conn, day="2026-11-25") if (r[1] or "").startswith("run:orphan-start-prior")] == []
+    assert count(conn) == 4 + 1 + 2 + 1                                                       # 1 start, 4 today, 2 prior+P1, wed's P1
+
+
+@pytest.mark.parametrize("days_ago,written", [(1, True), (6, True), (7, True), (8, False), (30, False)])
+def test_a_start_is_a_prior_orphan_only_within_the_seven_days_before_today(conn, days_ago, written):
+    at = utc(2026, 11, 24, 14, 55) - timedelta(days=days_ago)
+    start(conn, at)
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    day = at.date().strftime("%Y%m%d")
+    assert (("FAULT", f"run:orphan-start-prior:{day}:0655") in deadman_rows(conn, day=TUE)) is written
+
+
+def test_yesterdays_start_with_its_own_end_gives_nothing(conn):
+    yesterdays_hung_start(conn)
+    run_end(conn, utc(2026, 11, 23, 14, 58))
+    run_end(conn, utc(2026, 11, 23, 15, 0), trigger="0710", outcome="NOOP", root_cause="run:noop:lock-held")      # another trigger's end
+    lock_held_tuesday(conn)
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert fault_rows(conn, TUE) == []
+
+
+def test_a_prior_day_start_is_closed_only_by_an_end_on_its_own_day_and_trigger(conn):
+    yesterdays_hung_start(conn)
+    run_end(conn, utc(2026, 11, 24, 14, 58))                                                  # today's 0655 end does not close it
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert [r["root_cause"] for r in fault_rows(conn, TUE)] == ["run:orphan-start-prior:20261123:0655"]
+
+
+def test_each_prior_day_and_trigger_has_its_own_row_in_this_book_only(conn):
+    start(conn, utc(2026, 11, 20, 14, 30), "0630")
+    start(conn, utc(2026, 11, 20, 14, 55))
+    start(conn, utc(2026, 11, 23, 15, 0), "MANUAL")
+    start(conn, utc(2026, 11, 23, 14, 55), book="another-book")
+    first = rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert sorted(r["root_cause"] for r in fault_rows(conn, TUE)) == [
+        "run:orphan-start-prior:20261120:0630", "run:orphan-start-prior:20261120:0655", "run:orphan-start-prior:20261123:manual"]
+    assert len(first) == 4 and rl.deadman_check(conn, BOOK, T_TUE_0725) == []
+    assert fault_rows(conn, TUE) and deadman_rows(conn, book="another-book", day=TUE) == []
+
+
+def test_a_prior_orphan_row_in_another_book_does_not_stop_this_books_row(conn):
+    start(conn, utc(2026, 11, 20, 14, 55), book="another-book")
+    start(conn, utc(2026, 11, 20, 14, 55))
+    assert len(rl.deadman_check(conn, "another-book", T_TUE_0725)) >= 1
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert [r["root_cause"] for r in fault_rows(conn, TUE)] == ["run:orphan-start-prior:20261120:0655"]
+
+
+def test_a_prior_orphan_is_not_checked_before_1025_or_on_a_day_that_is_no_session(conn):
+    yesterdays_hung_start(conn)
+    assert rl.deadman_check(conn, BOOK, utc(2026, 11, 24, 15, 24)) == []
+    assert rl.deadman_check(conn, BOOK, utc(2026, 11, 28, 16, 0)) == []                       # a Saturday
+    assert count(conn) == 1
+
+
+def test_the_prior_orphan_p0_is_sent_once_and_retried_when_the_send_fails(conn):
+    yesterdays_hung_start(conn)
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert notify(conn, FakeSender(always=True), T_TUE_0725)["failed"] >= 1
+    s = FakeSender()
+    notify(conn, s, T_TUE_0725)
+    notify(conn, s, T_TUE_0725)
+    assert len([t for t in titles(s) if t.startswith("P0")]) == 1
+
+
+def test_a_prior_orphan_row_is_a_valid_cause_in_the_table_and_the_regex(conn):
+    for trig in rl.TRIGGERS:
+        cause = f"run:orphan-start-prior:20261123:{trig.lower()}"
+        assert add(conn, "DEADMAN", "0725", "FAULT", T_TUE_0725, root_cause=cause) > 0
+
+
+def test_the_prior_orphan_gets_its_own_wording_in_the_alert(conn):
+    yesterdays_hung_start(conn)
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    s = FakeSender()
+    notify(conn, s, T_TUE_0725)
+    title, text = s.sent[0]
+    assert title.startswith("P0") and "earlier day" in title
+    assert "run:orphan-start-prior:20261123:0655" in text and "2026-11-23" in text
+
+
+def test_the_wait_never_waits_for_a_prior_orphan(conn):
+    yesterdays_hung_start(conn)
+    clock = Clock(T_TUE_0725)
+    written = rl.deadman_wait(conn, BOOK, clock, clock.sleep)
+    assert written == [] and clock.sleeps == []                                               # only today's open start is waited for

@@ -4,7 +4,7 @@
     python -m valedia_trader.core.run_ledger record-run --store PATH --book BOOK --trigger T --exit-code N   (summary on stdin)
     python -m valedia_trader.core.run_ledger preflight  --store PATH --book BOOK --repo R --accepted-commit-file F \\
                                                         --files-file L --venv-python P [--trigger T]
-    python -m valedia_trader.core.run_ledger deadman    --store PATH --book BOOK
+    python -m valedia_trader.core.run_ledger deadman    --store PATH --book BOOK [--wait-open]
     python -m valedia_trader.core.run_ledger notify     --store PATH --book BOOK [--mac]
     python -m valedia_trader.core.run_ledger streak     --store PATH --book BOOK --since YYYY-MM-DD
 
@@ -44,6 +44,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time as _time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -66,6 +67,9 @@ HOLIDAY = "calendar:holiday"
 DEADMAN_CAUSE = "deadman:no-terminal-row"
 ORPHAN_MINUTES = 10                                                   # a RUN_START with no RUN_END after this long is an orphan
 ORPHAN_CAUSE = "run:orphan-start:"                                    # + the trigger, lower case
+PRIOR_ORPHAN_CAUSE = "run:orphan-start-prior:"                        # + <YYYYMMDD of the start>:<trigger lower case>
+PRIOR_ORPHAN_DAYS = 7                                                 # the calendar days before today that are looked back at
+WAIT_POLL_SECONDS = 15
 STILL_OPEN_CAUSE = "deadman:run-still-open:"                          # + the trigger, lower case: an open start too young to be an orphan
 NOOP_LOCK_HELD = "run:noop:lock-held"
 NOOP_OUTSIDE_WINDOW = "run:noop:outside-window"
@@ -352,6 +356,13 @@ def decide(events_today: Sequence[dict], incidents_today: Sequence[dict]) -> lis
             if e["event_id"] in shown_ids:
                 continue                                                        # this very fault was told already
             cause = cause or f"run:{str(e['outcome']).lower()}"
+            if e["kind"] == "DEADMAN" and cause.startswith(PRIOR_ORPHAN_CAUSE):
+                started = cause[len(PRIOR_ORPHAN_CAUSE):].split(":")[0]
+                started = f"{started[:4]}-{started[4:6]}-{started[6:8]}"
+                out.append(_outbound("P0", e, cause, "P0 order step: a run from an earlier day never ended",
+                                     f"{cause} on {e['trade_date']}: a run started on {started} and no run end ever followed it; "
+                                     f"its process may still be alive and hold the order step's lock"))
+                continue
             if e["kind"] == "DEADMAN":
                 out.append(_outbound("P0", e, cause, "P0 order step: a run started and never ended",
                                      f"{cause} on {e['trade_date']}: a run started and no run end followed it within "
@@ -576,6 +587,18 @@ def _has_terminal_row(conn, trade_date: str, book: str) -> bool:
         (trade_date, book)).fetchone() is not None
 
 
+def _unpaired_starts(day_events: Sequence[dict]) -> list[dict]:
+    """The RUN_START rows of one day that never got their own RUN_END, in event order. Starts and ends pair per trigger in
+    event order: each RUN_END closes the latest still-open start of its trigger before it (a NOOP end counts)."""
+    open_starts: dict[str, list[dict]] = {}
+    for e in sorted(day_events, key=lambda x: x["event_id"]):
+        if e["kind"] == "RUN_START":
+            open_starts.setdefault(e["trigger"], []).append(e)
+        elif e["kind"] == "RUN_END" and open_starts.get(e["trigger"]):
+            open_starts[e["trigger"]].pop()
+    return sorted((e for starts in open_starts.values() for e in starts), key=lambda x: x["event_id"])
+
+
 def _open_triggers(day_events: Sequence[dict], now: datetime) -> tuple[list[str], list[str]]:
     """The triggers with a RUN_START that never got its own RUN_END, as (orphans, still_open), each in the order they started.
     A start older than ORPHAN_MINUTES is an orphan; a younger one (or exactly that old) is still open: too young to say it
@@ -583,13 +606,7 @@ def _open_triggers(day_events: Sequence[dict], now: datetime) -> tuple[list[str]
     the latest still-open start of its trigger before it (a NOOP end counts). So a later run's end, even a lock-held NOOP,
     never closes an earlier hung start. A trigger with an orphan is not also listed as still open. Only today's events are given."""
     limit = stamp(now - timedelta(minutes=ORPHAN_MINUTES))                      # stamps sort as text: older is smaller
-    open_starts: dict[str, list[dict]] = {}
-    for e in sorted(day_events, key=lambda x: x["event_id"]):
-        if e["kind"] == "RUN_START":
-            open_starts.setdefault(e["trigger"], []).append(e)
-        elif e["kind"] == "RUN_END" and open_starts.get(e["trigger"]):
-            open_starts[e["trigger"]].pop()
-    left = sorted((e for starts in open_starts.values() for e in starts), key=lambda x: x["event_id"])
+    left = _unpaired_starts(day_events)
     orphans: list[str] = []
     for e in left:
         if e["at_utc"] < limit and e["trigger"] not in orphans:
@@ -609,10 +626,14 @@ def deadman_check(conn, book: str, now: datetime) -> list[int]:
     - an open run start that is not yet an orphan (ORPHAN_MINUTES old or less) writes DEADMAN/MISSING with cause
       deadman:run-still-open:<trigger> (lower case), once for each (day, trigger): a P1. It covers a run launchd fired late;
       a later check writes the orphan P0 beside it if the run is still open by then;
+    - an unpaired run start from one of the PRIOR_ORPHAN_DAYS calendar days before today (same book, paired per trigger within
+      its own trade_date) writes, on TODAY's trade_date, DEADMAN/FAULT with cause run:orphan-start-prior:<YYYYMMDD of the
+      start>:<trigger lower case>: a P0 that names a process alive since an earlier day, written once for each (start day,
+      trigger) across all later checks (the cause is looked for on any day). It resets today's streak (a fault);
     - the day's dead-man row: DEADMAN/MISSING when no run ended (a NOOP end is not a run end) and none was skipped at 6:55 or
       7:10, else DEADMAN/OK; once a day. A still-open row never stands in for it.
     The rows are separate, so all of them can be there on one day. Nothing is written before 10:25 or on a day that is not a
-    session; a check that finds all already written writes nothing. Orphan rows come first in the result, then still-open rows."""
+    session; a check that finds all already written writes nothing. Today's orphan rows come first in the result, then prior-day orphan rows, then still-open rows."""
     ny = _utc(now).astimezone(NEW_YORK)
     day = ny.date().isoformat()
     if ny.time() < DEADMAN_CUTOFF or not is_session(day):
@@ -628,6 +649,24 @@ def deadman_check(conn, book: str, now: datetime) -> list[int]:
                 written.append(_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="FAULT", now=now, trade_date=day,
                                              root_cause=cause, detail=f"the {_RUN_NAMES.get(trigger, trigger)} run started and did not end "
                                                                       f"within {ORPHAN_MINUTES} minutes"))
+        today = date.fromisoformat(day)
+        by_day: dict[str, list[dict]] = {}
+        for e in events_between(conn, book, (today - timedelta(days=PRIOR_ORPHAN_DAYS)).isoformat(),
+                                (today - timedelta(days=1)).isoformat()):
+            by_day.setdefault(e["trade_date"], []).append(e)
+        for prior_day in sorted(by_day):
+            seen: list[str] = []
+            for e in _unpaired_starts(by_day[prior_day]):
+                if e["trigger"] in seen:
+                    continue
+                seen.append(e["trigger"])
+                cause = f"{PRIOR_ORPHAN_CAUSE}{prior_day.replace('-', '')}:{e['trigger'].lower()}"
+                if conn.execute("SELECT 1 FROM run_events WHERE book = ? AND kind = 'DEADMAN' AND outcome = 'FAULT' AND root_cause = ? "
+                                "LIMIT 1", (book, cause)).fetchone() is None:
+                    written.append(_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="FAULT", now=now,
+                                                 trade_date=day, root_cause=cause,
+                                                 detail=f"the {_RUN_NAMES.get(e['trigger'], e['trigger'])} run of {prior_day} started and "
+                                                        f"never ended: its process may still hold the order step's lock"))
         have_open = [r[0] for r in conn.execute("SELECT root_cause FROM run_events WHERE trade_date = ? AND book = ? AND kind = 'DEADMAN' "
                                                 "AND outcome = 'MISSING' AND root_cause GLOB ?", (day, book, STILL_OPEN_CAUSE + "*"))]
         for trigger in still_open:
@@ -658,6 +697,40 @@ def deadman(conn, book: str, now: datetime) -> int | None:
         if outcome in ("OK", "MISSING") and not (cause or "").startswith(STILL_OPEN_CAUSE):
             return i
     return None
+
+
+def _any_open_today(conn, book: str, now: datetime) -> bool:
+    """True when it is 10:25 New York or later on a session day and one of today's run starts is unpaired and not yet an orphan."""
+    ny = _utc(now).astimezone(NEW_YORK)
+    day = ny.date().isoformat()
+    if ny.time() < DEADMAN_CUTOFF or not is_session(day):
+        return False
+    return bool(_open_triggers(events_for(conn, day, book), now)[1])
+
+
+def deadman_wait(conn, book: str, now_fn, sleep_fn, poll_s: float = WAIT_POLL_SECONDS) -> list[int]:
+    """Call this after `deadman_check` has written, and notify has sent, the still-open P1. While one of today's run starts is
+    still open and at most ORPHAN_MINUTES old, `sleep_fn(poll_s)` and run `deadman_check` again; return the ids written (the
+    orphan P0, normally) as soon as every start is paired or is an orphan. A run that hangs thus gets its P0 from this very
+    process. Nothing open (or before 10:25, or on a day that is no session): it returns at once, never sleeping. A prior-day
+    orphan is written by `deadman_check` itself, so it is never waited for.
+
+    The wait is capped at ORPHAN_MINUTES + 1 minutes in all, by the sum of the sleeps and by `now_fn`, whichever comes first;
+    the last sleep is shortened to fit. `now_fn() -> datetime` and `sleep_fn(seconds)` are injected, so a test never really
+    sleeps. After the cap it returns whatever was written, even if a start is still open."""
+    cap = (ORPHAN_MINUTES + 1) * 60
+    began = now_fn()
+    slept = 0.0
+    written: list[int] = []
+    while _any_open_today(conn, book, now_fn()):
+        waited = max(slept, (now_fn() - began).total_seconds())
+        if waited >= cap:
+            break
+        step = min(poll_s, cap - waited)
+        sleep_fn(step)
+        slept += step
+        written += deadman_check(conn, book, now_fn())
+    return written
 
 
 # ------------------------------------------------------------------------------------------------ the order step's summary
@@ -777,7 +850,9 @@ def _parser() -> argparse.ArgumentParser:
     c.add_argument("--files-file", required=True)
     c.add_argument("--venv-python", required=True)
     c.add_argument("--trigger", default="0630", choices=TRIGGERS)
-    command("deadman", "write the day's dead-man row when it is due")
+    c = command("deadman", "write the day's dead-man row when it is due")
+    c.add_argument("--wait-open", action="store_true",
+                   help="then wait (at most ORPHAN_MINUTES + 1 minutes) for a still-open run to end or become an orphan")
     c = command("notify", "decide what the owner is owed, send it, write it down")
     c.add_argument("--mac", action="store_true", help="send through macOS notifications (without it nothing is sent or written)")
     c = command("streak", "print the clean-week streak")
@@ -785,7 +860,7 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
-def _run(args, now: datetime, stdin, sender) -> int:
+def _run(args, now: datetime, stdin, sender, now_fn=None, sleep_fn=None) -> int:
     conn = connect(args.store)
     try:
         if args.cmd == "record":
@@ -807,6 +882,8 @@ def _run(args, now: datetime, stdin, sender) -> int:
             return 1 if _needs_owner(conn, i) else 0
         if args.cmd == "deadman":
             ids = deadman_check(conn, args.book, now)
+            if args.wait_open:
+                ids += deadman_wait(conn, args.book, now_fn or (lambda: now), sleep_fn or _time.sleep)
             if not ids:
                 _print({"recorded": False})
                 return 0
@@ -837,14 +914,28 @@ def _run(args, now: datetime, stdin, sender) -> int:
         conn.close()
 
 
-def main(argv: Sequence[str] | None = None, *, now: datetime | None = None, stdin=None, sender=None) -> int:
-    """The command line. 0: nothing needs the owner. 1: an alert was raised or is due. 2: the command itself failed."""
+def main(argv: Sequence[str] | None = None, *, now: datetime | None = None, stdin=None, sender=None, sleep=None) -> int:
+    """The command line. 0: nothing needs the owner. 1: an alert was raised or is due. 2: the command itself failed.
+    `now` fixes the time for a test; the clock of `deadman --wait-open` is then a virtual one that moves forward by each
+    sleep (and `sleep` is called too, to watch it), so a test never really sleeps. Without `now` the clock and sleep are real."""
     try:
         args = _parser().parse_args(list(sys.argv[1:] if argv is None else argv))
     except SystemExit as stop:
         return int(stop.code or 0) if isinstance(stop.code, int) else 2
     try:
-        return _run(args, now if now is not None else datetime.now(timezone.utc), stdin if stdin is not None else sys.stdin, sender)
+        if now is None:
+            now_fn, sleep_fn = (lambda: datetime.now(timezone.utc)), (sleep or _time.sleep)
+        else:
+            virtual = [now]
+
+            def now_fn():
+                return virtual[0]
+
+            def sleep_fn(seconds):
+                virtual[0] += timedelta(seconds=seconds)
+                if sleep is not None:
+                    sleep(seconds)
+        return _run(args, now_fn(), stdin if stdin is not None else sys.stdin, sender, now_fn, sleep_fn)
     except Exception as exc:                                                     # the command failed: say so, no traceback
         print(f"error: {clean(f'{type(exc).__name__}: {exc}', 300)}", file=sys.stderr)
         return 2
