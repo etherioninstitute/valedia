@@ -511,9 +511,12 @@ Queued (roadmap):
   Before order #1: fault/order-type counting, recorded-answer rehearsals (partial, EXPIRED, cancel 'not yet', sale) + 5
   clean sessions, the T+1 settled-cash guard (buys and the sell cap min(book settled qty, account sellable qty)), EXPIRED
   not a reconcile fault. Later (stake ladder): halving keyed by (order_id, anomaly), Carver's live buffer.
-  QUEUED, live path, in order: (1) a 6:30 AM PST zero-network pre-flight of the order-path revision, an alert on a
-  skipped run, and an out-of-band dead-man job 15 min after the 2nd trigger on open days (no outcome dated today ->
-  alert); (2) the order step's own entry point so cli.py's imports of desk/panel/research leave the pinned list (full
+  DONE 2026-11-23 T57 run ledger + alert policy merged cd5b0b3 (312 tests; 2 blind checks, 1 FAIL -> repaired:
+  REPLACE on incidents/attempts). `valedia_trader/core/run_ledger.py`: run_events / alert_incidents / send_attempts
+  append-only; decide() P0-P3; streak(); preflight(); deadman(); CLI. WIRING STAGED, NOT LIVE (owner's yes needed:
+  new launchd job): valedia-deploy/staged-t57/ (ledger-lib.zsh, alerts-morning.sh 6:30 pre-flight + 7:25 dead-man,
+  wrapper records every skip/run and notifies). Rehearsed on a throwaway ledger: pre-flight OK at 8fb509f.
+  QUEUED, live path, in order: (1) install the T57 wiring; (2) the order step's own entry point so cli.py's imports of desk/panel/research leave the pinned list (full
   blind check); (3) the 'before order #1' gate items. CHECK: cancel_all_open cancels only Valedia's own ids.
   OWNER: replace roadmap 4.2's organic sightings (partial fill, cancel 'not yet') with recorded-answer rehearsals?
   OWNER: keep his hand trades out of the 15 fund symbols? Not adopted: caffeinate (sleep already 0); 'no market orders'
@@ -787,7 +790,9 @@ Finnhub-derived sent to an outside model. Order: after the live path (priority 1
   10k facts; quick=True for quick_check) and the exact schema multiset. Seven blind checks (6 FAIL -> repaired).
   Known limits in the module docstring (text-only read-path scan; invalid UTF-8 storable by raw SQL but reads
   raise StoreError; temp objects and raw writable_schema between opens). Real store path: decided with K-3.
-- **NEXT** K-3 (calendars/closures) and K-4 (venue rules) tickets on top of K-7. K-3's write helper carries the
+- **IN PROGRESS** T58 K-3 (cand/t58-k3-calendar 900bb77, 224 + 1110 tests; blind check 1 PASS with notes -> 4 fixes;
+  re-check running). T59 K-4 ticket written (.foreman/tickets/T59-K4-venue-rules.md), dispatch after K-3 merges.
+  Was: K-3 (calendars/closures) and K-4 (venue rules) tickets on top of K-7. K-3's write helper carries the
   date-only rule (end of the date in the source's own zone) and each source's zone in the registry.
 
 ## 6. Analytics and decisions
