@@ -434,6 +434,14 @@ Queued (roadmap):
   run_end, universe, alignment and sealed_fraction (INSERT-only); legacy rows are rebuilt from spec plus the price
   store as of recorded_at and must reproduce n_obs exactly, else HOLD_FOR_OWNER_AUDIT; sealed_fraction joins the
   run signature.
+  Round 22: SEAL BLEED confirmed (gauntlet.py:490 recomputes the cut from len(prices) every run, so new bars pull
+  earlier sealed bars into development). Fix for Epoch >= 1: development ends <= 2024-12-31 (sealed = 2025+), and
+  write_prediction locks each hypothesis's sealed_start (develop refuses a different one). Epoch-0 legacy rows: a
+  shifted window counts +1 in K always and +1 in r_true up to the pass; POST_PASS_REVERIFY +0. n_obs witness may
+  try prev_session once, never earlier. Owner's SQL/Rust notes: SQLite + Parquet + DuckDB already the pattern;
+  a doctor check prints each DB's journal/sync/busy settings, no order-path pragma change before go-live; Rust
+  (PyO3) only for a hot loop > 60 s replay or > 5 ms per tick, with a parity test (Kalshi queue simulator first,
+  after 12-03).
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
