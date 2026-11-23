@@ -479,6 +479,12 @@ Queued (roadmap):
   every decision is ok, at most 1 a minute, each done by second 20, with a heartbeat in the last 3 min; one read-only
   read a minute; any error holds. Past day: idle 27% of the time (mostly evenings and nights). Restarted 12:49 AM
   under the guard, holding while busy; its first idle-time sending is not yet observed.
+  1:06 AM: the guard stopped the HELD pull (it had sent nothing for 17 min) on the collector's own model blip (tag
+  check timed out, 3 model_unavailable, ok again at 1:07). Guard (lead scratch) now takes --sent-mark: the pull
+  touches ~/valedia-data/kalshi/kalshi_pull.sent per request (commit 176a1ac); a fault with no send in the 120 s
+  before it is ignored, any fault after a send counts, strict restarts on resuming after >= 300 s held; two-way
+  checked incl. the real 1:06 replay. Restarted 1:21 AM. Carbon: reply 25 addendum sent (busy-collector stop, the
+  gate, the question of a randomized on/off load test after 12-03).
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
