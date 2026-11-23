@@ -16,6 +16,9 @@ import pytest
 
 _NO_SECRETS_DIR = Path(tempfile.mkdtemp(prefix="valedia-no-secrets-"))
 os.environ["VALEDIA_ENV_FILE"] = str(_NO_SECRETS_DIR / "trading.env")      # never created
+# No test reads the real Hermes profiles or runs the real LM Studio CLI (the placement guard does both).
+os.environ["HERMES_HOME"] = str(_NO_SECRETS_DIR / "hermes-home")          # never created
+os.environ["VALEDIA_LMS"] = str(_NO_SECRETS_DIR / "no-lms")               # never created
 
 from valedia_trader.core import secrets  # noqa: E402
 
