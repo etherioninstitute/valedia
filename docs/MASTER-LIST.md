@@ -522,6 +522,10 @@ Queued (roadmap):
   (not terminal, not in streak, P3; with faults P0 + reset); calendar load/answer errors = FAULT; RUN_START > 20 min with
   no paired RUN_END = DEADMAN/FAULT run:orphan-start:<trigger> P0 (ends pair with their own start). Schema v2. Known
   limit (CLOSED by T61): a hung 7:10 start was only 15 min old at 7:25. Gate still open at 8fb509f.
+  T62 MERGED 2026-11-23 (K-3, blind PASS WITH NOTES + lead fix): closure_votes counts authority GROUPS (FINNHUB,
+  US_PRESIDENT, XNYS_CALENDAR; sources_closed for the log); closing-agency orders never vote (closing_order_dates log
+  only; 16 real FR titles checked); void words + no/never/decline/withdraw/rescind/cancel, 'in the State of', 'in <year>'.
+  Known: a sentence that is both a closing title and a mourning form votes (by design).
   T61 MERGED 2026-11-23 (035b118, blind PASS WITH NOTES): ORPHAN_MINUTES 10; an unpaired start <= 10 min old at the
   dead-man = DEADMAN/MISSING deadman:run-still-open:<trigger> P1 (resets the streak; no later check runs that day).
   QUEUED, live path, in order: (1) check the first live morning; (2) the order step's own entry point so cli.py's imports of desk/panel/research leave the pinned list (full
