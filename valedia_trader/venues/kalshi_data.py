@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
-__all__ = ["BASE_URL", "HttpError", "KalshiDataError", "Pacer", "urllib_get", "normalize_market", "normalize_candle",
+__all__ = ["BASE_URL", "HttpError", "KalshiDataError", "Pacer", "PhasePacer", "quiet_pacer", "urllib_get", "normalize_market", "normalize_candle",
            "KalshiData", "normalize_levels", "best_quote", "normalize_trade", "iso_to_ts"]
 
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
@@ -63,6 +63,47 @@ class Pacer:
             if gap < self.spacing:
                 self.sleep(self.spacing - gap)
         self.last = self.clock()
+
+
+class PhasePacer:
+    """A `Pacer` that also stays inside a quiet part of each wall-clock minute.
+
+    Another process on this machine reads the same Kalshi host every minute and needs its part of the minute
+    (its reads and decisions run early, in busy hours to about second 40 and now and then 52). A study pull that
+    sends requests only while the wall clock's second-of-minute is in `window` (default 42 up to but not
+    including 57) keeps clear of it, and `spacing` (at least 1 s) keeps the rate to one request a second at most.
+    `wait()` returns only at a moment that is both far enough after the last start and inside the window, even
+    if a sleep runs long, and it records that moment as the start."""
+    _EPS = 1e-3     # past the edge, so float rounding cannot land a sleep just short of the window and spin
+
+    def __init__(self, spacing: float = 1.0, window: tuple[float, float] = (42.0, 57.0),
+                 sleep: Callable[[float], Any] = time.sleep, clock: Callable[[], float] = time.monotonic,
+                 wall: Callable[[], float] = time.time):
+        lo, hi = window
+        if not 0 <= lo < hi <= 60:
+            raise ValueError("window must satisfy 0 <= lo < hi <= 60, got %r" % (window,))
+        if not spacing >= 1.0:                     # also refuses NaN
+            raise ValueError("spacing must be at least 1.0 s, got %r" % (spacing,))
+        self.spacing, self.window, self.sleep, self.clock, self.wall = spacing, (lo, hi), sleep, clock, wall
+        self.last: float | None = None
+
+    def wait(self) -> None:
+        lo, hi = self.window
+        if self.last is not None:
+            gap = self.clock() - self.last
+            if gap < self.spacing:
+                self.sleep(self.spacing - gap)
+        while True:
+            phase = self.wall() % 60.0
+            if lo <= phase < hi:
+                break
+            self.sleep((lo - phase if phase < lo else 60.0 - phase + lo) + self._EPS)
+        self.last = self.clock()
+
+
+def quiet_pacer(window: tuple[float, float] = (42.0, 57.0)) -> PhasePacer:
+    """A `PhasePacer` at one request a second inside `window` of each wall-clock minute."""
+    return PhasePacer(1.0, window)
 
 
 def urllib_get(url: str, timeout: float = 60.0) -> bytes:
@@ -154,9 +195,10 @@ class KalshiData:
     """Read-only client. `fetch(url) -> bytes` is the transport (urllib by default; a fake in tests)."""
 
     def __init__(self, fetch: Callable[[str], bytes] = urllib_get, *, base_url: str = BASE_URL, max_per_second: float = 3.0,
-                 tries: int = 5, sleep: Callable[[float], Any] = time.sleep, clock: Callable[[], float] = time.monotonic):
+                 tries: int = 5, sleep: Callable[[float], Any] = time.sleep, clock: Callable[[], float] = time.monotonic,
+                 pacer: Any = None):
         self.fetch, self.base_url, self.tries, self.sleep = fetch, base_url.rstrip("/"), tries, sleep
-        self.pacer = Pacer(1.0 / max_per_second + 0.01, sleep, clock)    # a hair over 1/3 s: never 4 in a second
+        self.pacer = pacer if pacer is not None else Pacer(1.0 / max_per_second + 0.01, sleep, clock)    # a hair over 1/3 s: never 4 in a second
         self.last_date: str | None = None     # the Date header of the latest answer, when the transport hands it back
 
     def get_json(self, path: str, params: dict | None = None) -> dict:

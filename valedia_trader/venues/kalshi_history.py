@@ -74,9 +74,10 @@ class HistoryClient:
 
     def __init__(self, fetch: Callable[[str], bytes] = kd.urllib_get, *, base_url: str = kd.BASE_URL,
                  max_per_second: float = 5.0, tries: int = 4, sleep: Callable[[float], Any] = time.sleep,
-                 clock: Callable[[], float] = time.monotonic, max_requests: int | None = None):
+                 clock: Callable[[], float] = time.monotonic, max_requests: int | None = None,
+                 pacer: Any = None):
         self.fetch, self.base_url, self.tries, self.sleep = fetch, base_url.rstrip("/"), tries, sleep
-        self.pacer = kd.Pacer(1.0 / max_per_second + 0.001, sleep, clock)
+        self.pacer = pacer if pacer is not None else kd.Pacer(1.0 / max_per_second + 0.001, sleep, clock)
         self.max_requests, self.requests = max_requests, 0
 
     def get_json(self, path: str, params: dict | None = None) -> dict:
