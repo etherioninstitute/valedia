@@ -518,6 +518,10 @@ Queued (roadmap):
   ~/Library/Logs/valedia-orderstep-alerts.log); valedia-deploy/ledger-lib.zsh + alerts-morning.sh; the wrapper records
   every skip/run and notifies (backup orderstep-paper.sh.bak-20261123). Ledger ~/valedia-data/run-ledger/. First live
   morning Tue 11-24: CHECK the alerts log and the ledger. Rehearsed on a throwaway ledger: pre-flight OK at 8fb509f.
+  T60 MERGED 2026-11-23 (08d6439, blind PASS WITH NOTES + lead fixes): session stops lock-held / outside-window = NOOP
+  (not terminal, not in streak, P3; with faults P0 + reset); calendar load/answer errors = FAULT; RUN_START > 20 min with
+  no paired RUN_END = DEADMAN/FAULT run:orphan-start:<trigger> P0 (ends pair with their own start). Schema v2. Known
+  limit: a hung 7:10 start is only 15 min old at 7:25, caught by the P1 only. Gate still open at 8fb509f.
   QUEUED, live path, in order: (1) check the first live morning; (2) the order step's own entry point so cli.py's imports of desk/panel/research leave the pinned list (full
   blind check); (3) the 'before order #1' gate items. CHECK: cancel_all_open cancels only Valedia's own ids.
   OWNER: replace roadmap 4.2's organic sightings (partial fill, cancel 'not yet') with recorded-answer rehearsals?
@@ -569,7 +573,7 @@ Queued (roadmap):
   (sudden closures need Finnhub + exchange notice), Nasdaq out, Finnhub deletion clause. Qs: off-box dead-man; 6:20
   row key + dead-man owns P1; third closure authority page; Cand C stage-1 floor margin; Finnhub expiry vs rebuildable.
   Round 31 (Carbon response 30, reply 31 sent 2026-11-23): lock-held/outside-window session stops = NOOP, not terminal,
-  + orphan RUN_START > 20 min = P0 (T60 building); Cand C null ask bars carry forward last non-null close (all-null
+  + orphan RUN_START > 20 min = P0 (T60 merged); Cand C null ask bars carry forward last non-null close (all-null
   window passes); G_posted >= 50 at 1.00x, Guards 1-2 on stage-1 hourly candles; phone dead-man via iCloud receipt +
   Shortcut (owner sets up), mini layer needs owner yes; 6:20 closure row adopted, dead-man owns P1; no nyse/cboe/
   nasdaqtrader scrapers; WH Presidential Actions RSS verified (same-day pubDate, public domain) = K-3 authority, FR+WH
