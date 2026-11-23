@@ -729,9 +729,9 @@ Finnhub-derived sent to an outside model. Order: after the live path (priority 1
 - **QUEUED** K-1 listings: every US-listed stock and fund, plus new listings, delistings, symbol changes, splits
   and halts. Candidate free sources: the exchanges' published symbol directories and SEC's ticker file. OWNER:
   SEC's fair-access policy asks automated clients to name a contact in the User-Agent, which conflicts with our
-  generic-name rule. OWNER YES 2026-11-23: his name may be the contact for SEC requests only. Still OPEN: SEC's
-  example asks for a name AND an email; whether his email may be included is his to say. Every other site keeps
-  the generic name.
+  generic-name rule. OWNER YES 2026-11-23: his name AND email are the contact for SEC requests only. The values
+  stay OUT of this repo (public mirror): code reads them from a private file outside the repo. Every other site
+  keeps the generic name.
 - **QUEUED** K-2 financial news: company news inside the Finnhub plan (kept local), company filings (8-K and
   similar), the official release calendars (Fed, BLS, BEA, Treasury), and exchange notices. Tagged by symbol and
   event, so the learning loop can ask what was known at a given time.
