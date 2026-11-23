@@ -113,6 +113,11 @@ def test_sources_have_the_listed_fields_and_roles():
     assert k3.SOURCES[FR]["licence_tag"] == "US-PUBLIC-DOMAIN" and k3.SOURCES[FR]["time_zone"] == "America/New_York"
     for sid in (H, S):
         assert k3.SOURCES[sid]["allow_external_llm"] == 0
+        assert k3.SOURCES[sid]["licence_tag"] == "FINNHUB-PERSONAL-TOS"
+        assert k3.SOURCES[sid]["notes"] == ("terms: personal use only; no sharing with third parties; all data must be "
+                                            "deleted if the subscription ends; 30 calls/s cap")
+    assert k3.SOURCES[FR]["terms_url"] == \
+        "https://www.federalregister.gov/reader-aids/using-federalregister-gov/developer-resources"
     assert k3.SOURCES[FR]["allow_external_llm"] == 1 and k3.SOURCES[X]["allow_external_llm"] == 1
 
 
@@ -130,6 +135,8 @@ def test_register_all_registers_only_the_named_sources(conn):
     assert ids == {H, X}
     row = conn.execute("SELECT * FROM source_registry WHERE source_id = ?", (H,)).fetchone()
     assert row["allow_external_llm"] == 0 and row["ua_policy"] == "GENERIC_CLIENT" and row["personal_use_ok"] == 1
+    assert "personal use only; no sharing with third parties" in row["notes"] and "30 calls/s cap" in row["notes"]
+    assert row["licence_tag"] == "FINNHUB-PERSONAL-TOS"
     assert row["cost_usd_monthly"] == 0 and row["terms_read_at_utc"] == "2026-01-01T00:00:00.000000Z"
     k3.register_all(conn, T0, only=[H, X])                        # same values again: nothing happens
     k3.register_all(conn, T0, only=[FR])
@@ -922,6 +929,107 @@ def test_the_token_is_never_in_a_url_header_of_other_sources_or_a_stored_payload
             assert all(TOKEN not in v for h, v in headers.items() if h != "X-Finnhub-Token")
     rows = facts_as_of(conn, "2027-01-01T00:00:00Z")
     assert rows and not any(TOKEN in json.dumps(dict(r)) for r in rows)
+
+
+# ---- removed holidays (tombstones)
+
+def refresh_h(conn, body, now):
+    return k3.refresh(conn, H, http_get=Fake({H_URL: body}), now=now, credentials=creds)
+
+
+def closure_payload(conn, day, as_of="2099-01-01T00:00:00Z"):
+    rows = [r for r in facts_as_of(conn, as_of, domain="K3_CAL")
+            if r["source_id"] == H and r["entity_key"] == f"XNYS:CLOSURE:{day}"]
+    return json.loads(rows[0]["payload_json"]) if rows else None
+
+
+T_A = datetime(2026, 11, 23, 20, 0, tzinfo=timezone.utc)
+T_B = datetime(2026, 11, 24, 10, 0, tzinfo=timezone.utc)
+T_C = datetime(2026, 11, 24, 16, 0, tzinfo=timezone.utc)
+ANCHOR = ("Anchor Day", "2026-11-10", "")            # an earlier date, so that D falls inside the listed range
+LIST_1 = holiday_body(ANCHOR, ("Surprise Closure", D, ""), ("Thanksgiving Day", "2026-11-26", ""),
+                      ("Christmas Day", "2026-12-25", ""))
+LIST_NO_D = holiday_body(ANCHOR, ("Thanksgiving Day", "2026-11-26", ""), ("Christmas Day", "2026-12-25", ""))
+TOMBSTONE = {"closed": False, "removed": True, "trading_hours": None, "name": "Surprise Closure"}
+
+
+def test_a_date_removed_inside_the_listed_range_gets_a_tombstone_and_stops_voting(conn):
+    seed(conn)
+    assert refresh_h(conn, LIST_1, T_A) == {"stored": 4, "unchanged": 0, "error": 0}
+    assert votes(conn, as_of="2026-11-24T09:00:00Z")["authorities_closed"] == [H]
+    assert refresh_h(conn, LIST_NO_D, T_B) == {"stored": 1, "unchanged": 3, "error": 0}
+    assert closure_payload(conn, D) == TOMBSTONE
+    assert votes(conn, as_of="2026-11-24T11:00:00Z")["authorities_closed"] == []          # the source no longer counts
+    assert votes(conn, as_of="2026-11-24T09:00:00Z")["authorities_closed"] == [H]          # and the past is unchanged
+    assert closure_payload(conn, D, as_of="2026-11-24T09:00:00Z")["closed"] is True
+
+
+def test_a_tombstone_is_stored_once(conn):
+    seed(conn)
+    refresh_h(conn, LIST_1, T_A)
+    refresh_h(conn, LIST_NO_D, T_B)
+    assert refresh_h(conn, LIST_NO_D, T_C) == {"stored": 0, "unchanged": 3, "error": 0}
+
+
+def test_a_date_that_only_rolled_off_the_edge_of_the_list_is_not_a_removal(conn):
+    seed(conn)
+    refresh_h(conn, LIST_1, T_A)
+    front = holiday_body(("Christmas Day", "2026-12-25", ""), ("New Year's Day", "2027-01-01", ""))
+    refresh_h(conn, front, T_B)                    # D and Nov 26 are before the new list's first date
+    assert closure_payload(conn, D)["closed"] is True and "removed" not in closure_payload(conn, D)
+    assert closure_payload(conn, "2026-11-26")["closed"] is True
+    back = holiday_body(("Surprise Closure", D, ""), ("Thanksgiving Day", "2026-11-26", ""))
+    refresh_h(conn, back, T_C)                     # Dec 25 is after the new list's last date
+    assert closure_payload(conn, "2026-12-25")["closed"] is True and "removed" not in closure_payload(conn, "2026-12-25")
+
+
+def test_the_range_edges_themselves_are_inside_the_range(conn):
+    seed(conn)
+    refresh_h(conn, LIST_1, T_A)
+    inner = holiday_body(("Surprise Closure", D, ""), ("Christmas Day", "2026-12-25", ""))   # Nov 26 is between: removed
+    refresh_h(conn, inner, T_B)
+    assert closure_payload(conn, "2026-11-26") == {"closed": False, "removed": True, "trading_hours": None,
+                                                   "name": "Thanksgiving Day"}
+    assert closure_payload(conn, D)["closed"] is True and closure_payload(conn, "2026-12-25")["closed"] is True
+
+
+def test_a_re_added_date_is_closed_again(conn):
+    seed(conn)
+    refresh_h(conn, LIST_1, T_A)
+    refresh_h(conn, LIST_NO_D, T_B)
+    assert refresh_h(conn, LIST_1, T_C) == {"stored": 1, "unchanged": 3, "error": 0}
+    assert closure_payload(conn, D) == {"closed": True, "trading_hours": "", "name": "Surprise Closure"}
+    assert votes(conn, as_of="2026-11-24T17:00:00Z")["authorities_closed"] == [H]
+
+
+def test_an_empty_list_removes_nothing(conn):
+    seed(conn)
+    refresh_h(conn, LIST_1, T_A)
+    assert refresh_h(conn, holiday_body(), T_B) == {"stored": 0, "unchanged": 0, "error": 0}
+    assert closure_payload(conn, D)["closed"] is True
+
+
+def test_a_removed_half_day_is_also_marked_removed(conn):
+    seed(conn)
+    refresh_h(conn, holiday_body(("Half", "2026-11-27", "09:30-13:00"), ("A", "2026-11-26", ""), ("B", "2026-12-25", "")), T_A)
+    refresh_h(conn, holiday_body(("A", "2026-11-26", ""), ("B", "2026-12-25", "")), T_B)
+    assert closure_payload(conn, "2026-11-27")["removed"] is True
+
+
+def test_a_refused_body_adds_no_tombstones(conn):
+    seed(conn)
+    refresh_h(conn, LIST_1, T_A)
+    bad = holiday_body(("Thanksgiving Day", "2026-11-26", ""), ("x", "nope", ""))
+    assert refresh_h(conn, bad, T_B)["error"] == 1
+    assert closure_payload(conn, D)["closed"] is True
+
+
+def test_only_the_holiday_source_gets_tombstones(conn):
+    seed(conn)
+    seed_status(conn, holiday="Surprise Closure", t=unix(2026, 11, 24, 13, 0), fetched="2026-11-24T13:30:00.000000Z")
+    seed_fr(conn, closing_doc("2026-1", "November 24, 2026", "2026-11-21"))
+    k3.refresh(conn, FR, http_get=Fake({FR_URL: fr_body()}), now=T_C)          # an empty FR answer removes nothing
+    assert votes(conn, as_of="2026-11-24T17:00:00Z")["authorities_closed"] == sorted([FR, S])
 
 
 # ---- the command line

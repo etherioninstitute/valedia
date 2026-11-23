@@ -1838,6 +1838,14 @@ def test_the_module_docstring_states_its_limits():
 # Public callables of the package, by exact (module path, name). Adding a public function or class fails
 # this test on purpose: the author must then show it cannot return fact rows, and add it here.
 _ALLOWED_PUBLIC = {("store.py", n) for n in ("connect", "register_source", "add_fact", "facts_as_of", "StoreError")}
+# The K-3 calendar feed's public names. None of them returns rows of the facts table: `schedule_facts` and the three
+# `parse_*` functions build fact dicts from a library or a response body, to be handed to `add_fact`; `fr_closure_dates`
+# and `date_only_known_at` work on text; `fetch` returns the same built dicts; `refresh` returns counts; `register_all`
+# returns nothing; `closure_votes` returns a small summary dict, and gets every fact through `facts_as_of`, the only
+# reader. The scan below still checks that this module never names the facts table.
+_ALLOWED_PUBLIC |= {("k3_calendar.py", n) for n in (
+    "K3Error", "register_all", "schedule_facts", "date_only_known_at", "parse_finnhub_holiday", "parse_finnhub_status",
+    "parse_federal_register", "fr_closure_dates", "fetch", "refresh", "closure_votes")}
 # Every place that may name the facts table, as (module path, scope, kind). `_SCHEMA` is the SQL text (its
 # own two lookups are checked separately below); the one insert is in add_fact's inner function.
 _MAY_MENTION_FACTS = {
@@ -1867,7 +1875,59 @@ def test_public_surface_is_exactly_the_allowed_names():
     live = {name for name, obj in vars(store).items()
             if not name.startswith("_") and getattr(obj, "__module__", None) == store.__name__
             and (inspect.isfunction(obj) or inspect.isclass(obj))}
-    assert live == {n for _, n in _ALLOWED_PUBLIC}
+    assert live == {n for f, n in _ALLOWED_PUBLIC if f == "store.py"}
+
+
+def _alias_bindings(files):
+    """(file, name) for every public module-level name bound by assignment to a function, class or lambda defined in
+    the same module (`fetch = _fetch`), or put into the module's globals by subscript. The public-surface test reads
+    only `def` and `class` statements, so such a binding would hide a public function from it."""
+    found = set()
+    for f in files:
+        tree = ast.parse(f.read_text())
+        defined = {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+        for node in tree.body:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            value = node.value
+            hides = isinstance(value, ast.Lambda) or (isinstance(value, ast.Name) and value.id in defined)
+            for t in targets:
+                if isinstance(t, ast.Name) and hides and not t.id.startswith("_"):
+                    found.add((f.relative_to(_PKG).as_posix(), t.id))
+                if (isinstance(t, ast.Subscript) and isinstance(t.value, ast.Call)
+                        and getattr(t.value.func, "id", "") in ("globals", "vars")):
+                    found.add((f.relative_to(_PKG).as_posix(), "<globals>"))
+    return found
+
+
+def test_no_module_binds_a_public_name_by_assignment_to_a_function_or_class():
+    assert _alias_bindings(_package_files()) == set()
+
+
+@pytest.mark.parametrize("line", ["def _f():\n    pass\nf = _f\n", "class _C:\n    pass\nC = _C\n",
+                                  "g = lambda: 1\n", "def _h():\n    pass\nglobals()['h'] = _h\n"])
+def test_the_alias_check_catches_a_sidestep(tmp_path, monkeypatch, line):
+    extra = tmp_path / "pkg"
+    extra.mkdir()
+    (extra / "__init__.py").write_text("")
+    (extra / "store.py").write_text(Path(store.__file__).read_text())
+    monkeypatch.setattr(sys.modules[__name__], "_PKG", extra)
+    assert _alias_bindings(_package_files()) == set()                  # the clean copy passes
+    (extra / "k.py").write_text(line)
+    assert _alias_bindings(_package_files())                           # and the sidestep is found
+
+
+@pytest.mark.parametrize("line", ["NAME = 'text'\n", "TABLE = {'a': 1}\n", "_f = lambda: 1\n",
+                                  "def _f():\n    pass\n_g = _f\n"])
+def test_the_alias_check_leaves_plain_constants_and_private_bindings_alone(tmp_path, monkeypatch, line):
+    extra = tmp_path / "pkg"
+    extra.mkdir()
+    (extra / "__init__.py").write_text("")
+    (extra / "store.py").write_text(Path(store.__file__).read_text())
+    (extra / "k.py").write_text(line)
+    monkeypatch.setattr(sys.modules[__name__], "_PKG", extra)
+    assert _alias_bindings(_package_files()) == set()
 
 
 def _mentions():
@@ -1914,7 +1974,7 @@ def test_only_facts_as_of_returns_fact_rows():
     helper = inspect.getsource(store._latest_fact_for_key)
     assert "SELECT fact_version_id, raw_sha256 FROM knowledge_facts" in helper and "*" not in helper
     # (3) no public function other than facts_as_of is annotated as returning rows
-    for name in {n for _, n in _ALLOWED_PUBLIC} - {"facts_as_of", "StoreError"}:
+    for name in {n for f, n in _ALLOWED_PUBLIC if f == "store.py"} - {"facts_as_of", "StoreError"}:
         ret = str(inspect.signature(getattr(store, name)).return_annotation)
         assert "dict" not in ret and "Row" not in ret and "list" not in ret, name
     assert "list[dict]" in str(inspect.signature(store.facts_as_of).return_annotation)
