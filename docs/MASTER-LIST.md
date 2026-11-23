@@ -522,6 +522,21 @@ Queued (roadmap):
   (not terminal, not in streak, P3; with faults P0 + reset); calendar load/answer errors = FAULT; RUN_START > 20 min with
   no paired RUN_END = DEADMAN/FAULT run:orphan-start:<trigger> P0 (ends pair with their own start). Schema v2. Known
   limit (CLOSED by T61): a hung 7:10 start was only 15 min old at 7:25. Gate still open at 8fb509f.
+  T64 MERGED 2026-11-23 (0b3ed70, ledger, blind PASS WITH NOTES, 22/25 mutants caught + 2 lead tests; 409 tests):
+  deadman_wait (poll 15 s, cap 11 min even on a stuck clock, only from 10:25 NY on a session day); CLI deadman
+  --wait-open; prior-day orphans over 7 days -> run:orphan-start-prior:<YYYYMMDD>:<trigger>, P0, once per (start day,
+  trigger, book), on today's date, resets the streak. Deploy: alerts-morning.sh deadman = deadman, notify, deadman
+  --wait-open, notify (backup .bak-20261123-t64). Live ledger file not yet created, so no stale starts. Open (Carbon
+  r34 Q3): a Monday hang gives a same-day P0 AND a prior-day P0 on Tuesday. Known LOW: poll_s<=0 + stuck clock loops
+  (no CLI flag exposes it).
+  CODEBASE-MEMORY 2026-11-23 (owner yes): codebase-memory-mcp v0.12.1 (MIT, sha256 checked) at ~/.local/bin, NO
+  installer, no hooks, no daemon left running. v0.12.1 makes no automatic network request (the update check was removed
+  from the daemon; SECURITY.md is stale); only the manual `update` command calls GitHub: never run it. Index at
+  ~/.cache/codebase-memory-mcp (internal disk), 25,253 nodes, 4.5 s; .cbmignore (ced048f) keeps journal, backtests,
+  research, strategies, memory, artifacts, state and secrets out. Hermes: valedia (replaced the parked 11-11 entry),
+  valedia-cto, valedia-coder, 13 read tools (no delete_project/manage_adr/ingest_traces), CBM_ALLOWED_ROOT = this repo;
+  backups config.yaml.bak-20261123-cbm. Takes effect at the next gateway restart (owner's). Seats untouched (VAL-19
+  hold). Claude Code: user-scope MCP.
   T63 MERGED 2026-11-23 (bf20128, K-3, blind PASS WITH NOTES + 2 lead fixes; 322 K-3 tests): FR death proclamations
   (Proclamation + "Announcing the Death of"/"National Day of Mourning") get one body read from raw_text_url (https
   www.federalregister.gov only); mourning sentences vote; only body_sha256 stored. Failed read: title/abstract's own vote
