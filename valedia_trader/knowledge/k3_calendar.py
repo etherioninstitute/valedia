@@ -57,6 +57,16 @@ were real closures, and a separate proclamation declared each National Day of Mo
 are kept in the payload field `closing_order_dates`, a signal for the log and never a vote. A document with an unsure
 sentence has neither kind of date.
 
+Death proclamations (T63). A Proclamation titled "Announcing the Death of ..." or naming a National Day of Mourning often
+has an empty abstract and no date in the title: the date is in the body ("I do further appoint <date>, as a National Day
+of Mourning"). For such a document only, `refresh` makes one extra request for its `raw_text_url` (https on
+www.federalregister.gov only; the same client, user agent and size cap). `fr_body_closure_dates(body_text)` strips tags,
+collapses whitespace and reads only the sentences that contain "National Day of Mourning", with the same forms and void
+words as above, so the death and half-staff sentences never vote or void. One unsure sentence across title, abstract and
+body voids the document. The payload keeps the dates, `body_read` and the body's sha256 (`body_sha256`), never the text.
+A body that cannot be fetched or read (another host, a failed request, an empty or oversize answer) stores the document
+with `closure_dates: []`, `body_read: false` and counts one error: it never guesses.
+
 Quorum (`closure_votes`): `ordinary_stop` is "the calendar says open and at least two authority GROUPS say closed";
 `suspected` is "open and exactly one group says closed". Every source has an `authority_group` (the sources of one
 vendor or one government share a group: both Finnhub endpoints are FINNHUB, the Federal Register and the White House
@@ -71,11 +81,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import re
 import sys
 from datetime import date, datetime, timedelta, timezone
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
 from valedia_trader.knowledge import store
@@ -85,7 +96,8 @@ _NY = "America/New_York"
 _DOMAIN = "K3_CAL"
 _FINNHUB_KEY_NAME = "FINNHUB_API_KEY"
 _FR_URL = "https://www.federalregister.gov/api/v1/documents.json"
-_FR_FIELDS = ("document_number", "title", "type", "subtype", "publication_date", "signing_date", "html_url", "abstract")
+_FR_FIELDS = ("document_number", "title", "type", "subtype", "publication_date", "signing_date", "html_url", "abstract",
+               "raw_text_url")
 _FR_PER_PAGE = 100                  # the Federal Register's largest page; a bigger window is refused, never cut
 _FR_DEFAULT_DAYS = 30
 _FR_MAX_DAYS = 92
@@ -428,6 +440,23 @@ def _sentence_dates(sentence: str):
     return (out, []) if is_mourning else ([], out)
 
 
+def _scan_text(parts, *, mourning_only=False):
+    """(mourning dates, closing-order dates) of the trigger sentences of the given texts, each a sorted unique list; None
+    when one trigger sentence is unsure. With `mourning_only`, only a sentence that names the National Day of Mourning is
+    a trigger sentence (a document body: its other sentences never are)."""
+    mourning, closing = set(), set()
+    for part in parts:
+        for sentence in _SENTENCE.split(part):
+            if not (_MOURNING.search(sentence) or (not mourning_only and _CLOSING.search(sentence))):
+                continue
+            found = _sentence_dates(sentence)
+            if found is None:
+                return None
+            mourning.update(found[0])
+            closing.update(found[1])
+    return sorted(mourning), sorted(closing)
+
+
 def _fr_scan(title, abstract, subtype) -> tuple[list[str], list[str]]:
     """(mourning dates, closing-order dates) a presidential document names, each sorted and unique. Both empty when the
     document is the wrong kind, changes or withdraws something, or has one unsure sentence."""
@@ -438,17 +467,35 @@ def _fr_scan(title, abstract, subtype) -> tuple[list[str], list[str]]:
         return [], []
     if _CHANGE.search(title + " " + (abstract or "")):
         return [], []
-    mourning, closing = set(), set()
-    for part in (title, abstract or ""):
-        for sentence in _SENTENCE.split(part):
-            if not (_MOURNING.search(sentence) or _CLOSING.search(sentence)):
-                continue
-            found = _sentence_dates(sentence)
-            if found is None:
-                return [], []
-            mourning.update(found[0])
-            closing.update(found[1])
-    return sorted(mourning), sorted(closing)
+    return _scan_text((title, abstract or "")) or ([], [])
+
+
+_TAG = re.compile(r"<[^>]*>")
+_DEATH_TITLE = re.compile(r"^\s*Announcing the Death of\b", re.I)
+_FR_BODY_HOST = "www.federalregister.gov"
+
+
+def _is_death_proclamation(title, subtype) -> bool:
+    """A Proclamation announcing a death or naming a National Day of Mourning in its title: the kind whose abstract is
+    often empty and whose date sits in the body, so `refresh` reads the body."""
+    return (isinstance(subtype, str) and subtype.strip().casefold() == "proclamation" and isinstance(title, str)
+            and bool(_DEATH_TITLE.search(title) or _MOURNING.search(title)))
+
+
+def _plain_text(body_text: str) -> str:
+    # the real raw text carries stray control characters (NUL among them): they are whitespace here
+    return re.sub(r"[\s\x00-\x1f]+", " ", html.unescape(_TAG.sub(" ", body_text))).strip()
+
+
+def fr_body_closure_dates(body_text) -> list[str]:
+    """The National Day of Mourning dates a document body names, as sorted ISO dates; an empty list when unsure. Tags
+    are stripped and whitespace collapsed, then only the sentences that contain "National Day of Mourning" are read,
+    with the same forms and void words as `fr_closure_dates`. The other sentences (the death date, the half-staff
+    order) are never trigger sentences. One unsure trigger sentence gives an empty list."""
+    if not isinstance(body_text, str) or not _encodable(body_text):
+        raise K3Error(f"body_text: must be text, got {str(body_text)[:40]!r}")
+    found = _scan_text((_plain_text(body_text),), mourning_only=True)
+    return found[0] if found else []
 
 
 def fr_closure_dates(title, abstract, subtype) -> list[str]:
@@ -507,6 +554,11 @@ def parse_federal_register(raw, *, fetched_at_utc) -> list[dict]:
         payload = {"document_number": number, "title": title, "type": dtype, "subtype": subtype,
                    "publication_date": pub, "signing_date": signing, "html_url": url, "abstract": abstract,
                    "closure_dates": mourning, "closing_order_dates": closing}
+        if _is_death_proclamation(title, subtype):
+            # the date is usually in the body, which `refresh` reads: until it has, the body is unread
+            raw_url = doc.get("raw_text_url")
+            payload.update({"raw_text_url": raw_url if isinstance(raw_url, str) else None, "body_read": False,
+                            "body_sha256": None})
         facts.append(_fact(_FR, f"FR:{number}", payload, effective_from=_day_start_utc(pub_day, _NY),
                            effective_to=None, fetched=fetched, published=stamp if proven else None, proven=proven))
     return facts
@@ -647,12 +699,81 @@ def _store_facts(conn, facts: list[dict]) -> dict:
     return counts
 
 
+def _body_url_ok(url) -> bool:
+    if not isinstance(url, str):
+        return False
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    return parts.scheme == "https" and parts.netloc == _FR_BODY_HOST
+
+
+def _kept_good_read(conn, fact: dict, payload: dict) -> bool:
+    """True when the version of this Federal Register document current at this fetch was a good body read and its title
+    and abstract are the ones just fetched: a failed re-read then stores nothing, so that version (and its vote) stays."""
+    rows = [r for r in store.facts_as_of(conn, fact["fetched_at_utc"], domain=_DOMAIN, entity_key=fact["entity_key"])
+            if r["source_id"] == _FR]
+    if len(rows) != 1:
+        return False
+    try:
+        prior = json.loads(rows[0]["payload_json"])
+    except (TypeError, ValueError):
+        return False
+    return (isinstance(prior, dict) and prior.get("body_read") is True and prior.get("title") == payload["title"]
+            and prior.get("abstract") == payload["abstract"])
+
+
+def _read_death_bodies(conn, facts: list[dict], http_get) -> tuple[list[dict], int]:
+    """For each death proclamation among the Federal Register facts, one request for its `raw_text_url` (https on
+    www.federalregister.gov only; the same client, user agent and size cap), then the body's mourning sentences are read
+    together with the title and abstract. Returns the facts and the number of bodies that could not be read: such a
+    document keeps only the dates its title and abstract give (`body_read: false`), never a guess. Only the body's sha256 is
+    kept, never its text. Any other document costs no request."""
+    out, errors = [], 0
+    headers = {"User-Agent": _UA, "Accept": "text/html, text/plain"}
+    for fact in facts:
+        payload = json.loads(fact["payload_json"])
+        if fact["source_id"] != _FR or "body_read" not in payload:
+            out.append(fact)
+            continue
+        text = None
+        digest = None
+        if _body_url_ok(payload.get("raw_text_url")):
+            try:
+                body = http_get(payload["raw_text_url"], headers)
+                if isinstance(body, bytes) and 0 < len(body) <= _MAX_BODY:
+                    text, digest = body.decode("utf-8"), hashlib.sha256(body).hexdigest()
+            except Exception:
+                text = None
+        head = _scan_text((payload["title"], payload["abstract"] or ""))
+        tail = None if text is None else _scan_text((_plain_text(text),), mourning_only=True)
+        if text is None:
+            errors += 1
+            if _kept_good_read(conn, fact, payload):
+                continue  # lead: a failed re-read never replaces an earlier good read of the same document
+            keep = [] if head is None or _CHANGE.search(payload["title"] + " " + (payload["abstract"] or "")) else head[0]
+            payload.update({"closure_dates": sorted(set(keep)), "body_read": False, "body_sha256": None})  # lead: an
+            # unreadable body costs only the body's vote; a vote the title or abstract casts by itself is kept
+        else:
+            unsure = head is None or tail is None or _CHANGE.search(payload["title"] + " " + (payload["abstract"] or ""))
+            payload.update({"closure_dates": [] if unsure else sorted(set(head[0]) | set(tail[0])),
+                            "body_read": True, "body_sha256": digest})
+        out.append(_fact(_FR, fact["entity_key"], payload, effective_from=fact["effective_from_utc"],
+                         effective_to=fact["effective_to_utc"], fetched=fact["fetched_at_utc"],
+                         published=fact["published_at_utc"], proven=fact["published_proven"]))
+    return out, errors
+
+
 def refresh(conn, source_id, *, http_get=None, now, credentials=None, params=None) -> dict:
     """Fetch, parse and store every fact of one source. A bad argument raises. A failed request, a refused body or a
-    fact the store refuses is counted as an error (a refused body stores nothing at all)."""
+    fact the store refuses is counted as an error (a refused body stores nothing at all). A Federal Register death
+    proclamation also costs one request for its body text; if that fails the failure is counted as an error, an earlier
+    good read of the same title and abstract stays current, and otherwise only the title's and abstract's own dates are stored."""
     if not isinstance(source_id, str) or source_id not in SOURCES:
         raise K3Error(f"unknown source {str(source_id)[:60]!r}")
     _check_params(source_id, params, _now_text(now))
+    body_errors = 0
     if source_id == _X:
         facts = fetch(source_id, http_get=http_get, now=now, params=params)
     else:
@@ -660,9 +781,15 @@ def refresh(conn, source_id, *, http_get=None, now, credentials=None, params=Non
             facts = fetch(source_id, http_get=http_get, now=now, credentials=credentials, params=params)
         except K3Error as exc:
             return {"stored": 0, "unchanged": 0, "error": 1, "detail": str(exc)[:200]}
+    if source_id == _FR:
+        facts, body_errors = _read_death_bodies(conn, facts, http_get)
     if source_id == _H:
         facts = facts + _holiday_tombstones(conn, facts)
-    return _store_facts(conn, facts)
+    counts = _store_facts(conn, facts)
+    if body_errors:
+        counts["error"] += body_errors
+        counts.setdefault("detail", f"{body_errors} death proclamation body(ies) could not be read")
+    return counts
 
 
 # ---- the quorum
