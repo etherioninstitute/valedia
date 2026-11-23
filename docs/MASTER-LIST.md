@@ -530,6 +530,9 @@ Queued (roadmap):
   date. GAP: an UNSCHEDULED closure (mourning day, storm) is known only after a library release. QUESTION for Carbon:
   how should the order step treat a day the calendar calls open but the venue is closed (ordinary stop, not a fault),
   and should the pre-flight compare against the exchange's published notice?
+  Reply 27 addendum SENT 2026-11-23 11:05 AM PST: the gate move, SEC allowed (contact kept out of the repo), the holiday
+  check + the unscheduled-closure question, and the near-omniscient goal (K-1..K-7 + the tax track) asking Carbon for
+  sources, cadence, change detection, one as-of store, text-to-rule checks and build order.
   Round 17: per-probe Sharpes already survive (gauntlet.py:694-695 one ledger row per variant with sha + spec;
   TrialRegistry INSERT-only, distinct collapses on read), so the fingerprint bug's harm is the change guard
   (gauntlet.py:527) missing same-version arg changes; Epoch-0 re-checks every past spec vs sha and lists misses.
