@@ -27,6 +27,14 @@ lock), and nothing else stands in for one: no environment variable, flag or argu
     it is not a paper_broker_day; it does not reset the stopped-run clock (the owner acted; nothing of hers failed). The
     record then lists those runs' days as `unclean_shared_runs`, and the days of runs stopped at `shortfall` as
     `skipped_shortfall_runs` (a key only when there are some).
+    A run that ended `done` whose summary carries `faults` (a list with anything in it; a `faults` that is not a list
+    is read on the safe side, as a fault; absent or an empty list is none) is likewise NOT clean: its fills are not
+    reconciled_fills and it is not a paper_broker_day; it too leaves the stopped-run clock alone. The record lists its
+    day as `faulted_runs` (a key only when there are some).
+    The record also shows, over the fills of clean `done` runs only, how many were `whole_fills` (units above 0 and
+    leg not `remainder`: a whole share), `remainder_fills` (leg `remainder`, units above 0) and `sale_fills` (units
+    below 0); a fill whose units are not a nonzero number is in none. They are shown only (no lock reads them), and
+    only when at least one fill was counted into a shape.
     - fills_checked_by_hand at least min_fills_checked_by_hand (the owner's own statement).
 * Lock 3, the limits (`config/risk.json`): the risk gate's own file, which in live mode must hold
   `max_orders_per_day`, a whole number from 1 to 200 (the test environment's fallback of 40 does not apply), and
@@ -163,14 +171,18 @@ def paper_record(journal_dir: str | Path, paper_venue: str, today: date, calenda
         mine = [e for e in entries if isinstance(e, dict) and e.get("type") == "order_step" and e.get("venue") == paper_venue]
         summaries = [e for e in mine if e.get("event") == "summary"]
         unclean = [e for e in summaries if e.get("status") == "done" and _shortfall_seen(e)]
+        faulted = [e for e in summaries if e.get("status") == "done" and _faults_seen(e)]
         done = {e.get("batch") for e in summaries if e.get("status") == "done" and type(e.get("batch")) is str
-                and not _shortfall_seen(e)}
+                and not _shortfall_seen(e) and not _faults_seen(e)}
         days = set()
         for e in summaries:
             d = _day(e.get("day"))
-            if e.get("status") == "done" and not _shortfall_seen(e) and d is not None and d <= today and bool(cal.is_session(d.isoformat())):
+            if (e.get("status") == "done" and not _shortfall_seen(e) and not _faults_seen(e) and d is not None
+                    and d <= today and bool(cal.is_session(d.isoformat()))):
                 days.add(d)
-        fills = sum(1 for e in mine if e.get("event") == "fill" and e.get("batch") in done)
+        clean_fills = [e for e in mine if e.get("event") == "fill" and e.get("batch") in done]
+        fills = len(clean_fills)
+        shapes = [_fill_shape(e) for e in clean_fills]
         stopped = [e for e in summaries if e.get("status") == "stopped"]
         skipped = [e for e in stopped if _ordinary_stop(e) and e.get("stage") == "shortfall" and _day(e.get("day")) is not None]
         stops = [d for e in stopped if not _ordinary_stop(e) for d in [_day(e.get("day"))] if d is not None]
@@ -183,7 +195,10 @@ def paper_record(journal_dir: str | Path, paper_venue: str, today: date, calenda
     record = {"paper_broker_days": len(days), "reconciled_fills": fills,
               "days_since_a_stopped_run": None if last is None else (today - last).days,
               "last_stopped_run": None if last is None else last.isoformat()}
-    for key, runs in (("unclean_shared_runs", unclean), ("skipped_shortfall_runs", skipped)):
+    if any(shapes):
+        for key, shape in (("whole_fills", "whole"), ("remainder_fills", "remainder"), ("sale_fills", "sale")):
+            record[key] = shapes.count(shape)
+    for key, runs in (("unclean_shared_runs", unclean), ("skipped_shortfall_runs", skipped), ("faulted_runs", faulted)):
         listed = sorted(d.isoformat() for d in (_day(e.get("day")) for e in runs) if d is not None)
         if listed:                                       # said only when there are some: a non-shared record is as it was
             record[key] = listed
@@ -195,6 +210,28 @@ def _ordinary_stop(summary: dict) -> bool:
     that is a record (R32). A `shortfall` stop without one is corrupt (only a shared run raises it) and counts as a stop."""
     stage = summary.get("stage")
     return stage in ORDINARY_STOP_STAGES or (stage == "shortfall" and isinstance(summary.get("shared"), dict))
+
+
+def _faults_seen(summary: dict) -> bool:
+    """A summary that says the run had faults (the order step writes `faults` only when there are some). Absent or an
+    empty list is none; a `faults` that is not a list (null, text, a record, a number) is read on the safe side, as a
+    fault, as R33 reads `shared`."""
+    if "faults" not in summary:
+        return False
+    faults = summary["faults"]
+    return not isinstance(faults, list) or bool(faults)
+
+
+def _fill_shape(fill: dict) -> str | None:
+    """`whole`, `remainder` or `sale` for a fill line (units are signed like the order: a sale is below 0; `leg` is
+    `remainder` for the market leg of a fractional buy and is absent on a whole-share run), or None when its units
+    are not a nonzero finite number."""
+    units = fill.get("units")
+    if type(units) not in (int, float) or not math.isfinite(units) or units == 0:
+        return None
+    if units < 0:
+        return "sale"
+    return "remainder" if fill.get("leg") == "remainder" else "whole"
 
 
 def _shortfall_seen(summary: dict) -> bool:
