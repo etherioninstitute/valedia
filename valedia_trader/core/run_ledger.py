@@ -8,8 +8,11 @@
     python -m valedia_trader.core.run_ledger notify     --store PATH --book BOOK [--mac]
     python -m valedia_trader.core.run_ledger streak     --store PATH --book BOOK --since YYYY-MM-DD
 
-The store is a sqlite file whose path is always given; this module has no default path. (The one other file it reads is the
-order ledger, read only and only for the P2 `p2:collar-miss`; see `_collar_miss`.) Three tables:
+The store is a sqlite file whose path is always given: this module has no default path for it. The one other file it reads is the
+practice order ledger, read only and only for the P2 `p2:collar-miss` (see `_collar_miss`). That file has a default,
+`default_orders_ledger()`: `memory/orders-webull-sandbox.sqlite` of the repository the module is run from (the order step's
+own place for it), so the 7:25 job needs no new argument; `deadman --orders-ledger PATH` overrides it, and a missing or unreadable
+file only makes the check fall back to the printed counts. Three tables:
 
   run_events      one row for each thing that happened (a pre-flight, a run start, a run end, a skip, the dead-man).
                   Append-only: the database itself refuses UPDATE, DELETE and a REPLACE or UPSERT on an existing id.
@@ -817,7 +820,7 @@ def default_orders_ledger() -> Path:
     return Path(__file__).resolve().parents[2] / "memory" / ORDERS_LEDGER_NAME
 
 
-def _collar_miss(conn, book: str, day: str, now: datetime, orders_ledger=None) -> list[int]:
+def _collar_detail(conn, book: str, day: str, orders_ledger=None) -> str | None:
     """The P2 `p2:collar-miss` (read the master list, rounds 37 to 40): written by the 7:25 job on today's trade date D when the
     two latest COUNTED, SETTLED sessions both ended with fewer than half their orders filled.
 
@@ -842,9 +845,13 @@ def _collar_miss(conn, book: str, day: str, now: datetime, orders_ledger=None) -
     fault days and days without runs included, and it stops at the first check whose latest settled pair is not a miss. Misses on
     sessions D1 and D2 therefore give the first row at the check of the next session day that has a completed run after D2
     (D3 in a week of runs): a lag of one session day compared with judging D2 at its own check, which is what makes the count
-    reliable. Sessions whose orders all fill eventually never trip it while the ledger is readable, whatever the fill timing.
+    reliable. Sessions whose orders all fill never trip it while the ledger is readable, because the order step sends equity orders as
+    DAY orders (venues/webull.py, time in force `DAY`) and the fills of one day's orders are journaled by the next run's reconcile,
+    which has completed before the session counts as settled.
     Known limits:
     - when no run completes after a session, it stays unsettled and is not judged;
+    - an order still unjournaled after the next completed run (a fill the venue reports late, or a reconcile that missed it) reads
+      as unfilled until a later run journals it, so it can count against its session at that check;
     - a fill that lands after the settling run has reconciled reads as unfilled until a later run journals it, so a session
       counted right after its first settling run can still show a late fill as unfilled (it is counted right at the next check);
     - a partly filled order counts as filled;
@@ -881,18 +888,32 @@ def _collar_miss(conn, book: str, day: str, now: datetime, orders_ledger=None) -
             t[1] += fil
     counted = [(d, o, f) for d, (o, f) in sorted(totals.items()) if o >= COLLAR_MIN_ORDERS]
     if len(counted) < 2:
-        return []
+        return None
     pair = counted[-2:]
     if any(f / o >= COLLAR_FILL_RATIO for _, o, f in pair):
+        return None
+    (d1, o1, f1), (d2, o2, f2) = pair
+    how = ("the count is an estimate from the run summary" if {d1, d2} & estimate_days
+           else "counted from the order ledger at the check")
+    return f"fewer than half the orders filled on {d1} (fil {f1} of ord {o1}) and {d2} (fil {f2} of ord {o2}); {how}"
+
+
+def _collar_write(conn, book: str, day: str, now: datetime, detail: str | None) -> list[int]:
+    """The write half of `_collar_miss`: the row for `detail` (from `_collar_detail`), unless today already has one. This is what
+    runs inside the store's write lock, and the only check made there: at most one collar row for each trade date."""
+    if detail is None:
         return []
     if conn.execute("SELECT 1 FROM run_events WHERE trade_date = ? AND book = ? AND kind = 'DEADMAN' AND root_cause = ? LIMIT 1",
                     (day, book, COLLAR_CAUSE)).fetchone():
         return []
-    (d1, o1, f1), (d2, o2, f2) = pair
-    how = ("the count is an estimate from the run summary" if {d1, d2} & estimate_days
-           else "counted from the order ledger at the check")
-    return [_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="WARN", now=now, trade_date=day, root_cause=COLLAR_CAUSE,
-                          detail=f"fewer than half the orders filled on {d1} (fil {f1} of ord {o1}) and {d2} (fil {f2} of ord {o2}); {how}")]
+    return [_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="WARN", now=now, trade_date=day,
+                          root_cause=COLLAR_CAUSE, detail=detail)]
+
+
+def _collar_miss(conn, book: str, day: str, now: datetime, orders_ledger=None) -> list[int]:
+    """The two halves together (`_collar_detail`, then `_collar_write`); `deadman_check` calls them apart so that the order ledger
+    is read BEFORE the store's write lock is taken. The rule is in `_collar_detail`."""
+    return _collar_write(conn, book, day, now, _collar_detail(conn, book, day, orders_ledger))
 
 
 def deadman_check(conn, book: str, now: datetime, orders_ledger=None) -> list[int]:
@@ -925,6 +946,8 @@ def deadman_check(conn, book: str, now: datetime, orders_ledger=None) -> list[in
       filled, counted in full from the order ledger (`orders_ledger`, read only, default `default_orders_ledger()`) for rows that
       carry a `batch=` token; once for each check day, at every check where the latest settled pair is a miss; it is last in the
       result and no row of the streak reads it.
+    The order ledger for the collar row is read once, before the store's write lock is taken (a slow or locked order ledger
+    never holds the run ledger's lock); inside the lock only the one-row-for-each-date check and the writes are made.
     The rows are separate, so all of them can be there on one day. Nothing is written before 10:25 or on a day that is not a
     session; a check that finds all already written writes nothing. Today's orphan rows come first in the result, then prior-day rows (oldest start first), then still-open rows, then the day row, then the collar row."""
     ny = _utc(now).astimezone(NEW_YORK)
@@ -932,6 +955,7 @@ def deadman_check(conn, book: str, now: datetime, orders_ledger=None) -> list[in
     if ny.time() < DEADMAN_CUTOFF or not is_session(day):
         return []
     written: list[int] = []
+    collar = _collar_detail(conn, book, day, orders_ledger)                      # reads the order ledger BEFORE the write lock is taken
     with _tx(conn):
         have = [r[0] for r in conn.execute("SELECT root_cause FROM run_events WHERE trade_date = ? AND book = ? AND kind = 'DEADMAN' "
                                            "AND outcome = 'FAULT'", (day, book))]
@@ -960,7 +984,7 @@ def deadman_check(conn, book: str, now: datetime, orders_ledger=None) -> list[in
             else:
                 written.append(_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="MISSING", now=now, trade_date=day,
                                              root_cause=DEADMAN_CAUSE, detail="no run ended and none was skipped by 10:25 New York"))
-        written += _collar_miss(conn, book, day, now, orders_ledger)
+        written += _collar_write(conn, book, day, now, collar)                   # only the once-for-each-date check is made in the lock
     return written
 
 

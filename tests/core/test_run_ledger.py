@@ -55,6 +55,25 @@ def conn(tmp_path):
     c.close()
 
 
+REAL_DEFAULT_LEDGER = Path(rl.__file__).resolve().parents[2] / "memory" / rl.ORDERS_LEDGER_NAME      # the real practice ledger
+OPENED_LEDGERS: list = []                                       # every path `_orders_reader` was asked to read in this test run
+
+
+@pytest.fixture(autouse=True)
+def no_real_order_ledger(monkeypatch, tmp_path_factory):
+    """No test reads the real practice order ledger: a check that passes no ledger finds a missing file, and every path the
+    module is asked to read is recorded (see `test_the_real_order_ledger_is_never_opened_by_this_test_run`)."""
+    nowhere = tmp_path_factory.mktemp("no-orders-ledger") / "missing.sqlite"
+    monkeypatch.setattr(rl, "default_orders_ledger", lambda: nowhere)
+    real_reader = rl._orders_reader
+
+    def spy(path):
+        OPENED_LEDGERS.append(None if path is None else Path(path))
+        return real_reader(path)
+
+    monkeypatch.setattr(rl, "_orders_reader", spy)
+
+
 def add(conn, kind, trigger, outcome, now, **kw):
     return rl.record_event(conn, book=kw.pop("book", BOOK), kind=kind, trigger=trigger, outcome=outcome, now=now, **kw)
 
@@ -3453,8 +3472,8 @@ def test_the_opposite_a_days_fil_one_of_ord_six_over_two_runs_is_a_miss(conn):
 
 from valedia_trader.execution_and_risk import orders as order_mod       # only its table layout is used, to build a test ledger
 
-STEM_FRI, STEM_FRI2 = "os-20261120-095515", "os-20261120-101014"
-STEM_MON, STEM_MON2 = "os-20261123-095515", "os-20261123-101014"
+STEM_FRI, STEM_FRI2 = "os-20990101-095515", "os-20990101-101014"          # synthetic stems: no live batch id
+STEM_MON, STEM_MON2 = "os-20990102-095515", "os-20990102-101014"
 
 
 def orders_ledger(tmp_path, name="orders.sqlite"):
@@ -3599,7 +3618,7 @@ def empty_db(tmp_path):
 
 def other_batches_db(tmp_path):
     path = orders_ledger(tmp_path, "other.sqlite")
-    put_orders(path, "os-20200101-000000", SYMS4, filled=SYMS4)                                  # a ledger that has none of these batches
+    put_orders(path, "os-20990909-000000", SYMS4, filled=SYMS4)                                  # a ledger that has none of these batches
     return path
 
 
@@ -3644,7 +3663,7 @@ def test_the_recount_counts_distinct_orders_of_that_batch_only(tmp_path):
     db.commit()
     db.close()
     with rl._orders_reader(path) as filled:
-        assert filled(STEM_MON) == 2 and filled(STEM_MON2) == 1 and filled("os-20261123-000000") is None
+        assert filled(STEM_MON) == 2 and filled(STEM_MON2) == 1 and filled("os-20990303-000000") is None
     with rl._orders_reader(None) as filled:
         assert filled(STEM_MON) is None
 
@@ -3819,7 +3838,7 @@ def simulate(conn, tmp_path, days, dates, ledger_name="sim.sqlite"):
     got = []
     for i, (runs, (y, m, d)) in enumerate(zip(days, dates)):
         for n, (trigger, outcome, fates) in enumerate(runs):
-            stem = f"os-{y}{m:02d}{d:02d}-{95500 + n * 1500:06d}"
+            stem = f"os-2099{i + 1:02d}01-{95500 + n * 1500:06d}"        # synthetic: 2099, one month a test day
             printed = sum(1 for f in fates if f == 0)
             if outcome == "COMPLETED":
                 add(conn, "RUN_END", trigger, outcome, utc(y, m, d, 14, 40 + n), revision_ok=1,
@@ -4041,3 +4060,41 @@ def test_a_later_clean_run_closes_the_start_that_the_ambiguous_crash_end_left_bl
     proof_run(conn, utc(2026, 11, 23, 20, 30), trigger="0655")                              # started after A', completed
     rl.deadman_check(conn, BOOK, T_TUE_0725)
     assert prior_rows(conn, TUE) == [("FAULT", "run:orphan-start-unreported:20261123:manual")]
+
+# ------------------------------------------------------------------------------------------------ tests never read the real order ledger
+
+def test_the_real_order_ledger_is_never_opened_by_this_test_run(conn):
+    assert rl.default_orders_ledger() != REAL_DEFAULT_LEDGER                                # the autouse fixture moved the default away
+    session_runs(conn, 2026, 11, 20, [(4, 0)])
+    session_runs(conn, 2026, 11, 23, [(4, 0)])
+    batch_runs(conn, 2026, 11, 24, [("os-20990505-095515", 4, 0)])                         # a batch row, and no ledger passed
+    session_runs(conn, 2026, 11, 25, [(0, 0)])
+    seen = len(OPENED_LEDGERS)
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 25))
+    mine = OPENED_LEDGERS[seen:]
+    assert len(mine) == 1 and not Path(mine[0]).exists()                                    # one read, of the default: a missing file, as meant
+    assert all(p is None or p.resolve() != REAL_DEFAULT_LEDGER.resolve() for p in OPENED_LEDGERS)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def check_the_real_order_ledger_was_never_opened():
+    yield
+    real = REAL_DEFAULT_LEDGER.resolve()
+    assert not [p for p in OPENED_LEDGERS if p is not None and p.resolve() == real]
+
+
+def test_the_order_ledger_is_opened_once_for_a_check_and_before_the_store_write_lock(conn, tmp_path, monkeypatch):
+    path = late_fill_store(conn, tmp_path)                                                  # four batch rows
+    session_runs(conn, 2026, 11, 24, [(0, 0)])
+    seen = []
+    spied = rl._orders_reader
+
+    def reader(p):
+        seen.append(conn.in_transaction)                                                    # True inside the store's BEGIN IMMEDIATE
+        return spied(p)
+
+    monkeypatch.setattr(rl, "_orders_reader", reader)
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 24), orders_ledger=path)
+    assert seen == [False]
+    cnt = conn.execute("SELECT COUNT(*) FROM run_events WHERE kind = 'RUN_END' AND detail LIKE '%batch=%'").fetchone()[0]
+    assert cnt == 4                                                                          # four rows, one open
