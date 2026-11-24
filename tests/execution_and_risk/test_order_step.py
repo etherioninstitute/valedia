@@ -9959,3 +9959,76 @@ def test_br_e_a_practice_propose_and_a_second_run_say_held_lock_true(tw):
     out = propose(tw)
     assert out["status"] == "done" and _held(out) is True
     assert tw.entries("summary")[-1]["held_lock"] is True
+
+
+# ==== BR-E part 2: an unapproved propose is a clean run (test pin only; no production change)
+#
+# A propose run that wrote a ticket is `done` with no `faults`; when nobody approves it and its fifteen minutes pass,
+# nothing is written and nothing is faulted: a later ordinary run or a second propose is clean, opens no attention
+# item, and the second propose marks the old ticket `superseded`. Approving the expired ticket still stops at `ticket`.
+
+def _br_e_open_attention(w):
+    led = w.ledger()
+    try:
+        return led.attention(open_only=False)
+    finally:
+        led.close()
+
+
+def _br_e_fates(w):
+    return {r["number"]: r["fate"] for r in ticket_rows(w, "fates")}
+
+
+def test_br_e_a_propose_run_that_wrote_a_ticket_is_done_with_no_faults_key(tw):
+    out, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    assert out["status"] == "done" and out["mode"] == "propose" and out["orders_sent"] == 0
+    assert "faults" not in out and "faults" not in tw.entries("summary")[-1]
+    assert _br_e_open_attention(tw) == [] and _br_e_fates(tw) == {}        # nothing opened, the ticket has no fate yet
+
+
+def test_br_e_a_propose_with_nothing_to_propose_is_done_with_no_faults_key(tw):
+    tw.paper = paper({})
+    out = propose(tw)
+    assert out["status"] == "done" and out["mode"] == "propose" and "faults" not in out
+    assert "ticket_number" not in out and out["ticket"]["orders"] == []
+    assert ticket_rows(tw, "tickets") == []
+
+
+def test_br_e_an_unapproved_propose_expires_with_zero_faults_and_a_second_propose_supersedes_it(tw):
+    _, first = _proposed(tw, {"a": {"SPY": 10.0}})
+    tw.clock.t += osx.TICKET_LIFE_SECONDS + 1                              # the fifteen minutes pass; nobody approves
+    out, second = _proposed(tw, {"a": {"SPY": 10.0}})
+    assert out["status"] == "done" and "faults" not in out and "faults" not in tw.entries("summary")[-1]
+    assert _br_e_open_attention(tw) == []
+    assert _br_e_fates(tw) == {first: "superseded"} and second != first   # the old one superseded, the new one live
+    assert tw.venue.submits() == [] and tw.orders() == []
+
+
+def test_br_e_an_unapproved_propose_expires_with_zero_faults_and_an_ordinary_run_leaves_it_unused(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    tw.clock.t += osx.TICKET_LIFE_SECONDS + 1
+    out = tw.run()                                                         # an ordinary run: the practice flow, no ticket
+    assert out["status"] == "done" and out["orders_sent"] == 1 and "faults" not in out
+    assert "faults" not in tw.entries("summary")[-1] and _br_e_open_attention(tw) == []
+    assert _br_e_fates(tw) == {}                                           # the old ticket stays unused: no event at all
+    assert [r["number"] for r in ticket_rows(tw, "tickets")] == [number]
+
+
+def test_br_e_the_expired_unapproved_ticket_still_stops_an_approve_at_ticket_and_that_is_no_fault_either(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    tw.clock.t += osx.TICKET_LIFE_SECONDS + 1
+    out = approve(tw, number)
+    assert out["status"] == "stopped" and out["stage"] == "ticket" and "expired" in out["reason"]
+    assert "faults" not in out and _br_e_open_attention(tw) == [] and tw.venue.submits() == []
+    assert _br_e_fates(tw) == {number: "expired"}
+
+
+def test_br_e_the_opposite_a_forced_unclean_reconcile_after_an_expired_propose_does_carry_reconcile(tmp_path):
+    w = ticket_world(tmp_path / "w", venue=_with_odd(Booked)())
+    _, number = _proposed(w, {"a": {"SPY": 2.0}})
+    w.clock.t += osx.TICKET_LIFE_SECONDS + 1
+    _later_submit(w, 0, then=lambda x: setattr(x.venue, "odd", ("SPY",)))
+    out = w.run()                                                          # the same flow, the venue reports an anomaly
+    assert out["status"] == "done" and out["faults"] == ["reconcile"], out
+    assert w.entries("summary")[-1]["faults"] == ["reconcile"]
+    assert _br_e_fates(w) == {}                                            # the expiry itself added nothing
