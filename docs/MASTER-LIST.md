@@ -619,6 +619,19 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 50 (Carbon response 50, file named Valedia_Carbon_Response49.md; reply 50 sent 2026-11-23): tracker
+  unchanged (5/19, 26.3%). FOCUS RULE ADOPTED: one NOW + one NEXT governs attention (coding, specs, scoring);
+  unattended jobs take no slot. Order: NOW P1 (owner's P2 alongside); NEXT BTC desk (Step 0, locked doc, logger from
+  12-04); then P3 one test at a time (collector 12-03 score, CPI Stage 0, Candidate C Stage 1; both QUEUED, not
+  running); then P4 (Finnhub store, WH feed, Nasdaq terms, K-1 first, before any unattended running). BTC spec
+  adopted: q = sigma(w0 + w1 logit(P_mid) + w2 z_ROC3 + w3 z_dist vs floor_strike), L2, free signs; train 1,500
+  windows, LR p<0.05 + 5-fold time CV gate; t* = open+5m; Rule 1 taker primary, Rule 2 post-only join-bid 60 s TTL
+  scored by the virtual-queue rule + public tape; Holm over 2; no ETH (rho 0.8 = ~10% faster). Lead changes: BRTI
+  constituent list read from CF Benchmarks at Step 0; fee charged as rounded per order (1-lot = 2c at 50c); maker
+  scored at 0.0175 until Step 0 reads the series fee_type (sources conflict); tape reads inside the Kalshi read
+  budget. Sources checked: arXiv 2606.31675 and botforkalshi confirmed; $4.45 composite error and 1-in-8 near-target
+  figures UNSOURCED (measured on train). Direct Kalshi account = OWNER decision. Two owner tax questions before order
+  #1: hold DBC (K-1) over Dec 31; any loss sales of the 15 funds in the last 30 days (shared account).
   Round 49 (Carbon response 49, file named Valedia_Carbon_Response48.md; reply 49 sent 2026-11-23): tracker
   unchanged (5/19, 26.3%). Carbon advised parking the BTC desk at Step 0; OWNER OVERRODE 2026-11-23 (use the guide's
   methods for BTC Up/Down; no real event order until a rule passes). Adopted: forward shadow log ONLY (SEAL_EPOCH_1
