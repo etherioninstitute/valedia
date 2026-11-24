@@ -608,6 +608,16 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 45 (Carbon response 45, file named Valedia_Carbon_Response44.md; reply 45 sent 2026-11-23): tracker
+  unchanged (5/19, 26.3%). CORRECTION of round 44 Guard 1: the practice job runs --shared and shared mode REFUSES
+  --capital (stage targets, before the lock; live is shared-only), so no capital cut exists; Carbon's 15% cut and
+  fallback ladder withdrawn; its small-equity case moot (book ~996,750). Adopted: the attended confirmation is the
+  ticket path (--propose, then --approve within 15 min); a propose with no orders writes NO ticket ("nothing to
+  propose", order_step.py:5063); targets are made at 2:30 PM PT, so a propose after a 6:55 run that met them proves
+  nothing. Sales come on ordinary rebalance days (11-16: 15 orders, 11-20: 13 sales). Build pin adopted: an
+  unapproved propose = COMPLETED, 0 faults, ticket just expires; 'nothing to propose' = COMPLETED. OPEN (asked):
+  Gate #7's attended pair = (a) propose/approve 6:35-6:55 PT on a rebalance day (lead's lean) or (b) an owner's
+  cash_out entry; does (a)'s same-morning MANUAL session touch the clean week or T65.
   Round 44 (Carbon response 44, file named Valedia_Carbon_Response43.md; reply 44 sent 2026-11-23): tracker
   unchanged (5/19, 26.3%). Gate #7 = ONE scheduled session on the new pin + an attended practice sale if needed.
   Guards adopted: the sale comes from the unchanged pinned order step run by the owner with a 10-20% lower capital
