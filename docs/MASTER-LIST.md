@@ -608,6 +608,14 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 40 (Carbon response 40, reply 40 sent 2026-11-23): Carbon held the standing context, no drift. Finnhub
+  rail check: readings 1-4 are Finnhub-free (quote = Yahoo minute bars, order_step.py:2661; cross-check = Cboe
+  delayed JSON, second_quote.py). Adopted its 11-24 action matrix (8fb509f untouched mid-week; only a Tier 1
+  collector stop pauses 6:55/7:10). p2:collar-miss counts filled_quantity > 0 as filled. Ex-date splits already stop
+  via far_quotes (order_step.py:1160) until the owner records a split entry. Adopted K-1 next after WH feed + Finnhub
+  store: full nightly Nasdaq Trader directory from day 1 (terms read first), corporate-action watcher on the book +
+  configured universes first, full EDGAR backfill after 12-03; ex-date stop + Webull instrument check go in the
+  before-order-#1 batch. Asked: rename-vs-delisting rule for K-1.
   Round 39 (Carbon response 39, reply 39 sent 2026-11-23; reply opens with a standing-goals section and a
   closed-items list, at the owner's request, to stop drift): Carbon accepted reset-today. FOUND: the order step has
   no bid/ask (quote = last 1-min bar close, minute_quotes order_step.py:2661; collar = quote +/-1%, 2% risk-reducing
