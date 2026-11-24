@@ -320,10 +320,86 @@ def test_order_status_maps_every_documented_status(tmp_path, raw, state):
     assert ("detail", "ACC-0001-1234", wb.client_order_id("t")) in client.calls
 
 
-@pytest.mark.parametrize("raw", ["EXPIRED", "CANCELED", "DONE", "", None, 7])
+@pytest.mark.parametrize("raw", ["CANCELED", "DONE", "EXPIRED ", " EXPIRED", "expired", "Expired", "", None, 7])
 def test_an_unlisted_status_is_unknown_never_filled_or_cancelled(tmp_path, raw):
     out = status_venue(tmp_path, detail(order(raw)))[0].order_status("t")
     assert out["state"] == "unknown_status"
+
+
+def test_expired_is_the_state_expired_by_exact_match_only(tmp_path):
+    """EXPIRED is not in Webull's documented statuses and has not been seen live: the value is the parser's own reading
+    (DEAD_RAW_STATUSES). Exact match; every near spelling stays unknown_status (see the test above)."""
+    out = status_venue(tmp_path, detail(order("EXPIRED")))[0].order_status("t")
+    assert out["state"] == "expired" and out["raw_status"] == "EXPIRED" and out["venue_order_id"] == "WB-1"
+    assert wb.ORDER_STATES["EXPIRED"] == "expired"
+    assert out["filled_units"] == 0.0
+
+
+def test_expired_stays_dead_for_the_refusal_and_sale_checks(tmp_path):
+    assert wb.DEAD_RAW_STATUSES >= {"EXPIRED"}
+    assert wb._row_life("EXPIRED", wb._state("EXPIRED")) == "dead"
+    assert wb._row_life("EXPIRED ", wb._state("EXPIRED ")) == "unknown"
+
+
+def test_an_expired_row_gives_its_filled_quantity_and_a_zero_row_gives_zero(tmp_path):
+    partly = status_venue(tmp_path, detail(order("EXPIRED", filled_quantity="3", filled_price="90.5")))[0].order_status("t")
+    assert partly["state"] == "expired" and partly["filled_units"] == 3.0 and partly["avg_price"] == 90.5
+    none = status_venue(tmp_path, detail(order("EXPIRED", filled_quantity="0")))[0].order_status("t")
+    assert none["state"] == "expired" and none["filled_units"] == 0.0 and none["avg_price"] is None
+
+
+def _ledger_after_expiry(tmp_path, units, raw, **fields):
+    """The real OrderLedger over the real adapter: an accepted order of 10, then Webull's row says `raw`."""
+    from valedia_trader.execution_and_risk.orders import OrderLedger
+    now = [1_000_000.0]
+    ledger = OrderLedger(":memory:", not_sent=(wb.NotTransmitted, wb.OrderRejected), clock=lambda: now[0])
+    v, client = status_venue(tmp_path, detail(order("SUBMITTED", total_quantity="10")))
+    client._positions = []
+
+    class Placed:                                     # the adapter for reading; placement is stubbed as accepted
+        name = "webull-test"
+        submit = staticmethod(lambda symbol, units_, tag, price=None, limit_price=None: {"status": "accepted", "venue_order_id": "WB-1"})
+        order_status = staticmethod(v.order_status)
+        positions = staticmethod(v.positions)
+
+    assert ledger.reconcile(Placed, {})["clean"]
+    ledger.intend("t", "SPY", 10.0, 90.0, limit_price=90.0)
+    assert ledger.submit_once(Placed, "t")["state"] == "accepted"
+    client._details[wb.client_order_id("t")] = detail(order(raw, total_quantity="10", **fields))
+    client._positions = [{"symbol": "SPY", "quantity": str(units), "instrument_type": "EQUITY"}] if units else []
+    now[0] += 60
+    return ledger, Placed, now
+
+
+def test_a_partly_filled_order_that_expires_books_the_fill_and_ends_expired(tmp_path):
+    ledger, venue_, now = _ledger_after_expiry(tmp_path, 3, "EXPIRED", filled_quantity="3", filled_price="90.5")
+    out = ledger.reconcile(venue_, {})
+    assert out["anomalies"] == [] and out["unresolved"] == [] and out["clean"], out
+    rec = ledger.order("t")
+    assert rec["state"] == "expired" and rec["filled_units"] == 3.0, rec
+    assert [f["units"] for f in ledger.fills("t")] == [3.0]
+
+
+def test_an_order_that_expires_with_nothing_filled_books_nothing_and_ends_expired(tmp_path):
+    ledger, venue_, now = _ledger_after_expiry(tmp_path, 0, "EXPIRED", filled_quantity="0")
+    out = ledger.reconcile(venue_, {})
+    assert out["anomalies"] == [] and out["unresolved"] == [] and out["clean"], out
+    assert ledger.order("t")["state"] == "expired" and ledger.fills("t") == []
+
+
+def test_an_expired_open_order_is_terminal_so_the_next_reconcile_has_nothing_unresolved(tmp_path):
+    ledger, venue_, now = _ledger_after_expiry(tmp_path, 0, "EXPIRED", filled_quantity="0")
+    ledger.reconcile(venue_, {})
+    now[0] += 60
+    again = ledger.reconcile(venue_, {})
+    assert again["unresolved"] == [] and again["anomalies"] == [] and again["clean"], again
+
+
+def test_an_order_under_a_status_not_listed_stays_unresolved_on_the_ledger(tmp_path):
+    ledger, venue_, now = _ledger_after_expiry(tmp_path, 0, "EXPIRED ", filled_quantity="0")
+    out = ledger.reconcile(venue_, {})
+    assert ledger.order("t")["state"] == "accepted" and not out["clean"], out
+    assert [u["tag"] for u in out["unresolved"]] == ["t"]
 
 
 NOT_FOUND_ANSWERS = [detail(), Response({"orders": []}), ServerError("ORDER_NOT_FOUND", "business error", 417),

@@ -53,8 +53,9 @@ Reading orders and cash (added 2026-11-12). "SDK" means webull-openapi-python-sd
 * Order statuses: docs order-detail, field orders[].status, enum PENDING, SUBMITTED, CANCELLED, FILLED, FAILED
   ("a failed order, such as REJECTED"), PARTIAL_FILLED. The SDK disagrees on one spelling: its OrderStatus
   (SDK trade/common/order_status.py:21-25) writes "PARTIAL FILLED" with a space and has no PENDING. Both
-  spellings are mapped. No documented status means expired, so nothing maps to `expired` yet; an expired order
-  that Webull reports under a status not in the table shows as `unknown_status`.
+  spellings are mapped. No documented status means expired. EXPIRED is mapped to `expired` on the parser's own
+  reading (it is in DEAD_RAW_STATUSES, read as dead): that value has NOT been seen live, and only the exact
+  string "EXPIRED" matches. An expired order that Webull reports under any other spelling shows as `unknown_status`.
 * No such order (as read from the docs on 2026-11-12; what the test environment answers is at the end of these
   notes, and order_status reads those answers too). The order-detail page documents only 200, 401, 417 and 500 answers, and the
   error-code page (developer.webull.hk/apis/docs/error-codes.md; developer.webull.com has none) lists no
@@ -253,8 +254,10 @@ __all__ = ["WebullVenue", "WebullError", "NotTransmitted", "LiveTradingNotConfir
 # Webull's order status -> the trader's order state. Source: developer.webull.com/apis/docs/reference/order-detail
 # (read 2026-11-12), field orders[].status; "PARTIAL FILLED" is the SDK's spelling (webull/trade/common/order_status.py:25).
 # A status not in this table is `unknown_status`, never filled or cancelled.
+# EXPIRED is not in the docs and has not been seen live: it is the parser's own reading (DEAD_RAW_STATUSES below),
+# accepted so an expired day order ends terminal on the ledger instead of a reconcile fault. Exact match only.
 ORDER_STATES = {"PENDING": "open", "SUBMITTED": "open", "PARTIAL_FILLED": "partly_filled", "PARTIAL FILLED": "partly_filled",
-                "FILLED": "filled", "CANCELLED": "cancelled", "FAILED": "rejected"}
+                "FILLED": "filled", "CANCELLED": "cancelled", "FAILED": "rejected", "EXPIRED": "expired"}
 # The error code read as "no such order" (with an empty `orders` list), and only with confirmed_not_found=True.
 # Not confirmed for the US API: see the module notes.
 ORDER_NOT_FOUND_CODES = frozenset({"ORDER_NOT_FOUND"})
