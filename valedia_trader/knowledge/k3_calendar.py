@@ -34,6 +34,17 @@ Removed holidays: when a Finnhub holiday read no longer lists a date that an ear
 the range the new list covers (its earliest to its latest date), `refresh` stores a "removed" version for it (closed
 false), so the old closure stops counting. A date outside that range only rolled off the list's edge: it is left alone.
 
+Two store files (K-7). Only the two Finnhub sources live in the Finnhub store (a store opened with
+`store.connect(path, role="finnhub")`); the XNYS calendar, the Federal Register and the White House feed live in the general
+store. `register_all` and `refresh` take the connection that matches the source and refuse the other one (a Finnhub source
+on a general connection, or any other source on the Finnhub connection) before anything is fetched or written; a mixed
+`only` list is refused whole. `closure_votes(conn, trade_date, as_of_utc, *, finnhub_conn=None)` reads Finnhub rows only from
+`finnhub_conn` and every other source from `conn`. Without `finnhub_conn` there is NO Finnhub vote, and the general file is
+never read for Finnhub rows (a Finnhub row found there is ignored): the result then says `finnhub_store_given: false`, so a
+caller cannot mistake "the Finnhub store was not asked" for "Finnhub says open". There is no default path for the Finnhub
+store anywhere: the command line takes `--finnhub-store`, required to register or refresh a Finnhub source, and optional
+for `votes` (left out, the answer says so). Retiring Finnhub is deleting that one file.
+
 Roles: SCHEDULE (the library, derived), AUTHORITY (a source that can say "closed" and votes, through its group),
 SIGNAL (logged only, never votes, has no group; no source has this role today).
 
@@ -281,6 +292,23 @@ def _load(raw, what: str) -> dict:
 
 # ---- source registration
 
+def _wants_finnhub_store(source_id: str) -> bool:
+    """True for the two Finnhub sources: the only rows that belong in the Finnhub store."""
+    return "finnhub" in source_id.casefold()
+
+
+def _need_store(conn, source_id: str) -> None:
+    """Refuse a connection whose role does not match the source: Finnhub sources go to the Finnhub store, the others to
+    the general store. Raised before any request or write."""
+    try:
+        role = store.role_of(conn)
+    except store.StoreError as exc:
+        raise K3Error(f"conn: {exc}") from exc
+    want = "finnhub" if _wants_finnhub_store(source_id) else "general"
+    if role != want:
+        raise K3Error(f"{source_id}: needs the {want} store, but the connection given is the {role} store")
+
+
 def register_all(conn, terms_read_at_utc, *, only) -> None:
     """Register the named sources. The caller decides which: the owner reads the terms first. Same values again:
     nothing happens. An unknown, empty or malformed list registers nothing."""
@@ -290,6 +318,8 @@ def register_all(conn, terms_read_at_utc, *, only) -> None:
     for name in names:
         if not isinstance(name, str) or name not in SOURCES:
             raise K3Error(f"only: unknown source {str(name)[:60]!r}")
+    for name in names:
+        _need_store(conn, name)                # a mixed list is refused whole, before anything is registered
     for name in names:
         e = SOURCES[name]
         store.register_source(
@@ -922,13 +952,16 @@ def _read_death_bodies(conn, facts: list[dict], http_get) -> tuple[list[dict], i
 
 
 def refresh(conn, source_id, *, http_get=None, now, credentials=None, params=None) -> dict:
-    """Fetch, parse and store every fact of one source. A bad argument raises. A failed request, a refused body or a
+    """Fetch, parse and store every fact of one source, into the store that matches it: `conn` is the Finnhub store's
+    connection for a Finnhub source and the general store's for any other (the other pairing raises K3Error, before any
+    request). A bad argument raises. A failed request, a refused body or a
     fact the store refuses is counted as an error (a refused body stores nothing at all). A Federal Register death
     proclamation also costs one request for its body text; if that fails the failure is counted as an error, an earlier
     good read of the same title and abstract stays current, and otherwise only the title's and abstract's own dates are stored."""
     if not isinstance(source_id, str) or source_id not in SOURCES:
         raise K3Error(f"unknown source {str(source_id)[:60]!r}")
     _check_params(source_id, params, _now_text(now))
+    _need_store(conn, source_id)             # the connection must match the source, before any request
     body_errors = 0
     if source_id == _X:
         facts = fetch(source_id, http_get=http_get, now=now, params=params)
@@ -975,14 +1008,29 @@ _CLOSURE_RULES = {_H: _rule_finnhub_holiday, _S: _rule_finnhub_status, _FR: _rul
                   _WH: _rule_whitehouse}
 
 
-def closure_votes(conn, trade_date, as_of_utc) -> dict:
+def closure_votes(conn, trade_date, as_of_utc, *, finnhub_conn=None) -> dict:
     """What was known at `as_of_utc` about `trade_date`: the calendar's answer and the authority GROUPS that say closed
     (`authorities_closed`), with the source ids behind them (`sources_closed`). A group counts once however many of its
-    sources say closed. A pure read: no network, and facts known after `as_of_utc` are not seen."""
+    sources say closed. A pure read: no network, and facts known after `as_of_utc` are not seen.
+
+    `conn` is the general store. `finnhub_conn` is the Finnhub store and is optional: Finnhub rows are read only from it.
+    Without it there is NO Finnhub vote, and the general file is never read for Finnhub rows (one found there is
+    ignored). The result carries `finnhub_store_given` (true or false) so "the Finnhub store was not asked" can never be
+    mistaken for "Finnhub says open". A connection of the wrong role is refused."""
     day = _parse_date(trade_date, "trade_date").isoformat()
     if not isinstance(trade_date, str):
         raise K3Error("trade_date: must be text written YYYY-MM-DD")
-    rows = store.facts_as_of(conn, as_of_utc, domain=_DOMAIN)
+    try:
+        if store.role_of(conn) != "general":
+            raise K3Error("conn: must be the general store; the Finnhub store goes in finnhub_conn")
+        if finnhub_conn is not None and store.role_of(finnhub_conn) != "finnhub":
+            raise K3Error("finnhub_conn: must be the Finnhub store, opened with role=\"finnhub\"")
+    except store.StoreError as exc:
+        raise K3Error(f"closure_votes: {exc}") from exc
+    rows = [r for r in store.facts_as_of(conn, as_of_utc, domain=_DOMAIN) if not _wants_finnhub_store(r["source_id"])]
+    if finnhub_conn is not None:
+        rows += [r for r in store.facts_as_of(finnhub_conn, as_of_utc, domain=_DOMAIN)
+                 if _wants_finnhub_store(r["source_id"])]
     open_now = None
     closed_by = set()                                  # source ids
     groups = set()                                     # their authority groups
@@ -1012,7 +1060,8 @@ def closure_votes(conn, trade_date, as_of_utc) -> dict:
             groups.add(group)
     authorities = sorted(groups)
     return {
-        "trade_date": day, "as_of_utc": as_of_utc, "schedule_known": open_now is not None,
+        "trade_date": day, "as_of_utc": as_of_utc, "finnhub_store_given": finnhub_conn is not None,
+        "schedule_known": open_now is not None,
         "calendar_open": open_now, "calendar_closed": None if open_now is None else not open_now,
         "authorities_closed": authorities, "sources_closed": sorted(closed_by),
         "ordinary_stop": open_now is True and len(authorities) >= 2,
@@ -1044,6 +1093,7 @@ def _main(argv=None) -> int:
     def command(name):
         p = sub.add_parser(name)
         p.add_argument("--store", required=True)
+        p.add_argument("--finnhub-store", dest="finnhub_store")    # no default: the owner names the file every time
         return p
 
     p = command("register")
@@ -1061,28 +1111,53 @@ def _main(argv=None) -> int:
     p.add_argument("--as-of")
     args = parser.parse_args(argv)
     now = datetime.now(timezone.utc)
-    conn = None
+    conn = fin_conn = None
     try:
-        conn = store.connect(args.store)
         if args.cmd == "register":
-            register_all(conn, args.terms_read_at, only=[s.strip() for s in args.only.split(",") if s.strip()])
-            _print({"registered": [s.strip() for s in args.only.split(",") if s.strip()]})
+            names = [s.strip() for s in args.only.split(",") if s.strip()]
+            if any(_wants_finnhub_store(n) for n in names) and not args.finnhub_store:
+                raise K3Error("a Finnhub source goes in the Finnhub store: --finnhub-store is required")
+            if not names:
+                raise K3Error("only: name the sources to register, as a non-empty list")
+            general = [n for n in names if not _wants_finnhub_store(n)]
+            finnhub = [n for n in names if _wants_finnhub_store(n)]
+            if general:
+                conn = store.connect(args.store)
+            if finnhub:
+                fin_conn = store.connect(args.finnhub_store, role="finnhub")      # both files open before either is written
+            if conn is not None:
+                register_all(conn, args.terms_read_at, only=general)
+            if fin_conn is not None:
+                register_all(fin_conn, args.terms_read_at, only=finnhub)
+            _print({"registered": names})
             return 0
         if args.cmd in ("schedule", "refresh"):
             source = _X if args.cmd == "schedule" else args.source
+            if isinstance(source, str) and _wants_finnhub_store(source):
+                if not args.finnhub_store:
+                    raise K3Error(f"{source[:60]}: a Finnhub source is read into the Finnhub store: --finnhub-store is required")
+                fin_conn = store.connect(args.finnhub_store, role="finnhub")
+                target = fin_conn
+            else:
+                conn = store.connect(args.store)
+                target = conn
             params = {k: v for k, v in (("start", args.start), ("end", args.end)) if v is not None}
-            result = refresh(conn, source, http_get=_urllib_get, now=now, params=params or None)
+            result = refresh(target, source, http_get=_urllib_get, now=now, params=params or None)
             _print(result)
             return 1 if result["error"] else 0
-        result = closure_votes(conn, args.date, args.as_of or _fmt(now))
+        conn = store.connect(args.store)
+        if args.finnhub_store:
+            fin_conn = store.connect(args.finnhub_store, role="finnhub")
+        result = closure_votes(conn, args.date, args.as_of or _fmt(now), finnhub_conn=fin_conn)
         _print(result)
         return 1 if (result["suspected"] or not result["schedule_known"]) else 0
     except (K3Error, store.StoreError, OSError) as exc:
         print(f"error: {exc}"[:300], file=sys.stderr)
         return 2
     finally:
-        if conn is not None:
-            conn.close()
+        for c in (conn, fin_conn):
+            if c is not None:
+                c.close()
 
 
 if __name__ == "__main__":

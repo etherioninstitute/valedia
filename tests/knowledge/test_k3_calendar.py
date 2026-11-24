@@ -36,11 +36,28 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket, "create_connection", refuse)
 
 
+_FIN = {}      # general connection -> its paired Finnhub-store connection (K-7: Finnhub rows live in their own file)
+
+
 @pytest.fixture
 def conn(tmp_path):
     c = connect(tmp_path / "k.db")
+    f = connect(tmp_path / "finnhub.db", role="finnhub")
+    _FIN[id(c)] = f
     yield c
+    _FIN.pop(id(c), None)
+    f.close()
     c.close()
+
+
+def fin(conn):
+    """The Finnhub-store connection that goes with this test's general connection."""
+    return _FIN[id(conn)]
+
+
+def side(conn, source_id):
+    """The connection a source's rows belong in: the Finnhub store for the two Finnhub sources, else the general one."""
+    return fin(conn) if "finnhub" in source_id else conn
 
 
 def sha(text):
@@ -54,7 +71,7 @@ def raw(obj):
 def put(conn, facts):
     """Store parsed fact dicts the way `refresh` does, straight through add_fact."""
     for f in facts:
-        add_fact(conn, **f)
+        add_fact(side(conn, f["source_id"]), **f)
 
 
 def unix(y, m, d, hh=0, mm=0):
@@ -109,7 +126,13 @@ def mourning_doc(num, day_text, pub):
 
 
 def register(conn, *ids, at=T0):
-    k3.register_all(conn, at, only=ids or [X, H, S, FR, WH])
+    ids = ids or [X, H, S, FR, WH]
+    general = [i for i in ids if "finnhub" not in i]
+    finnhub = [i for i in ids if "finnhub" in i]
+    if general:
+        k3.register_all(conn, at, only=general)
+    if finnhub:
+        k3.register_all(fin(conn), at, only=finnhub)
 
 
 # ---- SOURCES and registration
@@ -150,7 +173,7 @@ def test_every_source_names_its_authority_group_and_signals_have_none():
 def test_the_group_is_code_only_and_registration_is_unchanged(conn):
     register(conn)
     for sid in (X, H, S, FR, WH):
-        cur = conn.execute("SELECT * FROM source_registry WHERE source_id = ?", (sid,))
+        cur = side(conn, sid).execute("SELECT * FROM source_registry WHERE source_id = ?", (sid,))
         row = cur.fetchone()
         assert row is not None and "authority_group" not in [d[0] for d in cur.description]
         assert "authority_group" not in str(tuple(row))
@@ -165,17 +188,18 @@ def test_the_nasdaq_halts_feed_is_gone_and_the_docstring_says_why():
 
 
 def test_register_all_registers_only_the_named_sources(conn):
-    k3.register_all(conn, T0, only=[H, X])
-    ids = {r[0] for r in conn.execute("SELECT source_id FROM source_registry")}
-    assert ids == {H, X}
-    row = conn.execute("SELECT * FROM source_registry WHERE source_id = ?", (H,)).fetchone()
+    register(conn, H, X)                       # K-7: the Finnhub source goes to the Finnhub store, the other to the general one
+    assert {r[0] for r in conn.execute("SELECT source_id FROM source_registry")} == {X}
+    assert {r[0] for r in fin(conn).execute("SELECT source_id FROM source_registry")} == {H}
+    row = fin(conn).execute("SELECT * FROM source_registry WHERE source_id = ?", (H,)).fetchone()
     assert row["allow_external_llm"] == 0 and row["ua_policy"] == "GENERIC_CLIENT" and row["personal_use_ok"] == 1
     assert "personal use only; no sharing with third parties" in row["notes"] and "30 calls/s cap" in row["notes"]
     assert row["licence_tag"] == "FINNHUB-PERSONAL-TOS"
     assert row["cost_usd_monthly"] == 0 and row["terms_read_at_utc"] == "2026-01-01T00:00:00.000000Z"
-    k3.register_all(conn, T0, only=[H, X])                        # same values again: nothing happens
-    k3.register_all(conn, T0, only=[FR])
-    assert {r[0] for r in conn.execute("SELECT source_id FROM source_registry")} == {H, X, FR}
+    register(conn, H, X)                                          # same values again: nothing happens
+    register(conn, FR)
+    assert {r[0] for r in conn.execute("SELECT source_id FROM source_registry")} == {X, FR}
+    assert {r[0] for r in fin(conn).execute("SELECT source_id FROM source_registry")} == {H}
 
 
 @pytest.mark.parametrize("only", [[], ["no_such_source"], [X, "no_such_source"], None, "finnhub_market_holiday"])
@@ -728,7 +752,7 @@ LATE = "2026-11-23T20:00:00.000000Z"
 
 
 def votes(conn, day=D, as_of=AS_OF):
-    return k3.closure_votes(conn, day, as_of)
+    return k3.closure_votes(conn, day, as_of, finnhub_conn=fin(conn))
 
 
 def seed(conn, days=("2026-11-23", "2026-11-30"), now=NOW):
@@ -985,9 +1009,12 @@ def test_quorum_is_a_pure_read_and_stores_nothing(conn):
     seed(conn)
     seed_holiday(conn, ("Surprise Closure", D, ""))
     before = facts_as_of(conn, "2027-01-01T00:00:00Z")
+    before_fin = facts_as_of(fin(conn), "2027-01-01T00:00:00Z")
+    assert before_fin and before                                               # both files hold rows, so both checks bite
     votes(conn)
     votes(conn)
     assert facts_as_of(conn, "2027-01-01T00:00:00Z") == before
+    assert facts_as_of(fin(conn), "2027-01-01T00:00:00Z") == before_fin
 
 
 def test_the_module_never_names_the_facts_table_itself():
@@ -1141,24 +1168,24 @@ def test_http_get_must_return_bytes():
 def test_refresh_stores_then_rereads_unchanged_then_stores_a_changed_version(conn):
     register(conn)
     fake = Fake({H_URL: HOLIDAYS})
-    assert k3.refresh(conn, H, http_get=fake, now=NOW, credentials=creds) == {"stored": 3, "unchanged": 0, "error": 0}
-    assert k3.refresh(conn, H, http_get=fake, now=NOW + timedelta(hours=1), credentials=creds) == \
+    assert k3.refresh(fin(conn), H, http_get=fake, now=NOW, credentials=creds) == {"stored": 3, "unchanged": 0, "error": 0}
+    assert k3.refresh(fin(conn), H, http_get=fake, now=NOW + timedelta(hours=1), credentials=creds) == \
         {"stored": 0, "unchanged": 3, "error": 0}
     changed = holiday_body(("Thanksgiving Day", "2026-11-26", ""), ("Day After Thanksgiving", "2026-11-27", "09:30-14:00"),
                            ("Christmas Day", "2026-12-25", ""), ("New Year's Day", "2027-01-01", ""))
     fake2 = Fake({H_URL: changed})
-    got = k3.refresh(conn, H, http_get=fake2, now=NOW + timedelta(days=1), credentials=creds)
+    got = k3.refresh(fin(conn), H, http_get=fake2, now=NOW + timedelta(days=1), credentials=creds)
     assert got == {"stored": 2, "unchanged": 2, "error": 0}                   # one changed date, one new date
-    rows = {r["entity_key"]: json.loads(r["payload_json"]) for r in facts_as_of(conn, "2027-06-01T00:00:00Z", domain="K3_CAL")}
+    rows = {r["entity_key"]: json.loads(r["payload_json"]) for r in facts_as_of(fin(conn), "2027-06-01T00:00:00Z", domain="K3_CAL")}
     assert rows["XNYS:CLOSURE:2026-11-27"]["trading_hours"] == "09:30-14:00" and "XNYS:CLOSURE:2027-01-01" in rows
-    old = {r["entity_key"]: json.loads(r["payload_json"]) for r in facts_as_of(conn, "2026-11-23T19:00:00Z", domain="K3_CAL")}
+    old = {r["entity_key"]: json.loads(r["payload_json"]) for r in facts_as_of(fin(conn), "2026-11-23T19:00:00Z", domain="K3_CAL")}
     assert old["XNYS:CLOSURE:2026-11-27"]["trading_hours"] == "09:30-13:00"            # the old version is still readable
 
 
 def test_refresh_returns_counts_only_and_a_failed_fetch_is_an_error_not_a_crash(conn):
     register(conn)
     boom = Fake({H_URL: RuntimeError(f"connection reset for {TOKEN}")})
-    got = k3.refresh(conn, H, http_get=boom, now=NOW, credentials=creds)
+    got = k3.refresh(fin(conn), H, http_get=boom, now=NOW, credentials=creds)
     assert got["error"] == 1 and got["stored"] == 0 and got["unchanged"] == 0
     assert TOKEN not in json.dumps(got) and TOKEN not in str(got.get("detail", ""))
 
@@ -1166,14 +1193,16 @@ def test_refresh_returns_counts_only_and_a_failed_fetch_is_an_error_not_a_crash(
 def test_refresh_never_stores_half_a_parsed_body(conn):
     register(conn)
     body = holiday_body(("a", "2026-11-26", ""), ("b", "nope", ""))
-    got = k3.refresh(conn, H, http_get=Fake({H_URL: body}), now=NOW, credentials=creds)
+    got = k3.refresh(fin(conn), H, http_get=Fake({H_URL: body}), now=NOW, credentials=creds)
     assert got["error"] == 1 and got["stored"] == 0
-    assert facts_as_of(conn, "2027-01-01T00:00:00Z") == []
+    assert facts_as_of(fin(conn), "2027-01-01T00:00:00Z") == []                # the file a Finnhub refresh writes
+    assert facts_as_of(conn, "2027-01-01T00:00:00Z") == []                     # and the general file, which must stay empty too
 
 
 def test_refresh_with_an_unregistered_source_stores_nothing_and_reports_an_error(conn):
-    got = k3.refresh(conn, H, http_get=Fake({H_URL: HOLIDAYS}), now=NOW, credentials=creds)
+    got = k3.refresh(fin(conn), H, http_get=Fake({H_URL: HOLIDAYS}), now=NOW, credentials=creds)
     assert got["error"] >= 1 and got["stored"] == 0
+    assert facts_as_of(fin(conn), "2027-01-01T00:00:00Z") == []
     assert facts_as_of(conn, "2027-01-01T00:00:00Z") == []
 
 
@@ -1183,45 +1212,49 @@ def test_refresh_federal_register_and_status(conn):
     assert k3.refresh(conn, FR, http_get=fr, now=NOW) == {"stored": 1, "unchanged": 0, "error": 0}
     assert k3.refresh(conn, FR, http_get=fr, now=NOW + timedelta(hours=1)) == {"stored": 0, "unchanged": 1, "error": 0}
     st = Fake({S_URL: status_body()})
-    assert k3.refresh(conn, S, http_get=st, now=NOW, credentials=creds)["stored"] == 1
+    assert k3.refresh(fin(conn), S, http_get=st, now=NOW, credentials=creds)["stored"] == 1
     st2 = Fake({S_URL: status_body(session="regular", isOpen=True)})
-    assert k3.refresh(conn, S, http_get=st2, now=NOW + timedelta(hours=1), credentials=creds)["stored"] == 1
+    assert k3.refresh(fin(conn), S, http_get=st2, now=NOW + timedelta(hours=1), credentials=creds)["stored"] == 1
 
 
 def test_finnhub_facts_never_reach_an_outside_model(conn):
     register(conn)
-    k3.refresh(conn, H, http_get=Fake({H_URL: HOLIDAYS}), now=NOW, credentials=creds)
-    k3.refresh(conn, S, http_get=Fake({S_URL: status_body()}), now=NOW, credentials=creds)
+    k3.refresh(fin(conn), H, http_get=Fake({H_URL: HOLIDAYS}), now=NOW, credentials=creds)
+    k3.refresh(fin(conn), S, http_get=Fake({S_URL: status_body()}), now=NOW, credentials=creds)
     k3.refresh(conn, FR, http_get=Fake({FR_URL: fr_body(fr_doc())}), now=NOW)
     k3.refresh(conn, X, http_get=None, now=NOW, params={"start": "2026-11-23", "end": "2026-11-24"})
-    inside = facts_as_of(conn, "2027-01-01T00:00:00Z")
+    # K-7: the Finnhub rows are in their own store; the general store holds none and the Finnhub store refuses the outside read
+    inside = facts_as_of(conn, "2027-01-01T00:00:00Z") + facts_as_of(fin(conn), "2027-01-01T00:00:00Z")
     outside = facts_as_of(conn, "2027-01-01T00:00:00Z", for_outside_llm=True)
     assert {r["source_id"] for r in inside} == {H, S, FR, X}                       # the two-way check: they do exist
+    assert {r["source_id"] for r in facts_as_of(fin(conn), "2027-01-01T00:00:00Z")} == {H, S}
     assert {r["source_id"] for r in outside} == {FR, X}
     assert not any("finnhub" in r["source_id"] for r in outside)
+    with pytest.raises(StoreError):
+        facts_as_of(fin(conn), "2027-01-01T00:00:00Z", for_outside_llm=True)
 
 
 def test_the_token_is_never_in_a_url_header_of_other_sources_or_a_stored_payload(conn):
     register(conn)
     fakes = [Fake({H_URL: HOLIDAYS}), Fake({S_URL: status_body()}), Fake({FR_URL: fr_body(fr_doc())})]
     for sid, fake in zip((H, S, FR), fakes):
-        k3.refresh(conn, sid, http_get=fake, now=NOW, credentials=creds)
+        k3.refresh(side(conn, sid), sid, http_get=fake, now=NOW, credentials=creds)
     for fake in fakes:
         for url, headers in fake.calls:
             assert TOKEN not in url
             assert all(TOKEN not in v for h, v in headers.items() if h != "X-Finnhub-Token")
-    rows = facts_as_of(conn, "2027-01-01T00:00:00Z")
-    assert rows and not any(TOKEN in json.dumps(dict(r)) for r in rows)
+    rows = facts_as_of(conn, "2027-01-01T00:00:00Z") + facts_as_of(fin(conn), "2027-01-01T00:00:00Z")
+    assert {r["source_id"] for r in rows} == {H, S, FR} and not any(TOKEN in json.dumps(dict(r)) for r in rows)
 
 
 # ---- removed holidays (tombstones)
 
 def refresh_h(conn, body, now):
-    return k3.refresh(conn, H, http_get=Fake({H_URL: body}), now=now, credentials=creds)
+    return k3.refresh(fin(conn), H, http_get=Fake({H_URL: body}), now=now, credentials=creds)
 
 
 def closure_payload(conn, day, as_of="2099-01-01T00:00:00Z"):
-    rows = [r for r in facts_as_of(conn, as_of, domain="K3_CAL")
+    rows = [r for r in facts_as_of(fin(conn), as_of, domain="K3_CAL")
             if r["source_id"] == H and r["entity_key"] == f"XNYS:CLOSURE:{day}"]
     return json.loads(rows[0]["payload_json"]) if rows else None
 
@@ -1291,7 +1324,7 @@ def test_an_empty_list_is_refused_whole_and_old_closures_stay_as_they_were(conn)
     got = refresh_h(conn, holiday_body(), T_B)
     assert got["error"] == 1 and got["stored"] == 0 and got["unchanged"] == 0
     assert closure_payload(conn, D)["closed"] is True and "removed" not in closure_payload(conn, D)
-    assert facts_as_of(conn, "2099-01-01T00:00:00Z", domain="K3_CAL", entity_key="XNYS:CLOSURE:2026-11-26")[0][
+    assert facts_as_of(fin(conn), "2099-01-01T00:00:00Z", domain="K3_CAL", entity_key="XNYS:CLOSURE:2026-11-26")[0][
         "known_at_utc"] == "2026-11-23T20:00:00.000000Z"            # no new version of anything
 
 
@@ -1328,28 +1361,36 @@ def run(args, capsys):
 
 def test_cli_register_schedule_votes_end_to_end(tmp_path, capsys):
     db = str(tmp_path / "cli.db")
-    code, out, _ = run(["register", "--store", db, "--only", f"{X},{H}", "--terms-read-at", T0], capsys)
+    fdb = str(tmp_path / "cli-finnhub.db")
+    code, out, _ = run(["register", "--store", db, "--finnhub-store", fdb, "--only", f"{X},{H}", "--terms-read-at", T0], capsys)
     assert code == 0
     code, out, _ = run(["schedule", "--store", db, "--from", "2026-11-23", "--to", "2026-11-30"], capsys)
     assert code == 0 and json.loads(out)["stored"] == 8
-    code, out, _ = run(["votes", "--store", db, "--date", "2026-11-24", "--as-of", "2099-01-01T00:00:00Z"], capsys)
+    code, out, _ = run(["votes", "--store", db, "--finnhub-store", fdb, "--date", "2026-11-24",
+                        "--as-of", "2099-01-01T00:00:00Z"], capsys)
     v = json.loads(out)
     assert code == 0 and v["calendar_open"] is True and v["authorities_closed"] == []
-    code, out, _ = run(["votes", "--store", db, "--date", "2026-11-26", "--as-of", "2099-01-01T00:00:00Z"], capsys)
+    code, out, _ = run(["votes", "--store", db, "--finnhub-store", fdb, "--date", "2026-11-26",
+                        "--as-of", "2099-01-01T00:00:00Z"], capsys)
     assert code == 0 and json.loads(out)["calendar_closed"] is True
 
 
 def test_cli_votes_exit_one_when_a_closure_is_suspected(tmp_path, capsys):
     db = str(tmp_path / "cli.db")
-    run(["register", "--store", db, "--only", f"{X},{H}", "--terms-read-at", T0], capsys)
+    fdb = str(tmp_path / "cli-finnhub.db")
+    run(["register", "--store", db, "--finnhub-store", fdb, "--only", f"{X},{H}", "--terms-read-at", T0], capsys)
     run(["schedule", "--store", db, "--from", "2026-11-23", "--to", "2026-11-30"], capsys)
-    c = connect(db)
+    c = connect(fdb, role="finnhub")
     try:
-        seed_holiday(c, ("Surprise Closure", D, ""))
+        for f in parse_h(holiday_body(("Surprise Closure", D, "")), fetched=LATE):
+            add_fact(c, **f)
     finally:
         c.close()
+    code, out, _ = run(["votes", "--store", db, "--finnhub-store", fdb, "--date", D, "--as-of", "2099-01-01T00:00:00Z"], capsys)
+    assert code == 1 and json.loads(out)["suspected"] is True and json.loads(out)["finnhub_store_given"] is True
+    # the opposite: without the Finnhub store the same question has no Finnhub vote, and the answer says so
     code, out, _ = run(["votes", "--store", db, "--date", D, "--as-of", "2099-01-01T00:00:00Z"], capsys)
-    assert code == 1 and json.loads(out)["suspected"] is True
+    assert code == 0 and json.loads(out)["suspected"] is False and json.loads(out)["finnhub_store_given"] is False
 
 
 def test_cli_votes_exit_one_when_the_schedule_is_missing(tmp_path, capsys):
@@ -1392,9 +1433,10 @@ def test_cli_never_prints_the_token(tmp_path, capsys, monkeypatch):
     from valedia_trader.core import secrets
     monkeypatch.setattr(secrets, "secret", lambda name, *a, **k: TOKEN)
     db = str(tmp_path / "cli.db")
-    run(["register", "--store", db, "--only", H, "--terms-read-at", T0], capsys)
+    fdb = str(tmp_path / "cli-finnhub.db")
+    run(["register", "--store", db, "--finnhub-store", fdb, "--only", H, "--terms-read-at", T0], capsys)
     monkeypatch.setattr(k3, "_urllib_get", Fake({H_URL: RuntimeError(f"failed with {TOKEN}")}))
-    code, out, err = run(["refresh", "--store", db, "--source", H], capsys)
+    code, out, err = run(["refresh", "--store", db, "--finnhub-store", fdb, "--source", H], capsys)
     assert code == 1 and TOKEN not in out and TOKEN not in err
 
 
@@ -1624,22 +1666,24 @@ def test_finnhub_plus_a_death_proclamation_with_an_empty_abstract_is_an_ordinary
     register(conn)
     k3.refresh(conn, X, http_get=None, now=NOW, params={"start": "2026-11-23", "end": "2026-11-26"})
     holidays = holiday_body(("Surprise Closure", TUESDAY, ""))
-    k3.refresh(conn, H, http_get=Fake({H_URL: holidays}), now=NOW, credentials=creds)
+    k3.refresh(fin(conn), H, http_get=Fake({H_URL: holidays}), now=NOW, credentials=creds)
     fake = Fake({FR_URL: fr_body(death_doc("2026-11", abstract=None)), BODY_URL: MOURNING_BODY.encode()})
     assert k3.refresh(conn, FR, http_get=fake, now=NOW) == {"stored": 1, "unchanged": 0, "error": 0}
-    v = k3.closure_votes(conn, TUESDAY, "2026-11-24T12:00:00.000000Z")
+    v = k3.closure_votes(conn, TUESDAY, "2026-11-24T12:00:00.000000Z", finnhub_conn=fin(conn))
     assert v["authorities_closed"] == [G_FIN, G_PRES] and v["ordinary_stop"] is True
     # the two-way check: with the body unreadable, the Federal Register casts no vote
     conn2 = connect(tmp_path / "k2.db")
+    _FIN[id(conn2)] = connect(tmp_path / "k2-finnhub.db", role="finnhub")
     try:
         register(conn2)
         k3.refresh(conn2, X, http_get=None, now=NOW, params={"start": "2026-11-23", "end": "2026-11-26"})
-        k3.refresh(conn2, H, http_get=Fake({H_URL: holidays}), now=NOW, credentials=creds)
+        k3.refresh(fin(conn2), H, http_get=Fake({H_URL: holidays}), now=NOW, credentials=creds)
         broken = Fake({FR_URL: fr_body(death_doc("2026-11", abstract=None)), BODY_URL: RuntimeError("down")})
         assert k3.refresh(conn2, FR, http_get=broken, now=NOW)["error"] == 1
-        v2 = k3.closure_votes(conn2, TUESDAY, "2026-11-24T12:00:00.000000Z")
+        v2 = k3.closure_votes(conn2, TUESDAY, "2026-11-24T12:00:00.000000Z", finnhub_conn=fin(conn2))
         assert v2["authorities_closed"] == [G_FIN] and v2["ordinary_stop"] is False and v2["suspected"] is True
     finally:
+        _FIN.pop(id(conn2)).close()
         conn2.close()
 
 

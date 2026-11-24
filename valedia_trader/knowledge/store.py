@@ -24,6 +24,17 @@ could hide a Finnhub name, a time's tail or JSON garbage). Every text column is 
 The file carries a schema version (PRAGMA user_version). `connect` creates a new empty file at the current
 version and refuses any existing file with a different one, rather than opening a store made with weaker guards.
 
+Two roles, one code path (K-7). The same code makes two kinds of file, and the kind is stamped in the file itself
+(`PRAGMA application_id`): the GENERAL store (id 0, which is also what every file made before this change carries, so
+those keep opening) and the FINNHUB store (id 0x46494E48). The schema and the schema version are identical. A general
+store refuses any source whose id contains "finnhub" (any letter case) and so can never hold a Finnhub fact; a Finnhub
+store refuses any source whose id does not, and is never allowed to feed an outside model, so `facts_as_of` with
+`for_outside_llm=True` raises on it instead of returning rows. `connect(path, role=...)` stamps the role on a new file
+and refuses an existing file whose stamp is a different role, and `role_of(conn)` reads it back from the file. There is no
+default path for the Finnhub store: every caller names it. `audit_roles(conn)` lists what breaks the role of a file
+(a Finnhub-named source or fact in a general file, anything else in a Finnhub file); it only reports and never rewrites.
+Retiring Finnhub means deleting that one file: nothing from Finnhub is anywhere else.
+
 "Current version at time t" means one thing everywhere: the version with the greatest `known_at_utc` at or
 before t, ties broken by the highest `fact_version_id`. `facts_as_of` returns it.
 
@@ -63,12 +74,16 @@ import math
 import os
 import re
 import sqlite3
+import unicodedata
 from collections import Counter
 from datetime import datetime, timezone
 
 SCHEMA_VERSION = 2   # kept in PRAGMA user_version
 DOMAINS = ("K1_LISTING", "K2_NEWS", "K3_CAL", "K4_VENUE", "K5_REG", "K6_TAX")
 UA_POLICIES = ("GENERIC_CLIENT", "SEC_DECLARED_CONTACT")
+ROLES = ("general", "finnhub")
+_ROLE_IDS = {"general": 0, "finnhub": 0x46494E48}      # kept in PRAGMA application_id; 0 is every file made before roles
+_ID_ROLES = {v: k for k, v in _ROLE_IDS.items()}
 
 _TIME_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?Z")
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
@@ -239,15 +254,73 @@ def _conn(conn) -> None:
         raise StoreError("conn: must be a sqlite3 connection, normally the one `connect` returns")
 
 
-def connect(path, *, quick: bool = False) -> sqlite3.Connection:
+def role_of(conn) -> str:
+    """The role of the store behind `conn`, read from the file's own stamp each time ("general" or "finnhub"). A
+    stamp this code does not know is refused."""
+    _conn(conn)
+    try:
+        stamp = conn.execute("PRAGMA application_id").fetchone()[0]
+    except sqlite3.Error as exc:
+        raise StoreError(f"cannot read the store's role: {exc}") from exc
+    role = _ID_ROLES.get(stamp)
+    if role is None:
+        raise StoreError(f"application_id {stamp} is not a role this code knows")
+    return role
+
+
+def _is_finnhub(source_id: str) -> bool:
+    """The one name test, in Python: a source id naming Finnhub in any letter case (casefold, so ligatures too), after
+    NFKC (fullwidth forms) and with format characters, spaces and combining marks left out (zero-width joiners, "finn hub",
+    the Turkish dotted I). A different alphabet's look-alike letter (Cyrillic i) is not folded: no table of those is kept."""
+    folded = unicodedata.normalize("NFKD", unicodedata.normalize("NFKC", source_id).casefold())
+    return "finnhub" in "".join(c for c in folded if unicodedata.category(c)[0] not in "CZM")
+
+
+def _check_source_role(conn, source_id: str) -> None:
+    """A general store holds no Finnhub-named source; a Finnhub store holds nothing else."""
+    role = role_of(conn)
+    named = _is_finnhub(source_id)
+    if role == "general" and named:
+        raise StoreError(f"source {source_id[:60]!r} names Finnhub: it belongs in the Finnhub store, never in a general store")
+    if role == "finnhub" and not named:
+        raise StoreError(f"source {source_id[:60]!r} does not name Finnhub: the Finnhub store holds only Finnhub sources")
+
+
+def audit_roles(conn) -> list[str]:
+    """What breaks the role of this file, as "source:<id>" and "fact:<id>" entries (empty when it is clean). A general
+    file must hold no Finnhub-named source or fact; a Finnhub file must hold only Finnhub-named ones, none of them
+    allowed to reach an outside model. Reports only: nothing is rewritten, moved or deleted."""
+    role = role_of(conn)
+    out_sources, bad_names = [], set()
+    try:
+        for source_id, external in conn.execute("SELECT source_id, allow_external_llm FROM source_registry ORDER BY source_id"):
+            wrong_name = _is_finnhub(source_id) if role == "general" else not _is_finnhub(source_id)
+            if wrong_name:
+                bad_names.add(source_id)
+            if wrong_name or (role == "finnhub" and external != 0):
+                out_sources.append(f"source:{source_id}")
+        out_facts = [f"fact:{fact_id}" for fact_id, source_id in conn.execute(
+            "SELECT fact_version_id, source_id FROM knowledge_facts ORDER BY fact_version_id") if source_id in bad_names]
+    except (sqlite3.Error, UnicodeError) as exc:
+        raise StoreError(f"audit failed: {exc}") from exc
+    return out_sources + out_facts
+
+
+def connect(path, *, role: str = "general", quick: bool = False) -> sqlite3.Connection:
     """Open (and create if needed) the store at `path`. The one place connections are made. A store with a
     different schema version or text encoding, with any expected table, index or trigger missing or changed,
     or that fails SQLite's own integrity check, is refused. A new empty file is created at the current version.
+
+    `role` is "general" (the default, so every existing caller is unchanged) or "finnhub". A new file is stamped with
+    its role in `PRAGMA application_id`; an existing file must carry the same stamp or it is refused (a file made
+    before roles carries 0 and is a general store). The role changes nothing else about the file.
 
     Cost: opening an existing store runs `PRAGMA integrity_check`, which is a full-file read on every open
     (measured 0.14 s for 10,000 facts in a 5 MB file, so roughly 1.4 s per hundred thousand). `quick=True` runs
     `PRAGMA quick_check` instead, which skips some index and uniqueness checks."""
     quick = _flag(quick, "quick")
+    if not isinstance(role, str) or role not in ROLES:
+        raise StoreError(f"role: must be one of {ROLES}, got {str(role)[:40]!r}")
     path = _path(path)
     try:
         conn = sqlite3.connect(path, isolation_level=None)  # autocommit; writes use explicit BEGIN
@@ -264,11 +337,19 @@ def connect(path, *, quick: bool = False) -> sqlite3.Connection:
         encoding = conn.execute("PRAGMA encoding").fetchone()[0]
         if encoding != "UTF-8":
             raise StoreError(f"{path}: store text encoding is {encoding}, this code needs UTF-8")
+        stamp = conn.execute("PRAGMA application_id").fetchone()[0]
+        fresh = version == 0 and not has_objects
+        if stamp != _ROLE_IDS[role] and not (fresh and stamp == 0):
+            have = _ID_ROLES.get(stamp)
+            if have is None:
+                raise StoreError(f"{path}: application_id {stamp} is not a role this code knows; it is not opened silently")
+            raise StoreError(f"{path}: this is a {have} store, not a {role} store; it is not opened in the wrong role")
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA synchronous = FULL")
         conn.execute("PRAGMA ignore_check_constraints = OFF")
         if version == 0:   # a brand-new empty file: create everything and stamp the version in one transaction
-            conn.executescript(f"BEGIN IMMEDIATE;{_SCHEMA}PRAGMA user_version = {SCHEMA_VERSION};COMMIT;")
+            conn.executescript(f"BEGIN IMMEDIATE;{_SCHEMA}PRAGMA user_version = {SCHEMA_VERSION};"
+                               f"PRAGMA application_id = {_ROLE_IDS[role]};COMMIT;")
         else:              # an existing store: SQLite's own consistency check, before anything is trusted
             check = "quick_check" if quick else "integrity_check"
             found = [row[0] for row in conn.execute(f"PRAGMA {check}(5)").fetchall()]
@@ -433,8 +514,9 @@ def register_source(
     external = _flag(allow_external_llm, "allow_external_llm")
     if not personal:
         raise StoreError("personal_use_ok must be true: a source we may not use is not registered")
-    if external and "finnhub" in source_id.lower():
+    if external and _is_finnhub(source_id):
         raise StoreError("a Finnhub source may never be allowed to reach an outside model")
+    _check_source_role(conn, source_id)
     if not isinstance(ua_policy, str) or ua_policy not in UA_POLICIES:
         raise StoreError(f"ua_policy: must be one of {UA_POLICIES}")
     row = (
@@ -503,6 +585,7 @@ def add_fact(
         raise StoreError(f"domain: must be one of {DOMAINS}")
     _text(entity_key, "entity_key")
     _text(source_id, "source_id")
+    _check_source_role(conn, source_id)
     proven = _flag(published_proven, "published_proven")
     if not isinstance(raw_sha256, str) or not _SHA_RE.fullmatch(raw_sha256):
         raise StoreError("raw_sha256: must be 64 lowercase hex characters")
@@ -579,6 +662,8 @@ def facts_as_of(
     _conn(conn)
     as_of = _utc(as_of_utc, "as_of_utc")
     outside = _flag(for_outside_llm, "for_outside_llm")
+    if outside and role_of(conn) == "finnhub":
+        raise StoreError("the Finnhub store can never feed an outside model: for_outside_llm is refused on it")
     _text(entity_key, "entity_key", required=False)
     if domain is not None and domain not in DOMAINS:
         raise StoreError(f"domain: must be one of {DOMAINS}")
@@ -606,5 +691,5 @@ def facts_as_of(
     except (sqlite3.Error, UnicodeError) as exc:           # e.g. text in the file that is not valid UTF-8
         raise StoreError(f"read failed: {exc}") from exc
     if outside:     # belt and braces, in Python (not a SQL function): nothing Finnhub-named, whatever the registry says
-        rows = [r for r in rows if "finnhub" not in r["source_id"].casefold()]
+        rows = [r for r in rows if "finnhub" not in r["source_id"].casefold() and not _is_finnhub(r["source_id"])]
     return rows
