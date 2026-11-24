@@ -4,11 +4,15 @@
     python -m valedia_trader.core.run_ledger record-run --store PATH --book BOOK --trigger T --exit-code N   (summary on stdin)
     python -m valedia_trader.core.run_ledger preflight  --store PATH --book BOOK --repo R --accepted-commit-file F \\
                                                         --files-file L --venv-python P [--trigger T]
-    python -m valedia_trader.core.run_ledger deadman    --store PATH --book BOOK [--wait-open]
+    python -m valedia_trader.core.run_ledger deadman    --store PATH --book BOOK [--wait-open] [--orders-ledger PATH]
     python -m valedia_trader.core.run_ledger notify     --store PATH --book BOOK [--mac]
     python -m valedia_trader.core.run_ledger streak     --store PATH --book BOOK --since YYYY-MM-DD
 
-The store is a sqlite file whose path is always given; this module has no default path. Three tables:
+The store is a sqlite file whose path is always given: this module has no default path for it. Besides it, `preflight` reads the
+accepted-commit and file-list files it is given, and the P2 `p2:collar-miss` reads the practice order ledger, read only (see
+`_collar_miss`). That ledger has a default, `default_orders_ledger()`: `memory/orders-webull-sandbox.sqlite` of the repository that holds this module (the order step's
+own place for it), so the 7:25 job needs no new argument; `deadman --orders-ledger PATH` overrides it, and a missing or unreadable
+file only makes the check fall back to the printed counts. Three tables:
 
   run_events      one row for each thing that happened (a pre-flight, a run start, a run end, a skip, the dead-man).
                   Append-only: the database itself refuses UPDATE, DELETE and a REPLACE or UPSERT on an existing id.
@@ -53,6 +57,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from valedia_trader.core.alerts import NOTIFY_MAX_TRIES, Alert, MacNotifier, clean
@@ -79,6 +84,8 @@ HELD_LOCK_TOKEN = "held_lock=1"                                       # first wo
 COLLAR_CAUSE = "p2:collar-miss"                                       # two counted sessions where fewer than half the orders filled
 COLLAR_MIN_ORDERS = 3                                                 # a session of fewer orders pauses the check
 COLLAR_FILL_RATIO = 0.5                                               # a miss is fil/ord below this
+ORDERS_LEDGER_NAME = "orders-webull-sandbox.sqlite"                   # the practice venue's order ledger, in the repository's memory folder
+ORDERS_LEDGER_SECONDS = 5.0                                           # how long a read of the order ledger waits for a lock
 NOOP_LOCK_HELD = "run:noop:lock-held"
 NOOP_OUTSIDE_WINDOW = "run:noop:outside-window"
 # How the order step words a stop at its `session` stage. tests/core/test_run_ledger.py reads the order step's source for
@@ -98,6 +105,8 @@ _CAUSE_RE = re.compile(r"[a-z0-9_:.-]{1,120}")
 _STAGE_RE = re.compile(r"[a-z0-9_-]{1,40}")
 _SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}")
 _COLLAR_TOKENS_RE = re.compile(r"ord=(\d{1,8}) fil=(\d{1,8})(?: |$)")
+_COLLAR_BATCH_RE = re.compile(r"ord=\d{1,8} fil=\d{1,8} batch=(os-\d{8}-\d{6})(?: |$)")   # the token after the two counts
+_BATCH_ID_RE = re.compile(r"(os-\d{8}-\d{6})-[0-9a-f]{4,16}")                   # the order step's batch id: os-<date>-<time>-<hex>
 
 
 def _sql_in(values: Iterable[str]) -> str:
@@ -634,16 +643,44 @@ def _has_terminal_row(conn, trade_date: str, book: str) -> bool:
         (trade_date, book)).fetchone() is not None
 
 
-def _unpaired_starts(day_events: Sequence[dict]) -> list[dict]:
-    """The RUN_START rows of one day that never got their own RUN_END, in event order. Starts and ends pair per trigger in
-    event order: each RUN_END closes the latest still-open start of its trigger before it (a NOOP end counts)."""
+def _pair_runs(day_events: Sequence[dict], conservative: bool = False) -> tuple[list[dict], dict[int, dict]]:
+    """One day's run rows paired: (the RUN_START rows that never got their own RUN_END, in event order; each paired RUN_END's
+    event id mapped to its own RUN_START row). Starts and ends pair per trigger in event order: each RUN_END closes the latest
+    still-open start of its trigger before it (a NOOP end counts). A RUN_END with no open start of its trigger is in neither.
+    A RUN_END carries no run id (the wrapper writes the trigger only), so when two starts of one trigger are open an end cannot
+    say which of them it ends. `conservative` is the pairing for judging lock proofs (`_prior_starts`), where the returned
+    mapping holds only the ends whose start is KNOWN:
+    - an end that arrives while MORE THAN ONE start of its trigger is open is ambiguous, whatever its kind (a lock-held NOOP
+      too): it proves nothing, it closes the EARLIEST open start, so the later starts, the ones that may have hung, stay open
+      and are the ones judged, and every start still open at that moment is TAINTED;
+    - a later end that closes a tainted start proves nothing either (it may be another run's end);
+    - an end that closes the only open start of its trigger, a start that is not tainted, proves it: that is the mapping.
+    A start is thus proven only by a run whose own start is later and unambiguously paired. The next such run after a start
+    proves it as usual (a run of another trigger, or of this trigger once nothing of it is open), so one ambiguous end never
+    blocks a start for good."""
     open_starts: dict[str, list[dict]] = {}
+    ended: dict[int, dict] = {}
+    tainted: set[int] = set()
     for e in sorted(day_events, key=lambda x: x["event_id"]):
         if e["kind"] == "RUN_START":
             open_starts.setdefault(e["trigger"], []).append(e)
         elif e["kind"] == "RUN_END" and open_starts.get(e["trigger"]):
-            open_starts[e["trigger"]].pop()
-    return sorted((e for starts in open_starts.values() for e in starts), key=lambda x: x["event_id"])
+            stack = open_starts[e["trigger"]]
+            if not conservative:
+                ended[e["event_id"]] = stack.pop()
+            elif len(stack) > 1:
+                stack.pop(0)                                                     # ambiguous: no proof, the later starts stay open
+                tainted.update(x["event_id"] for x in stack)
+            else:
+                start = stack.pop()
+                if start["event_id"] not in tainted:
+                    ended[e["event_id"]] = start
+    return sorted((e for starts in open_starts.values() for e in starts), key=lambda x: x["event_id"]), ended
+
+
+def _unpaired_starts(day_events: Sequence[dict]) -> list[dict]:
+    """The RUN_START rows of one day that never got their own RUN_END, in event order (see `_pair_runs`)."""
+    return _pair_runs(day_events)[0]
 
 
 def _open_triggers(day_events: Sequence[dict], now: datetime) -> tuple[list[str], list[str]]:
@@ -683,26 +720,42 @@ def _prior_starts(conn, book: str, day: str, now: datetime) -> list[int]:
     rows = [dict(r) for r in conn.execute(
         "SELECT * FROM run_events WHERE book = ? AND trade_date <= ? AND kind IN ('RUN_START', 'RUN_END', 'DEADMAN') ORDER BY event_id",
         (book, day))]
-    proof_at = max((e["at_utc"] for e in rows if _is_lock_proof(e)), default="")
     by_day: dict[str, list[dict]] = {}
     for e in rows:
-        if e["trade_date"] < day and e["kind"] in ("RUN_START", "RUN_END"):
+        if e["kind"] in ("RUN_START", "RUN_END"):
             by_day.setdefault(e["trade_date"], []).append(e)
+    # A lock proof for a start is the RUN_END of a run that STARTED after it: the proof's own RUN_START (paired as everywhere
+    # here) has a later `at_utc` than the start (stamps sort as text; the same second is not later). A run that began earlier and
+    # ended later may have taken the lock before the start and says nothing about it; a RUN_END with no start of its own proves
+    # nothing (the safe side: the start keeps blocking). Pairing is the conservative one (`_pair_runs`): an end that arrives while
+    # two starts of its trigger are open is ambiguous and proves nothing, nor does a later end of a start it left tainted.
+    proof_start = ""
+    for day_rows in by_day.values():
+        ended = _pair_runs(day_rows, True)[1]
+        proof_start = max([proof_start, *(ended[e["event_id"]]["at_utc"] for e in day_rows
+                                          if e["event_id"] in ended and _is_lock_proof(e))])
     faults = [e for e in rows if e["kind"] == "DEADMAN" and e["outcome"] == "FAULT" and e.get("root_cause")]
-    p0_own_day = {(e["trade_date"], e["root_cause"]) for e in faults}
-    p0_anywhere = {e["root_cause"] for e in faults}                              # a prior or unreported P0 on any day
+    p0_own_day: dict[tuple[str, str], str] = {}                                  # (its day, cause) -> the time of the latest such P0
+    p0_anywhere: dict[str, str] = {}                                             # a prior or unreported P0 on any day: cause -> its latest time
+    for e in faults:
+        key = (e["trade_date"], e["root_cause"])
+        p0_own_day[key] = max(e["at_utc"], p0_own_day.get(key, ""))
+        p0_anywhere[e["root_cause"]] = max(e["at_utc"], p0_anywhere.get(e["root_cause"], ""))
     today_causes = {e["root_cause"] for e in rows if e["kind"] == "DEADMAN" and e["trade_date"] == day and e.get("root_cause")}
     written: list[int] = []
-    for prior_day in sorted(by_day):
+    for prior_day in sorted(d for d in by_day if d < day):
         latest: dict[str, dict] = {}
-        for e in _unpaired_starts(by_day[prior_day]):
+        for e in _pair_runs(by_day[prior_day], True)[0]:
             latest[e["trigger"]] = e                                             # the latest unpaired start of the trigger: the safe side
         for trigger, e in latest.items():
             tag = f"{prior_day.replace('-', '')}:{trigger.lower()}"
-            had_p0 = ((prior_day, ORPHAN_CAUSE + trigger.lower()) in p0_own_day or PRIOR_ORPHAN_CAUSE + tag in p0_anywhere
-                      or UNREPORTED_CAUSE + tag in p0_anywhere)
+            # A P0 counts for THIS start only when it was written after the start was: a P0 of the same trigger and day that
+            # was written before it (an earlier hung run of that trigger) never told the owner about it.
+            had_p0 = (p0_own_day.get((prior_day, ORPHAN_CAUSE + trigger.lower()), "") > e["at_utc"]
+                      or p0_anywhere.get(PRIOR_ORPHAN_CAUSE + tag, "") > e["at_utc"]
+                      or p0_anywhere.get(UNREPORTED_CAUSE + tag, "") > e["at_utc"])
             name = _RUN_NAMES.get(trigger, trigger)
-            if proof_at > e["at_utc"]:                                           # a later run took the lock: this one is not running
+            if proof_start > e["at_utc"]:                                        # a run that started later took the lock: this one is not running
                 if not had_p0:
                     written.append(_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="FAULT", now=now, trade_date=day,
                                                  root_cause=UNREPORTED_CAUSE + tag,
@@ -719,43 +772,151 @@ def _prior_starts(conn, book: str, day: str, now: datetime) -> list[int]:
     return written
 
 
-def _collar_miss(conn, book: str, day: str, now: datetime) -> list[int]:
-    """The P2 `p2:collar-miss` (read the master list, rounds 37 to 40): written by the 7:25 job on today's trade date when today
-    and the session before it, among the book's COUNTED sessions, both ended with fewer than half their orders filled.
+@contextmanager
+def _orders_reader(path):
+    """Read-only access to the order ledger's filled-order counts: yields `filled(stem) -> int | None`, then closes.
+    `filled('os-YYYYMMDD-HHMMSS')` is the number of DISTINCT order tags that start with `stem + '-'` (a batch's tags are its id,
+    a dash, the symbol) and hold at least one fill row with a nonzero number of units, as the ledger holds them now; a partly
+    filled order counts. It is None when nothing can be said: no path, no file, a file sqlite will not read as the order ledger
+    (the connection is `mode=ro` with `query_only`: nothing is created, written or upgraded), a failed query, or a batch with no
+    order row in the file (a different ledger would otherwise read as nothing filled). The caller then keeps its estimate."""
+    db = None
+    if path is not None:
+        try:
+            file = Path(path)
+            if file.is_file():
+                db = sqlite3.connect("file:" + quote(str(file.resolve())) + "?mode=ro", uri=True, timeout=ORDERS_LEDGER_SECONDS,
+                                     isolation_level=None)
+                db.execute("PRAGMA query_only = ON")
+                db.execute("SELECT 1 FROM orders LIMIT 1")
+                db.execute("SELECT 1 FROM fills LIMIT 1")
+        except (OSError, ValueError, sqlite3.Error):
+            if db is not None:
+                db.close()
+            db = None
 
-    A session is one trade date; its totals are the sums of `ord` and `fil` over that day's COMPLETED RUN_END rows that carry
-    the tokens `ord=N fil=M` first in `detail` (written by `map_run`: the order count and an estimate of the filled count; see
-    `_collar_tokens` for the limits of the estimate). A session is COUNTED when its ord is at least COLLAR_MIN_ORDERS (0 to 2
-    orders pause it); a counted session is a MISS when fil/ord is below COLLAR_FILL_RATIO. Days with no COMPLETED run and rows
-    without tokens (an older revision, a FAULT, a SKIP) neither count nor break the pair. The pair is the two latest counted
-    sessions up to today; they need not be neighbours. One query reads them all, whatever their number.
-    The row is DEADMAN/WARN, cause p2:collar-miss, fault_count 0, once for each session day while the pair holds: `_judge` and
-    `streak` never read it, so it neither resets nor pauses the clean streak and cannot make a clean day unclean, and
-    nothing is ever removed or rewritten. A store with no tokens, or with one counted session, writes nothing."""
+    def filled(stem: str) -> int | None:
+        if db is None:
+            return None
+        prefix = stem + "-"
+        try:
+            if db.execute("SELECT 1 FROM orders WHERE substr(tag, 1, ?) = ? LIMIT 1", (len(prefix), prefix)).fetchone() is None:
+                return None
+            return int(db.execute("SELECT COUNT(DISTINCT tag) FROM fills WHERE substr(tag, 1, ?) = ? AND abs(units) > 1e-9",
+                                  (len(prefix), prefix)).fetchone()[0])
+        except (sqlite3.Error, TypeError, ValueError):
+            return None
+    try:
+        yield filled
+    finally:
+        if db is not None:
+            db.close()
+
+
+def default_orders_ledger() -> Path:
+    """The practice order ledger the order step keeps for the paper book: `memory/orders-webull-sandbox.sqlite` in the repository
+    this module is part of (the order step puts one ledger for each venue name in the loop's memory folder; the paper book's venue is
+    `webull-sandbox`). Only a path: nothing is opened, created or moved."""
+    return Path(__file__).resolve().parents[2] / "memory" / ORDERS_LEDGER_NAME
+
+
+def _collar_detail(conn, book: str, day: str, orders_ledger=None) -> str | None:
+    """The P2 `p2:collar-miss` (read the master list, rounds 37 to 40): written by the 7:25 job on today's trade date D when the
+    two latest COUNTED, SETTLED sessions both ended with fewer than half their orders filled.
+
+    A session is one trade date. At the check on D a session S is SETTLED when S < D and at least one COMPLETED RUN_END of the
+    book has a trade date after S and up to D: that later run's reconcile has journaled S's late fills (the order step journals
+    the fills of earlier orders at the start of its next run). Today's session is never judged at its own check, and a session
+    after which no run has completed stays unsettled (the dead-man and the run faults are the alert then).
+    A settled session is counted in FULL: its totals are the sums of `ord` and `fil` over ALL its COMPLETED RUN_END rows that carry
+    the tokens `ord=N fil=M` first in `detail` (written by `map_run`: the order count and an estimate of the filled count made
+    when the run printed its summary; see `_collar_tokens`). A row with a third token `batch=os-<date>-<time>` is counted again
+    at the check: its `fil` is the number of that run's orders (the order ledger's tags that start with the batch id and a dash)
+    that hold a fill in the order LEDGER now (`orders_ledger`, default `default_orders_ledger()`, opened read only), at most the
+    row's `ord`. A row without the batch token (an older revision), or whose ledger cannot be read or holds no order of that
+    batch, keeps its printed `fil`. A session is COUNTED when its ord is at least COLLAR_MIN_ORDERS (0 to 2 orders pause it); a
+    counted session is a MISS when fil/ord is below COLLAR_FILL_RATIO. Days with no COMPLETED run and rows without tokens (an
+    older revision, a FAULT, a SKIP) neither count nor break the pair. The pair is the two latest counted settled sessions; they
+    need not be neighbours. One query reads the rows and one read-only connection the ledger, whatever their number.
+    The detail says `estimate` only when one of the two sessions of the pair used a printed `fil` (an old row, an unreadable
+    ledger or an unknown batch); a row of no orders never does.
+    The row is written at most once for each check day (trade date), at every check where the latest settled pair is a miss: a
+    check where no new session became settled judges the same pair again, so a miss that goes on gives one row at EVERY check,
+    fault days and days without runs included, and it stops at the first check whose latest settled pair is not a miss. Misses on
+    sessions D1 and D2 therefore give the first row at the check of the next session day that has a completed run after D2
+    (D3 in a week of runs): a lag of one session day compared with judging D2 at its own check, which is what makes the count
+    reliable. Sessions whose orders all fill never trip it while the ledger is readable, because the order step sends equity orders as
+    DAY orders (venues/webull.py, time in force `DAY`) and the fills of one day's orders are journaled by the next run's reconcile,
+    which has completed before the session counts as settled.
+    Known limits:
+    - when no run completes after a session, it stays unsettled and is not judged;
+    - an order still unjournaled after the next completed run (a fill the venue reports late, or a reconcile that missed it) reads
+      as unfilled until a later run journals it, so it can count against its session at that check;
+    - a fill that lands after the settling run has reconciled reads as unfilled until a later run journals it, so a session
+      counted right after its first settling run can still show a late fill as unfilled (counted at the first check after a run journals it);
+    - a partly filled order counts as filled;
+    - FALLBACK: when the order ledger cannot be read, holds no order of the batch, or the row has no `batch=` token, the printed
+      `fil` is used (see `_collar_tokens` for its own limits), and a fill that lands after the run printed its summary reads as
+      unfilled, so LATE FILLS CAN TRIP A P2 in that mode; the detail says `estimate`. An order ledger that is not where
+      `default_orders_ledger` says is such a case unless `orders_ledger` is given.
+    The row is DEADMAN/WARN, cause p2:collar-miss, fault_count 0: `_judge` and `streak` never read it, so it neither resets nor
+    pauses the clean streak and cannot make a clean day unclean, and nothing is ever removed or rewritten. A store with no
+    tokens, or with one counted settled session, writes nothing."""
+    rows = [dict(r) for r in conn.execute(
+        "SELECT trade_date, detail FROM run_events WHERE book = ? AND trade_date <= ? AND kind = 'RUN_END' "
+        "AND outcome = 'COMPLETED' ORDER BY event_id", (book, day))]
+    last_run_day = max((r["trade_date"] for r in rows), default="")             # a session before it has a later completed run
     totals: dict[str, list[int]] = {}
-    for r in conn.execute("SELECT trade_date, detail FROM run_events WHERE book = ? AND trade_date <= ? AND kind = 'RUN_END' "
-                          "AND outcome = 'COMPLETED' AND detail GLOB 'ord=*' ORDER BY event_id", (book, day)):
-        m = _COLLAR_TOKENS_RE.match(r["detail"] or "")
-        if m:
+    estimate_days: set[str] = set()                                              # the days with a row that used its printed `fil`
+    with _orders_reader(default_orders_ledger() if orders_ledger is None else orders_ledger) as filled:
+        for r in rows:
+            if r["trade_date"] >= last_run_day or r["trade_date"] >= day:
+                continue                                                         # not settled
+            detail = r["detail"] or ""
+            m = _COLLAR_TOKENS_RE.match(detail)
+            if not m:
+                continue
+            ord_, fil = int(m.group(1)), int(m.group(2))
+            b = _COLLAR_BATCH_RE.match(detail)
+            seen = filled(b.group(1)) if b else None
+            if seen is not None:
+                fil = min(seen, ord_)
+            elif ord_ > 0:
+                estimate_days.add(r["trade_date"])                               # a row of no orders adds nothing to be unsure of
             t = totals.setdefault(r["trade_date"], [0, 0])
-            t[0] += int(m.group(1))
-            t[1] += int(m.group(2))
+            t[0] += ord_
+            t[1] += fil
     counted = [(d, o, f) for d, (o, f) in sorted(totals.items()) if o >= COLLAR_MIN_ORDERS]
-    if len(counted) < 2 or counted[-1][0] != day:
-        return []
+    if len(counted) < 2:
+        return None
     pair = counted[-2:]
     if any(f / o >= COLLAR_FILL_RATIO for _, o, f in pair):
+        return None
+    (d1, o1, f1), (d2, o2, f2) = pair
+    how = ("the count is an estimate from the run summary" if {d1, d2} & estimate_days
+           else "counted from the order ledger at the check")
+    return f"fewer than half the orders filled on {d1} (fil {f1} of ord {o1}) and {d2} (fil {f2} of ord {o2}); {how}"
+
+
+def _collar_write(conn, book: str, day: str, now: datetime, detail: str | None) -> list[int]:
+    """The write half of `_collar_miss`: the row for `detail` (from `_collar_detail`), unless today already has one. This is what
+    runs inside the store's write lock, and the only check made there: at most one collar row for each trade date."""
+    if detail is None:
         return []
     if conn.execute("SELECT 1 FROM run_events WHERE trade_date = ? AND book = ? AND kind = 'DEADMAN' AND root_cause = ? LIMIT 1",
                     (day, book, COLLAR_CAUSE)).fetchone():
         return []
-    (d1, o1, f1), (d2, o2, f2) = pair
-    return [_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="WARN", now=now, trade_date=day, root_cause=COLLAR_CAUSE,
-                          detail=f"fewer than half the orders filled on {d1} (fil {f1} of ord {o1}) and {d2} (fil {f2} of ord {o2}); "
-                                 f"the count is an estimate from the run summary")]
+    return [_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="WARN", now=now, trade_date=day,
+                          root_cause=COLLAR_CAUSE, detail=detail)]
 
 
-def deadman_check(conn, book: str, now: datetime) -> list[int]:
+def _collar_miss(conn, book: str, day: str, now: datetime, orders_ledger=None) -> list[int]:
+    """The two halves together (`_collar_detail`, then `_collar_write`); `deadman_check` calls them apart so that the order ledger
+    is read BEFORE the store's write lock is taken. The rule is in `_collar_detail`."""
+    return _collar_write(conn, book, day, now, _collar_detail(conn, book, day, orders_ledger))
+
+
+def deadman_check(conn, book: str, now: datetime, orders_ledger=None) -> list[int]:
     """The dead-man check of the 7:25 job: on a session day from 10:25 New York on, write what is due and return the new ids.
 
     - an orphaned run start (see `_open_triggers`) writes DEADMAN/FAULT with cause run:orphan-start:<trigger> (lower case),
@@ -764,21 +925,29 @@ def deadman_check(conn, book: str, now: datetime) -> list[int]:
       deadman:run-still-open:<trigger> (lower case), once for each (day, trigger): a P1. It covers a run launchd fired late;
       a later check writes the orphan P0 beside it if the run is still open by then;
     - an unpaired run start from an earlier day (same book, paired per trigger within its own trade_date, however old) is judged
-      by whether a LOCK PROOF has come since it: a RUN_END of this book with `at_utc` later than the start's that is COMPLETED,
+      by whether a LOCK PROOF has come since it: the RUN_END, of a run that STARTED after the start (its own RUN_START, paired per
+      trigger as above, was recorded after the start; a run that began earlier and ended later may have taken the lock before the
+      start and proves nothing, nor does an end with no start of its own), that is COMPLETED,
       or ORDINARY_STOP with cause run:ordinary-stop:session, or NOOP with cause run:noop:outside-window (the order step takes
       its lock before the `session` stage, so those runs held it; a FAULT whose detail starts with the word `held_lock=1`, written when
       the order step's summary says it held the lock, proves it too; a lock-held NOOP, any other FAULT and a CRASH prove nothing).
         no proof: on TODAY's trade_date, once for each (today, start day, trigger), cause run:orphan-start-prior:<YYYYMMDD of
           the start>:<trigger lower case>. DEADMAN/FAULT (a P0) when no P0 was ever written for the start (its own day's
-          run:orphan-start:<trigger>, or an earlier prior or unreported row), else DEADMAN/MISSING (a P1). Either resets today's streak;
+          run:orphan-start:<trigger>, or an earlier prior or unreported row; a P0 counts for a start only when it was written
+          AFTER that start, so a second hung start of one trigger and day is not covered by the first one's P0), else DEADMAN/MISSING (a P1). Either resets today's streak;
         a proof, and the start already had a P0: nothing;
         a proof, and the start never had a P0: DEADMAN/FAULT with cause run:orphan-start-unreported:<YYYYMMDD>:<trigger>,
           once ever for the book, written on today (a P0, and it resets today's streak);
       all of it is found with ONE query of the book's run rows, whatever the number of starts;
     - the day's dead-man row: DEADMAN/MISSING when no run ended (a NOOP end is not a run end) and none was skipped at 6:55 or
       7:10, else DEADMAN/OK; once a day. A still-open row never stands in for it.
-    - the P2 `p2:collar-miss` (DEADMAN/WARN, see `_collar_miss`): two counted sessions in a row with fewer than half the orders
-      filled, today being the second; once for each session day; it is last in the result and no row of the streak reads it.
+    - the P2 `p2:collar-miss` (DEADMAN/WARN, see `_collar_miss`): the two latest counted SETTLED sessions (a session before today
+      that a later completed run has followed; today is never judged at its own check) both with fewer than half their orders
+      filled, counted in full from the order ledger (`orders_ledger`, read only, default `default_orders_ledger()`) for rows that
+      carry a `batch=` token; once for each check day, at every check where the latest settled pair is a miss; it is last in the
+      result and no row of the streak reads it.
+    The order ledger for the collar row is read once, before the store's write lock is taken (a slow or locked order ledger
+    never holds the run ledger's lock); inside the lock only the one-row-for-each-date check and the writes are made (a run ending between the read and the lock is judged at the next check).
     The rows are separate, so all of them can be there on one day. Nothing is written before 10:25 or on a day that is not a
     session; a check that finds all already written writes nothing. Today's orphan rows come first in the result, then prior-day rows (oldest start first), then still-open rows, then the day row, then the collar row."""
     ny = _utc(now).astimezone(NEW_YORK)
@@ -786,6 +955,7 @@ def deadman_check(conn, book: str, now: datetime) -> list[int]:
     if ny.time() < DEADMAN_CUTOFF or not is_session(day):
         return []
     written: list[int] = []
+    collar = _collar_detail(conn, book, day, orders_ledger)                      # reads the order ledger BEFORE the write lock is taken
     with _tx(conn):
         have = [r[0] for r in conn.execute("SELECT root_cause FROM run_events WHERE trade_date = ? AND book = ? AND kind = 'DEADMAN' "
                                            "AND outcome = 'FAULT'", (day, book))]
@@ -814,15 +984,15 @@ def deadman_check(conn, book: str, now: datetime) -> list[int]:
             else:
                 written.append(_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="MISSING", now=now, trade_date=day,
                                              root_cause=DEADMAN_CAUSE, detail="no run ended and none was skipped by 10:25 New York"))
-        written += _collar_miss(conn, book, day, now)
+        written += _collar_write(conn, book, day, now, collar)                   # only the once-for-each-date check is made in the lock
     return written
 
 
-def deadman(conn, book: str, now: datetime) -> int | None:
+def deadman(conn, book: str, now: datetime, orders_ledger=None) -> int | None:
     """`deadman_check`, returning the id of the day's DEADMAN/OK or DEADMAN/MISSING row if this call wrote it. None: nothing
     written (before 10:25, on a day that is not a session, or the day already has its dead-man row; an orphan row may still
     have been written, and `deadman_check` says so)."""
-    ids = deadman_check(conn, book, now)
+    ids = deadman_check(conn, book, now, orders_ledger)
     for i in ids:
         outcome, cause = conn.execute("SELECT outcome, root_cause FROM run_events WHERE event_id = ?", (i,)).fetchone()
         if outcome in ("OK", "MISSING") and not (cause or "").startswith((STILL_OPEN_CAUSE, PRIOR_ORPHAN_CAUSE)):
@@ -839,7 +1009,7 @@ def _any_open_today(conn, book: str, now: datetime) -> bool:
     return bool(_open_triggers(events_for(conn, day, book), now)[1])
 
 
-def deadman_wait(conn, book: str, now_fn, sleep_fn, poll_s: float = WAIT_POLL_SECONDS) -> list[int]:
+def deadman_wait(conn, book: str, now_fn, sleep_fn, poll_s: float = WAIT_POLL_SECONDS, orders_ledger=None) -> list[int]:
     """Call this after `deadman_check` has written, and notify has sent, the still-open P1. While one of today's run starts is
     still open and at most ORPHAN_MINUTES old, `sleep_fn(poll_s)` and run `deadman_check` again; return the ids written (the
     orphan P0, normally) as soon as every start is paired or is an orphan. A run that hangs thus gets its P0 from this very
@@ -860,7 +1030,7 @@ def deadman_wait(conn, book: str, now_fn, sleep_fn, poll_s: float = WAIT_POLL_SE
         step = min(poll_s, cap - waited)
         sleep_fn(step)
         slept += step
-        written += deadman_check(conn, book, now_fn())
+        written += deadman_check(conn, book, now_fn(), orders_ledger)
     return written
 
 
@@ -914,11 +1084,18 @@ def _is_count(v) -> bool:
 
 
 def _collar_tokens(summary: dict) -> list[str]:
-    """`ord=N fil=M` for a COMPLETED run, or [] when the summary does not give the three facts as usable values.
+    """`ord=N fil=M` (and, when the summary names its batch, `batch=os-<date>-<time>` after them) for a COMPLETED run, or []
+    when the summary does not give the three facts as usable values.
     ord is `orders_sent`; fil is the number of entries of `sent` whose symbol has a nonzero value in `filled_so_far`.
-    The count is an ESTIMATE, because the printed summary has no per-order filled fact. Known limits: a fill that the next
-    run journals is not seen by this run; two legs of one symbol (a fractional order and its residual) count together; a
-    purchase and a sale of one symbol that net to zero read as unfilled."""
+    `fil` is an ESTIMATE at the moment the run printed its summary, because that summary has no per-order filled fact and
+    `filled_so_far` holds only the fills this run's own batch had journaled by then. Known limits of `fil` itself: a fill that a
+    later run journals is not seen by it; two legs of one symbol (a fractional order and its residual) count together; a
+    purchase and a sale of one symbol that net to zero read as unfilled. `_collar_miss` therefore does not trust `fil` when the
+    row has a `batch=` token: it counts the batch's filled orders again from the order ledger when it judges.
+    The batch token is the order step's batch id without its random tail (`os-YYYYMMDD-HHMMSS`): `clean` cuts a whole batch id
+    to its last 4 characters, which would leave nothing to match, and the stem alone names the run (a batch id is one run's
+    start time and the order step's lock allows one run at a time). A `batch` that is not in the order step's format adds
+    no token, and the row reads as before."""
     ord_, sent, filled = summary.get("orders_sent"), summary.get("sent"), summary.get("filled_so_far")
     if not _is_count(ord_) or not isinstance(sent, list) or not isinstance(filled, dict):
         return []
@@ -926,7 +1103,9 @@ def _collar_tokens(summary: dict) -> list[str]:
         v = filled.get(symbol) if isinstance(symbol, str) else None
         return type(v) in (int, float) and v == v and abs(v) > 1e-9
     fil = sum(1 for entry in sent if isinstance(entry, dict) and moved(entry.get("symbol")))
-    return [f"ord={ord_}", f"fil={fil}"]
+    batch = summary.get("batch")
+    m = _BATCH_ID_RE.fullmatch(batch) if isinstance(batch, str) else None
+    return [f"ord={ord_}", f"fil={fil}", *([f"batch={m.group(1)}"] if m else [])]
 
 
 def map_run(text: str, exit_code: int) -> RunMapping:
@@ -1014,6 +1193,8 @@ def _parser() -> argparse.ArgumentParser:
     c.add_argument("--venv-python", required=True)
     c.add_argument("--trigger", default="0630", choices=TRIGGERS)
     c = command("deadman", "write the day's dead-man row when it is due")
+    c.add_argument("--orders-ledger", help="the order ledger's file, read only, for the p2:collar-miss recount "
+                                           "(default: memory/orders-webull-sandbox.sqlite of this repository)")
     c.add_argument("--wait-open", action="store_true",
                    help="then wait (at most ORPHAN_MINUTES + 1 minutes) for a still-open run to end or become an orphan")
     c = command("notify", "decide what the owner is owed, send it, write it down")
@@ -1044,9 +1225,9 @@ def _run(args, now: datetime, stdin, sender, now_fn=None, sleep_fn=None) -> int:
             _print({"event_id": i, "outcome": r.outcome, "root_cause": r.root_cause})
             return 1 if _needs_owner(conn, i) else 0
         if args.cmd == "deadman":
-            ids = deadman_check(conn, args.book, now)
+            ids = deadman_check(conn, args.book, now, args.orders_ledger)
             if args.wait_open:
-                ids += deadman_wait(conn, args.book, now_fn or (lambda: now), sleep_fn or _time.sleep)
+                ids += deadman_wait(conn, args.book, now_fn or (lambda: now), sleep_fn or _time.sleep, orders_ledger=args.orders_ledger)
             if not ids:
                 _print({"recorded": False})
                 return 0
