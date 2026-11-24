@@ -607,6 +607,13 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 34 (Carbon response 34, reply 34 sent 2026-11-23): launchd checks all hold (no TimeOut key, no set -e,
+  sqlite timeout 15 s); 6:30+7:25 = ONE job, so a long sleep runs it once (dead-man). Dead vs hung: adopted as T65
+  (ticket written, build AFTER the 11-24 morning): no 7-day window; lock proof = later same-book COMPLETED, closed-market
+  ORDINARY_STOP or outside-window NOOP (lock taken before _session; FAULT/CRASH can be pre-lock, so no proof); rules:
+  no proof -> prior P0 each session day; proof + had P0 -> nothing; proof + never P0 -> unreported P0 once, reset on the
+  start day. WH HTML already handled by _plain_text. Q35: unreported-crash streak day; a held-lock flag in the summary
+  (order path, next revision).
   Round 33 (Carbon response 33, reply 33 sent 2026-11-23): T62 left FR with 0 votes on real mourning days (Proc 9830 +
   10876: empty FR abstract, undated title; the EOs had been the vote) -> T63 reads raw_text_url body of death
   proclamations (federalregister.gov only, dates + body_sha256 stored). Carbon's self-void claim WRONG: rule only reads
