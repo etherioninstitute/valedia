@@ -8,9 +8,9 @@
     python -m valedia_trader.core.run_ledger notify     --store PATH --book BOOK [--mac]
     python -m valedia_trader.core.run_ledger streak     --store PATH --book BOOK --since YYYY-MM-DD
 
-The store is a sqlite file whose path is always given: this module has no default path for it. The one other file it reads is the
-practice order ledger, read only and only for the P2 `p2:collar-miss` (see `_collar_miss`). That file has a default,
-`default_orders_ledger()`: `memory/orders-webull-sandbox.sqlite` of the repository the module is run from (the order step's
+The store is a sqlite file whose path is always given: this module has no default path for it. Besides it, `preflight` reads the
+accepted-commit and file-list files it is given, and the P2 `p2:collar-miss` reads the practice order ledger, read only (see
+`_collar_miss`). That ledger has a default, `default_orders_ledger()`: `memory/orders-webull-sandbox.sqlite` of the repository that holds this module (the order step's
 own place for it), so the 7:25 job needs no new argument; `deadman --orders-ledger PATH` overrides it, and a missing or unreadable
 file only makes the check fall back to the printed counts. Three tables:
 
@@ -853,7 +853,7 @@ def _collar_detail(conn, book: str, day: str, orders_ledger=None) -> str | None:
     - an order still unjournaled after the next completed run (a fill the venue reports late, or a reconcile that missed it) reads
       as unfilled until a later run journals it, so it can count against its session at that check;
     - a fill that lands after the settling run has reconciled reads as unfilled until a later run journals it, so a session
-      counted right after its first settling run can still show a late fill as unfilled (it is counted right at the next check);
+      counted right after its first settling run can still show a late fill as unfilled (counted at the first check after a run journals it);
     - a partly filled order counts as filled;
     - FALLBACK: when the order ledger cannot be read, holds no order of the batch, or the row has no `batch=` token, the printed
       `fil` is used (see `_collar_tokens` for its own limits), and a fill that lands after the run printed its summary reads as
@@ -947,7 +947,7 @@ def deadman_check(conn, book: str, now: datetime, orders_ledger=None) -> list[in
       carry a `batch=` token; once for each check day, at every check where the latest settled pair is a miss; it is last in the
       result and no row of the streak reads it.
     The order ledger for the collar row is read once, before the store's write lock is taken (a slow or locked order ledger
-    never holds the run ledger's lock); inside the lock only the one-row-for-each-date check and the writes are made.
+    never holds the run ledger's lock); inside the lock only the one-row-for-each-date check and the writes are made (a run ending between the read and the lock is judged at the next check).
     The rows are separate, so all of them can be there on one day. Nothing is written before 10:25 or on a day that is not a
     session; a check that finds all already written writes nothing. Today's orphan rows come first in the result, then prior-day rows (oldest start first), then still-open rows, then the day row, then the collar row."""
     ny = _utc(now).astimezone(NEW_YORK)
