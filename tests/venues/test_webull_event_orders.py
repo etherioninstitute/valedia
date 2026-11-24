@@ -3,6 +3,7 @@
 Every test uses a stand-in for the SDK's TradeClient; nothing here builds a Webull client or touches the network.
 The stand-in serves the shapes observed in Webull's test environment on 2026-11-13 (the ticket's CONTEXT)."""
 import importlib.util
+import inspect
 import random
 import re
 import string
@@ -402,7 +403,7 @@ def _spec(rng):
                           "instrument_type": rng.choice(kinds), **({"event_outcome": "yes"} if rng.random() < 0.3 else {})})
     open_rows = []
     for j in range(rng.randint(0, 3)):
-        open_rows.append({"client_order_id": f"o{j}", "order_id": f"W{j}", "symbol": rng.choice(syms + ["BTCUSD"]),
+        open_rows.append({"client_order_id": wb.client_order_id(f"o{j}"), "order_id": f"W{j}", "symbol": rng.choice(syms + ["BTCUSD"]),
                           "side": rng.choice(["BUY", "SELL", "SHORT", "sell", None]), "status": rng.choice(["SUBMITTED", "PARTIAL_FILLED", "WHAT"]),
                           "instrument_type": rng.choice(kinds), "total_quantity": rng.choice(["1", "2", "0.5", None]),
                           "filled_quantity": rng.choice(["0", "1", None]), **({"event_outcome": "no"} if rng.random() < 0.3 else {})})
@@ -636,12 +637,17 @@ def _record(module, s, tmp_path):
     client = SpecClient(s)
     venue = module.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "none.json", account_class=s["wanted"],
                                limits=HIGH, sleep=lambda x: None, clock=lambda: 0.0)
+    # cancel_all_open takes our own tags now (BR-W): the candidate is given the tags of every generated open row, so a
+    # row is "ours" exactly where the older adapter cancelled it; the older adapter takes no argument
+    own = [f"o{j}" for j in range(len(s["open_rows"]))]
+    takes_tags = "own_tags" in inspect.signature(module.WebullVenue.cancel_all_open).parameters
+    cancel_all = (lambda: venue.cancel_all_open(own)) if takes_tags else venue.cancel_all_open
     steps = [("name", lambda: venue.name),
              ("submit", lambda: venue.submit(s["symbol"], s["units"], "h-tag", price=s["price"], limit_price=s["limit"],
                                              session=s["session"])),
              ("positions", venue.positions), ("other_positions", venue.other_positions), ("open_orders", venue.open_orders),
              ("order_status", lambda: venue.order_status("h-tag")), ("cash", venue.cash), ("balance", venue.balance),
-             ("cancel", lambda: venue.cancel("h-tag")), ("cancel_all_open", venue.cancel_all_open), ("check", venue.check),
+             ("cancel", lambda: venue.cancel("h-tag")), ("cancel_all_open", cancel_all), ("check", venue.check),
              ("account_class", lambda: venue.account_class),
              ("second submit", lambda: venue.submit(s["symbol"], s["units"], SECOND_TAG, price=s["price"], limit_price=s["limit"],
                                                     session=s["session"]))]
@@ -958,13 +964,17 @@ def test_an_event_row_of_the_wrong_shape_is_an_error_everywhere(tmp_path, bad):
 
 
 def test_open_orders_and_cancel_all_open_name_the_outcome(tmp_path):
-    rows = [event_row("o1", side="SELL", total="2", filled="1"), event_row("o2", ticker="KXB-1", outcome="no")]
+    o1, o2 = wb.client_order_id("o1"), wb.client_order_id("o2")
+    rows = [event_row(o1, side="SELL", total="2", filled="1"), event_row(o2, ticker="KXB-1", outcome="no")]
     v, client = ev(tmp_path, Client(open_rows=rows))
     opened = v.open_orders()
     assert [(o["symbol"], o["units"], o["filled_units"], o["instrument_type"]) for o in opened] == [
         (f"{TICKER}:yes", -2.0, 1.0, "EVENT"), ("KXB-1:no", 1.0, 0.0, "EVENT")]
-    out = v.cancel_all_open()
+    out = v.cancel_all_open(["o1", "o2"])
     assert [(o["symbol"], o["status"]) for o in out] == [(f"{TICKER}:yes", "cancel requested"), ("KXB-1:no", "cancel requested")]
+    only = v.cancel_all_open(["o2"])                                       # a row not in the given tags is left alone
+    assert [(o["symbol"], o["status"]) for o in only] == [(f"{TICKER}:yes", "not ours"), ("KXB-1:no", "cancel requested")]
+    assert [x[2] for x in client.calls if x[0] == "cancel"] == [o1, o2, o2]
     assert v.cancel("t") == {"status": "cancel requested"}
 
 
@@ -1178,14 +1188,16 @@ def test_rev2_a_mismatched_open_row_does_not_stop_the_cancels(tmp_path):
     v, c = ev(tmp_path, Client())
     v.submit("KXQ-1:yes", 1, "a", limit_price=0.5)
     v.submit("KXQ-1:yes", 1, "b", limit_price=0.5)
-    a, b = wb.client_order_id("a"), wb.client_order_id("b")
+    v.submit("KXQ-1:yes", 1, "x", limit_price=0.5)                         # sent by this venue, but not among the tags given below
+    a, b, x = wb.client_order_id("a"), wb.client_order_id("b"), wb.client_order_id("x")
     c.open_rows = [event_row(a, ticker="KXQ-1", outcome="no"), event_row(b, ticker="KXQ-1", side="SELL"),
-                   event_row("u1", ticker="KXQ-1")]
+                   event_row(x, ticker="KXQ-1", outcome="no"), event_row("u1", ticker="KXQ-1")]
     with pytest.raises(wb.WebullError) as caught:
-        v.cancel_all_open()
-    assert [x[2] for x in c.calls if x[0] == "cancel"] == [a, b, "u1"]
-    assert a in str(caught.value) and b in str(caught.value) and "u1" not in str(caught.value)
+        v.cancel_all_open(["a", "b"])
+    assert [y[2] for y in c.calls if y[0] == "cancel"] == [a, b]           # not x (disagrees, not given), not u1 (foreign)
+    assert a in str(caught.value) and b in str(caught.value) and "u1" not in str(caught.value) and x not in str(caught.value)
     with pytest.raises(wb.WebullError):
         v.open_orders()                                                    # the list itself still refuses the rows
     c.open_rows = [event_row(a, ticker="KXQ-1"), event_row("u1", ticker="KXQ-1")]
-    assert [x["status"] for x in v.cancel_all_open()] == ["cancel requested", "cancel requested"]
+    assert [y["status"] for y in v.cancel_all_open(["a"])] == ["cancel requested", "not ours"]
+    assert [y[2] for y in c.calls if y[0] == "cancel"] == [a, b, a]

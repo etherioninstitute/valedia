@@ -53,8 +53,9 @@ Reading orders and cash (added 2026-11-12). "SDK" means webull-openapi-python-sd
 * Order statuses: docs order-detail, field orders[].status, enum PENDING, SUBMITTED, CANCELLED, FILLED, FAILED
   ("a failed order, such as REJECTED"), PARTIAL_FILLED. The SDK disagrees on one spelling: its OrderStatus
   (SDK trade/common/order_status.py:21-25) writes "PARTIAL FILLED" with a space and has no PENDING. Both
-  spellings are mapped. No documented status means expired, so nothing maps to `expired` yet; an expired order
-  that Webull reports under a status not in the table shows as `unknown_status`.
+  spellings are mapped. No documented status means expired. EXPIRED is mapped to `expired` on the parser's own
+  reading (it is in DEAD_RAW_STATUSES, read as dead): that value has NOT been seen live, and only the exact
+  string "EXPIRED" matches. An expired order that Webull reports under any other spelling shows as `unknown_status`.
 * No such order (as read from the docs on 2026-11-12; what the test environment answers is at the end of these
   notes, and order_status reads those answers too). The order-detail page documents only 200, 401, 417 and 500 answers, and the
   error-code page (developer.webull.hk/apis/docs/error-codes.md; developer.webull.com has none) lists no
@@ -253,8 +254,10 @@ __all__ = ["WebullVenue", "WebullError", "NotTransmitted", "LiveTradingNotConfir
 # Webull's order status -> the trader's order state. Source: developer.webull.com/apis/docs/reference/order-detail
 # (read 2026-11-12), field orders[].status; "PARTIAL FILLED" is the SDK's spelling (webull/trade/common/order_status.py:25).
 # A status not in this table is `unknown_status`, never filled or cancelled.
+# EXPIRED is not in the docs and has not been seen live: it is the parser's own reading (DEAD_RAW_STATUSES below),
+# accepted so an expired day order ends terminal on the ledger instead of a reconcile fault. Exact match only.
 ORDER_STATES = {"PENDING": "open", "SUBMITTED": "open", "PARTIAL_FILLED": "partly_filled", "PARTIAL FILLED": "partly_filled",
-                "FILLED": "filled", "CANCELLED": "cancelled", "FAILED": "rejected"}
+                "FILLED": "filled", "CANCELLED": "cancelled", "FAILED": "rejected", "EXPIRED": "expired"}
 # The error code read as "no such order" (with an empty `orders` list), and only with confirmed_not_found=True.
 # Not confirmed for the US API: see the module notes.
 ORDER_NOT_FOUND_CODES = frozenset({"ORDER_NOT_FOUND"})
@@ -2668,30 +2671,51 @@ class WebullVenue:
         return "error", self._final(error or "the cancel failed")
 
     @_public
-    def cancel_all_open(self) -> list[dict]:
-        """Cancel every order open_orders() returns, one cancel_order call each by client order id. One failure does
-        not stop the others: each entry is {client_order_id, venue_order_id, symbol, status} with status one of
-        cancel's words ("cancel requested", "not yet", "already finished", "no such order") or "error", with the gated
-        error under "error". Cancelling only reduces exposure, so it is allowed in production without the written
-        live confirmation. If open_orders() itself fails, this raises and nothing is cancelled, except that in an
-        Events venue a row of a known order whose name or side disagrees with what was sent is cancelled like the
-        others, and WebullError naming those rows (by client order id, with each one's cancel status) is raised only
-        after every cancel was attempted. Webull cancels only orders placed through the API (docs common-order-cancel)."""
+    def cancel_all_open(self, own_tags: Any) -> list[dict]:
+        """Cancel the open orders that are OURS, one cancel_order call each by client order id. `own_tags` (required,
+        no default) is an iterable of the tags of the orders this system placed (the ledger's tags): a listed row is
+        cancelled only when its client order id is client_order_id(tag) for one of them. The account is shared (the
+        owner trades it by hand, and another API tool or key may place orders), so every other listed row is left
+        alone and never sent to cancel_order: it appears in the answer as {client_order_id, venue_order_id, symbol,
+        status "not ours"}, and so does a row with no plain client order id. Empty `own_tags` cancels nothing (every
+        row reads "not ours"); anything that is not an iterable of non-empty strings (a bare string or bytes, None, a
+        number, a non-string or empty tag) raises WebullError before any call is made. Fail closed.
+
+        One failure does not stop the others: each entry is {client_order_id, venue_order_id, symbol, status} with
+        status one of cancel's words ("cancel requested", "not yet", "already finished", "no such order"), "not ours",
+        or "error", with the gated error under "error". Cancelling only reduces exposure, so it is allowed in production
+        without the written live confirmation. If open_orders() itself fails, this raises and nothing is cancelled,
+        except that in an Events venue a row of one of OUR known orders whose name or side disagrees with what was sent
+        is cancelled like the others, and WebullError naming those rows (by client order id, with each one's cancel
+        status) is raised only after every cancel was attempted. Webull cancels only orders placed through the API
+        (docs common-order-cancel)."""
+        own = self._own_client_ids(own_tags)                              # before any call, even the account read
         account = self.account_id
         out = []
         disagreeing: list[str] = []
         for o in self._open_orders(None, disagreeing):
             entry = {"client_order_id": o["client_order_id"], "venue_order_id": o["venue_order_id"], "symbol": o["symbol"]}
-            if not o["client_order_id"]:
-                out.append({**entry, "status": "error", "error": "no plain client order id; Webull cancels only orders placed through the API"})
+            if not o["client_order_id"] or o["client_order_id"] not in own:
+                out.append({**entry, "status": "not ours"})
                 continue
             status, error = self._cancel_one(account, o["client_order_id"])
             out.append({**entry, "status": status, **({"error": error} if status == "error" else {})})
+        disagreeing = [cid for cid in disagreeing if cid in own]          # a foreign row is none of our business
         if disagreeing:                                                   # only in an Events venue; every cancel was tried
             done = {e["client_order_id"]: e["status"] for e in out}
-            raise WebullError("every open order was asked to cancel, but open orders of this venue disagree with what was sent "
+            raise WebullError("every open order of ours was asked to cancel, but open orders of this venue disagree with what was sent "
                               "(name or side): " + "; ".join(f"{cid} ({done.get(cid, 'not cancelled')})" for cid in disagreeing))
         return out
+
+    @staticmethod
+    def _own_client_ids(own_tags: Any) -> frozenset:
+        """The client order ids of the given tags; WebullError for anything but an iterable of non-empty strings."""
+        if isinstance(own_tags, (str, bytes, bytearray)) or not hasattr(own_tags, "__iter__"):
+            raise WebullError("cancel_all_open needs an iterable of the tags of our own orders; nothing was read or cancelled")
+        tags = list(own_tags)                                             # read once (it may be a generator)
+        if any(type(t) is not str or not t for t in tags):
+            raise WebullError("cancel_all_open's tags must all be non-empty strings; nothing was read or cancelled")
+        return frozenset(client_order_id(t) for t in tags)
 
     # ---- what happened to orders (reading: allowed in both environments)
     @_public
