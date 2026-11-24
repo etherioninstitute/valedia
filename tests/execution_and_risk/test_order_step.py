@@ -10032,3 +10032,332 @@ def test_br_e_the_opposite_a_forced_unclean_reconcile_after_an_expired_propose_d
     assert out["status"] == "done" and out["faults"] == ["reconcile"], out
     assert w.entries("summary")[-1]["faults"] == ["reconcile"]
     assert _br_e_fates(w) == {}                                            # the expiry itself added nothing
+
+
+# ==== BR-E2: the False side of `held_lock`, for every stop before the run lock
+#
+# `held_lock` is `bool(self._locked)` in `_finish`, and the run ledger reads `held_lock: true` on a fault as PROOF that the
+# run took its lock. So a summary that says true for a run that never took it would hide a real hazard. The stops before
+# the lock (every one below says False, returns its summary and journals nothing):
+#   clock      the clock gave no finite number             (`_now`, at the very start of `go`)
+#   ticket     propose and approve asked in one run
+#   live       live mode asked without propose/approve, or without a capital
+#   lock       live mode given a limits file or journal that is not the repository's (`_live_place`)
+#   environment  a venue with no plain name; an "-events" name or class; an environment that is not the test one; a host
+#              that is unreadable or does not name the sandbox; an order ledger that does not treat exactly the two
+#              refusals as not sent; in live mode, an environment or host that is not production's
+#   targets    `--capital` given to a shared run
+#   session    another order step holds the lock (the lock is tried, not taken)
+# After the lock, `_locked` is True for good (it is set once, in `go`, and never put back) and every stop says True:
+# among them the SAME stages "clock" and "environment" again (`_now` and `_check_environment` are read again under the
+# lock), the "lock" stage of the four live locks, "session" outside the window, and "targets" on a stale paper book.
+
+class _E2Row:
+    def __init__(self, label, build, stage, held, site=None):
+        self.label, self.build, self.stage, self.held, self.site = label, build, stage, held, site
+
+
+def _e2_prun(w, **kw):
+    return w.run(**kw)
+
+
+def _e2_pw(tmp):
+    w = World(tmp)
+    w.paper = paper({"a": {"SPY": 10.0}})
+    return w
+
+
+def _e2_lw(tmp):
+    w = live_world(tmp)
+    w.paper = paper({"a": {"IWM": 3.0}}, equity=5000.0)
+    return w
+
+
+_E2_LIVE_KW = {"propose": True, "capital": 5000.0}
+
+
+def _e2_b_clock(tmp, cl):
+    w = _e2_pw(tmp)
+    w.clock.t = float("nan")
+    return w, _e2_prun, {}, lambda: setattr(w.clock, "t", ny("2026-11-13 10:00"))
+
+
+def _e2_b_ticket(tmp, cl):
+    w = ticket_world(tmp)
+    w.paper = paper({"a": {"SPY": 1.0}})
+    kw = {"propose": True, "approve": "123456"}
+    return w, _e2_prun, kw, lambda: kw.pop("approve")
+
+
+def _e2_b_live_mode(tmp, cl):
+    w = _e2_lw(tmp)
+    kw = {}
+    return w, lrun, kw, lambda: kw.update(_E2_LIVE_KW)
+
+
+def _e2_b_live_capital(tmp, cl):
+    w = _e2_lw(tmp)
+    kw = {"propose": True}
+    return w, lrun, kw, lambda: kw.update(capital=5000.0)
+
+
+def _e2_b_live_place(tmp, cl):
+    other = live_world(tmp / "other")
+    w = _e2_lw(tmp / "w")
+    good = w.limits
+    w.limits = other.limits                                       # not the repository's limits file
+    return w, lrun, dict(_E2_LIVE_KW), lambda: setattr(w, "limits", good)
+
+
+def _e2_b_name(tmp, cl):
+    w = _e2_pw(tmp)
+    w.venue = StandIn(name="not a plain name!")
+    return w, _e2_prun, {}, lambda: setattr(w, "venue", StandIn())
+
+
+def _e2_b_events_name(tmp, cl):
+    w = _e2_pw(tmp)
+    w.venue = StandIn(name="standin-sandbox-events")
+    return w, _e2_prun, {}, lambda: setattr(w, "venue", StandIn())
+
+
+def _e2_b_environment(tmp, cl):
+    w = _e2_pw(tmp)
+    w.venue.environment = "production"
+    return w, _e2_prun, {}, lambda: setattr(w.venue, "environment", osx.TEST_ENVIRONMENT)
+
+
+def _e2_b_host_unreadable(tmp, cl):
+    w = _e2_pw(tmp)
+
+    class V(StandIn):
+        host = property(lambda self: (_ for _ in ()).throw(RuntimeError("no host")))
+    w.venue = V()
+    return w, _e2_prun, {}, lambda: setattr(w, "venue", StandIn())
+
+
+def _e2_b_host_not_sandbox(tmp, cl):
+    w = _e2_pw(tmp)
+    w.venue.host = "api.webull.com"
+    return w, _e2_prun, {}, lambda: setattr(w.venue, "host", "api.sandbox.webull.com")
+
+
+def _e2_b_ledger(tmp, cl):
+    w = _e2_pw(tmp)
+    kw = {"ledger": OrderLedger(w.ledger_path, not_sent=(), clock=w.clock)}   # treats nothing as not sent
+    return w, _e2_prun, kw, lambda: kw.pop("ledger")
+
+
+def _e2_b_live_environment(tmp, cl):
+    w = _e2_lw(tmp)
+    w.venue = _live_venue("sandbox")
+    return w, lrun, dict(_E2_LIVE_KW), lambda: setattr(w, "venue", LiveVenue())
+
+
+def _e2_b_live_host(tmp, cl):
+    w = _e2_lw(tmp)
+    w.venue = _live_venue("api.webull.com.")
+    return w, lrun, dict(_E2_LIVE_KW), lambda: setattr(w, "venue", LiveVenue())
+
+
+def _e2_b_shared_capital(tmp, cl):
+    w = _e2_pw(tmp)
+    kw = {"shared": True, "capital": 1000.0}
+    return w, _e2_prun, kw, lambda: kw.pop("shared")              # the same capital, an ordinary run
+
+
+def _e2_b_lock_held(tmp, cl):
+    w = _e2_pw(tmp)
+    holder = osx._RunLock(str(w.state_path))
+    assert holder.acquire()
+    cl.append(holder.release)
+    return w, _e2_prun, {}, holder.release
+
+
+def _e2_a_session(tmp, cl):
+    w = _e2_pw(tmp)
+    w.clock.t = ny("2026-11-14 11:00")                            # a Saturday
+    return w, _e2_prun, {}, None
+
+
+def _e2_a_targets(tmp, cl):
+    w = _e2_pw(tmp)
+    w.paper = paper({"a": {"SPY": 1.0}}, day="2026-11-16")        # a book from the future: read under the lock
+    return w, _e2_prun, {}, None
+
+
+def _e2_a_baseline(tmp, cl):
+    w = _e2_pw(tmp)
+    w.venue.raise_on.add("positions")
+    return w, _e2_prun, {}, None
+
+
+def _e2_a_environment_read_again(tmp, cl):
+    w = _e2_pw(tmp)
+    w.paper = paper({"a": {"SPY": 1.0, "QQQ": 1.0}})
+    w.venue.host = "api.sandbox.webull.com"
+    _slow_venue(w, 0, after_first=lambda: setattr(w.venue, "environment", "production"))   # changed after the first send
+    return w, _e2_prun, {}, None
+
+
+def _e2_a_environment_class_in_the_session(tmp, cl):
+    w = _e2_pw(tmp)
+    w.venue = _events_venue("property")                           # the class a property gives is read in the session
+    return w, _e2_prun, {}, None
+
+
+class _E2FlakyClock(Clock):
+    """The run's own clock gives no number once `broken` is set (`.t`, which the stand-ins read, stays finite)."""
+    broken = False
+
+    def __call__(self):
+        return float("nan") if self.broken else self.t
+
+
+def _e2_a_clock_after_the_lock(tmp, cl):
+    w = _e2_pw(tmp)
+    w.clock = _E2FlakyClock(w.clock.t)
+    w.paper = paper({"a": {"SPY": 1.0, "QQQ": 1.0}})
+    _slow_venue(w, 0, after_first=lambda: setattr(w.clock, "broken", True))                # the clock fails mid-run
+    kw = {"ledger": osx.open_ledger(w.ledger_path, clock=Clock(w.clock.t))}              # the ledger keeps a good clock
+    return w, _e2_prun, kw, None
+
+
+def _e2_a_live_lock(tmp, cl):
+    w = _e2_lw(tmp)
+    w.venue.account_class = "IRA"                                 # the confirmation names another class: lock 1
+    return w, lrun, dict(_E2_LIVE_KW), None
+
+
+def _e2_a_done(tmp, cl):
+    return _e2_pw(tmp), _e2_prun, {}, None
+
+
+# label, build, stage, held_lock, and for a stop before the lock the source site it is (function, fragment of the call)
+_E2_ROWS = [
+    _E2Row("clock", _e2_b_clock, "clock", False, ("_now", "'clock'")),
+    _E2Row("ticket", _e2_b_ticket, "ticket", False, ("go", "propose and approve cannot")),
+    _E2Row("live_mode", _e2_b_live_mode, "live", False, ("go", "'live', why")),
+    _E2Row("live_capital", _e2_b_live_capital, "live", False, ("go", "'live', why")),
+    _E2Row("live_place", _e2_b_live_place, "lock", False, ("go", "'lock', why")),
+    _E2Row("name", _e2_b_name, "environment", False, ("_environment", "has no plain name")),
+    _E2Row("events_name", _e2_b_events_name, "environment", False, ("_check_events", "'environment', why")),
+    _E2Row("environment", _e2_b_environment, "environment", False, ("_check_environment", "runs against the test environment")),
+    _E2Row("host_unreadable", _e2_b_host_unreadable, "environment", False, ("_check_environment", "host could not be read")),
+    _E2Row("host_not_sandbox", _e2_b_host_not_sandbox, "environment", False, ("_check_environment", "host is not a plain str")),
+    _E2Row("ledger", _e2_b_ledger, "environment", False, ("_environment", "order ledger must treat")),
+    _E2Row("live_environment", _e2_b_live_environment, "environment", False,
+           ("_check_live_environment", "live mode runs against")),
+    _E2Row("live_host", _e2_b_live_host, "environment", False, ("_check_live_environment", "live mode needs the venue")),
+    _E2Row("shared_capital", _e2_b_shared_capital, "targets", False, ("go", "'targets'")),
+    _E2Row("lock_held", _e2_b_lock_held, "session", False, ("go", "'session'")),
+    _E2Row("session", _e2_a_session, "session", True),
+    _E2Row("targets", _e2_a_targets, "targets", True),
+    _E2Row("baseline", _e2_a_baseline, "baseline", True),
+    _E2Row("environment_read_again", _e2_a_environment_read_again, "environment", True),
+    _E2Row("environment_class", _e2_a_environment_class_in_the_session, "environment", True),
+    _E2Row("clock_after_the_lock", _e2_a_clock_after_the_lock, "clock", True),
+    _E2Row("live_lock", _e2_a_live_lock, "lock", True),
+    _E2Row("done", _e2_a_done, None, True),
+]
+_E2_BEFORE = [r for r in _E2_ROWS if r.held is False]
+
+
+def _e2_drive(row, tmp, request):
+    cleanups = []
+    request.addfinalizer(lambda: [c() for c in cleanups])
+    w, runner, kw, fix = row.build(tmp, cleanups)
+    n = len(w.entries())
+    return w, runner, kw, fix, n, runner(w, **kw)
+
+
+def _e2_check(row, w, n, out):
+    """The returned summary and the journal agree with the row: the stage, a real bool, and a summary line (the same
+    value) only for a run that held the lock; a run that did not hold it left the journal exactly as it was."""
+    assert out["stage"] == row.stage and out["status"] == ("done" if row.stage is None else "stopped"), (row.label, out)
+    assert type(out["held_lock"]) is bool, (row.label, out)
+    assert out["held_lock"] is row.held, (row.label, out["held_lock"])
+    if row.held:
+        last = w.entries("summary")[-1]
+        assert last["batch"] == out["batch"] and last["held_lock"] is True, (row.label, last)
+    else:
+        assert len(w.entries()) == n and "journal_error" not in out, (row.label, w.entries()[n:])
+
+
+@pytest.mark.parametrize("row", _E2_BEFORE, ids=lambda r: r.label)
+def test_br_e2_a_stop_before_the_lock_says_held_lock_false_and_the_run_after_the_fix_says_true(tmp_path, request, row):
+    w, runner, kw, fix, n, out = _e2_drive(row, tmp_path / "w", request)
+    _e2_check(row, w, n, out)                                     # False, nothing journaled
+    assert w.entries("summary")[n:] == [] and w.entries("stopped")[n:] == []
+    fix()                                                         # the opposite: the same world, the cause removed
+    n = len(w.entries())
+    out = runner(w, **kw)
+    assert out["status"] == "done" and _held(out) is True, (row.label, out)
+    last = w.entries("summary")[-1]
+    assert len(w.entries()) > n and last["batch"] == out["batch"] and last["held_lock"] is True
+
+
+def _e2_stop_sites():
+    """Every stop the code can make before the lock is taken, as (function, stage, the call's text): the `_Stop` raised
+    by the checks `go` runs first, and the `_finish` calls of `go` above the line that sets `_locked`."""
+    import ast
+    tree = ast.parse(Path(osx.__file__).read_text())
+    run = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_Run")
+    fns = {f.name: f for f in run.body if isinstance(f, ast.FunctionDef)}
+    sets = [n.lineno for n in ast.walk(run) if isinstance(n, ast.Assign) and any(
+        isinstance(t, ast.Attribute) and t.attr == "_locked" for t in n.targets)]
+    assert len(sets) == 2, "`_locked` is assigned somewhere new: the table below assumes it is set once and never put back"
+    locked_at = max(sets)
+    assert fns["go"].lineno < locked_at < fns["go"].end_lineno
+    sites = []
+    for name in ("go", "_now", "_environment", "_check_events", "_check_environment", "_check_live_environment"):
+        for n in ast.walk(fns[name]):
+            if not isinstance(n, ast.Call) or (name == "go" and n.lineno >= locked_at):
+                continue
+            f = n.func
+            if isinstance(f, ast.Name) and f.id == "_Stop":
+                stage = n.args[0]
+            elif isinstance(f, ast.Attribute) and f.attr == "_finish":
+                stage = n.args[1]
+            else:
+                continue
+            if isinstance(stage, ast.Constant):                   # `stop.stage` only passes on a stage raised elsewhere
+                sites.append((name, stage.value, ast.unparse(n)))
+    return sites
+
+
+def test_br_e2_every_stop_before_the_lock_says_held_lock_false_and_every_stop_after_it_says_true(tmp_path, request):
+    for row in _E2_ROWS:
+        w, runner, kw, fix, n, out = _e2_drive(row, tmp_path / row.label, request)
+        _e2_check(row, w, n, out)
+
+
+def test_br_e2_a_stop_added_before_the_lock_without_a_row_in_the_table_fails_in_words():
+    sites = _e2_stop_sites()
+    claimed = set()
+    for row in _E2_BEFORE:
+        func, fragment = row.site
+        hit = [i for i, (f, stage, text) in enumerate(sites) if f == func and fragment in text and stage == row.stage]
+        assert hit, f"row {row.label!r} names no stop before the lock any more: {row.site} at stage {row.stage!r}"
+        claimed.update(hit)
+    loose = [sites[i] for i in range(len(sites)) if i not in claimed]
+    assert not loose, ("a stop before the lock has no row in _E2_ROWS (add one, driven by the real run, that says "
+                       f"held_lock False): {[(f, stage, text[:90]) for f, stage, text in loose]}")
+    assert len(sites) == 14, len(sites)                           # the stops listed in the notes above, one call each
+
+
+def test_br_e2_the_table_walks_a_stop_that_is_not_in_it_red_in_words(monkeypatch):
+    """The other way: a call in `go` before the lock with no row is named, not passed over."""
+    real = _e2_stop_sites()
+    monkeypatch.setattr(sys.modules[__name__], "_E2_BEFORE", [r for r in _E2_BEFORE if r.label != "lock_held"])
+    with pytest.raises(AssertionError, match="has no row in _E2_ROWS"):
+        test_br_e2_a_stop_added_before_the_lock_without_a_row_in_the_table_fails_in_words()
+    assert ("go", "session") in [(f, s) for f, s, _ in real]
+
+
+def test_br_e2_a_stop_after_the_lock_in_a_stage_that_also_stops_before_it_says_held_lock_true(tmp_path, request):
+    """The same stage name on both sides of the lock: "clock", "environment", "session", "targets", "lock"."""
+    by = {}
+    for row in _E2_ROWS:
+        by.setdefault(row.stage, set()).add(row.held)
+    assert {s for s, held in by.items() if held == {True, False}} == {"clock", "environment", "session", "targets", "lock"}
