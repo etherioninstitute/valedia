@@ -608,6 +608,16 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 38 (Carbon response 38, reply 38 sent 2026-11-23): the outside-window NOOP runs after the lock
+  (order_step.py:3876 acquire, :3888 _session), so it stays a lock proof. Carbon asked T65's unreported P0 to reset
+  the START day; that reverses its own r35 answer, so kept: it resets TODAY (any P0 resets its day). Adopted: the P2
+  collar diagnostic as two non-resetting branches on COMPLETED sessions with N_ord>=3 (0-2 orders pause):
+  p2:collar-marketable-miss (2 sessions, len(M)>=3, filled(M)/len(M)<0.5) and p2:collar-spread-starved (3 sessions,
+  len(W)/N_ord>=0.5, filled/N_ord<0.5); first build step checks the order step logs bid/ask at order creation (if
+  not, it joins the before-order-#1 batch). Adopted: reading #4 (collector 6:55-6:58 vs 6:50-6:54 and 6:59-7:03) is
+  the immediate stop: any missed decision or a slip >=15 s pauses the 6:55/7:10 job before Wed 11-25, owner told.
+  Reading #1 near-cliff: a COMPLETED run >=8.5 min moves the run-time cap into the before-order-#1 batch. Its EXPIRED
+  next-day parenthesis refuted again (order_step.py:5466-5475). Asked: a relative bound (3x unexposed median).
   Round 37 (Carbon response 37, reply 37 sent 2026-11-23; Carbon moved to a NEW conversation, so reply 37 restates the
   state in full): a partial fill then cancel books the fill (test_orders.py:709, :1279; webull.py:2357), and Finnhub
   early closes don't vote (k3_calendar.py:340): both already true. Adopted: a clean half day = +1; a clean zero-fill day
