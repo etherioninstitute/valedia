@@ -316,11 +316,16 @@ morning. On `main`:
 - **WATCH** if Webull ever answers EXPIRED (never seen): for an open order the new code books any partial fill, sends
   no cancel for it and may send a new order for the rest; for an order already held as finished it is a reconcile
   anomaly and the run stops (no test covers that second path). The lead to decide whether the second is wanted.
-- **NEXT** run ledger, can bite from Wed 11-25: a fill that lands after the 6:55 run printed its summary is counted
-  as unfilled, so two such sessions in a row send a false `p2:collar-miss`. Two T65 edge cases: lock proof accepts a
-  run that took its lock before the unpaired start; "already had a P0" is kept per trigger, not per start.
-- **NEXT** branches not merged: `low/ua-generic-k3-k4` (1ade599; generic client name for the two knowledge readers,
-  blind pass with notes) and `docs/pooling-test-draft` (14ba870; one sentence left, then one fresh check).
+- **DONE 11-24 3:39 PM** (529b235, merge of `fix/collar-late-fill`; outside the pin, both gates clean after): the
+  false `p2:collar-miss` (a late fill read as unfilled; seen 11-24, the 7:10 run's `ord=1 fil=0`). The 7:25 check now
+  judges only sessions a later run has settled, counted in full from the order ledger (read only, before the write
+  lock; falls back to the printed counts, marked "estimate"), and fires at every check while the latest settled pair
+  is a miss: one day later than before, never on a day that filled. Also fixed: the T65 lock proof no longer accepts a
+  run that took the lock before the hung start, an ambiguous end proves nothing, and a P0 is judged per start. Four
+  blind checks failed it (design changed after the third); the fifth and a check of the lead's docstring fix passed;
+  913 tests. Owner rule from this (11-24): a found defect is fixed at once, never accepted as a "stated limit".
+- **DONE 11-24** `low/ua-generic-k3-k4` merged (642f4cc): the two knowledge readers send `calendar-and-notice-reader/1.0`.
+- **NEXT** `docs/pooling-test-draft` (14ba870; one sentence left, then one fresh check).
 - **IDEA** the practice gate passes silently over a malformed list line (line ending, trailing space, misspelt
   path). Tonight's lists were checked byte by byte. A stricter check was drafted and has NOT passed its blind
   checks; applied nowhere.
