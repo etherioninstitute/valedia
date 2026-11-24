@@ -608,6 +608,17 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 46 (Carbon response 46, file named Valedia_Carbon_Response45.md; reply 46 sent 2026-11-23): tracker
+  unchanged (5/19, 26.3%). Gate #7 attended pair = SHAPE (a): plain `order-step --shared --propose` then a second
+  propose + `--approve`, 6:35-6:55 PT on a rebalance morning, NEVER through the wrapper (ledger-lib labels 6:25-6:50
+  as 0630). Checked at 8fb509f: propose takes the same _RunLock (order_step.py:3875); a new ticket supersedes every
+  unused one in one transaction (:3398), so no 15-min wait. order_step writes NO run-ledger rows (only
+  orderstep-paper.sh does): a hand-run ticket pair leaves none, so it cannot touch the streak (max +1 per session
+  day, run_ledger.py:504) or falsely clear T65; Gate #7's attended evidence = ticket file fates + journal ticket
+  entries + order-ledger fills. CORRECTS round 44's 'MANUAL trigger' line. Batch pins: T+0 trim after Pass 2 clipped by
+  the T+1 cap as ordinary; Gate #7 morning's collector readings excluded from the Tier 2 two-day rule. Collector DB
+  read via file:...?mode=ro only. Tree matches 8fb509f (checked 7:55 PM). Asked: is that evidence enough, or a
+  command-written row for hand ticket runs.
   Round 45 (Carbon response 45, file named Valedia_Carbon_Response44.md; reply 45 sent 2026-11-23): tracker
   unchanged (5/19, 26.3%). CORRECTION of round 44 Guard 1: the practice job runs --shared and shared mode REFUSES
   --capital (stage targets, before the lock; live is shared-only), so no capital cut exists; Carbon's 15% cut and
