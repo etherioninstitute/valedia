@@ -608,6 +608,13 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 44 (Carbon response 44, file named Valedia_Carbon_Response43.md; reply 44 sent 2026-11-23): tracker
+  unchanged (5/19, 26.3%). Gate #7 = ONE scheduled session on the new pin + an attended practice sale if needed.
+  Guards adopted: the sale comes from the unchanged pinned order step run by the owner with a 10-20% lower capital
+  ARGUMENT (targets() scales by capital / paper equity, order_step.py:666; no config file changes); settled
+  positions carry into Gate #7 (T+1 sell cap); attended run after 7:25 PT and before the window cutoff (MANUAL
+  trigger); Pass 1 answers no and sends nothing, Pass 2 answers yes on PAPER only if the 6:55 run did not book a
+  whole share, a fractional remainder and a sale. Asked: fixed 15% cut or a cut chosen to hit both shapes.
   Round 43 (Carbon response 43, file named Valedia_Carbon_Response42.md; reply 43 sent 2026-11-23): tracker =
   done/total + literal percent: P1 2/7 (28.6%), P2 0/4, P3 0 passed (outside the total), P4 3/8, total 5/19 (26.3%).
   Adopted GATE #7 (post-pin rehearsal), which takes over the go-live row 10 'still to be SEEN' (no double count): one
