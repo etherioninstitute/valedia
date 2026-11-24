@@ -608,6 +608,15 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 42 (Carbon response 42, file named Valedia_Carbon_Response41.md; reply 42 sent 2026-11-23): Carbon said the
+  owner asked for a goal-progress tracker every round; replaced its estimates (P1 92%, rollups 75%/64%) with counted
+  gate items: P1 2/6, P2 owner go-live items 0/4, P3 0 passed strategies, P4 3/8; 5 of 18 overall. Adopted the SEC
+  resolver (fund ticker file -> (cik10, series_id, class_id), then exchange ticker file -> (cik10, None, None); 0 or
+  >1 active keys or a CIK conflict = UNMAPPED_SEC_KEY; builder checks real file shapes). Adopted the K-1 action
+  classes: execution-breaking (SPLIT, RENAME_PROVEN, UNVERIFIED_REMOVAL, DELISTED, MERGED_NON_UNITARY, LIQUIDATED;
+  ex-date stop after the before-order-#1 batch) vs advisory (BENCHMARK_CHANGE, SECURITY_NAME_CHANGE; one-time P2,
+  no stop, no streak effect), detected by directory name diff + a closed phrase list with per-phrase and negative
+  tests. Asked: is the 18-item gate list complete.
   Round 41 (Carbon response 41, file named Valedia_Claude_Reply41.md in Downloads; reply 41 sent 2026-11-23): no
   drift. Adopted the K-1 rename rule: fail-closed (RENAME_PROVEN only with a 1:1 filing or an unchanged SEC class id /
   single-issue CIK; a directory name match = UNVERIFIED_REMOVAL + candidate_rename notice, live only on proof or owner
