@@ -516,16 +516,80 @@ def test_cash_reads_the_documented_fields_and_leaves_a_missing_one_none(tmp_path
 
 
 def test_cancel_all_open_keeps_going_when_one_cancel_fails_and_needs_no_live_confirmation(tmp_path):
-    pages = {None: {"data": [detail(order("SUBMITTED", cid="c-1", order_id="WB-1"), cid="c-1"),
-                             detail(order("PENDING", cid="c-2", order_id="WB-2"), cid="c-2"),
-                             detail(order("PARTIAL_FILLED", cid="c-3", order_id="WB-3"), cid="c-3")]}}
-    client = FakeClient(open_pages=pages, cancel_fail={"c-2"})
+    c1, c2, c3 = (wb.client_order_id(t) for t in ("c-1", "c-2", "c-3"))
+    pages = {None: {"data": [detail(order("SUBMITTED", cid=c1, order_id="WB-1"), cid=c1),
+                             detail(order("PENDING", cid=c2, order_id="WB-2"), cid=c2),
+                             detail(order("PARTIAL_FILLED", cid=c3, order_id="WB-3"), cid=c3)]}}
+    client = FakeClient(open_pages=pages, cancel_fail={c2})
     v = wb.WebullVenue(KEY, SECRET, environment="production", client=client, confirmation_file=tmp_path / "absent.json")
-    out = v.cancel_all_open()
-    assert [c[2] for c in client.calls if c[0] == "cancel"] == ["c-1", "c-2", "c-3"]
-    assert [(r["client_order_id"], r["status"]) for r in out] == [("c-1", "cancel requested"), ("c-2", "error"), ("c-3", "cancel requested")]
+    out = v.cancel_all_open(["c-1", "c-2", "c-3"])
+    assert [c[2] for c in client.calls if c[0] == "cancel"] == [c1, c2, c3]
+    assert [(r["client_order_id"], r["status"]) for r in out] == [(c1, "cancel requested"), (c2, "error"), (c3, "cancel requested")]
     assert "ORDER_NOT_CANCELLABLE" in out[1]["error"] and KEY not in json.dumps(out) and SECRET not in json.dumps(out)
     assert "response" not in out[0] and client.placed() == []                # Webull's answer is not handed back
+
+
+def _own_foreign_idless_venue(tmp_path, own_tags):
+    """An open list holding two of our own rows, a foreign row (an id that is no tag's hash) and a row with no id."""
+    rows = [detail(order("SUBMITTED", cid=wb.client_order_id("own-1"), order_id="WB-1"), cid=wb.client_order_id("own-1")),
+            detail(order("PENDING", cid="hand-1", order_id="WB-2"), cid="hand-1"),
+            detail(order("SUBMITTED", client_order_id=None, order_id="WB-3"), cid=None),
+            detail(order("SUBMITTED", cid=wb.client_order_id("own-2"), order_id="WB-4"), cid=wb.client_order_id("own-2"))]
+    client = FakeClient(open_pages={None: {"data": rows}})
+    return wb.WebullVenue(KEY, SECRET, environment="production", client=client, confirmation_file=tmp_path / "absent.json"), client
+
+
+def _cancels(client):
+    return [c[2] for c in client.calls if c[0] == "cancel"]
+
+
+def test_cancel_all_open_cancels_only_our_own_ids_and_leaves_the_rest_not_ours(tmp_path):
+    v, client = _own_foreign_idless_venue(tmp_path, ["own-1"])
+    out = v.cancel_all_open(["own-1"])
+    assert _cancels(client) == [wb.client_order_id("own-1")]
+    assert [(r["venue_order_id"], r["status"]) for r in out] == [
+        ("WB-1", "cancel requested"), ("WB-2", "not ours"), ("WB-3", "not ours"), ("WB-4", "not ours")]
+    assert out[1] == {"client_order_id": "hand-1", "venue_order_id": "WB-2", "symbol": "SPY", "status": "not ours"}
+    assert out[2]["client_order_id"] is None and "error" not in out[2]
+
+
+def test_cancel_all_open_cancels_every_row_whose_tag_is_given(tmp_path):
+    v, client = _own_foreign_idless_venue(tmp_path, ["own-1", "own-2"])
+    out = v.cancel_all_open(["own-1", "own-2"])
+    assert _cancels(client) == [wb.client_order_id("own-1"), wb.client_order_id("own-2")]
+    assert [r["status"] for r in out] == ["cancel requested", "not ours", "not ours", "cancel requested"]
+    out = v.cancel_all_open(iter(["own-2"]))                                   # any iterable of tags, read once
+    assert [r["status"] for r in out] == ["not ours", "not ours", "not ours", "cancel requested"]
+
+
+def test_cancel_all_open_with_no_tags_cancels_nothing_and_reports_every_row_not_ours(tmp_path):
+    for empty in ([], (), set(), iter([])):
+        v, client = _own_foreign_idless_venue(tmp_path, [])
+        out = v.cancel_all_open(empty)
+        assert _cancels(client) == [] and [r["status"] for r in out] == ["not ours"] * 4
+
+
+@pytest.mark.parametrize("bad", [None, 5, "own-1", b"own-1", ["own-1", 7], ["own-1", None], [b"own-1"], ["own-1", ""], 1.5, object()])
+def test_cancel_all_open_fails_closed_on_tags_it_cannot_read_before_any_call(tmp_path, bad):
+    v, client = _own_foreign_idless_venue(tmp_path, [])
+    with pytest.raises(wb.WebullError):
+        v.cancel_all_open(bad)
+    assert client.calls == []                                                  # not even the open-order read
+
+
+def test_cancel_all_open_needs_the_tags_argument(tmp_path):
+    v, client = _own_foreign_idless_venue(tmp_path, [])
+    with pytest.raises(wb.WebullError):
+        v.cancel_all_open()
+    assert client.calls == []
+
+
+def test_cancel_all_open_cancels_nothing_when_the_open_list_cannot_be_read(tmp_path):
+    client = FakeClient(open_pages={None: ServerError("SYSTEM_ERROR", "business error", 500)})
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
+    with pytest.raises(wb.WebullError):
+        v.cancel_all_open(["own-1"])
+    assert _cancels(client) == []
 
 
 def test_check_reports_the_count_of_open_orders(tmp_path):
@@ -551,13 +615,14 @@ def test_a_malformed_open_order_list_raises_and_nothing_is_skipped(tmp_path, pag
 
 @pytest.mark.parametrize("key", [{"next": 2}, ["p2"], 2, ""])
 def test_a_pagination_key_that_is_not_a_string_raises_webull_error_everywhere(tmp_path, key):
-    pages = {None: {"data": [detail(order("SUBMITTED", cid="c-1"), cid="c-1")], "pagination_key": key}}
+    own = wb.client_order_id("c-1")
+    pages = {None: {"data": [detail(order("SUBMITTED", cid=own), cid=own)], "pagination_key": key}}
     make = lambda: wb.WebullVenue(KEY, SECRET, client=FakeClient(open_pages=pages), confirmation_file=tmp_path / "x.json")  # noqa: E731
     with pytest.raises(wb.WebullError, match="pagination key"):
         make().open_orders()
     client_v = make()
     with pytest.raises(wb.WebullError, match="pagination key"):
-        client_v.cancel_all_open()
+        client_v.cancel_all_open(["c-1"])
     assert [c for c in client_v._client.calls if c[0] == "cancel"] == []        # nothing is cancelled from a list that failed
     report = make().check()
     assert "pagination key" in report["open_orders_error"] and "open_orders" not in report
@@ -1096,7 +1161,7 @@ def test_a_transport_error_never_carries_the_url_or_the_account_id(tmp_path):
     client.order_v3.place_order = lambda a, orders: (client.calls.append(("place", a, orders)), (_ for _ in ()).throw(TransportError(URL_TEXT)))[1]
     v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
     messages = []
-    for call in (lambda: v.order_status("t"), v.open_orders, v.cash, lambda: v.submit("SPY", 1.0, "t"), v.cancel_all_open):
+    for call in (lambda: v.order_status("t"), v.open_orders, v.cash, lambda: v.submit("SPY", 1.0, "t"), lambda: v.cancel_all_open(["t"])):
         with pytest.raises(wb.WebullError) as exc:
             call()
         messages.append(str(exc.value))
@@ -1125,7 +1190,7 @@ def test_values_no_json_decoder_makes_still_raise_only_webull_error(tmp_path, od
     client = FakeClient(details={wb.client_order_id("t"): Response(detail(item))}, open_pages={None: page},
                         positions=[{"symbol": odd, "quantity": "1", "instrument_type": "EQUITY"}], accounts=[{"account_id": odd, "account_type": odd}])
     v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json", account_id="ACC-0001-1234")
-    for call in (lambda: v.order_status("t"), v.open_orders, v.cancel_all_open, v.positions, v.check, v.accounts):
+    for call in (lambda: v.order_status("t"), v.open_orders, lambda: v.cancel_all_open(["t"]), v.positions, v.check, v.accounts):
         try:
             call()
         except wb.WebullError as exc:
@@ -1432,14 +1497,14 @@ def _leaks(text, secrets=(PK, PS, PA)):
 ENDPOINTS = ["accounts", "balance", "positions", "open", "detail", "cancel", "place"]
 PUBLIC = {"accounts": lambda v: v.accounts(), "balance": lambda v: v.balance(), "positions": lambda v: v.positions(),
           "other_positions": lambda v: v.other_positions(), "cash": lambda v: v.cash(), "check": lambda v: v.check(),
-          "open_orders": lambda v: v.open_orders(), "cancel": lambda v: v.cancel("t"), "cancel_all_open": lambda v: v.cancel_all_open(),
+          "open_orders": lambda v: v.open_orders(), "cancel": lambda v: v.cancel("t"), "cancel_all_open": lambda v: v.cancel_all_open(["t"]),
           "order_status": lambda v: v.order_status("t"), "submit_buy": lambda v: v.submit("SPY", 1.0, "t"),
           "submit_sell": lambda v: v.submit("SPY", -1.0, "t2")}
 
 
 def _planted_client(kind, endpoint):
     client = FakeClient(positions=[{"symbol": "SPY", "instrument_type": "EQUITY", "quantity": "5"}],
-                        open_pages={None: {"data": [detail(order("SUBMITTED", cid="c-1"), cid="c-1")]}},
+                        open_pages={None: {"data": [detail(order("SUBMITTED", cid=wb.client_order_id("t")), cid=wb.client_order_id("t"))]}},
                         details={wb.client_order_id("t"): Response(detail(order("FILLED")))})
     fail = lambda *a: _planted(kind)                                      # noqa: E731
     target = {"accounts": (client.account_v2, "get_account_list"), "balance": (client.account_v2, "get_account_balance"),
@@ -1543,7 +1608,7 @@ def test_an_exception_whose_fields_cannot_be_read_leaves_only_as_webull_error(tm
         hits.clear()
     v = wb.WebullVenue(KEY, SECRET, client=_planted_client("sdk_text", "cancel"), confirmation_file=tmp_path / "x.json")
     v._client.order_v3.cancel_order = boom
-    assert v.cancel_all_open()[0]["status"] == "error"
+    assert v.cancel_all_open(["t"])[0]["status"] == "error"
 
     class ApiClient:
         def __init__(self, key, secret, region):
@@ -1717,7 +1782,7 @@ ENDPOINT_TARGETS = {"accounts": ("account_v2", "get_account_list"), "balance": (
                     "place": ("order_v3", "place_order")}
 METHODS = {"accounts": lambda v: v.accounts(), "balance": lambda v: v.balance(), "positions": lambda v: v.positions(),
            "other_positions": lambda v: v.other_positions(), "cash": lambda v: v.cash(), "check": lambda v: v.check(),
-           "open_orders": lambda v: v.open_orders(), "cancel": lambda v: v.cancel("t"), "cancel_all_open": lambda v: v.cancel_all_open(),
+           "open_orders": lambda v: v.open_orders(), "cancel": lambda v: v.cancel("t"), "cancel_all_open": lambda v: v.cancel_all_open(["t"]),
            "order_status": lambda v: v.order_status("t"), "submit_buy": lambda v: v.submit("SPY", 1.0, "t"),
            "submit_sell": lambda v: v.submit("SPY", -1.0, "t2")}
 
@@ -1725,7 +1790,7 @@ METHODS = {"accounts": lambda v: v.accounts(), "balance": lambda v: v.balance(),
 def _planted_venue(tmp_path, key, secret, account, source, endpoint, plant, known=True):
     client = FakeClient(accounts=[{"account_id": account, "account_type": "CASH", "account_class": "INDIVIDUAL_CASH"}],   # rev 8: orders fit
                         positions=[{"symbol": "SPY", "instrument_type": "EQUITY", "quantity": "5"}],
-                        open_pages={None: {"data": [detail(order("SUBMITTED", cid="c-1"), cid="c-1")]}},
+                        open_pages={None: {"data": [detail(order("SUBMITTED", cid=wb.client_order_id("t")), cid=wb.client_order_id("t"))]}},
                         details={wb.client_order_id("t"): Response(detail(order("FILLED")))})
     holder, name = ENDPOINT_TARGETS[endpoint]
     fn = _plant_source(source, plant)
@@ -1937,13 +2002,13 @@ def test_the_last_check_works_on_its_own(tmp_path, monkeypatch):
 
 def test_submit_and_cancels_hand_back_no_raw_answer(tmp_path):
     client = FakeClient(place_body={"order_id": "WB-9", "client_order_id": wb.client_order_id("t"), "echo": "x-app-key=" + KEY},
-                        open_pages={None: {"data": [detail(order("SUBMITTED", cid="c-1", order_id="WB-1"), cid="c-1")]}})
+                        open_pages={None: {"data": [detail(order("SUBMITTED", cid=wb.client_order_id("c-1"), order_id="WB-1"), cid=wb.client_order_id("c-1"))]}})
     v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
     out = v.submit("SPY", 1.0, "t")
     assert set(out) == {"status", "client_order_id", "venue_order_id", "environment", "side", "quantity"} and out["venue_order_id"] == "WB-9"
     assert v.cancel("t") == {"status": "cancel requested"}
-    entries = v.cancel_all_open()
-    assert entries == [{"client_order_id": "c-1", "venue_order_id": "WB-1", "symbol": "SPY", "status": "cancel requested"}]
+    entries = v.cancel_all_open(["c-1"])
+    assert entries == [{"client_order_id": wb.client_order_id("c-1"), "venue_order_id": "WB-1", "symbol": "SPY", "status": "cancel requested"}]
 
 
 @pytest.mark.parametrize("vid, kept", [("WB-9", "WB-9"), ("1234567890", "1234567890"), (1234567890, "1234567890"), ("ab_C-9", "ab_C-9"),
@@ -2549,7 +2614,7 @@ def test_no_such_order_as_observed(tmp_path, answer, none):
                                           (ServerException("SYSTEM_BUSY", "busy", 500), "error"),
                                           (ServerException("OPENAPI_ORDER_CAN_NOT_BE_CANCEL", "x", 500), "error")])
 def test_cancel_reports_the_four_observed_answers(tmp_path, answer, word):
-    page = {"data": [detail(order("PENDING", cid="c-1"), cid="c-1")]}
+    page = {"data": [detail(order("PENDING", cid=wb.client_order_id("c-1")), cid=wb.client_order_id("c-1"))]}
     client = FakeClient(open_pages={None: page})
 
     def cancel(a, cid):
@@ -2564,7 +2629,7 @@ def test_cancel_reports_the_four_observed_answers(tmp_path, answer, word):
             v.cancel("t")
     else:
         assert v.cancel("t") == {"status": word}
-    entry = v.cancel_all_open()[0]
+    entry = v.cancel_all_open(["c-1"])[0]
     assert entry["status"] == word and (("error" in entry) == (word == "error"))
     assert KEY not in json.dumps(entry)
 
@@ -2765,11 +2830,11 @@ def test_a_429_on_cancel_is_not_retried(tmp_path):
         client.calls.append(("cancel", a, cid))
         raise ServerException("TOO_MANY_REQUESTS", "Too many requests", 429)
     client.order_v3.cancel_order = cancel
-    client._open_pages = {None: {"data": [detail(order("SUBMITTED", cid="c-1"), cid="c-1")]}}
+    client._open_pages = {None: {"data": [detail(order("SUBMITTED", cid=wb.client_order_id("c-1")), cid=wb.client_order_id("c-1"))]}}
     v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json", clock=clock, sleep=clock.sleep)
     with pytest.raises(wb.WebullError, match="429"):
         v.cancel("t")
-    assert v.cancel_all_open()[0]["status"] == "error"
+    assert v.cancel_all_open(["c-1"])[0]["status"] == "error"
     assert len(_calls(client, "cancel")) == 2 and clock.slept == []
 
 
