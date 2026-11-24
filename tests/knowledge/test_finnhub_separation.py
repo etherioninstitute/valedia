@@ -418,6 +418,23 @@ def test_a_group_counts_once_across_both_finnhub_sources(tmp_path):
     f.close()
 
 
+def test_the_finnhub_file_is_read_only_for_finnhub_rows_even_when_a_stranger_is_in_it(tmp_path):
+    g, f = make_stores(tmp_path)
+    raw_source(f, FR)                                                    # a stranger in the Finnhub file, by raw SQL
+    raw_fact(f, FR, entity_key="FR:2026-99999", when="2026-11-23T20:00:00.000000Z",
+             payload=json.dumps({"closure_dates": [D]}))
+    assert audit_roles(f) == [f"source:{FR}", "fact:1"]                  # the audit sees it (the file is really dirty)
+    assert any(r["source_id"] == FR for r in facts_as_of(f, T9))         # and it is really there to be read
+    v = k3.closure_votes(g, D, AS_OF, finnhub_conn=f)                    # but it is not a vote
+    assert v["finnhub_store_given"] is True
+    assert "US_PRESIDENT" not in v["authorities_closed"] and v["authorities_closed"] == []
+    assert v["sources_closed"] == [] and v["suspected"] is False
+    fr_mourning_row(g)                                                   # the opposite: the same source in the general file counts
+    assert k3.closure_votes(g, D, AS_OF, finnhub_conn=f)["authorities_closed"] == ["US_PRESIDENT"]
+    g.close()
+    f.close()
+
+
 def test_closure_votes_refuses_connections_of_the_wrong_role(tmp_path):
     g, f = make_stores(tmp_path)
     with pytest.raises(k3.K3Error, match="(?i)general"):
@@ -519,6 +536,74 @@ def test_the_command_line_votes_say_whether_the_finnhub_store_was_given(tmp_path
     assert json.loads(capsys.readouterr().out)["finnhub_store_given"] is False
     k3._main(["votes", "--store", str(g), "--finnhub-store", str(f), "--date", D, "--as-of", AS_OF])
     assert json.loads(capsys.readouterr().out)["finnhub_store_given"] is True
+
+
+def _tree(root):
+    return sorted(p.name for p in root.iterdir())
+
+
+def test_votes_refuses_a_finnhub_store_path_that_does_not_exist_and_creates_nothing(tmp_path, capsys):
+    g, f = tmp_path / "g.db", tmp_path / "typo_f.db"
+    assert k3._main(["votes", "--store", str(g), "--finnhub-store", str(f), "--date", D, "--as-of", AS_OF]) == 2
+    out = capsys.readouterr()
+    assert out.out == "" and out.err.startswith("error:") and "typo_f.db" in out.err and "Traceback" not in out.err
+    assert not f.exists() and not g.exists() and _tree(tmp_path) == []   # neither file, as a side effect of the refusal
+    long_path = tmp_path / ("x" * 400)                                   # the path is named, cut to a sane length
+    assert k3._main(["votes", "--store", str(g), "--finnhub-store", str(long_path), "--date", D]) == 2
+    err = capsys.readouterr().err
+    assert "xxxx" in err and len(err) <= 301 and not g.exists() and _tree(tmp_path) == []
+    # the opposite: the same call with an existing Finnhub-role file works, and so does a general store that is new
+    connect(f, role="finnhub").close()
+    assert k3._main(["votes", "--store", str(g), "--finnhub-store", str(f), "--date", D, "--as-of", AS_OF]) in (0, 1)
+    assert json.loads(capsys.readouterr().out)["finnhub_store_given"] is True
+    assert g.exists()
+
+
+def test_votes_with_an_existing_finnhub_file_works_as_before_and_without_the_option_still_creates_the_general_store(
+        tmp_path, capsys):
+    g, f = tmp_path / "g.db", tmp_path / "f.db"
+    assert k3._main(["register", "--store", str(g), "--finnhub-store", str(f), "--only", f"{X},{H}",
+                     "--terms-read-at", T0]) == 0
+    capsys.readouterr()
+    assert k3._main(["votes", "--store", str(g), "--finnhub-store", str(f), "--date", D, "--as-of", AS_OF]) in (0, 1)
+    got = json.loads(capsys.readouterr().out)
+    assert got["finnhub_store_given"] is True and got["authorities_closed"] == []
+    fresh = tmp_path / "fresh.db"                                        # `--store` itself is unchanged: a new path is made
+    assert k3._main(["votes", "--store", str(fresh), "--date", D, "--as-of", AS_OF]) in (0, 1)
+    assert json.loads(capsys.readouterr().out)["finnhub_store_given"] is False and fresh.exists()
+
+
+def test_votes_still_refuses_an_existing_general_file_given_as_the_finnhub_store(tmp_path, capsys):
+    g, other = tmp_path / "g.db", tmp_path / "other_general.db"
+    connect(other).close()
+    before = other.read_bytes()
+    assert k3._main(["votes", "--store", str(g), "--finnhub-store", str(other), "--date", D, "--as-of", AS_OF]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:") and "general" in err and "Traceback" not in err
+    assert other.read_bytes() == before and app_id(other) == 0 and not g.exists()      # and no --store file is made
+    connect(tmp_path / "ok_f.db", role="finnhub").close()                # the opposite: the right role passes
+    assert k3._main(["votes", "--store", str(g), "--finnhub-store", str(tmp_path / "ok_f.db"), "--date", D,
+                     "--as-of", AS_OF]) in (0, 1)
+
+
+@pytest.mark.parametrize("make_bad", [lambda p: p / "a_dir", lambda p: ""], ids=["directory", "empty-string"])
+def test_votes_refuses_a_finnhub_store_that_is_a_directory_or_empty_in_words(tmp_path, capsys, make_bad):
+    bad = make_bad(tmp_path)
+    if bad:
+        bad.mkdir()
+    before = _tree(tmp_path)
+    g = tmp_path / "g.db"
+    assert k3._main(["votes", "--store", str(g), "--finnhub-store", str(bad), "--date", D, "--as-of", AS_OF]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error:") and "finnhub" in err.lower() and "Traceback" not in err and len(err) <= 301
+    assert not g.exists() and _tree(tmp_path) == before                  # nothing created
+
+
+def test_register_and_refresh_may_still_create_the_finnhub_file(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(k3, "_urllib_get", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no request")))
+    g, f = tmp_path / "g.db", tmp_path / "new_f.db"
+    assert k3._main(["register", "--store", str(g), "--finnhub-store", str(f), "--only", H, "--terms-read-at", T0]) == 0
+    assert f.exists() and app_id(f) == FIN_ID                            # register is how the Finnhub file is first made
 
 
 def test_there_is_no_default_path_for_the_finnhub_store_in_the_code():

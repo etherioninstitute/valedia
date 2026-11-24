@@ -108,6 +108,7 @@ import argparse
 import hashlib
 import html
 import json
+import os
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -1145,9 +1146,12 @@ def _main(argv=None) -> int:
             result = refresh(target, source, http_get=_urllib_get, now=now, params=params or None)
             _print(result)
             return 1 if result["error"] else 0
-        conn = store.connect(args.store)
-        if args.finnhub_store:
+        if args.finnhub_store is not None and not os.path.isfile(args.finnhub_store):     # named but missing: never made here
+            raise K3Error(f"--finnhub-store: no Finnhub store file at {args.finnhub_store[:120]!r} "
+                          "(register or refresh a Finnhub source makes it; votes only reads it)")
+        if args.finnhub_store is not None:                  # opened first: a refusal here leaves no new --store file
             fin_conn = store.connect(args.finnhub_store, role="finnhub")
+        conn = store.connect(args.store)
         result = closure_votes(conn, args.date, args.as_of or _fmt(now), finnhub_conn=fin_conn)
         _print(result)
         return 1 if (result["suspected"] or not result["schedule_known"]) else 0
