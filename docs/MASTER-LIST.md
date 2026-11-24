@@ -338,6 +338,15 @@ passing idea can trade at once.
 - **OWNER** the ATL practice contract (sold by hand, or his confirmation of what happened to it).
 - **QUEUED** `docs/WEBULL.md` line 276 still says event orders are not built: stale.
 - **IDEA** the live path for event orders in the shared account needs the same book-level accounting as T51c.
+- **IDEA** (owner, 2026-11-23) the "Grok desk" BTC 5-minute Up/Down rule from an outside setup guide
+  (`~/Downloads/AI_Flow_Lab_Grok_Desk_NINE_400K_Setup_Guide.pdf`; its "$400K" is unverified by its own text), run
+  in Valedia on Hermes, not Grok. Rule: ROC3 >= +0.10% Up / <= -0.10% Down, RANGE5 <= 0.45%, spread <= $0.03,
+  stake <= 1% and 0 without a calibrated q, every skip logged, thresholds frozen first. Lead's shape: arithmetic
+  roles in code, no LLM in the decision path; Hermes CoS team audits the log only; venue = Kalshi via Webull
+  (crypto series on Webull UNVERIFIED, so the venue check comes first); a locked test document before any
+  observation, scored q - ask - fee; historical stage if Kalshi candles reach back, then a forward shadow log; Kalshi
+  reads only after 12-03 and far below the collector's rate. Sent to Carbon in reply 48 section 3. OWNER: Hermes work
+  is PARKED until priority 1 (section 0 item 4), so building it needs his word to unpark.
 
 ## 4. Finding what makes money (tests and ideas)
 
@@ -608,6 +617,13 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 48 (Carbon response 48, file named Valedia_Carbon_Response47.md; reply 48 sent 2026-11-23): tracker
+  unchanged (5/19, 26.3%). Adopted for T65: blind check on a throwaway ledger (every branch, multi-day CLI) + a dry
+  run on a COPY of the real store (under /private/tmp/valedia-test-tmp/) with 0 surprise P0s; item 4 ticked only
+  after one real scheduled 7:25 morning with T65 merged. FOUND 8:20 PM: the real run-ledger store has NEVER been
+  written (folder ~/valedia-data/run-ledger/ made 1:24 PM 11-23, no file); Monday's two skips are only in the
+  order-step log; first write = Tue 6:30 pre-flight (connect makes the file). Tue reading added: the store
+  appears with 11-24 rows only. Sent Carbon the owner's BTC 5-minute desk idea (section 3 IDEA) for critique.
   Round 47 (Carbon response 47, file named Valedia_Carbon_Response46.md; reply 47 sent 2026-11-23): tracker
   unchanged (5/19, 26.3%). Adopted: order_step.py never writes the run ledger; Gate #7's attended evidence = ticket
   file + journal + order ledger. Checked: run_ledger.py is NOT in the 54-file pin list (T65/p2 land outside the pin);
