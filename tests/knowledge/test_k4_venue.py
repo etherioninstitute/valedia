@@ -589,7 +589,7 @@ def test_fetch_requests_the_page_with_a_generic_agent_and_no_credentials():
     facts = k4.fetch(KR, http_get=fake, now=NOW)
     assert len(facts) == 6 and [c[0] for c in fake.calls] == [KR_URL]
     headers = fake.calls[0][1]
-    assert headers["User-Agent"] == "valedia-client/1.0" and set(headers) == {"User-Agent", "Accept"}
+    assert headers["User-Agent"] == "calendar-and-notice-reader/1.0" and set(headers) == {"User-Agent", "Accept"}
     fake = Fake({WB_URL: WEBULL.encode()})
     assert len(k4.fetch(WB, http_get=fake, now=NOW)) == 5 and fake.calls[0][0] == WB_URL
 

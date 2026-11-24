@@ -1055,7 +1055,7 @@ def test_fetch_finnhub_holiday_request_and_facts():
     facts = k3.fetch(H, http_get=fake, now=NOW, credentials=creds)
     assert len(facts) == 3 and fake.calls[0][0] == H_URL
     headers = fake.calls[0][1]
-    assert headers["X-Finnhub-Token"] == TOKEN and headers["User-Agent"] == "valedia-client/1.0"
+    assert headers["X-Finnhub-Token"] == TOKEN and headers["User-Agent"] == "calendar-and-notice-reader/1.0"
     assert TOKEN not in fake.calls[0][0]
     assert all(f["fetched_at_utc"] == NOW_S for f in facts)
 
@@ -1070,7 +1070,7 @@ def test_fetch_user_agent_is_generic():
     fake = Fake({FR_URL: fr_body()})
     k3.fetch(FR, http_get=fake, now=NOW)
     ua = fake.calls[0][1]["User-Agent"]
-    assert ua == "valedia-client/1.0" and "@" not in ua
+    assert ua == "calendar-and-notice-reader/1.0" and "@" not in ua
     assert not any("X-Finnhub-Token" == h for h in fake.calls[0][1])           # no key goes to a keyless source
 
 
@@ -1566,7 +1566,7 @@ def test_refresh_reads_the_body_of_each_real_death_proclamation(conn):
     assert a["body_read"] is True and b["body_sha256"] == hashlib.sha256(BODY_10876.encode()).hexdigest()
     assert len(fake.calls) == 3                                               # one list request, one body each
     for url, headers in fake.calls[1:]:
-        assert headers["User-Agent"] == "valedia-client/1.0"
+        assert headers["User-Agent"] == "calendar-and-notice-reader/1.0"
     assert k3.refresh(conn, FR, http_get=fake, now=NOW + timedelta(hours=1)) == {"stored": 0, "unchanged": 2, "error": 0}
 
 
@@ -1779,7 +1779,7 @@ def test_the_whitehouse_source_entry():
     assert e["terms_url"] == "https://www.whitehouse.gov/copyright/" and e["terms_url"].startswith("https://")
     assert e["licence_tag"] == "US-PUBLIC-DOMAIN" and e["allow_external_llm"] == 1
     assert e["ua_policy"] == "GENERIC_CLIENT" and e["cost_usd_monthly"] == 0 and e["time_zone"] == "America/New_York"
-    assert k3._WH == WH and k3._UA == "valedia-client/1.0"
+    assert k3._WH == WH and k3._UA == "calendar-and-notice-reader/1.0"
 
 
 def test_the_whitehouse_source_registers_like_the_others(conn):
@@ -2240,7 +2240,7 @@ def test_refresh_stores_the_feed_with_one_exact_request(conn):
     assert len(fake.calls) == 1
     url, headers = fake.calls[0]
     assert url == WH_URL
-    assert headers == {"User-Agent": "valedia-client/1.0", "Accept": WH_ACCEPT}
+    assert headers == {"User-Agent": "calendar-and-notice-reader/1.0", "Accept": WH_ACCEPT}
     assert k3.refresh(conn, WH, http_get=fake, now=NOW) == {"stored": 0, "unchanged": 3, "error": 0}
     assert [c[0] for c in fake.calls] == [WH_URL, WH_URL]                                    # never an item page
 
