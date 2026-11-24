@@ -640,6 +640,13 @@ Queued (roadmap):
   files and the run ledger; 0.76.0 goes with the re-pin. Pinned work stays on branches until the clean week ends.
   Collector rails, the public mirror, worktrees off the SSD (16.6 MB tree), VAL-19 hold. Lead lean: Fable
   plans/judges, Sonnet builds, Opus blind checks per order-path slice.
+  REVISED AGAIN 9:13 PM PST (owner): the run is TONIGHT, before the clean week's first run (6:30 AM 11-24), so pinned
+  code may merge; "make sure that mechanism doesn't break". Guard: workers only in worktrees (the wrapper diffs the
+  MAIN CHECKOUT's working files vs accepted-orderpath-commit); pinned work on branch bigrun, landing in ONE merge +
+  re-pin (list rebuilt from the real import list, old pin files kept as *.before-bigrun); dry gate diff + paper dry
+  run via test-slot; 4:30 AM last pinned merge, 5:30 AM re-pin checked, 6:00 AM otherwise roll back to 8fb509f;
+  no tests/merges 3:35-4:10 AM (nightly backup). Version: tag pre-bigrun-20261123; 0.76.0 bump + tag only inside
+  the re-pin merge. Trade-off: new code first meets session 1 at 6:55; a fault moves the week a day.
   Round 49 (Carbon response 49, file named Valedia_Carbon_Response48.md; reply 49 sent 2026-11-23): tracker
   unchanged (5/19, 26.3%). Carbon advised parking the BTC desk at Step 0; OWNER OVERRODE 2026-11-23 (use the guide's
   methods for BTC Up/Down; no real event order until a rule passes). Adopted: forward shadow log ONLY (SEAL_EPOCH_1
