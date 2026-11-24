@@ -7,7 +7,8 @@ T51 build B: whatever build B changes, a run with fractional off must still writ
 
 History of the pin: it was 33ace6f (T51's own base) until T51c S4c-2 changed go_live.py and stake_ladder.py on purpose;
 it was then re-pinned on purpose to 75a51f5 (T51c re-pin ticket). Today every module either side imports is
-byte-identical between the two sides.
+byte-identical between the two sides except the four in MAY_DIFFER, each with its reason below (the big run's three
+changes to the order path, BR-A, BR-W and BR-E, are among them).
 
 How it is shown: seeded worlds of every kind of day (ordinary days, partial fills, refusals by the venue, an order
 left over by the day's cap, a fill through its limit, a stopped run, a ticket proposed and approved, a ticket that
@@ -17,7 +18,8 @@ the same seed: once by a fresh interpreter that imports ONLY 75a51f5's whole `va
 `git archive 75a51f5` into the test's temporary folder), once by a fresh interpreter that imports ONLY this tree's.
 Each side reports the file of every `valedia_trader` module it imported: none may come from the other side, and
 every one of them must be byte-identical between the two sides except `execution_and_risk/order_step.py`,
-`execution_and_risk/orders.py` and `venues/webull.py` (T51 build B changes these three on purpose; MAY_DIFFER says why). A later change on main to a module the run
+`execution_and_risk/orders.py`, `venues/webull.py` (T51 build B changes these three on purpose) and
+`execution_and_risk/go_live.py` (BR-A); MAY_DIFFER says why. A later change on main to a module the run
 imports fails these tests in words naming it (the base must then be re-pinned on purpose, or the module added to
 the list on purpose); a changed module that no run imports does not matter. If 75a51f5 cannot be read from this
 checkout's history the tests fail in words. After every run the whole world folder is compared, file by file.
@@ -26,13 +28,20 @@ What is masked, and why (nothing else is):
 - M1 the journal's `"timestamp": "..."` field: the journal stamps each line with the wall clock
   (paper.Journal.write, datetime.now), which no test controls. Every other byte of every journal file is compared.
   STILL NEEDED against 75a51f5 (the clock is the same on both sides).
+- M4 the summary key `held_lock` (BR-E: `_finish` of the order step ends every summary with `held_lock`, a bool: whether the
+  run held the run lock; the base's summaries never carry it). It is admitted in the returned summary and in the journal's
+  summary lines, and nowhere else (`_summary_same_but_held_lock`, `_journal_same_but_held_lock`): it must be there on this
+  tree and a real bool, absent on the base, last on a journal line, and the summary or line is otherwise the base's own
+  text. Any other key, in either direction, any other event's line, or a `held_lock` that is missing or not a bool on this
+  tree is a difference. The tests `test_r2_m4_...` show both sides of this.
 - M2 (the order ledger's layout: 33ace6f wrote layout 3, this tree layout 4) and M3 (the order step's state file's
   layout: 33ace6f wrote layout 1, this tree layout 2) are REMOVED. 75a51f5 writes layout 4 and layout 2 as this tree
   does, so the ledger file and the state file are compared byte for byte like every other file; a difference in
   either layout, schema or row now shows as a difference.
 - Random ids are NOT masked: the batch ids and the state file's account key (os.urandom) and the ticket numbers
   (secrets.randbelow) are drawn on both sides from the same seeded source, so they must be equal too.
-Every other file (ledger, state, ticket file, the live owner's files, the limits file) is compared byte for byte.
+Every other file (ledger, state, ticket file, the live owner's files, the limits file) is compared byte for byte, and
+every other byte of a journal file is compared (apart from M1 and M4).
 
 A sanity pair shows the comparison can fail: two different worlds, and one world with a single input changed by a
 cent, are each reported as different.
@@ -66,7 +75,9 @@ BASE = "75a51f5"
 # nothing else:
 #   - execution_and_risk/order_step.py and execution_and_risk/orders.py: the subject of the comparison (the live
 #     opening for fractions, the proof reading, first contact, the quote re-ask; the ledger's schema check and its
-#     reconciles() reader, B6 (2));
+#     reconciles() reader, B6 (2)); and BR-E, one line of `_finish` of the order step: every summary, returned and
+#     journaled, now ends with `held_lock` (a bool: whether the run held the run lock). It is the one difference in what
+#     a run writes or returns that the comparison finds, and it is admitted by M4 (above), as that key and nothing else;
 #   - venues/webull.py (build B, B2 and B3): the owner's consent key `fractional_live_consent` is judged by the
 #     confirmation's reader (an optional key; the judged dict holds it only when JSON true), and the production adapter
 #     takes an order with no limit price in ONE case (a remainder leg of a run that passed its locks: flag, consent re-read,
@@ -75,11 +86,23 @@ BASE = "75a51f5"
 #     every production LIMIT order survived it). The guard of the adapter is tests/venues/test_webull.py: its
 #     production-order tests, the seeded property over 400 production worlds, and `test_f2_...`, which pins the payload of
 #     whole-share production LIMIT orders byte for byte against a fixture generated by running 75a51f5's own webull.py.
+#     BR-W (big run, 2026-11) also changed it, in two places that this test cannot see for the same reason (its stand-in
+#     venue is not the adapter): an order the venue reports as EXPIRED is read as the ledger state `expired` (an exact
+#     match; it is not a reconcile fault), and `cancel_all_open` takes the client order ids of our own orders and
+#     cancels only those (it fails closed on a bad list). tests/venues/test_webull.py and test_webull_event_orders.py pin both;
+#   - execution_and_risk/go_live.py (BR-A, big run, 2026-11): the go-live record's reader `paper_record` (the practice
+#     journal read by lock 2) no longer counts a run that ended `done` with `faults` as clean (its fills are not
+#     reconciled fills, it is not a paper_broker_day; its day is listed as `faulted_runs`), and it shows how many clean
+#     fills were whole, remainder or sale (`whole_fills`, `remainder_fills`, `sale_fills`; shown only, no lock reads
+#     them). The worlds are still comparable because the change reads the practice journal and writes nothing, and a
+#     world whose run this changed would show as a difference in its summary, journal or files, which these worlds,
+#     run through the live lock too, do not show: they differ only by M4's `held_lock` (tests/execution_and_risk/
+#     test_go_live*.py hold the reader itself);
 # Not listed, each judged against 75a51f5: core/alerts.py (no run imports it; if one does and it changed, the test
-# fails in words), go_live.py and stake_ladder.py (byte-identical to the base), research_loop/cli.py (the command line is
-# not what these worlds drive; they call run_order_step).
+# fails in words), stake_ladder.py (byte-identical to the base), research_loop/cli.py (the command line is not what
+# these worlds drive; they call run_order_step).
 MAY_DIFFER = ("valedia_trader/execution_and_risk/order_step.py", "valedia_trader/execution_and_risk/orders.py",
-              "valedia_trader/venues/webull.py")
+              "valedia_trader/venues/webull.py", "valedia_trader/execution_and_risk/go_live.py")
 TESTS = Path(__file__).resolve().parent
 KINDS = ("ordinary", "partial", "refusal", "cap", "breach", "stopped", "approved", "expired", "second_run",
          "baseline", "live")
@@ -433,20 +456,62 @@ def _drive(mod, tmp, rng, kind):
     return snaps
 
 
+def _summary_same_but_held_lock(b, m):
+    """M4: the run summary of the base (`b`) and of this tree (`m`), both `json.dumps(out, sort_keys=True)`: equal but
+    for the key BR-E gave every summary of this tree, `held_lock`. It must be there on this tree and a real bool, and
+    absent on the base; without it the two are the same text. No other key is admitted, in either direction."""
+    try:
+        bs, ms = json.loads(b), json.loads(m)
+    except ValueError:
+        return b == m
+    if not (isinstance(bs, dict) and isinstance(ms, dict)):
+        return b == m
+    if "held_lock" in bs or type(ms.pop("held_lock", None)) is not bool:
+        return False
+    return json.dumps(ms, sort_keys=True, default=str) == b
+
+
+def _journal_same_but_held_lock(b, m):
+    """M4: a journal file (bytes, M1 applied) of the base (`b`) and of this tree (`m`): the same lines, but a line that
+    differs must be a summary line of this tree that ends with `held_lock` (a real bool), and be the base's line once
+    that key is taken out. Any other difference (another key, another event, another line count) is not admitted."""
+    if b == m:
+        return True
+    bl, ml = b.split(b"\n"), m.split(b"\n")
+    if len(bl) != len(ml):
+        return False
+    for x, y in zip(bl, ml):
+        if x == y:
+            continue
+        try:
+            e = json.loads(y)
+        except ValueError:
+            return False
+        if not (isinstance(e, dict) and e.get("event") == "summary" and list(e)[-1] == "held_lock"
+                and type(e["held_lock"]) is bool):
+            return False
+        if json.dumps({k: v for k, v in e.items() if k != "held_lock"}, default=str).encode() != x:
+            return False
+    return True
+
+
 def differences(b_runs, m_runs):
-    """Every difference between the base's runs and this revision's, as (run, artefact) pairs, with M1."""
+    """Every difference between the base's runs and this revision's, as (run, artefact) pairs, with M1 and M4."""
     diffs = []
     if len(b_runs) != len(m_runs):
         return [("runs", f"{len(b_runs)} against {len(m_runs)}")]
     for i, (b, m) in enumerate(zip(b_runs, m_runs)):
-        for key in ("calls", "handed", "second", "summary", "exit"):
+        for key in ("calls", "handed", "second", "exit"):
             if b[key] != m[key]:
                 diffs.append((i, key))
+        if not _summary_same_but_held_lock(b["summary"], m["summary"]):
+            diffs.append((i, "summary"))
         if sorted(b["files"]) != sorted(m["files"]):
             diffs.append((i, ("file names", sorted(set(b["files"]) ^ set(m["files"])))))
             continue
         for rel, (how, data) in b["files"].items():
-            if (how, data) != m["files"][rel]:
+            mhow, mdata = m["files"][rel]
+            if how != mhow or not (_journal_same_but_held_lock(data, mdata) if how == "journal" else data == mdata):
                 diffs.append((i, rel))
     return diffs
 
@@ -506,3 +571,118 @@ def test_r2_sanity_the_comparison_finds_two_different_worlds_and_a_one_cent_chan
     found = differences(b, sides["cent"]["runs"]["ordinary-0"])        # every limit a cent lower, nothing else
     assert found and {k for _, k in found} >= {"handed", "summary"}, found
     assert any(isinstance(k, str) and k.startswith("journal/") for _, k in found), found
+
+
+# ---- M4: the one admitted difference, `held_lock`, and nothing beside it
+
+def _grown(snap, **change):
+    """A copy of a snapshot of this tree's run whose summary has `change` applied (a value of _GONE takes the key out)."""
+    out = json.loads(snap["summary"])
+    for k, v in change.items():
+        if v is _GONE:
+            out.pop(k, None)
+        else:
+            out[k] = v
+    return dict(snap, summary=json.dumps(out, sort_keys=True, default=str))
+
+
+_GONE = object()
+
+
+def _summary_line(snap):
+    """(journal file, line index, parsed line) of the last summary line of the order step in a snapshot's journal."""
+    found = [(rel, n, json.loads(line)) for rel, (how, data) in sorted(snap["files"].items()) if how == "journal"
+             for n, line in enumerate(data.split(b"\n")) if line.strip() and json.loads(line).get("event") == "summary"
+             and "held_lock" in json.loads(line)]
+    assert found, "the run journaled no summary with held_lock"
+    return found[-1]
+
+
+def _put_line(snap, rel, n, line):
+    how, data = snap["files"][rel]
+    lines = data.split(b"\n")
+    lines[n] = line
+    return dict(snap, files={**snap["files"], rel: (how, b"\n".join(lines))})
+
+
+def _first_done(sides):
+    for name in sorted(sides["new"]["runs"]):
+        for b, m in zip(sides["old"]["runs"][name], sides["new"]["runs"][name]):
+            if json.loads(m["summary"]).get("orders_sent") and any(
+                    how == "journal" and b'"held_lock"' in data for how, data in m["files"].values()):
+                return b, m
+    pytest.fail("no run of the worlds sent an order and journaled its summary")
+
+
+def test_r2_m4_held_lock_is_the_whole_of_the_difference_and_both_sides_are_compared_with_it_taken_out(sides):
+    check_pinned(sides)
+    runs = held = lines = 0
+    for name, base_runs in sides["old"]["runs"].items():
+        for b, m in zip(base_runs, sides["new"]["runs"][name]):
+            ms, bs = json.loads(m["summary"]), json.loads(b["summary"])
+            assert "held_lock" not in bs, name
+            assert type(ms.get("held_lock")) is bool, (name, ms.get("held_lock"))
+            assert b["summary"] != m["summary"]                          # without M4 it would be a difference
+            rel, n, e = _summary_line(m)
+            assert list(e)[-1] == "held_lock" and type(e["held_lock"]) is bool
+            runs += 1
+            held += ms["held_lock"] is True
+            lines += sum(1 for _, (how, data) in m["files"].items() if how == "journal" and b'"held_lock"' in data)
+    assert runs > 100 and held > 0 and runs - held > 0 and lines > 0, (runs, held, lines)   # a run that never took the lock too
+
+
+def test_r2_m4_a_summary_that_differs_in_any_other_key_or_has_no_real_bool_held_lock_is_a_difference(sides):
+    b, m = _first_done(sides)
+    assert differences([b], [m]) == []
+    got = json.loads(m["summary"])
+    for held in (True, False):                                           # the key itself: either bool is admitted
+        assert differences([b], [_grown(m, held_lock=held)]) == []
+    for bad in (_grown(m, orders_sent=got["orders_sent"] + 1),            # another key's value differs
+                _grown(m, extra_key=1),                                  # another key beside held_lock
+                _grown(m, status=_GONE),                                 # another key gone
+                _grown(m, held_lock=True, notices=["x"])):               # held_lock is no licence for a second key
+        assert (0, "summary") in differences([b], [bad]), bad["summary"]
+    for held in (_GONE, None, 1, 0, "true", [True], {"held": True}):      # missing, or not a real bool
+        assert (0, "summary") in differences([b], [_grown(m, held_lock=held)]), held
+    assert (0, "summary") in differences([_grown(b, held_lock=True)], [m])   # the base never says it
+
+
+def test_r2_m4_a_journal_line_that_differs_in_any_other_way_than_held_lock_is_a_difference(sides):
+    b, m = _first_done(sides)
+    rel, n, e = _summary_line(m)
+    line = lambda d: json.dumps(d, default=str).encode()
+    other = {k: v for k, v in e.items() if k != "held_lock"}
+    assert differences([b], [m]) == []
+    for held in (True, False):                                           # either bool, as the line says it
+        assert differences([b], [_put_line(m, rel, n, line({**other, "held_lock": held}))]) == [], held
+    for bad in ({**other, "held_lock": None}, {**other, "held_lock": 1}, {**other, "held_lock": "true"},
+                {"held_lock": e["held_lock"], **other},                  # held_lock not the last key
+                {**other, "orders_sent": -1, "held_lock": e["held_lock"]},     # another key's value differs
+                {**other, "extra_key": 1, "held_lock": e["held_lock"]},        # another key beside it
+                {**e, "event": "order"}):                                # held_lock on a line that is not a summary
+        assert (0, rel) in differences([b], [_put_line(m, rel, n, line(bad))]), bad
+    assert (0, rel) in differences([b], [_put_line(m, rel, n, b"not json")])
+    how, data = m["files"][rel]
+    assert (0, rel) in differences([b], [dict(m, files={**m["files"], rel: (how, data + b"\n" + line(e))})])   # a line more
+
+
+def test_r2_m4_held_lock_on_a_line_of_another_event_and_every_other_part_of_the_run_are_still_differences(sides):
+    b, m = _first_done(sides)
+    for rel, (how, data) in sorted(b["files"].items()):                   # a base line of another event, grown at its end
+        if how != "journal":
+            continue
+        for n, text in enumerate(data.split(b"\n")):
+            if text.strip() and json.loads(text).get("event") != "summary":
+                grown = json.dumps({**json.loads(text), "held_lock": True}, default=str).encode()
+                assert (0, rel) in differences([b], [_put_line(m, rel, n, grown)]), (rel, n)
+                break
+        else:
+            continue
+        break
+    else:
+        pytest.fail("the run has no journal line of another event to try")
+    for key, value in (("calls", [("changed",)]), ("handed", ["changed"]), ("second", "changed"), ("exit", 9)):
+        assert (0, key) in differences([b], [dict(m, **{key: value})]), key
+    other = next(r for r, (how, _) in sorted(m["files"].items()) if how == "bytes")     # a file that is not a journal
+    assert (0, other) in differences([b], [dict(m, files={**m["files"], other: ("bytes", m["files"][other][1] + b"x")})])
+    assert differences([b], [dict(m, files={r: v for r, v in m["files"].items() if r != other})])[0][1][0] == "file names"
