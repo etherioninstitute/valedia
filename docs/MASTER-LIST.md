@@ -299,6 +299,32 @@ trading (his word, 2026-11-17).
     fill, an unfilled day order at the close, a cancel answered "not yet", one clean week.
 11. **OWNER** the first order itself: his word at the time; live commands are run by him at a terminal.
 
+**Big run** (2026-11-23 night to 11-24 6:00 AM PT, owner's yes; lead Fable 5.2, Sonnet builders, Opus blind checks,
+no review by another model family that night). Counted tracker unchanged at 5/19: nothing is ticked before a real
+morning. On `main`:
+- outside the order-path pin: T65 (ffd01b4), run ledger `held_lock` proof and `p2:collar-miss` (1d32a39), BTC up/down
+  logger, log-only and off until 2026-12-04 (67cdf3d, 8d93036), White House feed for K-3 (482143f), run-ledger test
+  pins (a1e5e1c), Finnhub rows in their own store (c33f4f1, 75f293a).
+- the ONE pinned merge e35c82f: 5 of 7 pieces of the before-order-#1 batch (fault and order-type counting in the
+  go-live gate; EXPIRED is not a reconcile fault; recorded-answer rehearsals; `held_lock` in every run summary;
+  `cancel_all_open` cancels only ids this program placed). **The practice gate's pin moved 8fb509f -> e35c82f, its
+  list 54 -> 56 paths** (added `core/decision_model.py`, `research_loop/decay.py`). Dry checks green at 4:31 AM;
+  before about 6:35 AM a dry order step stops at the session check, so the changed code past it is covered by tests
+  only (37 files). The old gate files are kept beside the new ones as `*.before-bigrun`.
+- **QUEUED** still open in the batch: the settled-cash SELL cap (needs one recorded answer from Webull first) and the
+  order step's own entry point (it changes what the 6:55 job starts; not a night job).
+- **WATCH** if Webull ever answers EXPIRED (never seen): for an open order the new code books any partial fill, sends
+  no cancel for it and may send a new order for the rest; for an order already held as finished it is a reconcile
+  anomaly and the run stops (no test covers that second path). The lead to decide whether the second is wanted.
+- **NEXT** run ledger, can bite from Wed 11-25: a fill that lands after the 6:55 run printed its summary is counted
+  as unfilled, so two such sessions in a row send a false `p2:collar-miss`. Two T65 edge cases: lock proof accepts a
+  run that took its lock before the unpaired start; "already had a P0" is kept per trigger, not per start.
+- **NEXT** branches not merged: `low/ua-generic-k3-k4` (1ade599; generic client name for the two knowledge readers,
+  blind pass with notes) and `docs/pooling-test-draft` (14ba870; one sentence left, then one fresh check).
+- **IDEA** the practice gate passes silently over a malformed list line (line ending, trailing space, misspelt
+  path). Tonight's lists were checked byte by byte. A stricter check was drafted and has NOT passed its blind
+  checks; applied nowhere.
+
 After a first attended order:
 - **QUEUED** T34b-4 the stake ladder in use (stake from the ladder, doubling after clean sessions, halving
   after a fault), unattended runs, the live kill switch for a venue and its reset (roadmap 5.9, 4.5).
@@ -536,7 +562,8 @@ Queued (roadmap):
   limit (CLOSED by T61): a hung 7:10 start was only 15 min old at 7:25. Gate still open at 8fb509f.
   T64 MERGED 2026-11-23 (0b3ed70, ledger, blind PASS WITH NOTES, 22/25 mutants caught + 2 lead tests; 409 tests):
   deadman_wait (poll 15 s, cap 11 min even on a stuck clock, only from 10:25 NY on a session day); CLI deadman
-  --wait-open; prior-day orphans over 7 days -> run:orphan-start-prior:<YYYYMMDD>:<trigger>, P0, once per (start day,
+  --wait-open; prior-day orphans over 7 days (the 7-day window was REMOVED by T65, ffd01b4, merged 2026-11-23 night)
+  -> run:orphan-start-prior:<YYYYMMDD>:<trigger>, P0, once per (start day,
   trigger, book), on today's date, resets the streak. Deploy: alerts-morning.sh deadman = deadman, notify, deadman
   --wait-open, notify (backup .bak-20261123-t64). Live ledger file not yet created, so no stale starts. Open (Carbon
   r34 Q3): a Monday hang gives a same-day P0 AND a prior-day P0 on Tuesday. Known LOW: poll_s<=0 + stuck clock loops
@@ -750,7 +777,7 @@ Queued (roadmap):
   delayed JSON, second_quote.py). Adopted its 11-24 action matrix (8fb509f untouched mid-week; only a Tier 1
   collector stop pauses 6:55/7:10). p2:collar-miss counts filled_quantity > 0 as filled. Ex-date splits already stop
   via far_quotes (order_step.py:1160) until the owner records a split entry. Adopted K-1 next after WH feed + Finnhub
-  store: full nightly Nasdaq Trader directory from day 1 (terms read first), corporate-action watcher on the book +
+  store: full nightly Nasdaq Trader directory from day 1 (terms read first: read 2026-11-23, UNCLEAR, see 5b K-1), corporate-action watcher on the book +
   configured universes first, full EDGAR backfill after 12-03; ex-date stop + Webull instrument check go in the
   before-order-#1 batch. Asked: rename-vs-delisting rule for K-1.
   Round 39 (Carbon response 39, reply 39 sent 2026-11-23; reply opens with a standing-goals section and a
@@ -788,7 +815,8 @@ Queued (roadmap):
   queued in the before-order-#1 batch. Carbon's repo scorecard (84% core, 75% with K-1..K-7) relayed as non-gating.
   Round 34 (Carbon response 34, reply 34 sent 2026-11-23): launchd checks all hold (no TimeOut key, no set -e,
   sqlite timeout 15 s); 6:30+7:25 = ONE job, so a long sleep runs it once (dead-man). Dead vs hung: adopted as T65
-  (ticket written, build AFTER the 11-24 morning): no 7-day window; lock proof = later same-book COMPLETED, closed-market
+  (MERGED 2026-11-23 night in the big run, ffd01b4; the ticket had said build after the 11-24 morning, the big-run
+  brief said that night): no 7-day window; lock proof = later same-book COMPLETED, closed-market
   ORDINARY_STOP or outside-window NOOP (lock taken before _session; FAULT/CRASH can be pre-lock, so no proof); rules:
   no proof -> prior P0 each session day; proof + had P0 -> nothing; proof + never P0 -> unreported P0 once, reset on the
   start day. WH HTML already handled by _plain_text. Q35: unreported-crash streak day; a held-lock flag in the summary
@@ -798,8 +826,9 @@ Queued (roadmap):
   proclamations (federalregister.gov only, dates + body_sha256 stored). Carbon's self-void claim WRONG: rule only reads
   trigger sentences; real bodies give 2018-12-05 / 2025-01-09. Pairing EO+death rejected (Ford died 12-26). Bush FR
   published 12-06 (late) -> WH feed is the same-day vote. T64: deadman --wait-open (P1 sent, poll 15 s, cap 11 min) +
-  prior-day orphans (7 days, run:orphan-start-prior:<date>:<trigger> P0). No Finnhub 'Mourning' exception. Carbon's
-  progress %s relayed as non-gating estimates. Qs: 11-min job vs launchd; 7-day window.
+  prior-day orphans (7 days, run:orphan-start-prior:<date>:<trigger> P0; the 7 days were removed by T65, ffd01b4).
+  No Finnhub 'Mourning' exception. Carbon's
+  progress %s relayed as non-gating estimates. Qs: 11-min job vs launchd; 7-day window (answered in round 34: none).
   Round 32 (Carbon response 32, reply 32 sent 2026-11-23): 7:10 hang after a 6:55 gate SKIP was silent (T60's 20 min
   > 15 min) -> T61: ORPHAN_MINUTES 10 (real runs 1-3 min) + P1 deadman:run-still-open; no order-step timeout, no job move.
   FR closing-agency orders: 15 of 17 since 1998 are Christmas leave with XNYS open (EO 14371 returned 2025-12-24/26) ->
@@ -1011,6 +1040,10 @@ Finnhub-derived sent to an outside model. Order: after the live path (priority 1
   generic-name rule. OWNER YES 2026-11-23: his name AND email are the contact for SEC requests only. The values
   stay OUT of this repo (public mirror): code reads them from a private file outside the repo. Every other site
   keeps the generic name.
+  Nasdaq Trader terms read 2026-11-23 (the site's copyright page): UNCLEAR. It allows one unaltered permanent copy
+  for personal, non-commercial use; a nightly dated history or a parsed database goes beyond that wording, and the
+  page says nothing about automated downloads. The directory feed is NOT built. OWNER: keep one overwritten copy, or
+  ask Nasdaq in writing. The nasdaq.com terms page timed out twice and is unread.
 - **QUEUED** K-2 financial news: company news inside the Finnhub plan (kept local), company filings (8-K and
   similar), the official release calendars (Fed, BLS, BEA, Treasury), and exchange notices. Tagged by symbol and
   event, so the learning loop can ask what was known at a given time.
