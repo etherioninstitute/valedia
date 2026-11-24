@@ -608,6 +608,15 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 39 (Carbon response 39, reply 39 sent 2026-11-23; reply opens with a standing-goals section and a
+  closed-items list, at the owner's request, to stop drift): Carbon accepted reset-today. FOUND: the order step has
+  no bid/ask (quote = last 1-min bar close, minute_quotes order_step.py:2661; collar = quote +/-1%, 2% risk-reducing
+  sale, limit_price :2294), so the M/W split cannot be computed and reading #3 has no logged spreads (r36 wording
+  corrected). P2 simplified to one branch p2:collar-miss (2 COMPLETED sessions, N_ord>=3, filled/N_ord<0.5; 0-2
+  orders pause); spread-starved branch parked as IDEA (needs a broker bid/ask field, before-order-#1 batch).
+  Adopted the two-tier collector rule: Tier 1 stop = missed decision, or E peak >= control median + 15.0 s, or any
+  E minute >= 45.0 s; Tier 2 watch = E peak > max(3x median, control max + 3.0 s, 8.0 s), pause only on 2 mornings
+  in a row; per-decision tau only if the collector logs decision counts (check 11-24). Asked: next knowledge row.
   Round 38 (Carbon response 38, reply 38 sent 2026-11-23): the outside-window NOOP runs after the lock
   (order_step.py:3876 acquire, :3888 _session), so it stays a lock proof. Carbon asked T65's unreported P0 to reset
   the START day; that reverses its own r35 answer, so kept: it resets TODAY (any P0 resets its day). Adopted: the P2
