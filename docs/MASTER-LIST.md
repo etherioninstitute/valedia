@@ -619,6 +619,18 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 51 (Carbon response 51, file named Valedia_Carbon_Response50.md; reply 51 sent 2026-11-23 ~9:35 PM PST):
+  tracker unchanged (5/19). Carbon's big-run design ADOPTED and written into ~/Valedia_BigRun_Brief.md (Fable 5.2
+  lead, Ultracode, ~9:45 PM-6:00 AM PT): preemptive waves (W1 NOW: T65 -> p2:collar-miss merged to main, the
+  before-order-#1 batch on bigrun; W2 NEXT: BTC non-Kalshi Step 0 + locked doc + logger disabled to 12-04; W3 only
+  with >40% allowance: Nasdaq terms, WH feed, Finnhub store, pooling-test doc); pinned merge tonight with an
+  all-or-nothing rollback (revert -m 1 + *.before-bigrun, script in .foreman/bigrun/); one writer on order_step.py;
+  real Webull shapes only; whole-wrapper rehearsal; seats Fable lead / Sonnet <=3 / Opus verifier / Haiku; <=2
+  test slots; no CPI scoring on the partial 976 candles; zero Kalshi. BTC pins: frozen constituent subset (trimmed
+  median >=3 else SKIP_FEED), C_paper = 10. Lead corrections: Lane 2 must reconcile the FULL batch (bid/ask field,
+  Carver buffer, cli.py imports were missing; run-time cap waits on reading #1); batch ticks only if every "in"
+  piece lands; held_lock is new (its parse goes in run_ledger.py after T65); settled_cash already parsed. Carbon
+  sources: $4.45 was its own estimate (dropped); 1-in-8 from SpectralEdge (background only).
   Round 50 (Carbon response 50, file named Valedia_Carbon_Response49.md; reply 50 sent 2026-11-23): tracker
   unchanged (5/19, 26.3%). FOCUS RULE ADOPTED: one NOW + one NEXT governs attention (coding, specs, scoring);
   unattended jobs take no slot. Order: NOW P1 (owner's P2 alongside); NEXT BTC desk (Step 0, locked doc, logger from
