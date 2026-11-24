@@ -346,7 +346,9 @@ passing idea can trade at once.
   (crypto series on Webull UNVERIFIED, so the venue check comes first); a locked test document before any
   observation, scored q - ask - fee; historical stage if Kalshi candles reach back, then a forward shadow log; Kalshi
   reads only after 12-03 and far below the collector's rate. Sent to Carbon in reply 48 section 3. OWNER: Hermes work
-  is PARKED until priority 1 (section 0 item 4), so building it needs his word to unpark.
+  is PARKED until priority 1 (section 0 item 4), so building it needs his word to unpark. 2026-11-23 OWNER: not
+  parked, use the guide's methods for BTC Up/Down (Carbon had advised parking). Test shape per round 49 (forward
+  only, after 12-03). NEXT step: Step 0 = Webull probe for KXBTC15M + the series' rules page.
 
 ## 4. Finding what makes money (tests and ideas)
 
@@ -617,6 +619,18 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 49 (Carbon response 49, file named Valedia_Carbon_Response48.md; reply 49 sent 2026-11-23): tracker
+  unchanged (5/19, 26.3%). Carbon advised parking the BTC desk at Step 0; OWNER OVERRODE 2026-11-23 (use the guide's
+  methods for BTC Up/Down; no real event order until a rule passes). Adopted: forward shadow log ONLY (SEAL_EPOCH_1
+  2025-01-01..2026-12-31 confirmed: no dev history), 1 fixed snapshot per 15-min window, frozen train slice
+  n>=1,000 fitting q = sigma(w0 + w1 logit(P_mid) + w2 ROC3) (stop if w2 > 0 not shown), OOS fast kill at 500
+  (mean net <= 0), pass at 3,500 (t >= 3.00, DSR >= 0.95, Brier beats price); power math re-derived and correct.
+  Facts: Webull event round trip seen $0.03 (fee schedule unread); KXBTCD listed in part, KXBTC15M NEVER PROBED (Step
+  0). UNVERIFIED Carbon claims, links asked: arXiv 2606.31675, '6,000+ windows' study, KXBTC15M launch, the BRTI
+  60-s rule, 'momentum AUC 0.494-0.521' (not on our closed list). Clock: 96 windows/day; r=0.25 -> fast kill ~21 d,
+  pass ~146 d. Asked: the one locked rule (maker vs taker) for highest net profit/day; and the owner's FOCUS question:
+  lead's draft 'one NOW, one NEXT' rule (NOW = P1; NEXT = BTC Step 0 + test doc, forward log from 12-04; P4 after
+  order #1; CPI, Cand C, WH feed, Finnhub store, Nasdaq terms, K-1 parked by name).
   Round 48 (Carbon response 48, file named Valedia_Carbon_Response47.md; reply 48 sent 2026-11-23): tracker
   unchanged (5/19, 26.3%). Adopted for T65: blind check on a throwaway ledger (every branch, multi-day CLI) + a dry
   run on a COPY of the real store (under /private/tmp/valedia-test-tmp/) with 0 surprise P0s; item 4 ticked only
