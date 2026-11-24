@@ -608,6 +608,14 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 41 (Carbon response 41, file named Valedia_Claude_Reply41.md in Downloads; reply 41 sent 2026-11-23): no
+  drift. Adopted the K-1 rename rule: fail-closed (RENAME_PROVEN only with a 1:1 filing or an unchanged SEC class id /
+  single-issue CIK; a directory name match = UNVERIFIED_REMOVAL + candidate_rename notice, live only on proof or owner
+  confirmation; else DELISTED/INACTIVE or MERGED_NON_UNITARY/LIQUIDATED). Order stops wait for the before-order-#1
+  batch. Adopted keys (cik, series_id, class_id) for trust series, (cik, None, None) for single pools. Correction
+  sent: EEM is believed to be iShares, Inc., not iShares Trust; build rule: every CIK/series/class id comes from SEC's
+  own files at first load, never hand-typed; fixtures use made-up ids; owner confirms the 15 keys once. Asked:
+  benchmark-index changes as a K-1 P2 or research scope.
   Round 40 (Carbon response 40, reply 40 sent 2026-11-23): Carbon held the standing context, no drift. Finnhub
   rail check: readings 1-4 are Finnhub-free (quote = Yahoo minute bars, order_step.py:2661; cross-check = Cboe
   delayed JSON, second_quote.py). Adopted its 11-24 action matrix (8fb509f untouched mid-week; only a Tier 1
