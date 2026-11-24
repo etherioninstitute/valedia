@@ -8039,12 +8039,15 @@ def _t34_same_but(b, m, keys, where, skip=(), counts=None):
     T34b-3: what it adds (`_t34b3_undo`) is taken out of `m` first, counted in `counts`."""
     m = _t34b3_undo(b, m, counts)
     added = {}
-    for key in b:
+    keys = (*keys, "held_lock")                          # BR-E: every summary of this revision says whether the run held
+    for key in b:                                        # the lock; the earlier revisions' never do, and it is the last key
         if key in skip:
             continue
         if key == "summary":
             bs, ms = json.loads(b[key]), json.loads(m[key])
             added = {k: ms.pop(k) for k in keys if k in ms and k not in bs}
+            held = added.pop("held_lock", None)          # always there, a real bool (a crashed run has no summary at all)
+            assert type(held) is bool or "crashed" in ms, (where, key)
             assert json.dumps(ms, sort_keys=True, default=str) == b[key], (where, key)
         elif key == "journal":
             assert sorted(b[key]) == sorted(m[key]), (where, key)
@@ -8245,7 +8248,7 @@ def test_t34b2_live_runs_send_a_subset_of_the_bases_orders_and_the_same_without_
             if not r["stop"]:                                                           # and without a day stop, the same
                 assert r["mine"] == r["base"] and mine_lines == base_lines, where
                 assert r["status"][0] == r["status"][1] and r["status"][2] == r["status"][3], (where, r["status"])
-            assert set(r["added"]) <= set(T34B2_LIVE_KEYS) and "ceiling" in r["added"], (where, r["added"])
+            assert set(r["added"]) <= {*T34B2_LIVE_KEYS, "held_lock"} and "ceiling" in r["added"], (where, r["added"])   # BR-E: held_lock
             stats["runs"] += 1
             stats["stopped days"] += r["stop"]
             stats["fewer sent"] += r["mine"] != r["base"]
@@ -9061,7 +9064,7 @@ def test_t34b3_live_runs_against_the_base_subset_equal_and_the_same_cap_marks(tm
                     assert b.get("stage") == "reconcile" and m["orders_sent"] == b["orders_sent"] == 0, where
                 else:
                     assert r["status"][0] == r["status"][1] and r["status"][2] == r["status"][3], (where, r["status"])
-                assert set(r["added"]) <= {"notices", "cap_refs"}, (where, r["added"])
+                assert set(r["added"]) <= {"notices", "cap_refs", "held_lock"}, (where, r["added"])   # BR-E: held_lock, always there
             else:
                 stats["runs after a notice"] += 1
                 stats["runs sending more than the base after a notice"] += bool(r["mine"] - r["base"])
@@ -9855,3 +9858,177 @@ def test_t34b3_an_open_notice_is_not_listed_as_standing_in_the_way(tmp_path):
     out = _prun(w)
     assert out["stage"] == "reconcile" and "1 attention item open (" in out["reason"], out
     assert "attention items open" not in out["reason"] and tag not in out["reason"].split("attention item open")[1], out
+
+
+# ==== BR-E part 1: the summary says whether the run held the run lock (`held_lock`, always present, a real bool)
+#
+# False until the lock is taken (the lock-held stop included); True from then on. The journaled summary line carries
+# the same value. Stops before the lock are returned and printed only, so they have no journal line to compare.
+
+def _held(out):
+    assert type(out["held_lock"]) is bool, out
+    return out["held_lock"]
+
+
+def test_br_e_a_run_that_took_the_lock_says_held_lock_true_returned_and_journaled(world):
+    world.paper = paper({"a": {"SPY": 10.0}})
+    out = world.run()
+    assert out["status"] == "done" and _held(out) is True
+    assert world.entries("summary")[-1]["held_lock"] is True
+
+
+def test_br_e_a_stop_after_the_lock_outside_the_session_says_held_lock_true_and_journals_it(world):
+    world.paper = paper({"a": {"SPY": 10.0}})
+    world.clock.t = ny("2026-11-14 11:00")
+    out = world.run()
+    assert out["stage"] == "session" and "another order step" not in out["reason"] and _held(out) is True
+    assert world.entries("summary")[-1]["held_lock"] is True
+
+
+def test_br_e_a_fault_after_the_lock_says_held_lock_true_returned_and_journaled(world):
+    world.paper = paper({"a": {"SPY": 2.0}})
+    world.venue.submit_mode = ["raise"]
+    world.run()
+    (lost,) = world.venue.submits()
+    world.later(30)
+    world.paper = paper({})
+    world.run()
+    world.venue.book[lost] = {"symbol": "SPY", "units": 2.0, "limit": 505.0, "filled": 0.0, "state": "open"}
+    world.later(30)
+    out = world.run()
+    assert out["stage"] == "reconcile" and out["faults"] == ["attention:turned_up"] and _held(out) is True
+    assert world.entries("summary")[-1]["held_lock"] is True
+
+
+def test_br_e_the_lock_held_stop_says_held_lock_false_and_the_run_after_it_says_true(world):
+    world.paper = paper({"a": {"SPY": 1.0}})
+    holder = osx._RunLock(str(world.state_path))
+    assert holder.acquire()
+    try:
+        out = world.run()
+        assert out["stage"] == "session" and "another order step" in out["reason"] and _held(out) is False
+    finally:
+        holder.release()
+    assert world.entries("summary") == []                      # a run without the lock journals nothing
+    out = world.run()
+    assert out["status"] == "done" and _held(out) is True
+
+
+@pytest.mark.parametrize("env", ["production", None])
+def test_br_e_a_stop_at_the_environment_before_the_lock_says_held_lock_false(world, env):
+    world.paper = paper({"a": {"SPY": 10.0}})
+    world.venue.environment = env
+    out = world.run()
+    assert out["stage"] == "environment" and _held(out) is False
+    world.venue.environment = osx.TEST_ENVIRONMENT
+    assert _held(world.run()) is True                          # the opposite: the same world, a good environment
+
+
+def test_br_e_a_stop_at_targets_after_the_lock_on_a_stale_paper_book_says_held_lock_true(world):
+    world.clock.t = ny("2026-11-13 10:00")
+    world.paper = paper({"a": {"SPY": 1.0}}, day="2026-11-16")      # a book from the future: read under the lock
+    out = world.run()
+    assert out["stage"] == "targets" and world.venue.calls == [] and _held(out) is True
+    assert world.entries("summary")[-1]["held_lock"] is True
+
+
+def test_br_e_a_shared_run_given_a_capital_stops_at_targets_before_the_lock_with_held_lock_false(world):
+    world.paper = paper({"a": {"SPY": 1.0}})
+    out = world.run(shared=True, capital=1000.0)
+    assert out["stage"] == "targets" and "--capital is refused" in out["reason"] and _held(out) is False
+    assert world.entries("summary") == []
+
+
+def test_br_e_a_stop_at_ticket_before_the_lock_says_held_lock_false(tw):
+    tw.paper = paper({"a": {"SPY": 1.0}})
+    out = tw.run(propose=True, approve="123456")
+    assert out["stage"] == "ticket" and "cannot be asked for in one run" in out["reason"] and _held(out) is False
+    assert tw.entries("summary") == []
+
+
+@pytest.mark.parametrize("kw", [{}, {"propose": True}])
+def test_br_e_a_live_stop_before_the_lock_says_held_lock_false(tmp_path, kw):
+    w = live_world(tmp_path / "w")
+    w.ledger().close()
+    out = lrun(w, **kw)
+    assert out["stage"] == "live" and _held(out) is False
+
+
+def test_br_e_a_practice_propose_and_a_second_run_say_held_lock_true(tw):
+    tw.paper = paper({"a": {"SPY": 10.0}})
+    out = propose(tw)
+    assert out["status"] == "done" and _held(out) is True
+    assert tw.entries("summary")[-1]["held_lock"] is True
+
+
+# ==== BR-E part 2: an unapproved propose is a clean run (test pin only; no production change)
+#
+# A propose run that wrote a ticket is `done` with no `faults`; when nobody approves it and its fifteen minutes pass,
+# nothing is written and nothing is faulted: a later ordinary run or a second propose is clean, opens no attention
+# item, and the second propose marks the old ticket `superseded`. Approving the expired ticket still stops at `ticket`.
+
+def _br_e_open_attention(w):
+    led = w.ledger()
+    try:
+        return led.attention(open_only=False)
+    finally:
+        led.close()
+
+
+def _br_e_fates(w):
+    return {r["number"]: r["fate"] for r in ticket_rows(w, "fates")}
+
+
+def test_br_e_a_propose_run_that_wrote_a_ticket_is_done_with_no_faults_key(tw):
+    out, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    assert out["status"] == "done" and out["mode"] == "propose" and out["orders_sent"] == 0
+    assert "faults" not in out and "faults" not in tw.entries("summary")[-1]
+    assert _br_e_open_attention(tw) == [] and _br_e_fates(tw) == {}        # nothing opened, the ticket has no fate yet
+
+
+def test_br_e_a_propose_with_nothing_to_propose_is_done_with_no_faults_key(tw):
+    tw.paper = paper({})
+    out = propose(tw)
+    assert out["status"] == "done" and out["mode"] == "propose" and "faults" not in out
+    assert "ticket_number" not in out and out["ticket"]["orders"] == []
+    assert ticket_rows(tw, "tickets") == []
+
+
+def test_br_e_an_unapproved_propose_expires_with_zero_faults_and_a_second_propose_supersedes_it(tw):
+    _, first = _proposed(tw, {"a": {"SPY": 10.0}})
+    tw.clock.t += osx.TICKET_LIFE_SECONDS + 1                              # the fifteen minutes pass; nobody approves
+    out, second = _proposed(tw, {"a": {"SPY": 10.0}})
+    assert out["status"] == "done" and "faults" not in out and "faults" not in tw.entries("summary")[-1]
+    assert _br_e_open_attention(tw) == []
+    assert _br_e_fates(tw) == {first: "superseded"} and second != first   # the old one superseded, the new one live
+    assert tw.venue.submits() == [] and tw.orders() == []
+
+
+def test_br_e_an_unapproved_propose_expires_with_zero_faults_and_an_ordinary_run_leaves_it_unused(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    tw.clock.t += osx.TICKET_LIFE_SECONDS + 1
+    out = tw.run()                                                         # an ordinary run: the practice flow, no ticket
+    assert out["status"] == "done" and out["orders_sent"] == 1 and "faults" not in out
+    assert "faults" not in tw.entries("summary")[-1] and _br_e_open_attention(tw) == []
+    assert _br_e_fates(tw) == {}                                           # the old ticket stays unused: no event at all
+    assert [r["number"] for r in ticket_rows(tw, "tickets")] == [number]
+
+
+def test_br_e_the_expired_unapproved_ticket_still_stops_an_approve_at_ticket_and_that_is_no_fault_either(tw):
+    _, number = _proposed(tw, {"a": {"SPY": 10.0}})
+    tw.clock.t += osx.TICKET_LIFE_SECONDS + 1
+    out = approve(tw, number)
+    assert out["status"] == "stopped" and out["stage"] == "ticket" and "expired" in out["reason"]
+    assert "faults" not in out and _br_e_open_attention(tw) == [] and tw.venue.submits() == []
+    assert _br_e_fates(tw) == {number: "expired"}
+
+
+def test_br_e_the_opposite_a_forced_unclean_reconcile_after_an_expired_propose_does_carry_reconcile(tmp_path):
+    w = ticket_world(tmp_path / "w", venue=_with_odd(Booked)())
+    _, number = _proposed(w, {"a": {"SPY": 2.0}})
+    w.clock.t += osx.TICKET_LIFE_SECONDS + 1
+    _later_submit(w, 0, then=lambda x: setattr(x.venue, "odd", ("SPY",)))
+    out = w.run()                                                          # the same flow, the venue reports an anomaly
+    assert out["status"] == "done" and out["faults"] == ["reconcile"], out
+    assert w.entries("summary")[-1]["faults"] == ["reconcile"]
+    assert _br_e_fates(w) == {}                                            # the expiry itself added nothing

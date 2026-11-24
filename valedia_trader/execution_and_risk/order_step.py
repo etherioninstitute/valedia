@@ -6364,6 +6364,7 @@ class _Run:
                 summary["working_stop"] = dict(self.working_stop)
             if self.day_stop is not None:
                 summary["day_stop"] = dict(self.day_stop)
+        summary["held_lock"] = bool(self._locked)        # BR-E: always the last key; False for a stop before the lock
         try:
             if not self._locked:                         # stopped before the lock: returned (and printed) only
                 return summary
