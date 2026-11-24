@@ -510,7 +510,8 @@ Queued (roadmap):
   stop = +1; exchange holiday with a clean session stop = pause; any skip/mismatch/crash/fault = reset (today = reset).
   Before order #1: fault/order-type counting, recorded-answer rehearsals (partial, EXPIRED, cancel 'not yet', sale) + 5
   clean sessions, the T+1 settled-cash guard (buys and the sell cap min(book settled qty, account sellable qty)), EXPIRED
-  not a reconcile fault. Later (stake ladder): halving keyed by (order_id, anomaly), Carver's live buffer.
+  not a reconcile fault, and (r35) a `held_lock: bool` in the order step's summary (False until the lock is taken,
+  then True for the run; CRASH/unreadable = False), so a post-lock FAULT proves an earlier start dead (T65). Later (stake ladder): halving keyed by (order_id, anomaly), Carver's live buffer.
   DONE 2026-11-23 T57 run ledger + alert policy merged cd5b0b3 (312 tests; 2 blind checks, 1 FAIL -> repaired:
   REPLACE on incidents/attempts). `valedia_trader/core/run_ledger.py`: run_events / alert_incidents / send_attempts
   append-only; decide() P0-P3; streak(); preflight(); deadman(); CLI. WIRING LIVE 2026-11-23 (owner's yes):
@@ -607,6 +608,10 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 35 (Carbon response 35, reply 35 sent 2026-11-23): Carbon's "7:00 wake gives a false P1" REFUTED: deadman_check
+  returns [] before 10:25 NY (run_ledger.py:639); still made explicit: alerts-morning.sh deadman exits 0 before 7:25 PT
+  (backup .bak-20261123-r35). T65 rule 3 changed: the unreported P0 resets TODAY (any P0 resets its day). held_lock
+  queued in the before-order-#1 batch. Carbon's repo scorecard (84% core, 75% with K-1..K-7) relayed as non-gating.
   Round 34 (Carbon response 34, reply 34 sent 2026-11-23): launchd checks all hold (no TimeOut key, no set -e,
   sqlite timeout 15 s); 6:30+7:25 = ONE job, so a long sleep runs it once (dead-man). Dead vs hung: adopted as T65
   (ticket written, build AFTER the 11-24 morning): no 7-day window; lock proof = later same-book COMPLETED, closed-market
