@@ -19,9 +19,12 @@ The store is a sqlite file whose path is always given; this module has no defaul
 
 What reaches the owner (`decide`, a pure function of the day's rows):
   P0  a run that ended in a fault or a crash, or any row with a fault count; a run that started and never ended (an
-      orphaned start, written by the dead-man check). Sent every time, never held back.
+      orphaned start, written by the dead-man check), the first time it is reported, whether on its own day or later;
+      a start that never ended and was never reported, found after a later run took the lock. Sent every time.
   P1  the dead-man: no run ended and none was skipped on purpose by 10:25 New York. Once a day. And a run start of today
       that is still open at the check but not yet old enough to be an orphan (a late launchd fire): once for each trigger.
+      And a start from an earlier day that is still unproven dead (no later run has taken the lock) and was already
+      reported once as a P0: once a day, naming the start; it replaces the generic dead-man P1 of that day.
   P2  a skip, or a pre-flight warning. Once for each cause in a day. A 6:55 skip with the cause of a warning already
       sent adds one quiet follow-up; a 7:10 skip of that cause is not sent.
   P3  an ordinary stop (a holiday, a closed market) or a no-op (another step held the lock; a run outside the session
@@ -67,8 +70,9 @@ HOLIDAY = "calendar:holiday"
 DEADMAN_CAUSE = "deadman:no-terminal-row"
 ORPHAN_MINUTES = 10                                                   # a RUN_START with no RUN_END after this long is an orphan
 ORPHAN_CAUSE = "run:orphan-start:"                                    # + the trigger, lower case
-PRIOR_ORPHAN_CAUSE = "run:orphan-start-prior:"                        # + <YYYYMMDD of the start>:<trigger lower case>
-PRIOR_ORPHAN_DAYS = 7                                                 # the calendar days before today that are looked back at
+PRIOR_ORPHAN_CAUSE = "run:orphan-start-prior:"                        # + <YYYYMMDD of the start>:<trigger lower case>: no lock proof since the start
+UNREPORTED_CAUSE = "run:orphan-start-unreported:"                     # + <YYYYMMDD of the start>:<trigger lower case>: a lock proof, and no P0 was ever written
+ORDINARY_STOP_SESSION = "run:ordinary-stop:session"                   # a closed market: the order step stops at `session`, after the lock
 WAIT_POLL_SECONDS = 15
 STILL_OPEN_CAUSE = "deadman:run-still-open:"                          # + the trigger, lower case: an open start too young to be an orphan
 NOOP_LOCK_HELD = "run:noop:lock-held"
@@ -346,6 +350,8 @@ def decide(events_today: Sequence[dict], incidents_today: Sequence[dict]) -> lis
                          "would look unsent and be sent again")
     shown_ids = {n for i in incidents_today for n in i["sent_event_ids"]}
     first_kind = {i["root_cause"]: _first_kind(i, events) for i in incidents_today}
+    prior_p1 = [e for e in events if e["kind"] == "DEADMAN" and e["outcome"] == "MISSING"
+                and (e.get("root_cause") or "").startswith(PRIOR_ORPHAN_CAUSE)]
     out: list[Outbound] = []
     for e in events:
         sev = classify(e)
@@ -356,9 +362,13 @@ def decide(events_today: Sequence[dict], incidents_today: Sequence[dict]) -> lis
             if e["event_id"] in shown_ids:
                 continue                                                        # this very fault was told already
             cause = cause or f"run:{str(e['outcome']).lower()}"
+            if e["kind"] == "DEADMAN" and cause.startswith(UNREPORTED_CAUSE):
+                out.append(_outbound("P0", e, cause, "P0 order step: a run started and never ended, and was never reported",
+                                     f"{cause} on {e['trade_date']}: a run on {_cause_day(cause, UNREPORTED_CAUSE)} started, never ended "
+                                     f"and was never reported; a later run took the lock, so it is no longer running"))
+                continue
             if e["kind"] == "DEADMAN" and cause.startswith(PRIOR_ORPHAN_CAUSE):
-                started = cause[len(PRIOR_ORPHAN_CAUSE):].split(":")[0]
-                started = f"{started[:4]}-{started[4:6]}-{started[6:8]}"
+                started = _cause_day(cause, PRIOR_ORPHAN_CAUSE)
                 out.append(_outbound("P0", e, cause, "P0 order step: a run from an earlier day never ended",
                                      f"{cause} on {e['trade_date']}: a run started on {started} and no run end ever followed it; "
                                      f"its process may still be alive and hold the order step's lock"))
@@ -375,7 +385,22 @@ def decide(events_today: Sequence[dict], incidents_today: Sequence[dict]) -> lis
             cause = cause or DEADMAN_CAUSE
             if cause in told:
                 continue                                                        # once a day
+            if cause == DEADMAN_CAUSE and prior_p1:
+                continue                                                        # one P1 a day: the one that names the start wins
+            if cause.startswith(PRIOR_ORPHAN_CAUSE) and any(
+                    t["severity"] == "P1" and (c == DEADMAN_CAUSE or c.startswith(PRIOR_ORPHAN_CAUSE)) for c, t in told.items()):
+                continue                                                        # the day's one P1 was told already
             told[cause], first_kind[cause] = {"root_cause": cause, "severity": "P1", "followup_sent": 0}, e["kind"]
+            if cause.startswith(PRIOR_ORPHAN_CAUSE):
+                names = "; ".join(f"the {_RUN_NAMES.get(_cause_trigger(p['root_cause']), _cause_trigger(p['root_cause']))} run of "
+                                  f"{_cause_day(p['root_cause'], PRIOR_ORPHAN_CAUSE)} ({p['root_cause']})" for p in prior_p1)
+                none_ended = "; no terminal row for the day either" if any(
+                    x["kind"] == "DEADMAN" and x["outcome"] == "MISSING" and (x.get("root_cause") or DEADMAN_CAUSE) == DEADMAN_CAUSE
+                    for x in events) else ""
+                out.append(_outbound("P1", e, cause, "P1 order step: a run from an earlier day may still hold the lock",
+                                     f"{names} started and never ended, and no run since has taken the order step's lock, so its "
+                                     f"process may still be hung on it{none_ended}"))
+                continue
             if cause.startswith(STILL_OPEN_CAUSE):
                 out.append(_outbound("P1", e, cause, "P1 order step: run still open",
                                      f"{cause} on {e['trade_date']}: a run started and had not ended at the dead-man check "
@@ -401,6 +426,16 @@ def decide(events_today: Sequence[dict], incidents_today: Sequence[dict]) -> lis
                                      f"skipped as warned; clean-week streak reset to 0 ({cause})", followup=True))
     out.sort(key=lambda o: (SEVERITIES.index(o.severity), o.event_id))
     return out
+
+
+def _cause_day(cause: str, prefix: str) -> str:
+    """The `YYYY-MM-DD` of the start a prior-orphan or unreported cause names."""
+    d = cause[len(prefix):].split(":")[0]
+    return f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+
+
+def _cause_trigger(cause: str) -> str:
+    return cause.rsplit(":", 1)[1].upper()
 
 
 def _first_kind(incident: dict, events: Sequence[dict]) -> str | None:
@@ -486,6 +521,8 @@ def _judge(day_events: Sequence[dict]) -> str | None:
         return "crash"
     if any(e["outcome"] == "FAULT" or (e.get("fault_count") or 0) > 0 for e in day_events):
         return "fault"
+    if any((e.get("root_cause") or "").startswith((PRIOR_ORPHAN_CAUSE, UNREPORTED_CAUSE)) for e in day_events):
+        return "a run from an earlier day never ended"                           # whatever the row's severity
     if any(e["kind"] in ("RUN_START", "RUN_END") and e.get("revision_ok") == 0 for e in day_events):
         return "revision mismatch"
     if any(e["kind"] == "DEADMAN" and e["outcome"] == "MISSING" for e in day_events):
@@ -618,6 +655,57 @@ def _open_triggers(day_events: Sequence[dict], now: datetime) -> tuple[list[str]
     return orphans, still_open
 
 
+def _is_lock_proof(e: dict) -> bool:
+    """A RUN_END that proves its run held the order step's lock (see `deadman_check`). Anything else proves nothing: a missed
+    proof only keeps a start blocking, which is the safe side."""
+    if e["kind"] != "RUN_END":
+        return False
+    cause = e.get("root_cause")
+    return (e["outcome"] == "COMPLETED" or (e["outcome"] == "ORDINARY_STOP" and cause == ORDINARY_STOP_SESSION)
+            or (e["outcome"] == "NOOP" and cause == NOOP_OUTSIDE_WINDOW))
+
+
+def _prior_starts(conn, book: str, day: str, now: datetime) -> list[int]:
+    """The prior-day rows of `deadman_check`, from one query of the book's run rows up to today."""
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM run_events WHERE book = ? AND trade_date <= ? AND kind IN ('RUN_START', 'RUN_END', 'DEADMAN') ORDER BY event_id",
+        (book, day))]
+    proof_at = max((e["at_utc"] for e in rows if _is_lock_proof(e)), default="")
+    by_day: dict[str, list[dict]] = {}
+    for e in rows:
+        if e["trade_date"] < day and e["kind"] in ("RUN_START", "RUN_END"):
+            by_day.setdefault(e["trade_date"], []).append(e)
+    faults = [e for e in rows if e["kind"] == "DEADMAN" and e["outcome"] == "FAULT" and e.get("root_cause")]
+    p0_own_day = {(e["trade_date"], e["root_cause"]) for e in faults}
+    p0_anywhere = {e["root_cause"] for e in faults}                              # a prior or unreported P0 on any day
+    today_causes = {e["root_cause"] for e in rows if e["kind"] == "DEADMAN" and e["trade_date"] == day and e.get("root_cause")}
+    written: list[int] = []
+    for prior_day in sorted(by_day):
+        latest: dict[str, dict] = {}
+        for e in _unpaired_starts(by_day[prior_day]):
+            latest[e["trigger"]] = e                                             # the latest unpaired start of the trigger: the safe side
+        for trigger, e in latest.items():
+            tag = f"{prior_day.replace('-', '')}:{trigger.lower()}"
+            had_p0 = ((prior_day, ORPHAN_CAUSE + trigger.lower()) in p0_own_day or PRIOR_ORPHAN_CAUSE + tag in p0_anywhere
+                      or UNREPORTED_CAUSE + tag in p0_anywhere)
+            name = _RUN_NAMES.get(trigger, trigger)
+            if proof_at > e["at_utc"]:                                           # a later run took the lock: this one is not running
+                if not had_p0:
+                    written.append(_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="FAULT", now=now, trade_date=day,
+                                                 root_cause=UNREPORTED_CAUSE + tag,
+                                                 detail=f"the {name} run of {prior_day} started and never ended, and was never reported; "
+                                                        f"a later run took the lock"))
+                continue
+            cause = PRIOR_ORPHAN_CAUSE + tag
+            if cause in today_causes:
+                continue                                                         # once for each session day
+            written.append(_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="MISSING" if had_p0 else "FAULT",
+                                         now=now, trade_date=day, root_cause=cause,
+                                         detail=f"the {name} run of {prior_day} started and never ended: its process may still hold "
+                                                f"the order step's lock"))
+    return written
+
+
 def deadman_check(conn, book: str, now: datetime) -> list[int]:
     """The dead-man check of the 7:25 job: on a session day from 10:25 New York on, write what is due and return the new ids.
 
@@ -626,14 +714,21 @@ def deadman_check(conn, book: str, now: datetime) -> list[int]:
     - an open run start that is not yet an orphan (ORPHAN_MINUTES old or less) writes DEADMAN/MISSING with cause
       deadman:run-still-open:<trigger> (lower case), once for each (day, trigger): a P1. It covers a run launchd fired late;
       a later check writes the orphan P0 beside it if the run is still open by then;
-    - an unpaired run start from one of the PRIOR_ORPHAN_DAYS calendar days before today (same book, paired per trigger within
-      its own trade_date) writes, on TODAY's trade_date, DEADMAN/FAULT with cause run:orphan-start-prior:<YYYYMMDD of the
-      start>:<trigger lower case>: a P0 that names a process alive since an earlier day, written once for each (start day,
-      trigger) across all later checks (the cause is looked for on any day). It resets today's streak (a fault);
+    - an unpaired run start from an earlier day (same book, paired per trigger within its own trade_date, however old) is judged
+      by whether a LOCK PROOF has come since it: a RUN_END of this book with `at_utc` later than the start's that is COMPLETED,
+      or ORDINARY_STOP with cause run:ordinary-stop:session, or NOOP with cause run:noop:outside-window (the order step takes
+      its lock before the `session` stage, so those runs held it; a lock-held NOOP, a FAULT and a CRASH prove nothing).
+        no proof: on TODAY's trade_date, once for each (today, start day, trigger), cause run:orphan-start-prior:<YYYYMMDD of
+          the start>:<trigger lower case>. DEADMAN/FAULT (a P0) when no P0 was ever written for the start (its own day's
+          run:orphan-start:<trigger>, or an earlier prior or unreported row), else DEADMAN/MISSING (a P1). Either resets today's streak;
+        a proof, and the start already had a P0: nothing;
+        a proof, and the start never had a P0: DEADMAN/FAULT with cause run:orphan-start-unreported:<YYYYMMDD>:<trigger>,
+          once ever for the book, written on today (a P0, and it resets today's streak);
+      all of it is found with ONE query of the book's run rows, whatever the number of starts;
     - the day's dead-man row: DEADMAN/MISSING when no run ended (a NOOP end is not a run end) and none was skipped at 6:55 or
       7:10, else DEADMAN/OK; once a day. A still-open row never stands in for it.
     The rows are separate, so all of them can be there on one day. Nothing is written before 10:25 or on a day that is not a
-    session; a check that finds all already written writes nothing. Today's orphan rows come first in the result, then prior-day orphan rows, then still-open rows."""
+    session; a check that finds all already written writes nothing. Today's orphan rows come first in the result, then prior-day rows (oldest start first), then still-open rows."""
     ny = _utc(now).astimezone(NEW_YORK)
     day = ny.date().isoformat()
     if ny.time() < DEADMAN_CUTOFF or not is_session(day):
@@ -649,24 +744,7 @@ def deadman_check(conn, book: str, now: datetime) -> list[int]:
                 written.append(_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="FAULT", now=now, trade_date=day,
                                              root_cause=cause, detail=f"the {_RUN_NAMES.get(trigger, trigger)} run started and did not end "
                                                                       f"within {ORPHAN_MINUTES} minutes"))
-        today = date.fromisoformat(day)
-        by_day: dict[str, list[dict]] = {}
-        for e in events_between(conn, book, (today - timedelta(days=PRIOR_ORPHAN_DAYS)).isoformat(),
-                                (today - timedelta(days=1)).isoformat()):
-            by_day.setdefault(e["trade_date"], []).append(e)
-        for prior_day in sorted(by_day):
-            seen: list[str] = []
-            for e in _unpaired_starts(by_day[prior_day]):
-                if e["trigger"] in seen:
-                    continue
-                seen.append(e["trigger"])
-                cause = f"{PRIOR_ORPHAN_CAUSE}{prior_day.replace('-', '')}:{e['trigger'].lower()}"
-                if conn.execute("SELECT 1 FROM run_events WHERE book = ? AND kind = 'DEADMAN' AND outcome = 'FAULT' AND root_cause = ? "
-                                "LIMIT 1", (book, cause)).fetchone() is None:
-                    written.append(_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="FAULT", now=now,
-                                                 trade_date=day, root_cause=cause,
-                                                 detail=f"the {_RUN_NAMES.get(e['trigger'], e['trigger'])} run of {prior_day} started and "
-                                                        f"never ended: its process may still hold the order step's lock"))
+        written += _prior_starts(conn, book, day, now)
         have_open = [r[0] for r in conn.execute("SELECT root_cause FROM run_events WHERE trade_date = ? AND book = ? AND kind = 'DEADMAN' "
                                                 "AND outcome = 'MISSING' AND root_cause GLOB ?", (day, book, STILL_OPEN_CAUSE + "*"))]
         for trigger in still_open:
@@ -676,8 +754,8 @@ def deadman_check(conn, book: str, now: datetime) -> list[int]:
                                              root_cause=cause, detail=f"the {_RUN_NAMES.get(trigger, trigger)} run started and had not ended "
                                                                       f"at the 10:25 New York check"))
         if not conn.execute("SELECT 1 FROM run_events WHERE trade_date = ? AND book = ? AND kind = 'DEADMAN' "
-                            "AND outcome IN ('OK', 'MISSING') AND COALESCE(root_cause, '') NOT GLOB ? LIMIT 1",
-                            (day, book, STILL_OPEN_CAUSE + "*")).fetchone():
+                            "AND outcome IN ('OK', 'MISSING') AND COALESCE(root_cause, '') NOT GLOB ? AND COALESCE(root_cause, '') NOT GLOB ? LIMIT 1",
+                            (day, book, STILL_OPEN_CAUSE + "*", PRIOR_ORPHAN_CAUSE + "*")).fetchone():
             if _has_terminal_row(conn, day, book):
                 written.append(_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="OK", now=now, trade_date=day,
                                              detail="a terminal row is there"))
@@ -694,7 +772,7 @@ def deadman(conn, book: str, now: datetime) -> int | None:
     ids = deadman_check(conn, book, now)
     for i in ids:
         outcome, cause = conn.execute("SELECT outcome, root_cause FROM run_events WHERE event_id = ?", (i,)).fetchone()
-        if outcome in ("OK", "MISSING") and not (cause or "").startswith(STILL_OPEN_CAUSE):
+        if outcome in ("OK", "MISSING") and not (cause or "").startswith((STILL_OPEN_CAUSE, PRIOR_ORPHAN_CAUSE)):
             return i
     return None
 
@@ -890,9 +968,10 @@ def _run(args, now: datetime, stdin, sender, now_fn=None, sleep_fn=None) -> int:
             rows = [dict(conn.execute("SELECT event_id, outcome, root_cause FROM run_events WHERE event_id = ?", (i,)).fetchone())
                     for i in ids]
             is_open = [(r["root_cause"] or "").startswith(STILL_OPEN_CAUSE) for r in rows]
-            main = next((r for r, o in zip(rows, is_open) if r["outcome"] in ("OK", "MISSING") and not o), rows[0])
+            is_prior = [(r["root_cause"] or "").startswith(PRIOR_ORPHAN_CAUSE) for r in rows]      # a P1 prior row is no day row
+            main = next((r for r, o, q in zip(rows, is_open, is_prior) if r["outcome"] in ("OK", "MISSING") and not o and not q), rows[0])
             _print({"recorded": True, "event_id": main["event_id"], "outcome": main["outcome"], "event_ids": ids,
-                    "orphans": [r["root_cause"] for r in rows if r["outcome"] == "FAULT"],
+                    "orphans": [r["root_cause"] for r, q in zip(rows, is_prior) if r["outcome"] == "FAULT" or q],
                     "still_open": [r["root_cause"] for r, o in zip(rows, is_open) if o]})
             return 1 if any(r["outcome"] in ("MISSING", "FAULT") for r in rows) else 0
         if args.cmd == "notify":
