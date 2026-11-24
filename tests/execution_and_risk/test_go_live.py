@@ -639,3 +639,172 @@ def test_read_owner_file_refuses_a_second_name_whatever_root_is_given(tmp_path):
         for p in (real, tmp_path / "f2.json"):
             data, why = wb.read_owner_file(p, root)
             assert data is None and "more than one name" in why
+
+
+# ---- BR-A: the record counts faults and order shapes (count and show only; no new floor, no new unmet reason) ----
+
+SHAPES = ("whole_fills", "remainder_fills", "sale_fills")
+
+
+def _shaped_run(j, day, batch, fills=(), status="done", **summary):
+    """A paper run of `batch` on `day`: one fill line per dict in `fills` (extra keys as given), then its summary."""
+    for k, fill in enumerate(fills):
+        j.write(day, {"type": "order_step", "venue": gl.PAPER_VENUE, "batch": batch, "event": "fill",
+                      "fill_id": f"{batch}-{k}", **fill})
+    j.write(day, {"type": "order_step", "venue": gl.PAPER_VENUE, "batch": batch, "event": "summary", "status": status,
+                  "stage": None, **summary})
+
+
+BUY, REMAINDER, SALE = {"units": 3}, {"units": 0.4, "leg": "remainder", "order_type": "MARKET"}, {"units": -2}
+
+
+def _rec(folder):
+    record, why = gl.paper_record(folder, gl.PAPER_VENUE, TODAY, CAL)
+    assert why is None
+    return record
+
+
+def test_t_bra_b_a_faulted_done_run_is_no_day_its_fills_are_not_counted_and_its_day_is_listed(tmp_path):
+    j = Journal(tmp_path / "j")
+    _shaped_run(j, "2026-11-12", "f1", [BUY, BUY], faults=["reconcile"])
+    record = _rec(tmp_path / "j")
+    assert record["paper_broker_days"] == 0 and record["reconciled_fills"] == 0
+    assert record["faulted_runs"] == ["2026-11-12"]
+    assert all(k not in record for k in SHAPES)                  # nothing clean to count: no shape figure
+
+
+@pytest.mark.parametrize("faults", [DROP, []])
+def test_t_bra_b_the_same_run_without_faults_counts_as_today(tmp_path, faults):
+    j = Journal(tmp_path / "j")
+    extra = {} if faults is DROP else {"faults": faults}
+    _shaped_run(j, "2026-11-12", "f1", [BUY, BUY], **extra)
+    record = _rec(tmp_path / "j")
+    assert record["paper_broker_days"] == 1 and record["reconciled_fills"] == 2
+    assert "faulted_runs" not in record
+
+
+@pytest.mark.parametrize("faults", [None, "reconcile", {"a": 1}, 0, ["attention:x", "cap"]])
+def test_t_bra_b_a_faults_value_that_is_not_an_empty_list_is_read_on_the_safe_side(tmp_path, faults):
+    j = Journal(tmp_path / "j")
+    _shaped_run(j, "2026-11-12", "f1", [BUY], faults=faults)
+    record = _rec(tmp_path / "j")
+    assert record["reconciled_fills"] == 0 and record["paper_broker_days"] == 0
+    assert record["faulted_runs"] == ["2026-11-12"]
+
+
+def test_t_bra_b_a_faulted_run_leaves_the_stopped_run_clock_and_the_other_runs_alone(tmp_path):
+    j = Journal(tmp_path / "j")
+    _shaped_run(j, "2026-11-12", "f1", [BUY], faults=["cap"])
+    _shaped_run(j, "2026-11-10", "c1", [BUY, SALE])
+    _shaped_run(j, "2026-11-09", "s1", [BUY], status="stopped", stage="reconcile")
+    record = _rec(tmp_path / "j")
+    assert record["days_since_a_stopped_run"] == 4 and record["last_stopped_run"] == "2026-11-09"   # not reset by the fault
+    assert record["paper_broker_days"] == 1 and record["reconciled_fills"] == 2
+    assert record["faulted_runs"] == ["2026-11-12"]
+
+
+def test_t_bra_b_a_faulted_run_beside_a_clean_run_on_the_same_day_counts_the_day_and_only_the_clean_fills(tmp_path):
+    j = Journal(tmp_path / "j")
+    _shaped_run(j, "2026-11-12", "f1", [BUY, BUY, BUY], faults=["reconcile"])
+    _shaped_run(j, "2026-11-12", "c1", [BUY])
+    record = _rec(tmp_path / "j")
+    assert record["paper_broker_days"] == 1 and record["reconciled_fills"] == 1
+    assert record["faulted_runs"] == ["2026-11-12"] and record["whole_fills"] == 1
+
+
+def test_t_bra_b_a_shortfall_run_that_also_faulted_is_listed_under_both_and_counted_in_neither(tmp_path):
+    j = Journal(tmp_path / "j")
+    _shaped_run(j, "2026-11-12", "f1", [BUY], faults=["reconcile"], shared={"shortfalls": {"VTI": {"short": 1}}})
+    record = _rec(tmp_path / "j")
+    assert record["faulted_runs"] == ["2026-11-12"] and record["unclean_shared_runs"] == ["2026-11-12"]
+    assert record["reconciled_fills"] == 0
+
+
+def test_t_bra_b_the_three_shapes_are_counted_one_each(tmp_path):
+    j = Journal(tmp_path / "j")
+    _shaped_run(j, "2026-11-12", "c1", [BUY, REMAINDER, SALE])
+    record = _rec(tmp_path / "j")
+    assert (record["whole_fills"], record["remainder_fills"], record["sale_fills"]) == (1, 1, 1)
+    assert record["reconciled_fills"] == 3
+
+
+@pytest.mark.parametrize("missing, expect", [("whole", (0, 1, 1)), ("remainder", (1, 0, 1)), ("sale", (1, 1, 0))])
+def test_t_bra_b_each_shape_missing_alone_counts_zero_and_the_others_stay(tmp_path, missing, expect):
+    j = Journal(tmp_path / "j")
+    fills = {"whole": BUY, "remainder": REMAINDER, "sale": SALE}
+    _shaped_run(j, "2026-11-12", "c1", [f for name, f in fills.items() if name != missing])
+    record = _rec(tmp_path / "j")
+    assert tuple(record[k] for k in SHAPES) == expect
+
+
+def test_t_bra_b_a_whole_share_fill_with_leg_whole_is_a_whole_fill_and_a_sale_with_leg_is_still_a_sale(tmp_path):
+    j = Journal(tmp_path / "j")
+    _shaped_run(j, "2026-11-12", "c1", [{"units": 2, "leg": "whole", "order_type": "LIMIT"},
+                                        {"units": -1, "leg": "remainder", "order_type": "MARKET"}])
+    record = _rec(tmp_path / "j")
+    assert (record["whole_fills"], record["remainder_fills"], record["sale_fills"]) == (1, 0, 1)
+
+
+@pytest.mark.parametrize("units", [None, "3", True, float("nan"), float("inf"), 0, 0.0, DROP])
+def test_t_bra_b_a_fill_with_units_that_are_not_a_nonzero_number_is_counted_in_no_shape(tmp_path, units):
+    j = Journal(tmp_path / "j")
+    fill = {} if units is DROP else {"units": units}
+    _shaped_run(j, "2026-11-12", "c1", [fill, BUY])
+    record = _rec(tmp_path / "j")
+    assert (record["whole_fills"], record["remainder_fills"], record["sale_fills"]) == (1, 0, 0)
+    assert record["reconciled_fills"] == 2                       # still a reconciled fill, as today
+
+
+def test_t_bra_b_fills_of_a_faulted_shortfall_or_stopped_run_are_in_no_shape(tmp_path):
+    j = Journal(tmp_path / "j")
+    _shaped_run(j, "2026-11-12", "f1", [BUY, REMAINDER, SALE], faults=["reconcile"])
+    _shaped_run(j, "2026-11-12", "u1", [BUY, REMAINDER, SALE], shared={"shortfalls": {"VTI": {"short": 1}}})
+    _shaped_run(j, "2026-11-11", "s1", [BUY, REMAINDER, SALE], status="stopped", stage="reconcile")
+    _shaped_run(j, "2026-11-10", "c1", [BUY])
+    record = _rec(tmp_path / "j")
+    assert (record["whole_fills"], record["remainder_fills"], record["sale_fills"]) == (1, 0, 0)
+
+
+def test_t_bra_b_other_venues_and_other_entry_kinds_are_in_no_shape(tmp_path):
+    j = Journal(tmp_path / "j")
+    _shaped_run(j, "2026-11-12", "c1", [BUY])
+    for venue in (gl.LIVE_VENUE, "alpaca-paper"):
+        j.write("2026-11-12", {"type": "order_step", "venue": venue, "batch": "c1", "event": "fill", "units": -9})
+    j.write("2026-11-12", {"type": "paper", "venue": gl.PAPER_VENUE, "batch": "c1", "event": "fill", "units": -9})
+    record = _rec(tmp_path / "j")
+    assert (record["whole_fills"], record["remainder_fills"], record["sale_fills"]) == (1, 0, 0)
+
+
+def test_t_bra_b_the_gate_returns_the_shape_counts_and_faulted_runs_and_adds_no_unmet_reason(tmp_path):
+    files = world(tmp_path, checklist=checklist_dict())          # the base record meets the owner's figures
+    assert judge(files, TODAY).locks[1]["met"]
+    j = Journal(files.journal)
+    _shaped_run(j, "2026-11-12", "g1", [BUY])                    # one shape only: sale and remainder are 0
+    _shaped_run(j, "2026-11-10", "g2", [BUY], faults=["cap"])
+    lock = judge(files, TODAY).locks[1]
+    shown = lock["figures"]["record"]
+    assert lock["met"] and lock["reason"] == "met"               # a shape at 0 is shown, never judged
+    assert (shown["whole_fills"], shown["remainder_fills"], shown["sale_fills"]) == (1, 0, 0)
+    assert shown["faulted_runs"] == ["2026-11-10"]
+    assert set(lock["figures"]["owner"]) == set(gl.CHECKLIST_NUMBERS)      # the owner's file gained no key
+
+
+def test_t_bra_b_a_checklist_with_a_shape_floor_key_is_still_refused(tmp_path):
+    files = world(tmp_path, checklist=checklist_dict(min_sale_fills=1))
+    lock = judge(files, TODAY).locks[1]
+    assert not lock["met"] and "not part of the checklist" in lock["reason"]
+
+
+def test_t_bra_b_a_faulted_run_does_not_count_toward_the_floor_and_the_shortfall_is_said_in_the_existing_words(tmp_path):
+    need = checklist_dict(min_paper_broker_days=3, min_reconciled_fills=3)
+    clean, faulted = tmp_path / "clean", tmp_path / "faulted"
+    for folder, fault in ((clean, False), (faulted, True)):
+        j = Journal(folder)
+        for i, day in enumerate(("2026-11-09", "2026-11-10", "2026-11-12")):
+            _shaped_run(j, day, f"b{i}", [BUY], **({"faults": ["cap"]} if fault and i == 2 else {}))
+    assert gl.judge_checklist(need, _rec(clean), None)["met"]
+    lock = gl.judge_checklist(need, _rec(faulted), None)
+    assert not lock["met"]
+    assert "2 paper trading days on which the order step ended done, 3 needed (1 short)" in lock["reason"]
+    assert "2 fills journaled in paper runs with a clean reconcile, 3 needed (1 short)" in lock["reason"]
+    assert "shape" not in lock["reason"] and "whole" not in lock["reason"]      # no reason comes from a shape
