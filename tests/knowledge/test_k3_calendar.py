@@ -3,11 +3,13 @@ socket guard makes any real connection fail the test. Every guard is tested both
 import hashlib
 import inspect
 import json
+import re
 import socket
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+from xml.sax.saxutils import escape as xml_escape
 
 import pytest
 
@@ -21,6 +23,7 @@ TOKEN = "tok_ABCDEF0123456789"
 H = "finnhub_market_holiday"
 S = "finnhub_market_status"
 FR = "federal_register_presdocs"
+WH = "whitehouse_presidential_actions"
 X = "xnys_exchange_calendars"
 G_FIN, G_PRES, G_CAL = "FINNHUB", "US_PRESIDENT", "XNYS_CALENDAR"      # the authority groups
 
@@ -33,11 +36,28 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket, "create_connection", refuse)
 
 
+_FIN = {}      # general connection -> its paired Finnhub-store connection (K-7: Finnhub rows live in their own file)
+
+
 @pytest.fixture
 def conn(tmp_path):
     c = connect(tmp_path / "k.db")
+    f = connect(tmp_path / "finnhub.db", role="finnhub")
+    _FIN[id(c)] = f
     yield c
+    _FIN.pop(id(c), None)
+    f.close()
     c.close()
+
+
+def fin(conn):
+    """The Finnhub-store connection that goes with this test's general connection."""
+    return _FIN[id(conn)]
+
+
+def side(conn, source_id):
+    """The connection a source's rows belong in: the Finnhub store for the two Finnhub sources, else the general one."""
+    return fin(conn) if "finnhub" in source_id else conn
 
 
 def sha(text):
@@ -51,7 +71,7 @@ def raw(obj):
 def put(conn, facts):
     """Store parsed fact dicts the way `refresh` does, straight through add_fact."""
     for f in facts:
-        add_fact(conn, **f)
+        add_fact(side(conn, f["source_id"]), **f)
 
 
 def unix(y, m, d, hh=0, mm=0):
@@ -106,13 +126,19 @@ def mourning_doc(num, day_text, pub):
 
 
 def register(conn, *ids, at=T0):
-    k3.register_all(conn, at, only=ids or [X, H, S, FR])
+    ids = ids or [X, H, S, FR, WH]
+    general = [i for i in ids if "finnhub" not in i]
+    finnhub = [i for i in ids if "finnhub" in i]
+    if general:
+        k3.register_all(conn, at, only=general)
+    if finnhub:
+        k3.register_all(fin(conn), at, only=finnhub)
 
 
 # ---- SOURCES and registration
 
 def test_sources_have_the_listed_fields_and_roles():
-    assert set(k3.SOURCES) == {X, H, S, FR}
+    assert set(k3.SOURCES) == {X, H, S, FR, WH}
     for sid, e in k3.SOURCES.items():
         assert e["source_id"] == sid
         assert e["ua_policy"] == "GENERIC_CLIENT" and e["cost_usd_monthly"] == 0
@@ -134,7 +160,7 @@ def test_sources_have_the_listed_fields_and_roles():
 
 def test_every_source_names_its_authority_group_and_signals_have_none():
     assert k3.SOURCES[H]["authority_group"] == k3.SOURCES[S]["authority_group"] == G_FIN
-    assert k3.SOURCES[FR]["authority_group"] == G_PRES
+    assert k3.SOURCES[FR]["authority_group"] == k3.SOURCES[WH]["authority_group"] == G_PRES
     assert k3.SOURCES[X]["authority_group"] == G_CAL
     for sid, e in k3.SOURCES.items():
         if e["role"] == "SIGNAL":
@@ -146,8 +172,8 @@ def test_every_source_names_its_authority_group_and_signals_have_none():
 
 def test_the_group_is_code_only_and_registration_is_unchanged(conn):
     register(conn)
-    for sid in (X, H, S, FR):
-        cur = conn.execute("SELECT * FROM source_registry WHERE source_id = ?", (sid,))
+    for sid in (X, H, S, FR, WH):
+        cur = side(conn, sid).execute("SELECT * FROM source_registry WHERE source_id = ?", (sid,))
         row = cur.fetchone()
         assert row is not None and "authority_group" not in [d[0] for d in cur.description]
         assert "authority_group" not in str(tuple(row))
@@ -162,17 +188,18 @@ def test_the_nasdaq_halts_feed_is_gone_and_the_docstring_says_why():
 
 
 def test_register_all_registers_only_the_named_sources(conn):
-    k3.register_all(conn, T0, only=[H, X])
-    ids = {r[0] for r in conn.execute("SELECT source_id FROM source_registry")}
-    assert ids == {H, X}
-    row = conn.execute("SELECT * FROM source_registry WHERE source_id = ?", (H,)).fetchone()
+    register(conn, H, X)                       # K-7: the Finnhub source goes to the Finnhub store, the other to the general one
+    assert {r[0] for r in conn.execute("SELECT source_id FROM source_registry")} == {X}
+    assert {r[0] for r in fin(conn).execute("SELECT source_id FROM source_registry")} == {H}
+    row = fin(conn).execute("SELECT * FROM source_registry WHERE source_id = ?", (H,)).fetchone()
     assert row["allow_external_llm"] == 0 and row["ua_policy"] == "GENERIC_CLIENT" and row["personal_use_ok"] == 1
     assert "personal use only; no sharing with third parties" in row["notes"] and "30 calls/s cap" in row["notes"]
     assert row["licence_tag"] == "FINNHUB-PERSONAL-TOS"
     assert row["cost_usd_monthly"] == 0 and row["terms_read_at_utc"] == "2026-01-01T00:00:00.000000Z"
-    k3.register_all(conn, T0, only=[H, X])                        # same values again: nothing happens
-    k3.register_all(conn, T0, only=[FR])
-    assert {r[0] for r in conn.execute("SELECT source_id FROM source_registry")} == {H, X, FR}
+    register(conn, H, X)                                          # same values again: nothing happens
+    register(conn, FR)
+    assert {r[0] for r in conn.execute("SELECT source_id FROM source_registry")} == {X, FR}
+    assert {r[0] for r in fin(conn).execute("SELECT source_id FROM source_registry")} == {H}
 
 
 @pytest.mark.parametrize("only", [[], ["no_such_source"], [X, "no_such_source"], None, "finnhub_market_holiday"])
@@ -725,7 +752,7 @@ LATE = "2026-11-23T20:00:00.000000Z"
 
 
 def votes(conn, day=D, as_of=AS_OF):
-    return k3.closure_votes(conn, day, as_of)
+    return k3.closure_votes(conn, day, as_of, finnhub_conn=fin(conn))
 
 
 def seed(conn, days=("2026-11-23", "2026-11-30"), now=NOW):
@@ -965,7 +992,7 @@ def entry_says_closed(entity_key, payload, day):
 
 def test_every_authority_has_a_rule_and_no_other_source_votes():
     authorities = {sid for sid, e in k3.SOURCES.items() if e["role"] == "AUTHORITY"}
-    assert authorities == {H, S, FR} and set(k3._CLOSURE_RULES) == authorities
+    assert authorities == {H, S, FR, WH} and set(k3._CLOSURE_RULES) == authorities
 
 
 def test_quorum_checks_its_inputs(conn):
@@ -982,9 +1009,12 @@ def test_quorum_is_a_pure_read_and_stores_nothing(conn):
     seed(conn)
     seed_holiday(conn, ("Surprise Closure", D, ""))
     before = facts_as_of(conn, "2027-01-01T00:00:00Z")
+    before_fin = facts_as_of(fin(conn), "2027-01-01T00:00:00Z")
+    assert before_fin and before                                               # both files hold rows, so both checks bite
     votes(conn)
     votes(conn)
     assert facts_as_of(conn, "2027-01-01T00:00:00Z") == before
+    assert facts_as_of(fin(conn), "2027-01-01T00:00:00Z") == before_fin
 
 
 def test_the_module_never_names_the_facts_table_itself():
@@ -1138,24 +1168,24 @@ def test_http_get_must_return_bytes():
 def test_refresh_stores_then_rereads_unchanged_then_stores_a_changed_version(conn):
     register(conn)
     fake = Fake({H_URL: HOLIDAYS})
-    assert k3.refresh(conn, H, http_get=fake, now=NOW, credentials=creds) == {"stored": 3, "unchanged": 0, "error": 0}
-    assert k3.refresh(conn, H, http_get=fake, now=NOW + timedelta(hours=1), credentials=creds) == \
+    assert k3.refresh(fin(conn), H, http_get=fake, now=NOW, credentials=creds) == {"stored": 3, "unchanged": 0, "error": 0}
+    assert k3.refresh(fin(conn), H, http_get=fake, now=NOW + timedelta(hours=1), credentials=creds) == \
         {"stored": 0, "unchanged": 3, "error": 0}
     changed = holiday_body(("Thanksgiving Day", "2026-11-26", ""), ("Day After Thanksgiving", "2026-11-27", "09:30-14:00"),
                            ("Christmas Day", "2026-12-25", ""), ("New Year's Day", "2027-01-01", ""))
     fake2 = Fake({H_URL: changed})
-    got = k3.refresh(conn, H, http_get=fake2, now=NOW + timedelta(days=1), credentials=creds)
+    got = k3.refresh(fin(conn), H, http_get=fake2, now=NOW + timedelta(days=1), credentials=creds)
     assert got == {"stored": 2, "unchanged": 2, "error": 0}                   # one changed date, one new date
-    rows = {r["entity_key"]: json.loads(r["payload_json"]) for r in facts_as_of(conn, "2027-06-01T00:00:00Z", domain="K3_CAL")}
+    rows = {r["entity_key"]: json.loads(r["payload_json"]) for r in facts_as_of(fin(conn), "2027-06-01T00:00:00Z", domain="K3_CAL")}
     assert rows["XNYS:CLOSURE:2026-11-27"]["trading_hours"] == "09:30-14:00" and "XNYS:CLOSURE:2027-01-01" in rows
-    old = {r["entity_key"]: json.loads(r["payload_json"]) for r in facts_as_of(conn, "2026-11-23T19:00:00Z", domain="K3_CAL")}
+    old = {r["entity_key"]: json.loads(r["payload_json"]) for r in facts_as_of(fin(conn), "2026-11-23T19:00:00Z", domain="K3_CAL")}
     assert old["XNYS:CLOSURE:2026-11-27"]["trading_hours"] == "09:30-13:00"            # the old version is still readable
 
 
 def test_refresh_returns_counts_only_and_a_failed_fetch_is_an_error_not_a_crash(conn):
     register(conn)
     boom = Fake({H_URL: RuntimeError(f"connection reset for {TOKEN}")})
-    got = k3.refresh(conn, H, http_get=boom, now=NOW, credentials=creds)
+    got = k3.refresh(fin(conn), H, http_get=boom, now=NOW, credentials=creds)
     assert got["error"] == 1 and got["stored"] == 0 and got["unchanged"] == 0
     assert TOKEN not in json.dumps(got) and TOKEN not in str(got.get("detail", ""))
 
@@ -1163,14 +1193,16 @@ def test_refresh_returns_counts_only_and_a_failed_fetch_is_an_error_not_a_crash(
 def test_refresh_never_stores_half_a_parsed_body(conn):
     register(conn)
     body = holiday_body(("a", "2026-11-26", ""), ("b", "nope", ""))
-    got = k3.refresh(conn, H, http_get=Fake({H_URL: body}), now=NOW, credentials=creds)
+    got = k3.refresh(fin(conn), H, http_get=Fake({H_URL: body}), now=NOW, credentials=creds)
     assert got["error"] == 1 and got["stored"] == 0
-    assert facts_as_of(conn, "2027-01-01T00:00:00Z") == []
+    assert facts_as_of(fin(conn), "2027-01-01T00:00:00Z") == []                # the file a Finnhub refresh writes
+    assert facts_as_of(conn, "2027-01-01T00:00:00Z") == []                     # and the general file, which must stay empty too
 
 
 def test_refresh_with_an_unregistered_source_stores_nothing_and_reports_an_error(conn):
-    got = k3.refresh(conn, H, http_get=Fake({H_URL: HOLIDAYS}), now=NOW, credentials=creds)
+    got = k3.refresh(fin(conn), H, http_get=Fake({H_URL: HOLIDAYS}), now=NOW, credentials=creds)
     assert got["error"] >= 1 and got["stored"] == 0
+    assert facts_as_of(fin(conn), "2027-01-01T00:00:00Z") == []
     assert facts_as_of(conn, "2027-01-01T00:00:00Z") == []
 
 
@@ -1180,45 +1212,49 @@ def test_refresh_federal_register_and_status(conn):
     assert k3.refresh(conn, FR, http_get=fr, now=NOW) == {"stored": 1, "unchanged": 0, "error": 0}
     assert k3.refresh(conn, FR, http_get=fr, now=NOW + timedelta(hours=1)) == {"stored": 0, "unchanged": 1, "error": 0}
     st = Fake({S_URL: status_body()})
-    assert k3.refresh(conn, S, http_get=st, now=NOW, credentials=creds)["stored"] == 1
+    assert k3.refresh(fin(conn), S, http_get=st, now=NOW, credentials=creds)["stored"] == 1
     st2 = Fake({S_URL: status_body(session="regular", isOpen=True)})
-    assert k3.refresh(conn, S, http_get=st2, now=NOW + timedelta(hours=1), credentials=creds)["stored"] == 1
+    assert k3.refresh(fin(conn), S, http_get=st2, now=NOW + timedelta(hours=1), credentials=creds)["stored"] == 1
 
 
 def test_finnhub_facts_never_reach_an_outside_model(conn):
     register(conn)
-    k3.refresh(conn, H, http_get=Fake({H_URL: HOLIDAYS}), now=NOW, credentials=creds)
-    k3.refresh(conn, S, http_get=Fake({S_URL: status_body()}), now=NOW, credentials=creds)
+    k3.refresh(fin(conn), H, http_get=Fake({H_URL: HOLIDAYS}), now=NOW, credentials=creds)
+    k3.refresh(fin(conn), S, http_get=Fake({S_URL: status_body()}), now=NOW, credentials=creds)
     k3.refresh(conn, FR, http_get=Fake({FR_URL: fr_body(fr_doc())}), now=NOW)
     k3.refresh(conn, X, http_get=None, now=NOW, params={"start": "2026-11-23", "end": "2026-11-24"})
-    inside = facts_as_of(conn, "2027-01-01T00:00:00Z")
+    # K-7: the Finnhub rows are in their own store; the general store holds none and the Finnhub store refuses the outside read
+    inside = facts_as_of(conn, "2027-01-01T00:00:00Z") + facts_as_of(fin(conn), "2027-01-01T00:00:00Z")
     outside = facts_as_of(conn, "2027-01-01T00:00:00Z", for_outside_llm=True)
     assert {r["source_id"] for r in inside} == {H, S, FR, X}                       # the two-way check: they do exist
+    assert {r["source_id"] for r in facts_as_of(fin(conn), "2027-01-01T00:00:00Z")} == {H, S}
     assert {r["source_id"] for r in outside} == {FR, X}
     assert not any("finnhub" in r["source_id"] for r in outside)
+    with pytest.raises(StoreError):
+        facts_as_of(fin(conn), "2027-01-01T00:00:00Z", for_outside_llm=True)
 
 
 def test_the_token_is_never_in_a_url_header_of_other_sources_or_a_stored_payload(conn):
     register(conn)
     fakes = [Fake({H_URL: HOLIDAYS}), Fake({S_URL: status_body()}), Fake({FR_URL: fr_body(fr_doc())})]
     for sid, fake in zip((H, S, FR), fakes):
-        k3.refresh(conn, sid, http_get=fake, now=NOW, credentials=creds)
+        k3.refresh(side(conn, sid), sid, http_get=fake, now=NOW, credentials=creds)
     for fake in fakes:
         for url, headers in fake.calls:
             assert TOKEN not in url
             assert all(TOKEN not in v for h, v in headers.items() if h != "X-Finnhub-Token")
-    rows = facts_as_of(conn, "2027-01-01T00:00:00Z")
-    assert rows and not any(TOKEN in json.dumps(dict(r)) for r in rows)
+    rows = facts_as_of(conn, "2027-01-01T00:00:00Z") + facts_as_of(fin(conn), "2027-01-01T00:00:00Z")
+    assert {r["source_id"] for r in rows} == {H, S, FR} and not any(TOKEN in json.dumps(dict(r)) for r in rows)
 
 
 # ---- removed holidays (tombstones)
 
 def refresh_h(conn, body, now):
-    return k3.refresh(conn, H, http_get=Fake({H_URL: body}), now=now, credentials=creds)
+    return k3.refresh(fin(conn), H, http_get=Fake({H_URL: body}), now=now, credentials=creds)
 
 
 def closure_payload(conn, day, as_of="2099-01-01T00:00:00Z"):
-    rows = [r for r in facts_as_of(conn, as_of, domain="K3_CAL")
+    rows = [r for r in facts_as_of(fin(conn), as_of, domain="K3_CAL")
             if r["source_id"] == H and r["entity_key"] == f"XNYS:CLOSURE:{day}"]
     return json.loads(rows[0]["payload_json"]) if rows else None
 
@@ -1288,7 +1324,7 @@ def test_an_empty_list_is_refused_whole_and_old_closures_stay_as_they_were(conn)
     got = refresh_h(conn, holiday_body(), T_B)
     assert got["error"] == 1 and got["stored"] == 0 and got["unchanged"] == 0
     assert closure_payload(conn, D)["closed"] is True and "removed" not in closure_payload(conn, D)
-    assert facts_as_of(conn, "2099-01-01T00:00:00Z", domain="K3_CAL", entity_key="XNYS:CLOSURE:2026-11-26")[0][
+    assert facts_as_of(fin(conn), "2099-01-01T00:00:00Z", domain="K3_CAL", entity_key="XNYS:CLOSURE:2026-11-26")[0][
         "known_at_utc"] == "2026-11-23T20:00:00.000000Z"            # no new version of anything
 
 
@@ -1325,28 +1361,36 @@ def run(args, capsys):
 
 def test_cli_register_schedule_votes_end_to_end(tmp_path, capsys):
     db = str(tmp_path / "cli.db")
-    code, out, _ = run(["register", "--store", db, "--only", f"{X},{H}", "--terms-read-at", T0], capsys)
+    fdb = str(tmp_path / "cli-finnhub.db")
+    code, out, _ = run(["register", "--store", db, "--finnhub-store", fdb, "--only", f"{X},{H}", "--terms-read-at", T0], capsys)
     assert code == 0
     code, out, _ = run(["schedule", "--store", db, "--from", "2026-11-23", "--to", "2026-11-30"], capsys)
     assert code == 0 and json.loads(out)["stored"] == 8
-    code, out, _ = run(["votes", "--store", db, "--date", "2026-11-24", "--as-of", "2099-01-01T00:00:00Z"], capsys)
+    code, out, _ = run(["votes", "--store", db, "--finnhub-store", fdb, "--date", "2026-11-24",
+                        "--as-of", "2099-01-01T00:00:00Z"], capsys)
     v = json.loads(out)
     assert code == 0 and v["calendar_open"] is True and v["authorities_closed"] == []
-    code, out, _ = run(["votes", "--store", db, "--date", "2026-11-26", "--as-of", "2099-01-01T00:00:00Z"], capsys)
+    code, out, _ = run(["votes", "--store", db, "--finnhub-store", fdb, "--date", "2026-11-26",
+                        "--as-of", "2099-01-01T00:00:00Z"], capsys)
     assert code == 0 and json.loads(out)["calendar_closed"] is True
 
 
 def test_cli_votes_exit_one_when_a_closure_is_suspected(tmp_path, capsys):
     db = str(tmp_path / "cli.db")
-    run(["register", "--store", db, "--only", f"{X},{H}", "--terms-read-at", T0], capsys)
+    fdb = str(tmp_path / "cli-finnhub.db")
+    run(["register", "--store", db, "--finnhub-store", fdb, "--only", f"{X},{H}", "--terms-read-at", T0], capsys)
     run(["schedule", "--store", db, "--from", "2026-11-23", "--to", "2026-11-30"], capsys)
-    c = connect(db)
+    c = connect(fdb, role="finnhub")
     try:
-        seed_holiday(c, ("Surprise Closure", D, ""))
+        for f in parse_h(holiday_body(("Surprise Closure", D, "")), fetched=LATE):
+            add_fact(c, **f)
     finally:
         c.close()
+    code, out, _ = run(["votes", "--store", db, "--finnhub-store", fdb, "--date", D, "--as-of", "2099-01-01T00:00:00Z"], capsys)
+    assert code == 1 and json.loads(out)["suspected"] is True and json.loads(out)["finnhub_store_given"] is True
+    # the opposite: without the Finnhub store the same question has no Finnhub vote, and the answer says so
     code, out, _ = run(["votes", "--store", db, "--date", D, "--as-of", "2099-01-01T00:00:00Z"], capsys)
-    assert code == 1 and json.loads(out)["suspected"] is True
+    assert code == 0 and json.loads(out)["suspected"] is False and json.loads(out)["finnhub_store_given"] is False
 
 
 def test_cli_votes_exit_one_when_the_schedule_is_missing(tmp_path, capsys):
@@ -1389,9 +1433,10 @@ def test_cli_never_prints_the_token(tmp_path, capsys, monkeypatch):
     from valedia_trader.core import secrets
     monkeypatch.setattr(secrets, "secret", lambda name, *a, **k: TOKEN)
     db = str(tmp_path / "cli.db")
-    run(["register", "--store", db, "--only", H, "--terms-read-at", T0], capsys)
+    fdb = str(tmp_path / "cli-finnhub.db")
+    run(["register", "--store", db, "--finnhub-store", fdb, "--only", H, "--terms-read-at", T0], capsys)
     monkeypatch.setattr(k3, "_urllib_get", Fake({H_URL: RuntimeError(f"failed with {TOKEN}")}))
-    code, out, err = run(["refresh", "--store", db, "--source", H], capsys)
+    code, out, err = run(["refresh", "--store", db, "--finnhub-store", fdb, "--source", H], capsys)
     assert code == 1 and TOKEN not in out and TOKEN not in err
 
 
@@ -1621,22 +1666,24 @@ def test_finnhub_plus_a_death_proclamation_with_an_empty_abstract_is_an_ordinary
     register(conn)
     k3.refresh(conn, X, http_get=None, now=NOW, params={"start": "2026-11-23", "end": "2026-11-26"})
     holidays = holiday_body(("Surprise Closure", TUESDAY, ""))
-    k3.refresh(conn, H, http_get=Fake({H_URL: holidays}), now=NOW, credentials=creds)
+    k3.refresh(fin(conn), H, http_get=Fake({H_URL: holidays}), now=NOW, credentials=creds)
     fake = Fake({FR_URL: fr_body(death_doc("2026-11", abstract=None)), BODY_URL: MOURNING_BODY.encode()})
     assert k3.refresh(conn, FR, http_get=fake, now=NOW) == {"stored": 1, "unchanged": 0, "error": 0}
-    v = k3.closure_votes(conn, TUESDAY, "2026-11-24T12:00:00.000000Z")
+    v = k3.closure_votes(conn, TUESDAY, "2026-11-24T12:00:00.000000Z", finnhub_conn=fin(conn))
     assert v["authorities_closed"] == [G_FIN, G_PRES] and v["ordinary_stop"] is True
     # the two-way check: with the body unreadable, the Federal Register casts no vote
     conn2 = connect(tmp_path / "k2.db")
+    _FIN[id(conn2)] = connect(tmp_path / "k2-finnhub.db", role="finnhub")
     try:
         register(conn2)
         k3.refresh(conn2, X, http_get=None, now=NOW, params={"start": "2026-11-23", "end": "2026-11-26"})
-        k3.refresh(conn2, H, http_get=Fake({H_URL: holidays}), now=NOW, credentials=creds)
+        k3.refresh(fin(conn2), H, http_get=Fake({H_URL: holidays}), now=NOW, credentials=creds)
         broken = Fake({FR_URL: fr_body(death_doc("2026-11", abstract=None)), BODY_URL: RuntimeError("down")})
         assert k3.refresh(conn2, FR, http_get=broken, now=NOW)["error"] == 1
-        v2 = k3.closure_votes(conn2, TUESDAY, "2026-11-24T12:00:00.000000Z")
+        v2 = k3.closure_votes(conn2, TUESDAY, "2026-11-24T12:00:00.000000Z", finnhub_conn=fin(conn2))
         assert v2["authorities_closed"] == [G_FIN] and v2["ordinary_stop"] is False and v2["suspected"] is True
     finally:
+        _FIN.pop(id(conn2)).close()
         conn2.close()
 
 
@@ -1650,3 +1697,672 @@ def test_no_body_text_is_stored(conn):
     assert max(len(str(v)) for v in payload.values()) < 300                       # no field holds a body
     dump = "\n".join(str(tuple(r)) for r in conn.execute("SELECT * FROM knowledge_facts"))
     assert "solemn duty" not in dump and "half-staff" not in dump
+
+
+# ---- W3-WH: the White House "Presidential Actions" feed (an AUTHORITY in the group US_PRESIDENT)
+#
+# WH_FEED is the real feed sample (fetched 2026-11-23: the channel header and the first 3 of 30 items), with each
+# `content:encoded` body cut to its first paragraph. The live feed holds NO mourning item. So the mourning items below are a
+# recorded item SHAPE (the sample's Proclamation item) carrying composed text: the title and sentences come from the
+# Federal Register mourning tests above, with a placeholder name ("Person A"). No White House mourning post was observed.
+
+WH_URL = "https://www.whitehouse.gov/presidential-actions/feed/"
+WH_ACCEPT = "application/rss+xml, application/xml, text/xml"
+WH_FEED = (FIXTURES / "whitehouse_presidential_actions.xml").read_bytes()
+_WH_TEXT = WH_FEED.decode("utf-8")
+_WH_ITEMS = re.findall(r"<item>.*?</item>", _WH_TEXT, re.S)
+_WH_HEAD = _WH_TEXT[:_WH_TEXT.index("<item>")]
+_WH_TAIL = _WH_TEXT[_WH_TEXT.rindex("</item>") + len("</item>"):]
+_WH_TEMPLATE = _WH_ITEMS[1]                       # the sample's Proclamation item: the shape every composed item copies
+GUID1, GUID2, GUID3 = (f"https://www.whitehouse.gov/?p={n}" for n in (55161, 55072, 55074))
+PUB_OK = "Mon, 23 Nov 2026 15:00:00 +0000"        # known well before NOW (18:00 UTC)
+DEATH_P = ("It is my solemn duty to announce officially the death of Person A, a former President of the United "
+           "States, on November 20, 2026.")
+MOURN_S = "I do further appoint {d}, as a National Day of Mourning throughout the United States."
+HALF_STAFF = "The flag shall be flown at half-staff until sunset on December 3, 2026."
+
+
+def wh_item(title="Announcing the Death of Person A", kind="Proclamations", n=70001, pub=PUB_OK,
+            description="<p>An excerpt of the post.</p>", body=("A paragraph of the post.",), cats=None):
+    """One item in the sample's own shape: the same tags, CDATA wrappers and attributes, with new values."""
+    cats = ["Presidential Actions", kind] if cats is None else cats
+    item = _WH_TEMPLATE
+    item = re.sub(r"<title>.*?</title>", lambda m: f"<title>{xml_escape(title)}</title>", item, count=1, flags=re.S)
+    item = re.sub(r"<link>.*?</link>", lambda m: f"<link>https://www.whitehouse.gov/presidential-actions/2026/11/"
+                  f"person-a-{n}/</link>", item, count=1, flags=re.S)
+    item = re.sub(r"<pubDate>.*?</pubDate>", lambda m: f"<pubDate>{pub}</pubDate>", item, count=1, flags=re.S)
+    item = re.sub(r"(?:\s*<category>.*?</category>)+",
+                  lambda m: "".join(f"\n\t\t<category><![CDATA[{c}]]></category>" for c in cats), item, count=1,
+                  flags=re.S)
+    item = re.sub(r'(<guid isPermaLink="false">).*?(</guid>)', lambda m: f"{m.group(1)}https://www.whitehouse.gov/?p={n}"
+                  f"{m.group(2)}", item, count=1, flags=re.S)
+    item = re.sub(r"(<description><!\[CDATA\[).*?(\]\]></description>)",
+                  lambda m: f"{m.group(1)}{description}\n{m.group(2)}", item, count=1, flags=re.S)
+    paras = "\n".join(f'<p class="wp-block-paragraph">{p}</p>' for p in body)
+    item = re.sub(r'(<content:encoded><!\[CDATA\[.*?)<p class="wp-block-paragraph">.*?(\]\]></content:encoded>)',
+                  lambda m: f"{m.group(1)}{paras}\n{m.group(2)}", item, count=1, flags=re.S)
+    return item
+
+
+def wh_feed(*items, head=_WH_HEAD):
+    return (head + "\n".join(items) + _WH_TAIL).encode("utf-8")
+
+
+def wh_mourning(day="November 24, 2026", n=70001, pub=PUB_OK, **over):
+    """A Proclamation announcing a death, the date in the body. The item shape is recorded (it is the sample's Proclamation
+    item); the text is composed (the Federal Register mourning sentences above, with the placeholder name "Person A");
+    no White House mourning post was observed in the live feed."""
+    kw = dict(body=(DEATH_P, MOURN_S.format(d=day) + " " + HALF_STAFF), n=n, pub=pub,
+              description=f"<p>TO THE PEOPLE OF THE UNITED STATES: {DEATH_P} [&#8230;]</p>")
+    kw.update(over)
+    return wh_item(**kw)
+
+
+def parse_wh(body, fetched=NOW_S):
+    return k3.parse_whitehouse_feed(body, fetched_at_utc=fetched)
+
+
+def wh_payload(body, i=0, fetched=NOW_S):
+    return json.loads(parse_wh(body, fetched)[i]["payload_json"])
+
+
+def seed_wh(conn, *items, fetched=LATE):
+    put(conn, parse_wh(wh_feed(*items), fetched=fetched))
+
+
+# -- the source entry
+
+def test_the_whitehouse_source_entry():
+    e = k3.SOURCES[WH]
+    assert e["source_id"] == WH and e["role"] == "AUTHORITY" and e["endpoint"] == WH_URL
+    assert e["authority_group"] == G_PRES == k3.SOURCES[FR]["authority_group"]
+    assert e["terms_url"] == "https://www.whitehouse.gov/copyright/" and e["terms_url"].startswith("https://")
+    assert e["licence_tag"] == "US-PUBLIC-DOMAIN" and e["allow_external_llm"] == 1
+    assert e["ua_policy"] == "GENERIC_CLIENT" and e["cost_usd_monthly"] == 0 and e["time_zone"] == "America/New_York"
+    assert k3._WH == WH and k3._UA == "valedia-client/1.0"
+
+
+def test_the_whitehouse_source_registers_like_the_others(conn):
+    register(conn, WH)
+    row = conn.execute("SELECT * FROM source_registry WHERE source_id = ?", (WH,)).fetchone()
+    assert row is not None
+    with pytest.raises(k3.K3Error):
+        k3.register_all(conn, T0, only=["whitehouse_nonsense"])
+
+
+def test_the_docstring_says_the_whitehouse_feed_is_built():
+    doc = k3.__doc__
+    assert "Presidential Actions" in doc and "same day" in doc
+    assert "NOT built yet" in doc                                   # the exchange's own notice still is not
+
+
+# -- the real sample
+
+def test_the_fixture_is_the_recorded_sample_shape():
+    assert len(_WH_ITEMS) == 3 and _WH_TEXT.count("<![CDATA[") >= 12
+    for tag in ("dc:creator", "content:encoded", 'guid isPermaLink="false"', "pubDate", "category"):
+        assert tag in _WH_TEXT
+    assert "<!DOCTYPE" not in _WH_TEXT and "<!ENTITY" not in _WH_TEXT
+    assert "National Day of Mourning" not in _WH_TEXT               # the live feed holds no mourning item
+
+
+def test_the_real_sample_parses_to_three_facts():
+    facts = parse_wh(WH_FEED)
+    assert [f["entity_key"] for f in facts] == [f"WH:{g}" for g in (GUID1, GUID2, GUID3)]
+    assert {f["source_id"] for f in facts} == {WH} and {f["domain"] for f in facts} == {"K3_CAL"}
+    assert all(f["fetched_at_utc"] == NOW_S and f["effective_to_utc"] is None for f in facts)
+    # the start of the New York day of the pubDate: 23 Nov 23:36Z is 23 Nov in New York; 21 Nov 02:31Z is still 20 Nov
+    assert facts[0]["effective_from_utc"] == "2026-11-23T05:00:00.000000Z"
+    assert facts[1]["effective_from_utc"] == facts[2]["effective_from_utc"] == "2026-11-20T05:00:00.000000Z"
+
+
+def test_the_real_sample_payloads():
+    p1, p2, p3 = (wh_payload(WH_FEED, i) for i in range(3))
+    assert p1["guid"] == GUID1 and p1["categories"] == ["Presidential Actions", "Presidential Memoranda"]
+    assert p2["categories"] == ["Presidential Actions", "Proclamations"] and p2["type"] == "Proclamation"
+    assert p3["categories"] == ["Presidential Actions", "Executive Orders"] and p3["type"] == "Executive Order"
+    assert p1["type"] is None                                       # a memorandum is not a voting kind
+    assert p3["title"] == "PROTECTING THE EXECUTIVE’S PRIVILEGES AND ENHANCING EFFICIENCIES IN FEDERAL CONTRACTING"
+    assert p1["link"].startswith("https://www.whitehouse.gov/presidential-actions/2026/11/expeditious-enforcement")
+    assert p1["pub_date_utc"] == "2026-11-23T23:36:12.000000Z"
+    for p in (p1, p2, p3):
+        assert p["closure_dates"] == [] and p["closing_order_dates"] == []
+        assert re.fullmatch(r"[0-9a-f]{64}", p["description_sha256"]) and re.fullmatch(r"[0-9a-f]{64}", p["content_sha256"])
+        assert p["description_sha256"] != p["content_sha256"]
+
+
+def test_no_body_text_is_stored_for_the_whitehouse_feed(conn):
+    register(conn, WH)
+    fake = Fake({WH_URL: WH_FEED})
+    assert k3.refresh(conn, WH, http_get=fake, now=NOW) == {"stored": 3, "unchanged": 0, "error": 0}
+    dump = "\n".join(str(tuple(r)) for r in conn.execute("SELECT * FROM knowledge_facts"))
+    for words in ("By the authority vested", "From the moment a child", "gift from God", "wp-block", "<p"):
+        assert words not in dump
+    for f in parse_wh(WH_FEED):
+        assert max(len(str(v)) for v in json.loads(f["payload_json"]).values()) < 400
+
+
+def test_the_hashes_are_of_the_description_and_the_body_text():
+    import xml.etree.ElementTree as ET
+    item = ET.fromstring(WH_FEED).find("channel/item")
+    d = item.find("description").text
+    c = item.find("{http://purl.org/rss/1.0/modules/content/}encoded").text
+    p = wh_payload(WH_FEED)
+    assert p["description_sha256"] == sha(d) and p["content_sha256"] == sha(c)
+
+
+# -- loud failures, and their opposites
+
+def drop(tag, which=0, feed=_WH_TEXT):
+    """The sample with one tag of one item removed."""
+    parts = re.split(r"(?=<item>)", feed)
+    parts[which + 1] = re.sub(rf"<{tag}[ >].*?</{tag}>", "", parts[which + 1], count=1, flags=re.S)
+    return "".join(parts).encode("utf-8")
+
+
+def _blank(tag_pattern, replacement, item):
+    out = re.sub(tag_pattern, lambda m: replacement, item, count=1, flags=re.S)
+    assert out != item
+    return out
+
+
+def test_an_item_with_an_empty_title_or_an_empty_body_is_refused_and_an_empty_description_is_not():
+    base = wh_mourning()
+    assert len(parse_wh(wh_feed(base))) == 1                                         # opposite: the item as it is parses
+    empty_title = _blank(r"<title>.*?</title>", "<title></title>", base)
+    blank_title = _blank(r"<title>.*?</title>", "<title>  </title>", base)
+    empty_body = _blank(r"<content:encoded>.*?</content:encoded>", "<content:encoded><![CDATA[ ]]></content:encoded>", base)
+    none_body = _blank(r"<content:encoded>.*?</content:encoded>", "<content:encoded></content:encoded>", base)
+    for bad, what in ((empty_title, "title"), (blank_title, "title"), (empty_body, "content:encoded"),
+                      (none_body, "content:encoded")):
+        with pytest.raises(k3.K3Error, match=f"empty {what}"):
+            parse_wh(wh_feed(bad))
+    empty_desc = _blank(r"<description>.*?</description>", "<description><![CDATA[]]></description>", base)
+    assert len(parse_wh(wh_feed(empty_desc))) == 1
+
+
+def test_an_item_missing_its_pubdate_makes_the_whole_read_loud():
+    assert len(parse_wh(WH_FEED)) == 3                              # opposite: the sample as it is parses
+    with pytest.raises(k3.K3Error, match="pubDate"):
+        parse_wh(drop("pubDate"))
+
+
+@pytest.mark.parametrize("tag", ["title", "link", "guid", "description", "content:encoded"])
+def test_an_item_missing_a_tag_is_loud(tag):
+    for which in (0, 2):
+        with pytest.raises(k3.K3Error):
+            parse_wh(drop(tag, which))
+
+
+@pytest.mark.parametrize("pub", ["", "garbage", "Mon, 23 Nov 2026 25:99:00 +0000", "Mon, 31 Feb 2026 10:00:00 +0000",
+                                 "Mon, 23 Nov 2026 23:36:12", "2026-11-23T23:36:12Z"])
+def test_a_bad_pubdate_is_loud(pub):
+    with pytest.raises(k3.K3Error, match="pubDate"):
+        parse_wh(wh_feed(wh_item(pub=pub)))
+
+
+@pytest.mark.parametrize("pub", ["Mon, 23 Nov 2026 15:00:00 +0000", "Mon, 23 Nov 2026 15:00:00 GMT",
+                                 "Mon, 23 Nov 2026 10:00:00 -0500"])
+def test_the_rfc822_forms_with_a_zone_all_mean_the_same_instant(pub):
+    (f,) = parse_wh(wh_feed(wh_item(pub=pub)))
+    assert json.loads(f["payload_json"])["pub_date_utc"] == "2026-11-23T15:00:00.000000Z"
+
+
+@pytest.mark.parametrize("guid", ["", "https://www.whitehouse.gov/?p=1 2", "x<y", "https://www.whitehouse.gov/?p=\"1\"",
+                                  "a" * 300])
+def test_an_unsafe_guid_is_loud(guid):
+    bad = re.sub(r'(<guid isPermaLink="false">).*?(</guid>)', lambda m: f"{m.group(1)}{xml_escape(guid)}{m.group(2)}",
+                 wh_item(n=70002), flags=re.S)
+    with pytest.raises(k3.K3Error, match="guid"):
+        parse_wh(wh_feed(bad))
+    assert len(parse_wh(wh_feed(wh_item(n=70002)))) == 1            # opposite: a normal guid is fine
+
+
+def test_a_repeated_guid_is_loud_and_distinct_guids_are_not():
+    with pytest.raises(k3.K3Error, match="repeated"):
+        parse_wh(wh_feed(wh_item(n=70003), wh_item(n=70003, title="Other")))
+    assert len(parse_wh(wh_feed(wh_item(n=70003), wh_item(n=70004)))) == 2
+
+
+def test_an_empty_channel_is_an_error_not_a_zero():
+    with pytest.raises(k3.K3Error, match="empty"):
+        parse_wh(wh_feed())
+    assert len(parse_wh(wh_feed(wh_item()))) == 1
+
+
+@pytest.mark.parametrize("body", [
+    b"",
+    b"<rss version=\"2.0\"><channel><title>x</title>",                                     # cut off
+    b"not xml at all",
+    b'{"data": []}',
+    b"<html><head><title>Blocked</title></head><body><p>Access denied</p></body></html>",
+    b"<!doctype html><html><body>Blocked</body></html>",
+    b'<?xml version="1.0"?><rss version="2.0"></rss>',                                       # no channel
+    b'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry/></feed>',      # not RSS
+    b'<?xml version="1.0"?><rss version="2.0"><channel><title>x</title></channel></rss>',    # no item tags at all
+])
+def test_a_body_that_is_not_the_feed_is_an_error(body):
+    with pytest.raises(k3.K3Error):
+        parse_wh(body)
+
+
+@pytest.mark.parametrize("prefix", [
+    b'<!DOCTYPE rss [<!ENTITY a "aaaaaaaaaa"><!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">]>',
+    b'<!DOCTYPE rss>',
+    b'<!doctype rss SYSTEM "http://example.invalid/x.dtd">',
+    b'<!ENTITY x "y">',
+])
+def test_a_doctype_or_entity_is_refused_before_any_parsing(prefix):
+    body = prefix + WH_FEED[WH_FEED.index(b"<rss"):]
+    with pytest.raises(k3.K3Error, match="DOCTYPE|ENTITY|entity"):
+        parse_wh(body)
+    assert len(parse_wh(WH_FEED)) == 3                                                          # opposite: no DOCTYPE parses
+
+
+_DTD_UTF = ('<!DOCTYPE rss [<!ENTITY a "PWNED">]>')
+
+
+def _as_encoded(codec, doctype=True, entity_in_title=True):
+    """The sample as one feed in another encoding, with an internal DTD whose entity is used in the first title."""
+    text = _WH_TEXT
+    if entity_in_title:
+        text = text.replace("<title>", "<title>&a; ", 1)
+    if doctype:
+        text = text.replace("<rss", _DTD_UTF + "<rss", 1)
+    return text.replace('encoding="UTF-8"', f'encoding="{codec}"', 1).encode(codec)
+
+
+@pytest.mark.parametrize("codec", ["utf-16", "utf-16-le", "utf-16-be", "utf-32", "utf-32-le", "utf-32-be"])
+def test_a_body_in_another_encoding_is_refused_so_a_doctype_cannot_hide_in_it(codec):
+    body = _as_encoded(codec)
+    assert b"<!DOCTYPE" not in body                                                  # the byte search alone cannot see it
+    with pytest.raises(k3.K3Error, match="UTF-8|NUL"):
+        parse_wh(body)
+    # also with no XML declaration at all
+    bare = (_DTD_UTF + _WH_TEXT[_WH_TEXT.index("<rss"):].replace("<title>", "<title>&a; ", 1)).encode(codec)
+    with pytest.raises(k3.K3Error, match="UTF-8|NUL"):
+        parse_wh(bare)
+    # the same text in UTF-8 is refused for its DTD
+    with pytest.raises(k3.K3Error, match="DOCTYPE|ENTITY"):
+        parse_wh(_as_encoded("utf-8"))
+
+
+def test_utf8_bodies_are_still_read_with_or_without_a_byte_order_mark_and_other_encodings_are_not():
+    assert len(parse_wh(WH_FEED)) == 3
+    assert len(parse_wh(b"\xef\xbb\xbf" + WH_FEED)) == 3                                # opposite: a UTF-8 mark is fine
+    assert len(parse_wh(_as_encoded("utf-8", doctype=False, entity_in_title=False))) == 3
+    with pytest.raises(k3.K3Error, match="UTF-8"):
+        parse_wh(_WH_TEXT.encode("latin-1").replace(b"<title>", b"<title>\xe9", 1))   # not UTF-8 bytes
+    with pytest.raises(k3.K3Error):
+        parse_wh(_as_encoded("utf-16", doctype=False, entity_in_title=False))
+
+
+def test_an_oversize_body_is_an_error_and_one_at_the_cap_is_not():
+    with pytest.raises(k3.K3Error, match="larger|oversize|limit"):
+        parse_wh(WH_FEED + b" " * k3._MAX_BODY)
+    assert len(parse_wh(WH_FEED + b" " * (k3._MAX_BODY - len(WH_FEED)))) == 3
+
+
+def test_the_parser_refuses_non_bytes_and_a_bad_fetch_time():
+    with pytest.raises(k3.K3Error):
+        parse_wh(WH_FEED.decode("utf-8"))
+    with pytest.raises(k3.K3Error):
+        parse_wh(WH_FEED, fetched="2026-11-23 18:00")
+    with pytest.raises(k3.K3Error):
+        parse_wh(None)
+
+
+# -- when the fact is known
+
+def test_a_pubdate_at_or_before_the_fetch_is_proven_and_known_then(conn):
+    register(conn, WH)
+    for pub in (PUB_OK, "Mon, 23 Nov 2026 18:00:00 +0000"):            # before the fetch, and at the very moment
+        (f,) = parse_wh(wh_feed(wh_item(n=70010, pub=pub)))
+        assert f["published_proven"] is True and f["published_at_utc"] == _fmt_pub(pub)
+    put(conn, parse_wh(wh_feed(wh_item(n=70010))))
+    assert len(facts_as_of(conn, "2026-11-23T15:00:00.000000Z", domain="K3_CAL")) == 1
+    assert facts_as_of(conn, "2026-11-23T14:59:59.000000Z", domain="K3_CAL") == []
+
+
+def _fmt_pub(pub):
+    from email.utils import parsedate_to_datetime
+    return k3._fmt(parsedate_to_datetime(pub))
+
+
+def test_a_pubdate_after_the_fetch_is_known_at_the_fetch_and_not_proven(conn):
+    register(conn, WH)
+    later = "Mon, 23 Nov 2026 18:00:01 +0000"
+    (f,) = parse_wh(wh_feed(wh_item(n=70011, pub=later)))
+    assert f["published_proven"] is False and f["published_at_utc"] is None
+    put(conn, [f])
+    assert facts_as_of(conn, "2026-11-23T17:59:59.000000Z", domain="K3_CAL") == []
+    assert len(facts_as_of(conn, NOW_S, domain="K3_CAL")) == 1
+    (row,) = conn.execute("SELECT known_at_basis, known_at_utc FROM knowledge_facts").fetchall()
+    assert tuple(row) == ("FETCHED", NOW_S)
+
+
+def test_a_revised_item_is_fetched_never_back_dated_and_the_same_bytes_again_are_unchanged(conn):
+    register(conn, WH)
+    v1 = wh_feed(wh_item(n=70020, body=("The first text.",)))
+    v2 = wh_feed(wh_item(n=70020, body=("The first text, revised.",)))
+    assert k3.refresh(conn, WH, http_get=Fake({WH_URL: v1}), now=NOW) == {"stored": 1, "unchanged": 0, "error": 0}
+    again = k3.refresh(conn, WH, http_get=Fake({WH_URL: v1}), now=NOW + timedelta(hours=1))
+    assert again == {"stored": 0, "unchanged": 1, "error": 0}
+    later = NOW + timedelta(hours=2)
+    assert k3.refresh(conn, WH, http_get=Fake({WH_URL: v2}), now=later) == {"stored": 1, "unchanged": 0, "error": 0}
+    rows = conn.execute("SELECT known_at_basis, known_at_utc, published_at_utc FROM knowledge_facts "
+                        "ORDER BY fact_version_id").fetchall()
+    assert [tuple(r)[:2] for r in rows] == [("PUBLISHED", "2026-11-23T15:00:00.000000Z"), ("FETCHED", k3._fmt(later))]
+    assert [r[2] for r in rows] == ["2026-11-23T15:00:00.000000Z", None]               # the revision is not proven
+    # the old version is still the one known between the publication and the revision's fetch
+    (old,) = facts_as_of(conn, "2026-11-23T19:30:00.000000Z", domain="K3_CAL")
+    (new,) = facts_as_of(conn, k3._fmt(later), domain="K3_CAL")
+    assert old["raw_sha256"] != new["raw_sha256"]
+
+
+# -- the vote text: type, sentences, change words
+
+SENT_CLEAN = MOURN_S.format(d="November 24, 2026")
+
+
+def votes_of(item):
+    p = wh_payload(wh_feed(item))
+    return p["closure_dates"], p["closing_order_dates"]
+
+
+def test_a_proclamation_with_the_mourning_sentence_in_its_body_votes_that_date():
+    assert votes_of(wh_mourning()) == (["2026-11-24"], [])
+    # opposite: the death and half-staff sentences alone name no mourning day
+    assert votes_of(wh_mourning(body=(DEATH_P, HALF_STAFF))) == ([], [])
+
+
+def test_the_same_text_under_other_types_does_not_vote():
+    assert votes_of(wh_mourning(kind="Presidential Memoranda")) == ([], [])
+    assert votes_of(wh_mourning(cats=["Presidential Actions", "Nominations & Appointments"])) == ([], [])
+    assert votes_of(wh_mourning(cats=["Presidential Actions"])) == ([], [])
+    assert votes_of(wh_mourning(cats=[])) == ([], [])
+    assert votes_of(wh_mourning(cats=["Presidential Actions", "Proclamations", "Presidential Memoranda"])) == ([], [])
+    assert votes_of(wh_mourning(cats=["Presidential Actions", "Proclamations", "Executive Orders"])) == ([], [])
+    # two voting kinds at once name no one kind: no type, whatever way a set of two would be ordered
+    both = wh_mourning(cats=["Presidential Actions", "Proclamations", "Executive Orders"])
+    assert wh_payload(wh_feed(both))["type"] is None
+    assert wh_payload(wh_feed(wh_mourning(cats=["Presidential Actions", "Executive Orders", "Proclamations"])))["type"] is None
+    assert wh_payload(wh_feed(wh_mourning(kind="Presidential Memoranda")))["type"] is None
+    assert votes_of(wh_mourning(kind="Proclamations")) == (["2026-11-24"], [])                # opposite
+
+
+def test_the_category_text_is_matched_without_regard_to_case_or_spaces():
+    assert votes_of(wh_mourning(cats=["Presidential Actions", "  proclamations "])) == (["2026-11-24"], [])
+
+
+def test_a_change_word_in_the_title_or_description_voids_the_item():
+    for title in ("Amending the Announcement of the Death of Person A", "Revoking the Announcement of the Death of Person A",
+                  "Postponing the National Day of Mourning for Person A"):
+        assert votes_of(wh_mourning(title=title)) == ([], [])
+    desc = "<p>This proclamation amends the earlier one. [&#8230;]</p>"
+    assert votes_of(wh_mourning(description=desc)) == ([], [])
+    assert votes_of(wh_mourning(description="<p>This proclamation announces a death. [&#8230;]</p>")) == (["2026-11-24"], [])
+
+
+def test_an_executive_order_votes_only_from_its_title_and_description():
+    t = "A National Day of Mourning on November 24, 2026"
+    assert votes_of(wh_item(title=t, kind="Executive Orders")) == (["2026-11-24"], [])
+    assert votes_of(wh_item(title="Amending the " + t, kind="Executive Orders")) == ([], [])
+    desc = f"<p>{SENT_CLEAN}</p>"
+    assert votes_of(wh_item(title="Remembering Person A", kind="Executive Orders", description=desc)) == (["2026-11-24"], [])
+    # the body of an Executive Order is never read for a vote, even when its description names the mourning day
+    other = "I do further appoint November 25, 2026, as a National Day of Mourning throughout the United States."
+    assert votes_of(wh_item(title="Remembering Person A", kind="Executive Orders", description=desc,
+                            body=(other,))) == (["2026-11-24"], [])
+    assert votes_of(wh_item(title="Remembering Person A", kind="Executive Orders", body=(SENT_CLEAN,))) == ([], [])
+
+
+def test_the_body_is_read_only_for_a_proclamation_that_announces_a_death_or_names_the_mourning_day():
+    plain = dict(title="National Adoption Month, 2026", body=(SENT_CLEAN,), description="<p>A month of adoption.</p>")
+    assert votes_of(wh_item(**plain)) == ([], [])                                           # not a death proclamation
+    assert votes_of(wh_item(**{**plain, "title": "National Day of Mourning for Person A"})) == (["2026-11-24"], [])
+    assert votes_of(wh_item(**{**plain, "description": f"<p>{SENT_CLEAN} [&#8230;]</p>"})) == (["2026-11-24"], [])
+
+
+def test_a_closing_order_is_a_signal_only_and_casts_no_vote(conn):
+    title = "Providing for the Closing of Executive Departments and Agencies of the Federal Government on November 24, 2026"
+    item = wh_item(title=title, kind="Executive Orders", n=70030)
+    assert votes_of(item) == ([], ["2026-11-24"])
+    seed(conn)
+    seed_wh(conn, item)
+    v = votes(conn)
+    assert v["authorities_closed"] == [] and v["sources_closed"] == [] and v["suspected"] is False
+    seed_wh(conn, wh_mourning(n=70031))                                                      # opposite: a mourning item votes
+    assert votes(conn)["authorities_closed"] == [G_PRES]
+
+
+def test_a_past_dated_mention_does_not_vote():
+    past = "In 2018, the President designated November 24, 2018, as a National Day of Mourning."
+    assert votes_of(wh_mourning(body=(DEATH_P, past))) == ([], [])
+    assert votes_of(wh_mourning(body=(DEATH_P, "I designate November 24, 2026, as a National Day of Mourning."))) == \
+        (["2026-11-24"], [])
+
+
+def test_one_unsure_sentence_voids_the_whole_item():
+    unsure = "A National Day of Mourning is not set for December 1, 2026."
+    assert votes_of(wh_mourning(body=(DEATH_P, SENT_CLEAN, unsure))) == ([], [])
+    assert votes_of(wh_mourning(body=(DEATH_P, unsure, SENT_CLEAN))) == ([], [])
+    assert votes_of(wh_mourning(body=(DEATH_P, SENT_CLEAN))) == (["2026-11-24"], [])           # opposite: the clear one alone
+    clear_head = "A National Day of Mourning on November 24, 2026"                           # a clear title, an unsure body
+    assert votes_of(wh_mourning(title=clear_head, body=(DEATH_P,))) == (["2026-11-24"], [])
+    assert votes_of(wh_mourning(title=clear_head, body=(DEATH_P, unsure))) == ([], [])
+    unsure_title = "National Day of Mourning for Person A through December 1, 2026"
+    assert votes_of(wh_mourning(title=unsure_title)) == ([], [])
+    unsure_desc = "<p>A National Day of Mourning is not set for December 1, 2026. [&#8230;]</p>"
+    assert votes_of(wh_mourning(description=unsure_desc)) == ([], [])
+
+
+def test_the_mourning_sentence_is_read_through_the_html_of_the_body():
+    body = ("It is my duty.", "I do further appoint <strong>November&nbsp;24, 2026</strong>, as a <em>National</em> Day of "
+            "Mourning throughout the United States.")
+    assert votes_of(wh_mourning(body=body)) == (["2026-11-24"], [])
+
+
+def test_the_posts_own_footer_line_is_not_read_as_a_sentence():
+    footer = ('<p>The post <a href="https://www.whitehouse.gov/x/">A National Day of Mourning on November 24, 2026</a> '
+              'appeared first on <a href="https://www.whitehouse.gov">The White House</a>.</p>')
+    assert votes_of(wh_item(title="Remembering Person A", kind="Proclamations", description=footer)) == ([], [])
+
+
+_WH_FOOTER_P = ('<p>The post <a href="https://www.whitehouse.gov/x/">A Title</a> appeared first on '
+                '<a href="https://www.whitehouse.gov">The White House</a>.</p>')
+
+
+def test_a_post_word_ahead_of_the_footer_cannot_hide_a_change_word_from_the_description():
+    amended = "<p>The post of envoy is amended here. I do further appoint November 24, 2026, as a National Day of Mourning throughout the United States.</p>"
+    assert votes_of(wh_mourning(description=amended + _WH_FOOTER_P)) == ([], [])
+    assert votes_of(wh_mourning(description=amended)) == ([], [])                            # the same without a footer
+    hyphen = "<p>The post-war order is revoked. " + MOURN_S.format(d="November 24, 2026") + "</p>"
+    assert votes_of(wh_mourning(description=hyphen + _WH_FOOTER_P)) == ([], [])
+    # opposite: the same text with no change word still votes, and the footer alone is still removed
+    plain = "<p>The post of envoy is open. " + MOURN_S.format(d="November 24, 2026") + "</p>"
+    assert votes_of(wh_mourning(description=plain + _WH_FOOTER_P)) == (["2026-11-24"], [])
+
+
+def test_a_post_word_ahead_of_the_footer_cannot_delete_an_unsure_sentence_of_the_body():
+    unsure = "The post is vacant. A National Day of Mourning on November 25."
+    assert votes_of(wh_mourning(body=(MOURN_S.format(d="November 24, 2026"), unsure, _WH_FOOTER_P))) == ([], [])
+    # opposite: with no unsure sentence, the same body votes, footer and all
+    ok = "The post is vacant."
+    assert votes_of(wh_mourning(body=(MOURN_S.format(d="November 24, 2026"), ok, _WH_FOOTER_P))) == (["2026-11-24"], [])
+
+
+def test_the_body_is_read_for_mourning_sentences_only_so_an_unsure_closing_sentence_there_does_not_void():
+    closing = "The closing of the executive departments and agencies on November 25 is announced."
+    assert votes_of(wh_mourning(body=(MOURN_S.format(d="November 24, 2026"), closing))) == (["2026-11-24"], [])
+    # opposite: an unsure sentence that names the mourning day does void
+    assert votes_of(wh_mourning(body=(MOURN_S.format(d="November 24, 2026"),
+                                      "A National Day of Mourning on November 25."))) == ([], [])
+
+
+def test_only_the_actions_category_and_the_one_voting_kind_may_stand_together():
+    assert votes_of(wh_mourning(cats=["Presidential Actions", "Proclamations", "Nominations & Appointments"])) == ([], [])
+    assert votes_of(wh_mourning(cats=["Presidential Actions", "Proclamations", "Briefings & Statements"])) == ([], [])
+    assert votes_of(wh_mourning(cats=["Proclamations", "Nominations & Appointments"])) == ([], [])
+    assert wh_payload(wh_feed(wh_mourning(cats=["Presidential Actions", "Proclamations", "Nominations & Appointments"])))["type"] is None
+    assert votes_of(wh_mourning(cats=["Presidential Actions", "Proclamations"])) == (["2026-11-24"], [])     # opposite
+    assert votes_of(wh_mourning(cats=["Proclamations"])) == (["2026-11-24"], [])
+
+
+def test_a_title_in_capital_letters_is_read_like_one_in_title_case():
+    assert votes_of(wh_item(title="A NATIONAL DAY OF MOURNING ON NOVEMBER 24, 2026", body=("x.",))) == (["2026-11-24"], [])
+    assert votes_of(wh_item(title="A NATIONAL DAY OF MOURNING ON MAY 5, 2027", body=("x.",))) == (["2027-05-05"], [])
+    # opposite: a capital-letter month with no year is still not a stated date, and a change word still voids
+    assert votes_of(wh_item(title="A NATIONAL DAY OF MOURNING ON NOVEMBER 24", body=("x.",))) == ([], [])
+    assert votes_of(wh_item(title="AMENDING A NATIONAL DAY OF MOURNING ON NOVEMBER 24, 2026", body=("x.",))) == ([], [])
+    assert votes_of(wh_item(title="A National Day of Mourning on November 24, 2026", body=("x.",))) == (["2026-11-24"], [])
+
+
+def test_the_shared_json_loader_still_refuses_a_body_that_starts_with_a_byte_order_mark():
+    assert k3._load(b'{"a": 1}', "x") == {"a": 1}
+    with pytest.raises(k3.K3Error, match="not valid JSON"):
+        k3._load(b'\xef\xbb\xbf{"a": 1}', "x")
+
+
+def test_a_normal_feed_with_no_mourning_stores_empty_closure_dates_and_no_error(conn):
+    register(conn, WH)
+    assert k3.refresh(conn, WH, http_get=Fake({WH_URL: WH_FEED}), now=NOW)["error"] == 0
+    for row in facts_as_of(conn, "2026-12-01T00:00:00Z", domain="K3_CAL"):
+        assert json.loads(row["payload_json"])["closure_dates"] == []
+
+
+# -- fetch and refresh
+
+def test_refresh_stores_the_feed_with_one_exact_request(conn):
+    register(conn, WH)
+    fake = Fake({WH_URL: WH_FEED})
+    assert k3.refresh(conn, WH, http_get=fake, now=NOW) == {"stored": 3, "unchanged": 0, "error": 0}
+    assert len(fake.calls) == 1
+    url, headers = fake.calls[0]
+    assert url == WH_URL
+    assert headers == {"User-Agent": "valedia-client/1.0", "Accept": WH_ACCEPT}
+    assert k3.refresh(conn, WH, http_get=fake, now=NOW) == {"stored": 0, "unchanged": 3, "error": 0}
+    assert [c[0] for c in fake.calls] == [WH_URL, WH_URL]                                    # never an item page
+
+
+def test_fetch_needs_no_credentials_and_sends_no_key(conn):
+    def no_credentials(name):
+        raise AssertionError("the White House feed asked for a credential")
+    fake = Fake({WH_URL: WH_FEED})
+    facts = k3.fetch(WH, http_get=fake, now=NOW, credentials=no_credentials)
+    assert len(facts) == 3 and set(fake.calls[0][1]) == {"User-Agent", "Accept"}
+
+
+def test_the_other_sources_still_ask_for_json(conn):
+    fake = Fake({FR_URL: fr_body(fr_doc())})
+    k3.fetch(FR, http_get=fake, now=NOW)
+    assert fake.calls[0][1]["Accept"] == "application/json"
+
+
+def test_refresh_with_a_failing_client_is_one_error_and_stores_nothing(conn):
+    register(conn, WH)
+    result = k3.refresh(conn, WH, http_get=Fake({WH_URL: RuntimeError("down")}), now=NOW)
+    assert result["error"] == 1 and result["stored"] == 0 and result["unchanged"] == 0
+    assert conn.execute("SELECT COUNT(*) FROM knowledge_facts").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("body", [b"", b'{"a": 1}', b"<html><body>blocked</body></html>", wh_feed(),
+                                  drop("pubDate"), b"<!DOCTYPE rss>" + WH_FEED])
+def test_refresh_with_a_refused_body_is_one_error_and_stores_nothing(conn, body):
+    register(conn, WH)
+    result = k3.refresh(conn, WH, http_get=Fake({WH_URL: body}), now=NOW)
+    assert result["error"] == 1 and result["stored"] == 0
+    assert conn.execute("SELECT COUNT(*) FROM knowledge_facts").fetchone()[0] == 0
+
+
+def test_fetch_needs_an_http_client_and_bytes():
+    with pytest.raises(k3.K3Error):
+        k3.fetch(WH, http_get=None, now=NOW)
+    with pytest.raises(k3.K3Error):
+        k3.fetch(WH, http_get=lambda url, headers: WH_FEED.decode("utf-8"), now=NOW)
+
+
+def test_params_are_refused_for_the_whitehouse_feed(conn):
+    register(conn, WH)
+    fake = Fake({WH_URL: WH_FEED})
+    for params in ({"start": "2026-11-01"}, {"end": "2026-11-30"}, {"start": "2026-11-01", "end": "2026-11-30"}):
+        with pytest.raises(k3.K3Error, match="no params"):
+            k3.refresh(conn, WH, http_get=fake, now=NOW, params=params)
+        with pytest.raises(k3.K3Error, match="no params"):
+            k3.fetch(WH, http_get=fake, now=NOW, params=params)
+    assert fake.calls == []
+    assert k3.refresh(conn, WH, http_get=fake, now=NOW, params={})["error"] == 0              # opposite: none is fine
+    assert k3.refresh(conn, WH, http_get=fake, now=NOW, params=None)["error"] == 0
+
+
+# -- the quorum
+
+def test_quorum_a_whitehouse_mourning_item_alone_is_only_suspected(conn):
+    seed(conn)
+    seed_wh(conn, wh_mourning())
+    v = votes(conn)
+    assert v["authorities_closed"] == [G_PRES] and v["sources_closed"] == [WH]
+    assert v["suspected"] is True and v["ordinary_stop"] is False and v["calendar_open"] is True
+
+
+def test_quorum_a_whitehouse_item_with_no_mourning_votes_nothing(conn):
+    seed(conn)
+    put(conn, parse_wh(WH_FEED, fetched=LATE))
+    v = votes(conn)
+    assert v["authorities_closed"] == [] and v["suspected"] is False and v["ordinary_stop"] is False
+
+
+def test_quorum_a_whitehouse_vote_is_for_its_own_date_only(conn):
+    seed(conn)
+    seed_wh(conn, wh_mourning(day="November 25, 2026"))
+    assert votes(conn)["authorities_closed"] == []
+    assert votes(conn, day="2026-11-25")["authorities_closed"] == [G_PRES]
+
+
+def test_quorum_whitehouse_and_federal_register_for_one_event_are_one_group(conn):
+    seed(conn)
+    seed_wh(conn, wh_mourning())
+    seed_fr(conn, mourning_doc("2026-55555", "November 24, 2026", "2026-11-22"))
+    v = votes(conn)
+    assert v["authorities_closed"] == [G_PRES] and v["sources_closed"] == sorted([FR, WH])
+    assert v["suspected"] is True and v["ordinary_stop"] is False
+
+
+def test_quorum_whitehouse_and_finnhub_are_two_groups(conn):
+    seed(conn)
+    seed_wh(conn, wh_mourning())
+    seed_holiday(conn, ("Surprise Closure", D, ""))
+    v = votes(conn)
+    assert v["authorities_closed"] == [G_FIN, G_PRES] and v["sources_closed"] == sorted([H, WH])
+    assert v["ordinary_stop"] is True and v["suspected"] is False
+
+
+def test_quorum_a_whitehouse_fact_known_after_as_of_never_counts(conn):
+    seed(conn)
+    seed_holiday(conn, ("Surprise Closure", D, ""))
+    # posted at 15:00 UTC on the day and fetched at 16:00: not known at 14:00, known at 17:00
+    seed_wh(conn, wh_mourning(pub="Tue, 24 Nov 2026 15:00:00 +0000"), fetched="2026-11-24T16:00:00.000000Z")
+    early = votes(conn, as_of="2026-11-24T14:00:00Z")
+    assert early["authorities_closed"] == [G_FIN] and early["ordinary_stop"] is False and early["suspected"] is True
+    late = votes(conn, as_of="2026-11-24T17:00:00Z")
+    assert late["authorities_closed"] == [G_FIN, G_PRES] and late["ordinary_stop"] is True
+
+
+def test_quorum_the_same_day_post_votes_before_the_federal_register_has_it(conn):
+    seed(conn)
+    seed_wh(conn, wh_mourning(pub="Tue, 24 Nov 2026 12:00:00 +0000"), fetched="2026-11-24T12:05:00.000000Z")
+    seed_fr(conn, mourning_doc("2026-55555", "November 24, 2026", "2026-11-24"), fetched="2026-11-25T12:00:00.000000Z")
+    v = votes(conn, as_of="2026-11-24T13:00:00Z")
+    assert v["sources_closed"] == [WH] and v["suspected"] is True                              # the Register lags a day
+    assert votes(conn, as_of="2026-11-25T13:00:00Z")["sources_closed"] == sorted([FR, WH])
+
+
+def test_quorum_a_revised_whitehouse_item_that_drops_the_date_stops_voting(conn):
+    register(conn, WH)
+    seed(conn)
+    k3.refresh(conn, WH, http_get=Fake({WH_URL: wh_feed(wh_mourning())}), now=NOW)
+    assert votes(conn, as_of="2026-11-23T19:00:00Z")["authorities_closed"] == [G_PRES]
+    revised = wh_feed(wh_mourning(body=(DEATH_P, "I withdraw the earlier designation.")))
+    k3.refresh(conn, WH, http_get=Fake({WH_URL: revised}), now=NOW + timedelta(hours=2))
+    assert votes(conn, as_of="2026-11-23T21:00:00Z")["authorities_closed"] == []
+    assert votes(conn, as_of="2026-11-23T19:00:00Z")["authorities_closed"] == [G_PRES]        # history is kept

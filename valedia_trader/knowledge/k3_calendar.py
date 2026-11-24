@@ -1,8 +1,9 @@
 """K-3: market calendars and closures, the first feed into the knowledge store.
 
 What it does, in plain words:
-- Turns the XNYS calendar (the `exchange_calendars` library) and three closure sources into versioned facts in the
-  knowledge store: Finnhub's holiday list, Finnhub's market status, and the Federal Register's presidential documents.
+- Turns the XNYS calendar (the `exchange_calendars` library) and four closure sources into versioned facts in the
+  knowledge store: Finnhub's holiday list, Finnhub's market status, the Federal Register's presidential documents, and
+  the White House "Presidential Actions" feed.
 - Answers one question, `closure_votes(conn, trade_date, as_of_utc)`: what did she know, at that time, about whether
   the exchange was open on that date, and how many independent authorities said it was closed?
 - Fetches nothing by itself. Every fetch goes through an injected `http_get(url, headers) -> bytes`. Only the command
@@ -16,9 +17,33 @@ Sources considered and left out:
   role AUTHORITY and its own `authority_group` to SOURCES and one rule to _CLOSURE_RULES, and the quorum counts it
   with no other change.
 
+The White House feed (built). The "Presidential Actions" RSS feed (`parse_whitehouse_feed`, one request for the feed
+address and none for any item page) is an AUTHORITY in the same group as the Federal Register, US_PRESIDENT, so a
+proclamation seen in both is ONE vote. It does not lag: an item is known at its `pubDate` when that is at or before the
+fetch (the same day it is posted), otherwise when fetched. An item counts as a Proclamation or an Executive Order only by
+its category text; a Presidential Memorandum or any other kind never votes. The same closure-date rule as the Federal
+Register reads the title and the description (the post's excerpt); for a Proclamation that announces a death or names a
+National Day of Mourning, the sentences of the full body that sit in the feed (`content:encoded`) that contain "National
+Day of Mourning" are read too, with the same forms and void words, so no second request is needed. The payload keeps the
+dates, the category text, the guid and the sha256 of the description and of the body, never their text. A feed that is
+empty, not RSS, cut short, over the size limit, carries a DOCTYPE or ENTITY, or has an item with no title, link, guid,
+description, body or valid `pubDate` (or a repeated guid) is refused whole: the read counts one error and stores nothing.
+It takes no window params.
+
 Removed holidays: when a Finnhub holiday read no longer lists a date that an earlier read listed, and the date is inside
 the range the new list covers (its earliest to its latest date), `refresh` stores a "removed" version for it (closed
 false), so the old closure stops counting. A date outside that range only rolled off the list's edge: it is left alone.
+
+Two store files (K-7). Only the two Finnhub sources live in the Finnhub store (a store opened with
+`store.connect(path, role="finnhub")`); the XNYS calendar, the Federal Register and the White House feed live in the general
+store. `register_all` and `refresh` take the connection that matches the source and refuse the other one (a Finnhub source
+on a general connection, or any other source on the Finnhub connection) before anything is fetched or written; a mixed
+`only` list is refused whole. `closure_votes(conn, trade_date, as_of_utc, *, finnhub_conn=None)` reads Finnhub rows only from
+`finnhub_conn` and every other source from `conn`. Without `finnhub_conn` there is NO Finnhub vote, and the general file is
+never read for Finnhub rows (a Finnhub row found there is ignored): the result then says `finnhub_store_given: false`, so a
+caller cannot mistake "the Finnhub store was not asked" for "Finnhub says open". There is no default path for the Finnhub
+store anywhere: the command line takes `--finnhub-store`, required to register or refresh a Finnhub source, and optional
+for `votes` (left out, the answer says so). Retiring Finnhub is deleting that one file.
 
 Roles: SCHEDULE (the library, derived), AUTHORITY (a source that can say "closed" and votes, through its group),
 SIGNAL (logged only, never votes, has no group; no source has this role today).
@@ -85,6 +110,8 @@ import html
 import json
 import re
 import sys
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlencode, urlsplit
 from zoneinfo import ZoneInfo
@@ -102,6 +129,8 @@ _FR_PER_PAGE = 100                  # the Federal Register's largest page; a big
 _FR_DEFAULT_DAYS = 30
 _FR_MAX_DAYS = 92
 _SCHEDULE_MAX_DAYS = 3660
+_WH_URL = "https://www.whitehouse.gov/presidential-actions/feed/"
+_RSS_ACCEPT = "application/rss+xml, application/xml, text/xml"
 _FINNHUB_TERMS = ("terms: personal use only; no sharing with third parties; all data must be deleted if the "
                   "subscription ends; 30 calls/s cap")
 _MAX_BODY = 5_000_000
@@ -137,11 +166,17 @@ SOURCES = {
         "source_id": "federal_register_presdocs", "role": "AUTHORITY", "endpoint": _FR_URL,
         "terms_url": "https://www.federalregister.gov/reader-aids/using-federalregister-gov/developer-resources",
         "licence_tag": "US-PUBLIC-DOMAIN", "allow_external_llm": 1, "ua_policy": "GENERIC_CLIENT",
-        "cost_usd_monthly": 0, "time_zone": _NY, "authority_group": "US_PRESIDENT",   # a White House source joins it
+        "cost_usd_monthly": 0, "time_zone": _NY, "authority_group": "US_PRESIDENT",   # the White House feed shares it
+    },
+    "whitehouse_presidential_actions": {
+        "source_id": "whitehouse_presidential_actions", "role": "AUTHORITY", "endpoint": _WH_URL,
+        "terms_url": "https://www.whitehouse.gov/copyright/",
+        "licence_tag": "US-PUBLIC-DOMAIN", "allow_external_llm": 1, "ua_policy": "GENERIC_CLIENT",
+        "cost_usd_monthly": 0, "time_zone": _NY, "authority_group": "US_PRESIDENT",   # one government: shares the FR's vote
     },
 }
-_X, _H, _S, _FR = ("xnys_exchange_calendars", "finnhub_market_holiday", "finnhub_market_status",
-                   "federal_register_presdocs")
+_X, _H, _S, _FR, _WH = ("xnys_exchange_calendars", "finnhub_market_holiday", "finnhub_market_status",
+                        "federal_register_presdocs", "whitehouse_presidential_actions")
 _ROLES = ("SCHEDULE", "AUTHORITY", "SIGNAL")
 
 
@@ -257,6 +292,23 @@ def _load(raw, what: str) -> dict:
 
 # ---- source registration
 
+def _wants_finnhub_store(source_id: str) -> bool:
+    """True for the two Finnhub sources: the only rows that belong in the Finnhub store."""
+    return "finnhub" in source_id.casefold()
+
+
+def _need_store(conn, source_id: str) -> None:
+    """Refuse a connection whose role does not match the source: Finnhub sources go to the Finnhub store, the others to
+    the general store. Raised before any request or write."""
+    try:
+        role = store.role_of(conn)
+    except store.StoreError as exc:
+        raise K3Error(f"conn: {exc}") from exc
+    want = "finnhub" if _wants_finnhub_store(source_id) else "general"
+    if role != want:
+        raise K3Error(f"{source_id}: needs the {want} store, but the connection given is the {role} store")
+
+
 def register_all(conn, terms_read_at_utc, *, only) -> None:
     """Register the named sources. The caller decides which: the owner reads the terms first. Same values again:
     nothing happens. An unknown, empty or malformed list registers nothing."""
@@ -266,6 +318,8 @@ def register_all(conn, terms_read_at_utc, *, only) -> None:
     for name in names:
         if not isinstance(name, str) or name not in SOURCES:
             raise K3Error(f"only: unknown source {str(name)[:60]!r}")
+    for name in names:
+        _need_store(conn, name)                # a mixed list is refused whole, before anything is registered
     for name in names:
         e = SOURCES[name]
         store.register_source(
@@ -564,7 +618,136 @@ def parse_federal_register(raw, *, fetched_at_utc) -> list[dict]:
     return facts
 
 
-_PARSERS = {_H: parse_finnhub_holiday, _S: parse_finnhub_status, _FR: parse_federal_register}
+# ---- the White House "Presidential Actions" feed
+
+_CONTENT_TAG = "{http://purl.org/rss/1.0/modules/content/}encoded"
+_WH_GUID = re.compile(r"[A-Za-z0-9][A-Za-z0-9:/._?=&%~-]{0,199}")
+_XML_DECL = re.compile(r"<!\s*(?:DOCTYPE|ENTITY)", re.I)
+_WH_KINDS = {"proclamations": "Proclamation", "executive orders": "Executive Order"}
+_WH_ONLY_WITH = "presidential actions"                  # the one category that may stand beside the voting kind
+_WH_BLOCK_TAG = re.compile(r"</?(?:p|div|br|h[1-6]|li|ul|ol|tr|td|th|table|blockquote|section|article|header|footer|nav|"
+                           r"figure|figcaption|hr)\b[^>]*>", re.I)
+# the footer is the LAST "The post ... appeared first on ..." line of the text: no other "The post" inside it, and nothing after
+_POST_FOOTER = re.compile(r"\bThe post\b(?:(?!\bThe post\b).){0,600}?\bappeared first on\b[^.]{0,80}\.?\s*$", re.S)
+_CAPITAL_MONTH = re.compile(r"\b" + _MONTH.upper() + r"\b")
+
+
+def _wh_kind(categories):
+    """"Proclamation" or "Executive Order" when the item's category text names exactly one of them and nothing else but
+    "Presidential Actions" (any other category, a memorandum or a nomination among them, means no vote); None otherwise.
+    Only these two kinds can vote."""
+    names = {c.strip().casefold() for c in categories}
+    kinds = {_WH_KINDS[n] for n in names if n in _WH_KINDS}
+    if len(kinds) != 1 or names - set(_WH_KINDS) - {_WH_ONLY_WITH}:
+        return None
+    return kinds.pop()
+
+
+def _wh_plain(markup: str) -> str:
+    """The text of a feed's HTML part, without the post's own "The post X appeared first on Y" footer line. A block tag
+    (paragraph, heading, line break, list item) is a space; an inline tag (the feed's underline spans, emphasis) is
+    nothing, so "<em>2026</em>," stays "2026,"."""
+    text = _WH_BLOCK_TAG.sub(" ", markup)
+    text = re.sub(r"[\s\x00-\x1f]+", " ", html.unescape(_TAG.sub("", text))).strip()
+    return _POST_FOOTER.sub(" ", text).strip()
+
+
+def _wh_scan(title, description, body, kind) -> tuple[list[str], list[str]]:
+    """(mourning dates, closing-order dates) of one feed item, each sorted and unique; both empty when the item is not a
+    Proclamation or an Executive Order, has a change word in its title or description, or has one unsure sentence. The
+    body is read only for a Proclamation that announces a death or names a National Day of Mourning."""
+    if kind is None or _CHANGE.search(title + " " + description):
+        return [], []
+    # a title in capital letters ("NOVEMBER 24, 2026") reads like one in title case: only its month names change
+    found = _scan_text((_CAPITAL_MONTH.sub(lambda m: m.group().capitalize(), title), description))
+    if found is None:
+        return [], []
+    mourning, closing = found
+    if kind == "Proclamation" and (_is_death_proclamation(title, kind) or _MOURNING.search(description)):
+        tail = _scan_text((body,), mourning_only=True)
+        if tail is None:
+            return [], []
+        mourning = sorted(set(mourning) | set(tail[0]))
+    return mourning, closing
+
+
+def _wh_child(item, tag: str, what: str, *, may_be_empty=False) -> str:
+    nodes = item.findall(tag)
+    if len(nodes) != 1:
+        raise K3Error(f"white house feed: an item needs exactly one {what}")
+    text = nodes[0].text or ""
+    if not may_be_empty and not text.strip():
+        raise K3Error(f"white house feed: an item has an empty {what}")
+    return _text(text, what, non_empty=False)
+
+
+def parse_whitehouse_feed(raw, *, fetched_at_utc) -> list[dict]:
+    """The White House "Presidential Actions" RSS feed (`rss` 2.0: a `channel` of `item`s with title, link, pubDate,
+    category, guid, description and content:encoded). One fact per item, keyed `WH:<guid>`, in effect from the start of
+    the pubDate's New York day, known at the pubDate when that is at or before the fetch (otherwise when fetched).
+    A refusal of the whole body: empty or over the size limit, a DOCTYPE or ENTITY, not XML, not RSS, no items, an item
+    without a title, link, guid, pubDate (with a zone), description or body, a guid that is not safe, or a repeated guid."""
+    fetched = _utc_text(fetched_at_utc, "fetched_at_utc")
+    if not isinstance(raw, bytes) or not raw:
+        raise K3Error("white house feed: the body must be non-empty bytes")
+    if len(raw) > _MAX_BODY:
+        raise K3Error("white house feed: the answer is larger than the limit")
+    try:
+        text = raw.decode("utf-8-sig")                       # only UTF-8: a UTF-16 or UTF-32 body would hide a DOCTYPE from the search
+    except UnicodeDecodeError:
+        raise K3Error("white house feed: the body is not UTF-8 text") from None
+    if "\x00" in text:
+        raise K3Error("white house feed: the body is not UTF-8 text (it holds a NUL character)")
+    if _XML_DECL.search(text):
+        raise K3Error("white house feed: a DOCTYPE or ENTITY declaration is refused")
+    try:
+        root = ET.fromstring(text)                       # text, not bytes: the parser reads it as UTF-8 whatever the declaration says
+    except (ET.ParseError, ValueError, RecursionError):
+        raise K3Error("white house feed: the body is not valid XML") from None
+    channels = root.findall("channel") if root.tag == "rss" and root.get("version") == "2.0" else []
+    if len(channels) != 1:
+        raise K3Error("white house feed: the body is not an RSS 2.0 feed with one channel")
+    items = channels[0].findall("item")
+    if not items:
+        raise K3Error("white house feed: the feed is empty (no item), which is a broken read and not 'nothing new'")
+    facts, seen = [], set()
+    for item in items:
+        title = " ".join(_wh_child(item, "title", "title").split())
+        link = _wh_child(item, "link", "link").strip()
+        guid = _wh_child(item, "guid", "guid").strip()
+        pub_text = _wh_child(item, "pubDate", "pubDate").strip()
+        description = _wh_child(item, "description", "description", may_be_empty=True)
+        content = _wh_child(item, _CONTENT_TAG, "content:encoded body")
+        if not link.startswith("https://"):
+            raise K3Error("white house feed: an item link must be https")
+        if not _WH_GUID.fullmatch(guid):
+            raise K3Error(f"white house feed: unsafe guid {guid[:30]!r}")
+        if guid in seen:
+            raise K3Error(f"white house feed: repeated guid {guid[:60]!r}")
+        seen.add(guid)
+        try:
+            moment = parsedate_to_datetime(pub_text)
+        except (TypeError, ValueError, IndexError):
+            moment = None
+        if moment is None or moment.tzinfo is None:
+            raise K3Error(f"white house feed: bad pubDate {pub_text[:40]!r} (RFC 822 with a zone is required)")
+        stamp = _fmt(moment)
+        proven = stamp <= fetched
+        pub_day = moment.astimezone(ZoneInfo(_NY)).date()
+        categories = [(c.text or "").strip() for c in item.findall("category")]
+        kind = _wh_kind(categories)
+        mourning, closing = _wh_scan(title, _wh_plain(description), _wh_plain(content), kind)
+        payload = {"guid": guid, "title": title, "link": link, "categories": categories, "type": kind,
+                   "pub_date_utc": stamp, "closure_dates": mourning, "closing_order_dates": closing,
+                   "description_sha256": hashlib.sha256(description.encode("utf-8")).hexdigest(),
+                   "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()}
+        facts.append(_fact(_WH, f"WH:{guid}", payload, effective_from=_day_start_utc(pub_day, _NY), effective_to=None,
+                           fetched=fetched, published=stamp if proven else None, proven=proven))
+    return facts
+
+
+_PARSERS = {_H: parse_finnhub_holiday, _S: parse_finnhub_status, _FR: parse_federal_register,
+            _WH: parse_whitehouse_feed}
 
 
 # ---- fetch and refresh
@@ -581,8 +764,8 @@ def _valid_key(key) -> bool:
 
 def _check_params(source_id: str, params, now_text: str):
     """The validated request window: (start, end) dates for the XNYS schedule and the Federal Register, None for
-    Finnhub (which takes none)."""
-    if source_id in (_H, _S):
+    Finnhub and the White House feed (which take none)."""
+    if source_id in (_H, _S, _WH):
         if params:
             raise K3Error(f"{source_id} takes no params")
         return None
@@ -628,6 +811,9 @@ def fetch(source_id, *, http_get=None, now, credentials=None, params=None) -> li
     headers = {"User-Agent": _UA, "Accept": "application/json"}
     if source_id == _FR:
         url = _fr_request_url(*window)
+    elif source_id == _WH:
+        url = SOURCES[_WH]["endpoint"]
+        headers["Accept"] = _RSS_ACCEPT
     else:
         url = SOURCES[source_id]["endpoint"]
         try:
@@ -766,13 +952,16 @@ def _read_death_bodies(conn, facts: list[dict], http_get) -> tuple[list[dict], i
 
 
 def refresh(conn, source_id, *, http_get=None, now, credentials=None, params=None) -> dict:
-    """Fetch, parse and store every fact of one source. A bad argument raises. A failed request, a refused body or a
+    """Fetch, parse and store every fact of one source, into the store that matches it: `conn` is the Finnhub store's
+    connection for a Finnhub source and the general store's for any other (the other pairing raises K3Error, before any
+    request). A bad argument raises. A failed request, a refused body or a
     fact the store refuses is counted as an error (a refused body stores nothing at all). A Federal Register death
     proclamation also costs one request for its body text; if that fails the failure is counted as an error, an earlier
     good read of the same title and abstract stays current, and otherwise only the title's and abstract's own dates are stored."""
     if not isinstance(source_id, str) or source_id not in SOURCES:
         raise K3Error(f"unknown source {str(source_id)[:60]!r}")
     _check_params(source_id, params, _now_text(now))
+    _need_store(conn, source_id)             # the connection must match the source, before any request
     body_errors = 0
     if source_id == _X:
         facts = fetch(source_id, http_get=http_get, now=now, params=params)
@@ -808,19 +997,40 @@ def _rule_federal_register(entity_key, payload, day) -> bool:
     return entity_key.startswith("FR:") and isinstance(dates, list) and day in dates
 
 
+def _rule_whitehouse(entity_key, payload, day) -> bool:
+    dates = payload.get("closure_dates")
+    return entity_key.startswith("WH:") and isinstance(dates, list) and day in dates
+
+
 # One rule per AUTHORITY source: does this source's fact say the date is closed? The exchange's own closure notice
 # (a third authority) goes here when it is built: add its source to SOURCES with role AUTHORITY and one rule.
-_CLOSURE_RULES = {_H: _rule_finnhub_holiday, _S: _rule_finnhub_status, _FR: _rule_federal_register}
+_CLOSURE_RULES = {_H: _rule_finnhub_holiday, _S: _rule_finnhub_status, _FR: _rule_federal_register,
+                  _WH: _rule_whitehouse}
 
 
-def closure_votes(conn, trade_date, as_of_utc) -> dict:
+def closure_votes(conn, trade_date, as_of_utc, *, finnhub_conn=None) -> dict:
     """What was known at `as_of_utc` about `trade_date`: the calendar's answer and the authority GROUPS that say closed
     (`authorities_closed`), with the source ids behind them (`sources_closed`). A group counts once however many of its
-    sources say closed. A pure read: no network, and facts known after `as_of_utc` are not seen."""
+    sources say closed. A pure read: no network, and facts known after `as_of_utc` are not seen.
+
+    `conn` is the general store. `finnhub_conn` is the Finnhub store and is optional: Finnhub rows are read only from it.
+    Without it there is NO Finnhub vote, and the general file is never read for Finnhub rows (one found there is
+    ignored). The result carries `finnhub_store_given` (true or false) so "the Finnhub store was not asked" can never be
+    mistaken for "Finnhub says open". A connection of the wrong role is refused."""
     day = _parse_date(trade_date, "trade_date").isoformat()
     if not isinstance(trade_date, str):
         raise K3Error("trade_date: must be text written YYYY-MM-DD")
-    rows = store.facts_as_of(conn, as_of_utc, domain=_DOMAIN)
+    try:
+        if store.role_of(conn) != "general":
+            raise K3Error("conn: must be the general store; the Finnhub store goes in finnhub_conn")
+        if finnhub_conn is not None and store.role_of(finnhub_conn) != "finnhub":
+            raise K3Error("finnhub_conn: must be the Finnhub store, opened with role=\"finnhub\"")
+    except store.StoreError as exc:
+        raise K3Error(f"closure_votes: {exc}") from exc
+    rows = [r for r in store.facts_as_of(conn, as_of_utc, domain=_DOMAIN) if not _wants_finnhub_store(r["source_id"])]
+    if finnhub_conn is not None:
+        rows += [r for r in store.facts_as_of(finnhub_conn, as_of_utc, domain=_DOMAIN)
+                 if _wants_finnhub_store(r["source_id"])]
     open_now = None
     closed_by = set()                                  # source ids
     groups = set()                                     # their authority groups
@@ -850,7 +1060,8 @@ def closure_votes(conn, trade_date, as_of_utc) -> dict:
             groups.add(group)
     authorities = sorted(groups)
     return {
-        "trade_date": day, "as_of_utc": as_of_utc, "schedule_known": open_now is not None,
+        "trade_date": day, "as_of_utc": as_of_utc, "finnhub_store_given": finnhub_conn is not None,
+        "schedule_known": open_now is not None,
         "calendar_open": open_now, "calendar_closed": None if open_now is None else not open_now,
         "authorities_closed": authorities, "sources_closed": sorted(closed_by),
         "ordinary_stop": open_now is True and len(authorities) >= 2,
@@ -882,6 +1093,7 @@ def _main(argv=None) -> int:
     def command(name):
         p = sub.add_parser(name)
         p.add_argument("--store", required=True)
+        p.add_argument("--finnhub-store", dest="finnhub_store")    # no default: the owner names the file every time
         return p
 
     p = command("register")
@@ -899,28 +1111,53 @@ def _main(argv=None) -> int:
     p.add_argument("--as-of")
     args = parser.parse_args(argv)
     now = datetime.now(timezone.utc)
-    conn = None
+    conn = fin_conn = None
     try:
-        conn = store.connect(args.store)
         if args.cmd == "register":
-            register_all(conn, args.terms_read_at, only=[s.strip() for s in args.only.split(",") if s.strip()])
-            _print({"registered": [s.strip() for s in args.only.split(",") if s.strip()]})
+            names = [s.strip() for s in args.only.split(",") if s.strip()]
+            if any(_wants_finnhub_store(n) for n in names) and not args.finnhub_store:
+                raise K3Error("a Finnhub source goes in the Finnhub store: --finnhub-store is required")
+            if not names:
+                raise K3Error("only: name the sources to register, as a non-empty list")
+            general = [n for n in names if not _wants_finnhub_store(n)]
+            finnhub = [n for n in names if _wants_finnhub_store(n)]
+            if general:
+                conn = store.connect(args.store)
+            if finnhub:
+                fin_conn = store.connect(args.finnhub_store, role="finnhub")      # both files open before either is written
+            if conn is not None:
+                register_all(conn, args.terms_read_at, only=general)
+            if fin_conn is not None:
+                register_all(fin_conn, args.terms_read_at, only=finnhub)
+            _print({"registered": names})
             return 0
         if args.cmd in ("schedule", "refresh"):
             source = _X if args.cmd == "schedule" else args.source
+            if isinstance(source, str) and _wants_finnhub_store(source):
+                if not args.finnhub_store:
+                    raise K3Error(f"{source[:60]}: a Finnhub source is read into the Finnhub store: --finnhub-store is required")
+                fin_conn = store.connect(args.finnhub_store, role="finnhub")
+                target = fin_conn
+            else:
+                conn = store.connect(args.store)
+                target = conn
             params = {k: v for k, v in (("start", args.start), ("end", args.end)) if v is not None}
-            result = refresh(conn, source, http_get=_urllib_get, now=now, params=params or None)
+            result = refresh(target, source, http_get=_urllib_get, now=now, params=params or None)
             _print(result)
             return 1 if result["error"] else 0
-        result = closure_votes(conn, args.date, args.as_of or _fmt(now))
+        conn = store.connect(args.store)
+        if args.finnhub_store:
+            fin_conn = store.connect(args.finnhub_store, role="finnhub")
+        result = closure_votes(conn, args.date, args.as_of or _fmt(now), finnhub_conn=fin_conn)
         _print(result)
         return 1 if (result["suspected"] or not result["schedule_known"]) else 0
     except (K3Error, store.StoreError, OSError) as exc:
         print(f"error: {exc}"[:300], file=sys.stderr)
         return 2
     finally:
-        if conn is not None:
-            conn.close()
+        for c in (conn, fin_conn):
+            if c is not None:
+                c.close()
 
 
 if __name__ == "__main__":

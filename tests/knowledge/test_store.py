@@ -254,7 +254,7 @@ def test_for_outside_llm_excludes_restricted_sources_and_keeps_allowed(conn):
 
 # ---- source registry -----------------------------------------------------------------------------
 
-def test_finnhub_with_external_llm_refused_in_code_and_in_database(conn):
+def test_finnhub_with_external_llm_refused_in_code_and_in_database(conn, tmp_path):
     with pytest.raises(StoreError, match="Finnhub"):
         src(conn, "finnhub_local", allow_external_llm=True)
     with pytest.raises(StoreError, match="Finnhub"):
@@ -265,8 +265,17 @@ def test_finnhub_with_external_llm_refused_in_code_and_in_database(conn):
                          (sid, "https://example.invalid/t", "x", 1, 1, "GENERIC_CLIENT", 0,
                           "2026-01-01T00:00:00.000000Z", None))
     assert count(conn, "source_registry") == 1
-    src(conn, "finnhub_local", allow_external_llm=False)  # the allowed case
-    assert count(conn, "source_registry") == 2
+    # K-7: a Finnhub source (without outside-model access) is allowed only in a Finnhub-role store; a general store
+    # refuses it. The allowed case therefore moves to a Finnhub-role connection.
+    with pytest.raises(StoreError, match="Finnhub"):
+        src(conn, "finnhub_local", allow_external_llm=False)
+    assert count(conn, "source_registry") == 1
+    finnhub = connect(tmp_path / "finnhub.db", role="finnhub")
+    try:
+        src(finnhub, "finnhub_local", allow_external_llm=False)  # the allowed case
+        assert count(finnhub, "source_registry") == 1
+    finally:
+        finnhub.close()
 
 
 def test_personal_use_not_ok_refused_in_code_and_in_database(conn):
@@ -1750,7 +1759,15 @@ def test_for_outside_llm_never_returns_a_finnhub_source_even_if_the_registry_say
     conn.execute("INSERT INTO source_registry VALUES (?, 'u', 'x', 1, 1, 'GENERIC_CLIENT', 0, "
                  "'2026-01-01T00:00:00.000000Z', NULL)", (name,))
     conn.execute("PRAGMA ignore_check_constraints = OFF")
-    bad = fact(conn, source_id=name, raw_sha256=sha("finn"))
+    # K-7: `add_fact` now refuses a Finnhub-named source in a general store, so the hostile fact goes in by raw SQL
+    # (the read-path filter must hold whatever a hostile writer put in the file)
+    with pytest.raises(StoreError, match="Finnhub"):
+        fact(conn, source_id=name, raw_sha256=sha("finn"))
+    bad = conn.execute(
+        "INSERT INTO knowledge_facts (domain, entity_key, effective_from_utc, effective_to_utc, published_at_utc,"
+        " fetched_at_utc, known_at_utc, known_at_basis, source_id, raw_sha256, payload_json)"
+        " VALUES ('K2_NEWS','ABC','2026-01-01T00:00:00.000000Z',NULL,NULL,'2026-01-02T00:00:00.000000Z',"
+        "'2026-01-02T00:00:00.000000Z','FETCHED',?,?,'{\"v\": 1}')", (name, sha("finn"))).lastrowid
     allowed = {r["fact_version_id"] for r in facts_as_of(conn, T3)}
     assert allowed == {keep, bad}                          # two-way: without the flag both are returned
     outside = {r["fact_version_id"] for r in facts_as_of(conn, T3, for_outside_llm=True)}
@@ -1837,7 +1854,10 @@ def test_the_module_docstring_states_its_limits():
 
 # Public callables of the package, by exact (module path, name). Adding a public function or class fails
 # this test on purpose: the author must then show it cannot return fact rows, and add it here.
-_ALLOWED_PUBLIC = {("store.py", n) for n in ("connect", "register_source", "add_fact", "facts_as_of", "StoreError")}
+# K-7 added `role_of` (reads the role stamp: a PRAGMA, no rows) and `audit_roles` (lists offending source and fact ids as
+# text; it is the one reader besides `facts_as_of` that names the facts table, and it selects only an id and a source id).
+_ALLOWED_PUBLIC = {("store.py", n) for n in ("connect", "register_source", "add_fact", "facts_as_of", "StoreError",
+                                              "role_of", "audit_roles")}
 # The K-3 calendar feed's public names. None of them returns rows of the facts table: `schedule_facts` and the three
 # `parse_*` functions build fact dicts from a library or a response body, to be handed to `add_fact`; `fr_closure_dates`
 # and `date_only_known_at` work on text; `fetch` returns the same built dicts; `refresh` returns counts; `register_all`
@@ -1845,7 +1865,11 @@ _ALLOWED_PUBLIC = {("store.py", n) for n in ("connect", "register_source", "add_
 # reader. The scan below still checks that this module never names the facts table.
 _ALLOWED_PUBLIC |= {("k3_calendar.py", n) for n in (
     "K3Error", "register_all", "schedule_facts", "date_only_known_at", "parse_finnhub_holiday", "parse_finnhub_status",
-    "parse_federal_register", "fr_closure_dates", "fr_body_closure_dates", "fetch", "refresh", "closure_votes")}
+    "parse_federal_register", "parse_whitehouse_feed", "fr_closure_dates", "fr_body_closure_dates", "fetch", "refresh",
+    "closure_votes")}
+# `import xml.etree.ElementTree as ET` in k3_calendar.py (the White House feed reader) renames a standard-library module,
+# not a function or class of the package, so it hides no public callable.
+_ALLOWED_IMPORT_ALIASES = {("k3_calendar.py", "ET")}
 # The K-4 venue feed's public names, all plain `def` and `class` statements. `normalize_text` and the three `parse_*`
 # functions work on a response body (the parsers build fact dicts to hand to `add_fact`); `fetch` returns the same built
 # dicts; `refresh` returns counts; `register_all` returns nothing; `pending_rule_diffs` returns small summary dicts and
@@ -1860,6 +1884,7 @@ _MAY_MENTION_FACTS = {
     ("store.py", "facts_as_of", "other"), ("store.py", "_latest_fact_for_key", "other"),
     ("store.py", "_SCHEMA", "other"), ("store.py", "insert", "insert"),
     ("store.py", "_verify_schema", "other"),     # only min/max of the id, checked below
+    ("store.py", "audit_roles", "other"),        # only the id and the source id, checked below
 }
 _PKG = Path(store.__file__).parent
 _MENTION = re.compile(r"knowledge_facts", re.IGNORECASE)     # catches "x", [x], `x`, main.x, main."x" alike
@@ -1972,7 +1997,8 @@ def _alias_bindings(files):
                     for a in st.names:
                         if a.name == "*":
                             found.add((rel, "from-import-star"))
-                        elif a.asname and a.asname != a.name and public(a.asname) and (rel, a.asname) not in _ALLOWED_PUBLIC:
+                        elif a.asname and a.asname != a.name and public(a.asname) and (rel, a.asname) not in _ALLOWED_PUBLIC \
+                            and (rel, a.asname) not in _ALLOWED_IMPORT_ALIASES:
                             found.add((rel, a.asname))
                 elif isinstance(st, (ast.For, ast.AsyncFor)):
                     if isinstance(st.iter, (ast.Tuple, ast.List, ast.Set)) and any(hides(e) for e in st.iter.elts):
@@ -2135,11 +2161,16 @@ def test_only_facts_as_of_returns_fact_rows():
     verify = inspect.getsource(store._verify_schema)
     assert re.findall(r"(?i)select[^\n]*knowledge_facts", verify) == [
         'SELECT min(fact_version_id), max(fact_version_id) FROM knowledge_facts']
+    # (1c) the role audit reads nothing but each fact's id and source id
+    audit = inspect.getsource(store.audit_roles)
+    assert re.findall(r'"SELECT fact_version_id, source_id FROM knowledge_facts ORDER BY fact_version_id"', audit)
+    assert "payload_json" not in audit and "*" not in audit.replace("**", "")
     # (2) the private helper never selects the payload or the other columns
     helper = inspect.getsource(store._latest_fact_for_key)
     assert "SELECT fact_version_id, raw_sha256 FROM knowledge_facts" in helper and "*" not in helper
     # (3) no public function other than facts_as_of is annotated as returning rows
-    for name in {n for f, n in _ALLOWED_PUBLIC if f == "store.py"} - {"facts_as_of", "StoreError"}:
+    assert str(inspect.signature(store.audit_roles).return_annotation) == "list[str]"   # text entries, never rows
+    for name in {n for f, n in _ALLOWED_PUBLIC if f == "store.py"} - {"facts_as_of", "StoreError", "audit_roles"}:
         ret = str(inspect.signature(getattr(store, name)).return_annotation)
         assert "dict" not in ret and "Row" not in ret and "list" not in ret, name
     assert "list[dict]" in str(inspect.signature(store.facts_as_of).return_annotation)

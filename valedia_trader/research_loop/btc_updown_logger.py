@@ -10,7 +10,8 @@ arrive through three caller-supplied reader callables (a later, separate adapter
 function that reads or writes first checks the date constant `ENABLED_FROM` against an injected, timezone-aware
 clock and refuses before that instant, whatever its other arguments.
 
-Its store is `<folder>/btc_updown_log.jsonl` under a folder the caller names: there is no default folder.
+Its store is `<folder>/btc_updown_log.jsonl` under a folder the caller names: there is no default folder, and the
+folder must be an absolute path outside the repository.
 Standard library only; nothing from the rest of the package is imported.
 """
 from __future__ import annotations
@@ -30,6 +31,7 @@ from typing import Any
 ENABLED_FROM = datetime(2026, 12, 4, 8, 0, 0, tzinfo=timezone.utc)
 SCHEMA_VERSION = 1
 LOG_NAME = "btc_updown_log.jsonl"
+_REPO_ROOT = Path(__file__).resolve().parents[2]   # the folder that holds the `valedia_trader` package
 T_STAR_OFFSET_S = 300.0     # t* = the window's open + 5 minutes
 TAPE_SPAN_S = 60.0          # the tape is read over [t*, t* + 60 s]
 MIN_RESPONDING = 3          # fewer responding exchanges than this is SKIP_FEED
@@ -106,7 +108,7 @@ def _now(clock: Callable[[], datetime]) -> datetime:
 def _gate(clock: Callable[[], datetime]) -> datetime:
     """ONE clock reading, checked against ENABLED_FROM and returned, so a caller uses the reading it gated on."""
     now = _now(clock)
-    if now < ENABLED_FROM:
+    if now.timestamp() < ENABLED_FROM.timestamp():     # epoch seconds: a datetime subclass cannot vote on its own date
         raise NotYetEnabled(f"disabled until {ENABLED_FROM.isoformat()}")
     return now
 
@@ -213,9 +215,24 @@ def _check_subset(frozen_subset: Any) -> tuple:
 
 
 def _check_folder(folder: Any) -> None:
-    """The store folder must be named: an empty path is the current directory, which could be the repository."""
-    if not isinstance(folder, (str, os.PathLike)) or str(folder) in ("", "."):
-        raise ValueError("folder must name a directory (not empty, not the current directory)")
+    """The store folder must be an absolute path outside the repository (the folder that holds this package).
+
+    A relative path of any spelling is refused: it means "wherever the process happens to be", which could be the
+    repository. Paths are resolved first, so a `..` or a symbolic link cannot get around the check; an existing
+    ancestor that is the very same directory as the repository root is refused too (letter case, hard aliases).
+    """
+    if not isinstance(folder, (str, os.PathLike)):
+        raise ValueError("folder must name a directory")
+    raw = os.fspath(folder)
+    if not isinstance(raw, str) or not raw or not os.path.isabs(raw):
+        raise ValueError("folder must be an absolute path (not empty, not relative)")
+    resolved = Path(os.path.realpath(raw))
+    root = Path(os.path.realpath(_REPO_ROOT))
+    if resolved == root or root in resolved.parents:
+        raise ValueError("folder must be outside the repository")
+    for candidate in (resolved, *resolved.parents):
+        if candidate.exists() and os.path.samefile(candidate, root):
+            raise ValueError("folder must be outside the repository")
 
 
 def _check_window(window: Window) -> None:
@@ -349,6 +366,7 @@ def dry_run(folder, clock: Callable[[], datetime], fixtures: Sequence[Fixture], 
     """
     check_enabled(clock)
     _check_folder(folder)
+    _check_subset(frozen_subset)
     if (Path(folder) / LOG_NAME).exists():
         raise ValueError("dry_run needs a fresh folder")
     records = []

@@ -2128,6 +2128,8 @@ def test_yesterdays_start_with_its_own_end_gives_nothing(conn):
 
 def test_a_prior_day_start_is_closed_only_by_an_end_on_its_own_day_and_trigger(conn):
     yesterdays_hung_start(conn)
+    # T65 changed this end from a COMPLETED one to a lock-held NOOP: a COMPLETED end is a lock proof later than the start, and with the
+    # 7-day window gone an old start is named for as long as no lock proof exists, so only a non-proof end still leaves it blocking.
     run_end(conn, utc(2026, 11, 24, 14, 58), outcome="NOOP", root_cause="run:noop:lock-held")   # today's 0655 end does not close it
     rl.deadman_check(conn, BOOK, T_TUE_0725)
     assert [r["root_cause"] for r in fault_rows(conn, TUE)] == ["run:orphan-start-prior:20261123:0655"]
@@ -3252,3 +3254,157 @@ def test_the_same_summaries_with_a_fault_are_completed_with_one_fault_and_its_ca
         m = rl.map_run(summary("done", faults=["reconcile"], **extra), 0)
         assert (m.outcome, m.root_cause, m.fault_count) == ("COMPLETED", "run:faults:reconcile", 1)
         assert rl.map_run(summary("done", **extra), 0).fault_count == 0                  # the opposite: no faults is no fault
+
+
+# ------------------------------------------------------------------------------------------------ LOW-1: pins of what the code does today (tests only)
+#
+# Each of these pins the code as it is on this revision; none asks for a change. Where a pin looks odd, the comment says so.
+
+PROOF_START = utc(2026, 11, 23, 16, 30)                # Monday 11:30 New York: a run started after the 10:25 check and hung
+
+
+def seconds_after_start(conn, delta, proof_trigger="0710"):
+    """Monday: the 10:25 check saw nothing open; a 6:55 run started at PROOF_START and hung (it never had a P0). Then one COMPLETED
+    run end of ANOTHER trigger (the same trigger would pair with the start) is written `delta` seconds after the start's second."""
+    late_start_after_the_deadman(conn)
+    run_end(conn, PROOF_START + timedelta(seconds=delta), trigger=proof_trigger)
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    return prior_rows(conn, TUE)
+
+
+# pin 1: a lock proof in the same second as the start (`_prior_starts`: `proof_at > e["at_utc"]`, strictly later)
+
+def test_a_lock_proof_in_the_same_second_as_the_start_is_no_proof_equal_falls_on_the_blocking_side(conn):
+    assert seconds_after_start(conn, 0) == [("FAULT", PRIOR_0655)]                              # still blocking: named as a prior orphan
+
+
+def test_a_lock_proof_one_second_after_the_start_closes_it_with_the_unreported_p0(conn):
+    assert seconds_after_start(conn, 1) == [("FAULT", UNREPORTED_0655)]                         # the opposite of "equal"
+
+
+def test_a_lock_proof_one_second_before_the_start_is_no_proof_either(conn):
+    assert seconds_after_start(conn, -1) == [("FAULT", PRIOR_0655)]
+
+
+def test_a_same_second_proof_written_after_the_start_is_judged_on_the_stamp_not_on_event_order(conn):
+    # the proof has a later event_id than the start yet the same stamp: the stamps are equal, and equal is no proof
+    late_start_after_the_deadman(conn)
+    proof_id = run_end(conn, PROOF_START, trigger="0710")
+    start_row = [e for e in rl.events_for(conn, MON, BOOK) if e["kind"] == "RUN_START"][0]
+    assert proof_id > start_row["event_id"] and start_row["at_utc"] == "2026-11-23T16:30:00Z"
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert prior_rows(conn, TUE) == [("FAULT", PRIOR_0655)]
+
+
+# pin 2: several unpaired starts of one trigger on one earlier day (`_prior_starts`: `latest[e["trigger"]] = e`)
+
+def three_hung_starts(conn):
+    """Monday 6:55 (at 14:55, 15:00 and 15:05 UTC): the same trigger started three times and never ended."""
+    for minute in (55, 60, 65):
+        start(conn, utc(2026, 11, 23, 14, 0) + timedelta(minutes=minute))                           # 14:55, 15:00, 15:05
+    return utc(2026, 11, 23, 14, 55), utc(2026, 11, 23, 15, 0), utc(2026, 11, 23, 15, 5)
+
+
+def test_three_unpaired_starts_of_one_trigger_on_one_day_write_one_row_not_three(conn):
+    three_hung_starts(conn)
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert prior_rows(conn, TUE) == [("FAULT", PRIOR_0655)]                                    # one row for the (day, trigger)
+    assert len([e for e in rl.events_for(conn, TUE, BOOK) if e["kind"] == "DEADMAN"]) == 2      # that row and the day's own dead-man row
+
+
+def test_a_proof_between_the_first_and_the_last_start_does_not_close_the_case_the_latest_start_is_judged(conn):
+    first, middle, last = three_hung_starts(conn)
+    run_end(conn, middle + timedelta(minutes=2), trigger="0710")                                # 15:02: later than the 1st and 2nd, not the 3rd
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert prior_rows(conn, TUE) == [("FAULT", PRIOR_0655)]                                    # the earliest start would have been closed by it
+
+
+def test_a_proof_later_than_all_three_starts_closes_them_with_one_unreported_p0(conn):
+    first, middle, last = three_hung_starts(conn)
+    run_end(conn, last + timedelta(seconds=1), trigger="0710")
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert prior_rows(conn, TUE) == [("FAULT", UNREPORTED_0655)]                               # one row for three starts, no prior row
+    rl.deadman_check(conn, BOOK, T_WED_0725)
+    assert prior_rows(conn, WED) == []                                                         # and it is closed for good: nothing on Wednesday
+
+
+def test_a_proof_in_the_same_second_as_the_latest_of_three_starts_closes_nothing(conn):
+    first, middle, last = three_hung_starts(conn)
+    run_end(conn, last, trigger="0710")                                                        # equal to the latest start: no proof
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert prior_rows(conn, TUE) == [("FAULT", PRIOR_0655)]
+
+
+def test_the_triggers_of_one_day_are_judged_each_by_its_own_latest_start(conn):
+    start(conn, utc(2026, 11, 23, 14, 55), "0655")
+    start(conn, utc(2026, 11, 23, 15, 10), "0710")
+    start(conn, utc(2026, 11, 23, 15, 12), "0710")
+    run_end(conn, utc(2026, 11, 23, 15, 11), trigger="0630")                                   # later than 0655's start and 0710's first
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert prior_rows(conn, TUE) == [("FAULT", UNREPORTED_0655), ("FAULT", "run:orphan-start-prior:20261123:0710")]   # in start order
+
+
+# pin 3: `fil` larger than `ord` (`_collar_tokens`: fil counts `sent` entries; `_collar_miss`: a miss is fil/ord below the ratio)
+
+def crowded_summary(filled_symbols):
+    """orders_sent is 3 while `sent` lists five entries (S0 to S4); the symbols in `filled_symbols` have a nonzero fill."""
+    return summary("done", orders_sent=3, sent=[{"symbol": f"S{i}", "units": 1.0, "side": "buy"} for i in range(5)],
+                   filled_so_far={s: 1.0 for s in filled_symbols})
+
+
+def written_by_the_cli(tmp_path, capsys, filled_symbols, now):
+    cli(["record-run", "--trigger", "0655", "--exit-code", "0", "--revision-ok", "1"], tmp_path, now=now,
+        stdin=crowded_summary(filled_symbols), capsys=capsys)
+    return rl.connect(tmp_path / "cli.sqlite")
+
+
+def test_fil_larger_than_ord_is_written_as_it_is_ord_3_fil_5(tmp_path, capsys):
+    c = written_by_the_cli(tmp_path, capsys, [f"S{i}" for i in range(5)], T0655)
+    try:
+        assert [(e["outcome"], e["detail"]) for e in rl.events_for(c, MON, BOOK)] == [("COMPLETED", "ord=3 fil=5 done")]
+    finally:
+        c.close()
+    assert rl.map_run(crowded_summary([f"S{i}" for i in range(5)]), 0).detail == "ord=3 fil=5 done"
+
+
+def test_the_opposite_fil_follows_the_filled_entries_not_orders_sent(tmp_path, capsys):
+    c = written_by_the_cli(tmp_path, capsys, ["S0"], T0655)
+    try:
+        assert [e["detail"] for e in rl.events_for(c, MON, BOOK)] == ["ord=3 fil=1 done"]
+    finally:
+        c.close()
+    assert rl.map_run(crowded_summary(["S0", "S1", "S2", "S3"]), 0).detail == "ord=3 fil=4 done"
+
+
+def test_a_session_whose_fil_is_larger_than_ord_reads_as_no_miss_the_safe_side(tmp_path, capsys):
+    session_runs(rl.connect(tmp_path / "cli.sqlite"), *FRI20, [(3, 0)])                         # Friday: 0 of 3 filled: a miss
+    c = written_by_the_cli(tmp_path, capsys, [f"S{i}" for i in range(5)], T0655)                # Monday: ord=3 fil=5
+    try:
+        rl.deadman_check(c, BOOK, day_at(*MON23))
+        assert collar_rows(c) == []                                                             # 5/3 is not below one half: no row
+    finally:
+        c.close()
+
+
+def test_the_opposite_one_filled_of_three_is_a_miss_beside_the_same_missed_friday(tmp_path, capsys):
+    session_runs(rl.connect(tmp_path / "cli.sqlite"), *FRI20, [(3, 0)])                         # Friday: 0 of 3 filled: a miss
+    c = written_by_the_cli(tmp_path, capsys, ["S0"], T0655)                                     # Monday: ord=3 fil=1: 1/3 is below one half
+    try:
+        rl.deadman_check(c, BOOK, day_at(*MON23))
+        assert [r["detail"] for r in collar_rows(c, MON)] == [
+            "fewer than half the orders filled on 2026-11-20 (fil 0 of ord 3) and 2026-11-23 (fil 1 of ord 3); "
+            "the count is an estimate from the run summary"]
+    finally:
+        c.close()
+
+
+def test_a_days_fil_and_ord_are_summed_over_its_runs_so_a_fil_above_ord_lifts_the_whole_day(conn):
+    session_runs(conn, *FRI20, [(3, 0)])
+    session_runs(conn, *MON23, [(3, 5), (3, 0)])                                                # one session: ord 6, fil 5: 5/6, no miss
+    assert rl.deadman_check(conn, BOOK, day_at(*MON23)) and collar_rows(conn) == []
+
+
+def test_the_opposite_a_days_fil_one_of_ord_six_over_two_runs_is_a_miss(conn):
+    session_runs(conn, *FRI20, [(3, 0)])
+    session_runs(conn, *MON23, [(3, 0), (3, 1)])                                                # one session: ord 6, fil 1: 1/6
+    assert rl.deadman_check(conn, BOOK, day_at(*MON23)) and [r["trade_date"] for r in collar_rows(conn)] == [MON]
