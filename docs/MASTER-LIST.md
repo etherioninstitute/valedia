@@ -608,6 +608,11 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 36 (Carbon response 36, reply 36 sent 2026-11-23): Carbon's "an unfilled DAY order EXPIREs and trips reconcile
+  next day" REFUTED: _reconcile_and_cancel (order_step.py:5448) cancels Valedia's open orders before every run ends; an
+  unconfirmed cancel faults THAT run. 11-24 readings to take: 6:55 duration vs 10 min; fills vs cancels; max quote age
+  vs 120 s + spreads (DBC/LQD/IEF/EEM); Kalshi collector decision-end seconds 6:55-6:58 PST. T65 rule 1: P0 at the first
+  report of a start, then P1; explicit streak reset at any severity; one P1 that names the start.
   Round 35 (Carbon response 35, reply 35 sent 2026-11-23): Carbon's "7:00 wake gives a false P1" REFUTED: deadman_check
   returns [] before 10:25 NY (run_ledger.py:639); still made explicit: alerts-morning.sh deadman exits 0 before 7:25 PT
   (backup .bak-20261123-r35). T65 rule 3 changed: the unreported P0 resets TODAY (any P0 resets its day). held_lock
