@@ -8039,12 +8039,15 @@ def _t34_same_but(b, m, keys, where, skip=(), counts=None):
     T34b-3: what it adds (`_t34b3_undo`) is taken out of `m` first, counted in `counts`."""
     m = _t34b3_undo(b, m, counts)
     added = {}
-    for key in b:
+    keys = (*keys, "held_lock")                          # BR-E: every summary of this revision says whether the run held
+    for key in b:                                        # the lock; the earlier revisions' never do, and it is the last key
         if key in skip:
             continue
         if key == "summary":
             bs, ms = json.loads(b[key]), json.loads(m[key])
             added = {k: ms.pop(k) for k in keys if k in ms and k not in bs}
+            held = added.pop("held_lock", None)          # always there, a real bool (a crashed run has no summary at all)
+            assert type(held) is bool or "crashed" in ms, (where, key)
             assert json.dumps(ms, sort_keys=True, default=str) == b[key], (where, key)
         elif key == "journal":
             assert sorted(b[key]) == sorted(m[key]), (where, key)
@@ -8245,7 +8248,7 @@ def test_t34b2_live_runs_send_a_subset_of_the_bases_orders_and_the_same_without_
             if not r["stop"]:                                                           # and without a day stop, the same
                 assert r["mine"] == r["base"] and mine_lines == base_lines, where
                 assert r["status"][0] == r["status"][1] and r["status"][2] == r["status"][3], (where, r["status"])
-            assert set(r["added"]) <= set(T34B2_LIVE_KEYS) and "ceiling" in r["added"], (where, r["added"])
+            assert set(r["added"]) <= {*T34B2_LIVE_KEYS, "held_lock"} and "ceiling" in r["added"], (where, r["added"])   # BR-E: held_lock
             stats["runs"] += 1
             stats["stopped days"] += r["stop"]
             stats["fewer sent"] += r["mine"] != r["base"]
@@ -9061,7 +9064,7 @@ def test_t34b3_live_runs_against_the_base_subset_equal_and_the_same_cap_marks(tm
                     assert b.get("stage") == "reconcile" and m["orders_sent"] == b["orders_sent"] == 0, where
                 else:
                     assert r["status"][0] == r["status"][1] and r["status"][2] == r["status"][3], (where, r["status"])
-                assert set(r["added"]) <= {"notices", "cap_refs"}, (where, r["added"])
+                assert set(r["added"]) <= {"notices", "cap_refs", "held_lock"}, (where, r["added"])   # BR-E: held_lock, always there
             else:
                 stats["runs after a notice"] += 1
                 stats["runs sending more than the base after a notice"] += bool(r["mine"] - r["base"])
@@ -9855,3 +9858,104 @@ def test_t34b3_an_open_notice_is_not_listed_as_standing_in_the_way(tmp_path):
     out = _prun(w)
     assert out["stage"] == "reconcile" and "1 attention item open (" in out["reason"], out
     assert "attention items open" not in out["reason"] and tag not in out["reason"].split("attention item open")[1], out
+
+
+# ==== BR-E part 1: the summary says whether the run held the run lock (`held_lock`, always present, a real bool)
+#
+# False until the lock is taken (the lock-held stop included); True from then on. The journaled summary line carries
+# the same value. Stops before the lock are returned and printed only, so they have no journal line to compare.
+
+def _held(out):
+    assert type(out["held_lock"]) is bool, out
+    return out["held_lock"]
+
+
+def test_br_e_a_run_that_took_the_lock_says_held_lock_true_returned_and_journaled(world):
+    world.paper = paper({"a": {"SPY": 10.0}})
+    out = world.run()
+    assert out["status"] == "done" and _held(out) is True
+    assert world.entries("summary")[-1]["held_lock"] is True
+
+
+def test_br_e_a_stop_after_the_lock_outside_the_session_says_held_lock_true_and_journals_it(world):
+    world.paper = paper({"a": {"SPY": 10.0}})
+    world.clock.t = ny("2026-11-14 11:00")
+    out = world.run()
+    assert out["stage"] == "session" and "another order step" not in out["reason"] and _held(out) is True
+    assert world.entries("summary")[-1]["held_lock"] is True
+
+
+def test_br_e_a_fault_after_the_lock_says_held_lock_true_returned_and_journaled(world):
+    world.paper = paper({"a": {"SPY": 2.0}})
+    world.venue.submit_mode = ["raise"]
+    world.run()
+    (lost,) = world.venue.submits()
+    world.later(30)
+    world.paper = paper({})
+    world.run()
+    world.venue.book[lost] = {"symbol": "SPY", "units": 2.0, "limit": 505.0, "filled": 0.0, "state": "open"}
+    world.later(30)
+    out = world.run()
+    assert out["stage"] == "reconcile" and out["faults"] == ["attention:turned_up"] and _held(out) is True
+    assert world.entries("summary")[-1]["held_lock"] is True
+
+
+def test_br_e_the_lock_held_stop_says_held_lock_false_and_the_run_after_it_says_true(world):
+    world.paper = paper({"a": {"SPY": 1.0}})
+    holder = osx._RunLock(str(world.state_path))
+    assert holder.acquire()
+    try:
+        out = world.run()
+        assert out["stage"] == "session" and "another order step" in out["reason"] and _held(out) is False
+    finally:
+        holder.release()
+    assert world.entries("summary") == []                      # a run without the lock journals nothing
+    out = world.run()
+    assert out["status"] == "done" and _held(out) is True
+
+
+@pytest.mark.parametrize("env", ["production", None])
+def test_br_e_a_stop_at_the_environment_before_the_lock_says_held_lock_false(world, env):
+    world.paper = paper({"a": {"SPY": 10.0}})
+    world.venue.environment = env
+    out = world.run()
+    assert out["stage"] == "environment" and _held(out) is False
+    world.venue.environment = osx.TEST_ENVIRONMENT
+    assert _held(world.run()) is True                          # the opposite: the same world, a good environment
+
+
+def test_br_e_a_stop_at_targets_after_the_lock_on_a_stale_paper_book_says_held_lock_true(world):
+    world.clock.t = ny("2026-11-13 10:00")
+    world.paper = paper({"a": {"SPY": 1.0}}, day="2026-11-16")      # a book from the future: read under the lock
+    out = world.run()
+    assert out["stage"] == "targets" and world.venue.calls == [] and _held(out) is True
+    assert world.entries("summary")[-1]["held_lock"] is True
+
+
+def test_br_e_a_shared_run_given_a_capital_stops_at_targets_before_the_lock_with_held_lock_false(world):
+    world.paper = paper({"a": {"SPY": 1.0}})
+    out = world.run(shared=True, capital=1000.0)
+    assert out["stage"] == "targets" and "--capital is refused" in out["reason"] and _held(out) is False
+    assert world.entries("summary") == []
+
+
+def test_br_e_a_stop_at_ticket_before_the_lock_says_held_lock_false(tw):
+    tw.paper = paper({"a": {"SPY": 1.0}})
+    out = tw.run(propose=True, approve="123456")
+    assert out["stage"] == "ticket" and "cannot be asked for in one run" in out["reason"] and _held(out) is False
+    assert tw.entries("summary") == []
+
+
+@pytest.mark.parametrize("kw", [{}, {"propose": True}])
+def test_br_e_a_live_stop_before_the_lock_says_held_lock_false(tmp_path, kw):
+    w = live_world(tmp_path / "w")
+    w.ledger().close()
+    out = lrun(w, **kw)
+    assert out["stage"] == "live" and _held(out) is False
+
+
+def test_br_e_a_practice_propose_and_a_second_run_say_held_lock_true(tw):
+    tw.paper = paper({"a": {"SPY": 10.0}})
+    out = propose(tw)
+    assert out["status"] == "done" and _held(out) is True
+    assert tw.entries("summary")[-1]["held_lock"] is True
