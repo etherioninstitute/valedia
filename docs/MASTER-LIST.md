@@ -632,6 +632,14 @@ Queued (roadmap):
   budget. Sources checked: arXiv 2606.31675 and botforkalshi confirmed; $4.45 composite error and 1-in-8 near-target
   figures UNSOURCED (measured on train). Direct Kalshi account = OWNER decision. Two owner tax questions before order
   #1: hold DBC (K-1) over Dec 31; any loss sales of the 15 funds in the last 30 days (shared account).
+  REVISED same night (owner idea): one big run, a Fable 5.2-led Claude Code session with Ultracode, after the
+  usage reset on Tue 11-24; Carbon asked to design it (phases, lanes, merge vs branch, checks, seats, stops,
+  success in tracker items). Facts given: only the Nasdaq terms check is ready; T65 is ready after the 11-24
+  check; other items have no ticket. __init__.py (version 0.75.0) is PINNED, so the version-up = a local annotated
+  tag (the hook pushes main only) + Tuesday's 3:40 AM nightly backup checked + a small extra copy of the deploy pin
+  files and the run ledger; 0.76.0 goes with the re-pin. Pinned work stays on branches until the clean week ends.
+  Collector rails, the public mirror, worktrees off the SSD (16.6 MB tree), VAL-19 hold. Lead lean: Fable
+  plans/judges, Sonnet builds, Opus blind checks per order-path slice.
   Round 49 (Carbon response 49, file named Valedia_Carbon_Response48.md; reply 49 sent 2026-11-23): tracker
   unchanged (5/19, 26.3%). Carbon advised parking the BTC desk at Step 0; OWNER OVERRODE 2026-11-23 (use the guide's
   methods for BTC Up/Down; no real event order until a rule passes). Adopted: forward shadow log ONLY (SEAL_EPOCH_1
