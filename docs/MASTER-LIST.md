@@ -608,6 +608,14 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 47 (Carbon response 47, file named Valedia_Carbon_Response46.md; reply 47 sent 2026-11-23): tracker
+  unchanged (5/19, 26.3%). Adopted: order_step.py never writes the run ledger; Gate #7's attended evidence = ticket
+  file + journal + order ledger. Checked: run_ledger.py is NOT in the 54-file pin list (T65/p2 land outside the pin);
+  test_run_ledger.py = 209 tests (Carbon said 409+); a hung hand-run is caught by the 7:25 PT dead-man P1 (NOOP is not
+  terminal), not by the NOOP. Tier 1 stays live on the Gate #7 morning, only Tier 2's baseline set aside. Counter pin
+  adopted: item 9's tightened gate counts order shapes + faults from the journal/order ledger; lock 2's paper_record
+  (go_live.py:148) already reads the journal only. Asked: T65's blind check on a throwaway ledger only, or one real
+  scheduled morning first.
   Round 46 (Carbon response 46, file named Valedia_Carbon_Response45.md; reply 46 sent 2026-11-23): tracker
   unchanged (5/19, 26.3%). Gate #7 attended pair = SHAPE (a): plain `order-step --shared --propose` then a second
   propose + `--approve`, 6:35-6:55 PT on a rebalance morning, NEVER through the wrapper (ledger-lib labels 6:25-6:50
