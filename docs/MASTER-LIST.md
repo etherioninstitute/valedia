@@ -608,6 +608,11 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 37 (Carbon response 37, reply 37 sent 2026-11-23; Carbon moved to a NEW conversation, so reply 37 restates the
+  state in full): a partial fill then cancel books the fill (test_orders.py:709, :1279; webull.py:2357), and Finnhub
+  early closes don't vote (k3_calendar.py:340): both already true. Adopted: a clean half day = +1; a clean zero-fill day
+  = +1 (fill booking proven on the go-live list). QUEUED: a non-resetting P2 when >= 3 orders and 0 fills on 2
+  consecutive sessions (collar vs spread).
   Round 36 (Carbon response 36, reply 36 sent 2026-11-23): Carbon's "an unfilled DAY order EXPIREs and trips reconcile
   next day" REFUTED: _reconcile_and_cancel (order_step.py:5448) cancels Valedia's open orders before every run ends; an
   unconfirmed cancel faults THAT run. 11-24 readings to take: 6:55 duration vs 10 min; fills vs cancels; max quote age
