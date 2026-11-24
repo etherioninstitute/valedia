@@ -839,3 +839,175 @@ def test_odd_quote_object_is_logged_not_lost(tmp_path, odd):
     # opposite: a well-formed quote for the same exchange counts
     rec2, _, _ = run(tmp_path, window(1), quotes=four_quotes())
     assert rec2["n_responding"] == 4
+
+
+# ---------------------------------------------------------------- LOW-2: three guard gaps
+
+class _Liar(datetime):
+    """A datetime whose comparison methods lie. `lie_early` True: it claims to be earlier than anything; False: later."""
+    lie_early = False
+
+    def __lt__(self, other):
+        return self.lie_early
+
+    def __le__(self, other):
+        return self.lie_early
+
+    def __gt__(self, other):
+        return not self.lie_early
+
+    def __ge__(self, other):
+        return not self.lie_early
+
+
+def _liar(ts: float, *, lie_early: bool) -> datetime:
+    cls = type("Liar", (_Liar,), {"lie_early": lie_early})
+    return cls.fromtimestamp(ts, tz=timezone.utc)
+
+
+@pytest.fixture
+def writes(monkeypatch):
+    """Record every call to the module's writer and perform none, so a refused-folder test can never write."""
+    seen = []
+    monkeypatch.setattr(L, "_append", lambda folder, record: seen.append(Path(folder)))
+    return seen
+
+
+def test_liar_clock_before_the_instant_is_refused_by_all_three(tmp_path):
+    early = _liar(EF.timestamp() - 1.0, lie_early=False)        # really before, claims to be after
+    assert isinstance(early, datetime) and early.timestamp() < EF.timestamp()
+    w = window(0)
+    q, b, t = Spy(four_quotes()), Spy(BOOK), Spy([])
+    with pytest.raises(NotYetEnabled):
+        log_window(tmp_path / "w", w, clock=lambda: early, read_quotes=q, read_book=b, frozen_subset=SUBSET)
+    with pytest.raises(NotYetEnabled):
+        log_tape(tmp_path / "t", w, posted=True, read_tape=t, clock=lambda: early, budget=TapeBudget(3))
+    with pytest.raises(NotYetEnabled):
+        dry_run(tmp_path / "d", lambda: early, [Fixture(w, four_quotes(), BOOK)], SUBSET)
+    with pytest.raises(NotYetEnabled):
+        check_enabled(lambda: early)
+    assert q.calls == [] and b.calls == [] and t.calls == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_liar_clock_at_the_instant_is_allowed_by_all_three(tmp_path):
+    at_instant = _liar(EF.timestamp(), lie_early=True)           # really at the instant, claims to be before
+    w = window(0)
+    q, b, t = Spy(four_quotes()), Spy(BOOK), Spy([])
+    rec = log_window(tmp_path / "w", w, clock=lambda: at_instant, read_quotes=q, read_book=b, frozen_subset=SUBSET)
+    assert rec["status"] == "OK" and len(q.calls) == 1 and len(b.calls) == 1
+    assert log_tape(tmp_path / "t", w, posted=True, read_tape=t, clock=lambda: at_instant,
+                    budget=TapeBudget(3)) is not None and len(t.calls) == 1
+    assert len(dry_run(tmp_path / "d", lambda: at_instant, [Fixture(w, four_quotes(), BOOK)], SUBSET)) == 1
+    assert check_enabled(lambda: at_instant) is None
+
+
+def test_dry_run_before_the_instant_refuses_even_with_no_fixtures(tmp_path):
+    early = lambda: EF - ONE_S
+    with pytest.raises(NotYetEnabled):
+        dry_run(tmp_path / "a", early, [], SUBSET)
+    with pytest.raises(NotYetEnabled):
+        dry_run(tmp_path / "b", early, [], ())              # the gate answers before the subset check
+    assert list(tmp_path.iterdir()) == []
+    # opposite: at the instant, valid arguments and no fixtures give no records
+    assert dry_run(tmp_path / "c", lambda: EF, [], SUBSET) == []
+
+
+@pytest.mark.parametrize("bad", [(), [], ("exa", "exa"), ("exa", ""), "exa", None])
+def test_dry_run_refuses_a_bad_subset_even_with_no_fixtures(tmp_path, bad):
+    with pytest.raises(ValueError) as dry_err:
+        dry_run(tmp_path / "a", lambda: EF, [], bad)
+    # the same error type log_window gives for the same subset
+    with pytest.raises(ValueError) as win_err:
+        log_window(tmp_path / "b", window(0), clock=lambda: EF, read_quotes=Spy([]), read_book=Spy(None),
+                   frozen_subset=bad)
+    assert type(dry_err.value) is type(win_err.value)
+    assert not (tmp_path / "a").exists() and not (tmp_path / "b").exists()
+
+
+@pytest.mark.parametrize("bad", ["", ".", "./", ".//", "logs", "../x", Path(""), Path("."), Path("logs"),
+                                 Path("../x"), "~", "a/../b"])
+def test_relative_folder_is_refused_in_any_spelling(tmp_path, monkeypatch, writes, bad):
+    monkeypatch.chdir(tmp_path)
+    w = window(0)
+    q, b, t = Spy(four_quotes()), Spy(BOOK), Spy([])
+    with pytest.raises(ValueError):
+        log_window(bad, w, clock=lambda: at(w.open_ts + 300.0), read_quotes=q, read_book=b, frozen_subset=SUBSET)
+    with pytest.raises(ValueError):
+        log_tape(bad, w, posted=True, read_tape=t, clock=lambda: at(w.open_ts + 400.0), budget=TapeBudget(2))
+    with pytest.raises(ValueError):
+        dry_run(bad, lambda: EF, [Fixture(w, four_quotes(), BOOK)], SUBSET)
+    assert q.calls == [] and b.calls == [] and t.calls == [] and writes == []
+
+
+def _refused_everywhere(folder, writes):
+    w = window(0)
+    q, b, t = Spy(four_quotes()), Spy(BOOK), Spy([])
+    with pytest.raises(ValueError):
+        log_window(folder, w, clock=lambda: at(w.open_ts + 300.0), read_quotes=q, read_book=b, frozen_subset=SUBSET)
+    with pytest.raises(ValueError):
+        log_tape(folder, w, posted=True, read_tape=t, clock=lambda: at(w.open_ts + 400.0), budget=TapeBudget(2))
+    with pytest.raises(ValueError):
+        dry_run(folder, lambda: EF, [Fixture(w, four_quotes(), BOOK)], SUBSET)
+    assert q.calls == [] and b.calls == [] and t.calls == [] and writes == []
+
+
+def test_the_repository_root_is_refused(writes):
+    assert (REPO / "valedia_trader").is_dir()
+    _refused_everywhere(REPO, writes)
+    _refused_everywhere(str(REPO), writes)
+
+
+def test_a_path_inside_the_repository_is_refused(writes):
+    _refused_everywhere(REPO / "valedia_trader", writes)
+    _refused_everywhere(REPO / "no-such-folder-low2" / "deeper", writes)
+    _refused_everywhere(str(REPO / "docs" / "research"), writes)
+
+
+def test_dot_dot_back_into_the_repository_is_refused(writes):
+    _refused_everywhere(os.path.join(str(REPO.parent), "elsewhere", "..", REPO.name), writes)
+    _refused_everywhere(os.path.join(str(REPO), "docs", "..", "valedia_trader", "x"), writes)
+
+
+def test_a_symbolic_link_into_the_repository_is_refused(tmp_path, writes):
+    link = tmp_path / "link"
+    link.symlink_to(REPO / "docs", target_is_directory=True)
+    _refused_everywhere(link, writes)
+    _refused_everywhere(link / "store", writes)
+    root_link = tmp_path / "rootlink"
+    root_link.symlink_to(REPO, target_is_directory=True)
+    _refused_everywhere(root_link, writes)
+
+
+def test_a_different_letter_case_of_the_repository_is_refused(writes):
+    twisted = str(REPO).swapcase()
+    if twisted == str(REPO) or not os.path.exists(twisted):
+        pytest.skip("this file system tells letter cases apart: the twisted path is a different place")
+    _refused_everywhere(twisted, writes)
+
+
+def test_an_absolute_folder_outside_the_repository_is_accepted(tmp_path):
+    assert REPO not in tmp_path.resolve().parents and tmp_path.resolve() != REPO
+    w = window(0)
+    q, b, t = Spy(four_quotes()), Spy(BOOK), Spy([])
+    log_window(tmp_path / "w", w, clock=lambda: at(w.open_ts + 300.0), read_quotes=q, read_book=b, frozen_subset=SUBSET)
+    assert log_tape(tmp_path / "t", w, posted=True, read_tape=t, clock=lambda: at(w.open_ts + 400.0),
+                    budget=TapeBudget(2)) is not None
+    assert len(dry_run(tmp_path / "d", lambda: EF, [Fixture(w, four_quotes(), BOOK)], SUBSET)) == 1
+    assert len(lines(tmp_path / "w")) == 1 and len(lines(tmp_path / "t")) == 1 and len(lines(tmp_path / "d")) == 1
+    # a link that points OUT of the repository is just another outside folder
+    out_link = tmp_path / "outlink"
+    out_link.symlink_to(tmp_path / "w", target_is_directory=True)
+    log_window(out_link, window(1), clock=lambda: at(window(1).open_ts + 300.0), read_quotes=q, read_book=b,
+               frozen_subset=SUBSET)
+    assert len(lines(tmp_path / "w")) == 2
+
+
+def test_the_date_gate_still_answers_before_the_folder_check():
+    w = window(0)
+    with pytest.raises(NotYetEnabled):
+        log_window("logs", w, clock=lambda: EF - ONE_S, read_quotes=Spy([]), read_book=Spy(None), frozen_subset=SUBSET)
+    with pytest.raises(NotYetEnabled):
+        log_tape(REPO, w, posted=True, read_tape=Spy([]), clock=lambda: EF - ONE_S, budget=TapeBudget(1))
+    with pytest.raises(NotYetEnabled):
+        dry_run("", lambda: EF - ONE_S, [], SUBSET)
