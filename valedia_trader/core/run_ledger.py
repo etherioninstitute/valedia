@@ -640,17 +640,21 @@ def _has_terminal_row(conn, trade_date: str, book: str) -> bool:
         (trade_date, book)).fetchone() is not None
 
 
-def _pair_runs(day_events: Sequence[dict]) -> tuple[list[dict], dict[int, dict]]:
+def _pair_runs(day_events: Sequence[dict], conservative: bool = False) -> tuple[list[dict], dict[int, dict]]:
     """One day's run rows paired: (the RUN_START rows that never got their own RUN_END, in event order; each paired RUN_END's
     event id mapped to its own RUN_START row). Starts and ends pair per trigger in event order: each RUN_END closes the latest
-    still-open start of its trigger before it (a NOOP end counts). A RUN_END with no open start of its trigger is in neither."""
+    still-open start of its trigger before it (a NOOP end counts). A RUN_END with no open start of its trigger is in neither.
+    A RUN_END carries no run id (the wrapper writes the trigger only), so when two starts of one trigger are open an end cannot
+    say which of them it ends. `conservative` pairs such an AMBIGUOUS end with the EARLIEST open start instead: the end then
+    proves no more than the earliest start could (see `_prior_starts`: a proof is judged by the start of the run it ends), and the
+    later start, the one a hung run is likelier to be, stays open and is the one judged. Unambiguous ends pair the same way."""
     open_starts: dict[str, list[dict]] = {}
     ended: dict[int, dict] = {}
     for e in sorted(day_events, key=lambda x: x["event_id"]):
         if e["kind"] == "RUN_START":
             open_starts.setdefault(e["trigger"], []).append(e)
         elif e["kind"] == "RUN_END" and open_starts.get(e["trigger"]):
-            ended[e["event_id"]] = open_starts[e["trigger"]].pop()
+            ended[e["event_id"]] = open_starts[e["trigger"]].pop(0 if conservative else -1)
     return sorted((e for starts in open_starts.values() for e in starts), key=lambda x: x["event_id"]), ended
 
 
@@ -703,10 +707,11 @@ def _prior_starts(conn, book: str, day: str, now: datetime) -> list[int]:
     # A lock proof for a start is the RUN_END of a run that STARTED after it: the proof's own RUN_START (paired as everywhere
     # here) has a later `at_utc` than the start (stamps sort as text; the same second is not later). A run that began earlier and
     # ended later may have taken the lock before the start and says nothing about it; a RUN_END with no start of its own proves
-    # nothing (the safe side: the start keeps blocking).
+    # nothing (the safe side: the start keeps blocking). Pairing is the conservative one (`_pair_runs`): an end that could belong
+    # to either of two open starts of one trigger counts as the run of the earlier, so a hung second start is never its own proof.
     proof_start = ""
     for day_rows in by_day.values():
-        ended = _pair_runs(day_rows)[1]
+        ended = _pair_runs(day_rows, True)[1]
         proof_start = max([proof_start, *(ended[e["event_id"]]["at_utc"] for e in day_rows
                                           if e["event_id"] in ended and _is_lock_proof(e))])
     faults = [e for e in rows if e["kind"] == "DEADMAN" and e["outcome"] == "FAULT" and e.get("root_cause")]
@@ -720,7 +725,7 @@ def _prior_starts(conn, book: str, day: str, now: datetime) -> list[int]:
     written: list[int] = []
     for prior_day in sorted(d for d in by_day if d < day):
         latest: dict[str, dict] = {}
-        for e in _unpaired_starts(by_day[prior_day]):
+        for e in _pair_runs(by_day[prior_day], True)[0]:
             latest[e["trigger"]] = e                                             # the latest unpaired start of the trigger: the safe side
         for trigger, e in latest.items():
             tag = f"{prior_day.replace('-', '')}:{trigger.lower()}"
@@ -796,8 +801,8 @@ def default_orders_ledger() -> Path:
 
 
 def _collar_miss(conn, book: str, day: str, now: datetime, orders_ledger=None) -> list[int]:
-    """The P2 `p2:collar-miss` (read the master list, rounds 37 to 40): written by the 7:25 job on today's trade date when today
-    and the session before it, among the book's COUNTED sessions, both ended with fewer than half their orders filled.
+    """The P2 `p2:collar-miss` (read the master list, rounds 37 to 40): written by the 7:25 job when the two latest COUNTED
+    sessions that can be judged at the check both ended with fewer than half their orders filled.
 
     A session is one trade date; its totals are the sums of `ord` and `fil` over that day's COMPLETED RUN_END rows that carry
     the tokens `ord=N fil=M` first in `detail` (written by `map_run`: the order count and an estimate of the filled count made
@@ -805,28 +810,36 @@ def _collar_miss(conn, book: str, day: str, now: datetime, orders_ledger=None) -
     at the check: its `fil` is the number of that run's orders (the order ledger's tags that start with the batch id and a dash)
     that hold a fill in the order LEDGER now (`orders_ledger`, default `default_orders_ledger()`, opened read only), so a fill that
     a following run journaled after this run printed its summary counts; it is at most the row's `ord`. A row without the batch
-    token (an older revision), or whose ledger cannot be read or holds no order of that batch, keeps its printed `fil`: the
-    detail of the row written then says `estimate`. One more rule keeps an ordinary day quiet: a recounted run that is the LAST
-    completed run of the book has no following run yet to journal its fills (the order step journals fills at the start of its
-    next run), so its orders are left out of the session's totals, both `ord` and `fil`, until a later run completes. At the
-    7:25 check that is the day's 7:10 run; the next day's check counts it. A session is COUNTED when its ord is at least
-    COLLAR_MIN_ORDERS (0 to 2 orders pause it); a counted session is a MISS when fil/ord is below COLLAR_FILL_RATIO. Days with no
-    COMPLETED run and rows without tokens (an older revision, a FAULT, a SKIP) neither count nor break the pair. The pair is the
-    two latest counted sessions up to today; they need not be neighbours. One query reads the rows and one read-only connection
-    the ledger, whatever their number.
-    Known limits: an order the venue filled but no run has journaled yet reads as unfilled (that is the leave-out above, for the
-    last run only); a partly filled order counts as filled; a store whose rows carry no batch token, or an order ledger that is not
-    where `default_orders_ledger` says and was not given, falls back to the printed estimate, whose own limits are in
-    `_collar_tokens`; the leave-out delays a miss that only the day's last run shows by one day.
-    The row is DEADMAN/WARN, cause p2:collar-miss, fault_count 0, once for each session day while the pair holds: `_judge` and
-    `streak` never read it, so it neither resets nor pauses the clean streak and cannot make a clean day unclean, and
-    nothing is ever removed or rewritten. A store with no tokens, or with one counted session, writes nothing."""
+    token (an older revision), or whose ledger cannot be read or holds no order of that batch, keeps its printed `fil`.
+    The sessions that can be judged are every session before today and today MINUS its left-out run: a recounted run that is the
+    LAST completed run of the book has no following run yet to journal its fills (the order step journals fills at the start of
+    its next run), so its orders are left out of the totals, both `ord` and `fil`, until a later run completes. At the 7:25 check
+    that is the day's last completed run (the 7:10 run, or the 6:55 run when the 7:10 run did not complete). Today need not be
+    one of the pair: a day whose only completed run is left out is judged by the next check, where it is a full session. A
+    session is COUNTED when its ord is at least COLLAR_MIN_ORDERS (0 to 2 orders pause it); a counted session is a MISS when
+    fil/ord is below COLLAR_FILL_RATIO. Days with no COMPLETED run and rows without tokens (an older revision, a FAULT, a SKIP)
+    neither count nor break the pair. The pair is the two latest judged counted sessions; they need not be neighbours. One
+    query reads the rows and one read-only connection the ledger, whatever their number.
+    The detail says `estimate` only when one of the two sessions of the pair used a printed `fil` (an old row, an unreadable
+    ledger or an unknown batch); a row of no orders never does.
+    Once a miss is reported it is not reported again for the same latest session: the row is written at most once for each
+    check day AND at most once for each judged latest session (an earlier row whose detail says `and <that day> (fil`), so a miss
+    that goes on gives one row at each check that brings a new latest session, and a store that held a missed pair before this
+    rule is not written twice. A miss therefore shows no later than the check one session day after the second missed session.
+    Known limits: an order the venue filled but no run has journaled yet reads as unfilled for the left-out run only; a partly
+    filled order counts as filled; a store whose rows carry no batch token, or an order ledger that is not where
+    `default_orders_ledger` says and was not given, falls back to the printed estimate, whose own limits are in `_collar_tokens`;
+    when no run completes for days, the last completed run stays left out (nothing has journaled its fills), and the faulting
+    runs are the owner's alert then.
+    The row is DEADMAN/WARN, cause p2:collar-miss, fault_count 0: `_judge` and `streak` never read it, so it neither resets nor
+    pauses the clean streak and cannot make a clean day unclean, and nothing is ever removed or rewritten. A store with no
+    tokens, or with one counted session, writes nothing."""
     rows = [dict(r) for r in conn.execute(
         "SELECT event_id, trade_date, detail FROM run_events WHERE book = ? AND trade_date <= ? AND kind = 'RUN_END' "
         "AND outcome = 'COMPLETED' ORDER BY event_id", (book, day))]
     last_done = rows[-1]["event_id"] if rows else 0
     totals: dict[str, list[int]] = {}
-    estimated = False
+    estimate_days: set[str] = set()                                              # the days with a row that used its printed `fil`
     with _orders_reader(default_orders_ledger() if orders_ledger is None else orders_ledger) as filled:
         for r in rows:
             detail = r["detail"] or ""
@@ -841,12 +854,12 @@ def _collar_miss(conn, book: str, day: str, now: datetime, orders_ledger=None) -
                     continue                                                     # its fills are not journaled until a later run
                 fil = min(seen, ord_)
             elif ord_ > 0:
-                estimated = True                                                 # a row of no orders adds nothing to be unsure of
+                estimate_days.add(r["trade_date"])                               # a row of no orders adds nothing to be unsure of
             t = totals.setdefault(r["trade_date"], [0, 0])
             t[0] += ord_
             t[1] += fil
     counted = [(d, o, f) for d, (o, f) in sorted(totals.items()) if o >= COLLAR_MIN_ORDERS]
-    if len(counted) < 2 or counted[-1][0] != day:
+    if len(counted) < 2:
         return []
     pair = counted[-2:]
     if any(f / o >= COLLAR_FILL_RATIO for _, o, f in pair):
@@ -855,7 +868,11 @@ def _collar_miss(conn, book: str, day: str, now: datetime, orders_ledger=None) -
                     (day, book, COLLAR_CAUSE)).fetchone():
         return []
     (d1, o1, f1), (d2, o2, f2) = pair
-    how = "the count is an estimate from the run summary" if estimated else "counted from the order ledger at the check"
+    if conn.execute("SELECT 1 FROM run_events WHERE book = ? AND kind = 'DEADMAN' AND root_cause = ? AND detail LIKE ? LIMIT 1",
+                    (book, COLLAR_CAUSE, f"% and {d2} (fil %")).fetchone():
+        return []                                                                # this latest session's miss was already reported
+    how = ("the count is an estimate from the run summary" if {d1, d2} & estimate_days
+           else "counted from the order ledger at the check")
     return [_insert_event(conn, book=book, kind="DEADMAN", trigger="0725", outcome="WARN", now=now, trade_date=day, root_cause=COLLAR_CAUSE,
                           detail=f"fewer than half the orders filled on {d1} (fil {f1} of ord {o1}) and {d2} (fil {f2} of ord {o2}); {how}")]
 
@@ -885,8 +902,9 @@ def deadman_check(conn, book: str, now: datetime, orders_ledger=None) -> list[in
       all of it is found with ONE query of the book's run rows, whatever the number of starts;
     - the day's dead-man row: DEADMAN/MISSING when no run ended (a NOOP end is not a run end) and none was skipped at 6:55 or
       7:10, else DEADMAN/OK; once a day. A still-open row never stands in for it.
-    - the P2 `p2:collar-miss` (DEADMAN/WARN, see `_collar_miss`): two counted sessions in a row with fewer than half the orders
-      filled, today being the second; once for each session day; it is last in the result and no row of the streak reads it. The
+    - the P2 `p2:collar-miss` (DEADMAN/WARN, see `_collar_miss`): the two latest judged counted sessions with fewer than half the
+      orders filled (today's last completed run is left out); once for each check day and for each latest session; it is last in
+      the result and no row of the streak reads it. The
       filled counts are recounted from the order ledger (`orders_ledger`, read only, default `default_orders_ledger()`) for rows
       that carry a `batch=` token, so a fill journaled after a run printed its summary counts.
     The rows are separate, so all of them can be there on one day. Nothing is written before 10:25 or on a day that is not a

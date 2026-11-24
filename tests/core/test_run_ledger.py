@@ -2786,12 +2786,16 @@ def test_a_session_of_two_orders_or_fewer_pauses_and_neither_counts_nor_breaks_t
     assert len(collar_rows(conn, "2026-11-24")) == 1
 
 
-def test_a_paused_session_that_is_today_does_not_fire_because_today_is_not_one_of_the_pair(conn):
+def test_a_paused_session_that_is_today_is_not_one_of_the_pair_and_the_earlier_pair_is_reported_once_and_late(conn):
     session_runs(conn, 2026, 11, 20, [(4, 0)])
     session_runs(conn, 2026, 11, 23, [(4, 0)])
-    session_runs(conn, 2026, 11, 24, [(2, 0)])
+    session_runs(conn, 2026, 11, 24, [(2, 0)])                           # today pauses; Monday's check never ran
     rl.deadman_check(conn, BOOK, day_at(2026, 11, 24))
-    assert collar_rows(conn) == []
+    rows = collar_rows(conn)
+    assert [r["trade_date"] for r in rows] == ["2026-11-24"] and "and 2026-11-23 (fil 0 of ord 4)" in rows[0]["detail"]   # Fri, Mon
+    session_runs(conn, 2026, 11, 25, [(2, 0)])                           # another paused day: the same latest session, not reported twice
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 25))
+    assert [r["trade_date"] for r in collar_rows(conn)] == ["2026-11-24"]
 
 
 def test_a_hit_between_two_misses_breaks_the_pair_and_a_hit_today_fires_nothing(conn):
@@ -2816,10 +2820,10 @@ def test_today_must_itself_be_a_miss(conn):
 def test_a_day_with_no_completed_run_or_no_runs_at_all_is_not_today_s_pair(conn):
     session_runs(conn, 2026, 11, 20, [(4, 0)])
     session_runs(conn, 2026, 11, 23, [(4, 0)])
-    rl.deadman_check(conn, BOOK, day_at(2026, 11, 24))                  # Tuesday: no runs
-    assert collar_rows(conn) == []
     rl.deadman_check(conn, BOOK, day_at(2026, 11, 23))                  # Monday itself: the pair is Fri, Mon
     assert len(collar_rows(conn, "2026-11-23")) == 1
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 24))                  # Tuesday: no runs, no new latest session: nothing more
+    assert collar_rows(conn, "2026-11-24") == []
 
 
 @pytest.mark.parametrize("outcome,cause,fc", [("FAULT", "run:status-stopped:send", 1), ("CRASH", "run:exit-nonzero", 0),
@@ -3720,3 +3724,110 @@ def test_a_covered_start_with_a_later_proof_writes_nothing(conn):
     proof_run(conn, utc(2026, 11, 23, 15, 40), trigger="MANUAL")
     rl.deadman_check(conn, BOOK, T_TUE_0725)
     assert prior_rows(conn, TUE) == []
+
+
+# ------------------------------------------------------------------------------------------------ the collar over five session days (a real miss is never hidden)
+
+FIVE_DAYS = [(2026, 11, 30), (2026, 12, 1), (2026, 12, 2), (2026, 12, 3), (2026, 12, 4)]
+
+
+def collar_week(conn, tmp_path, runs, fills):
+    """Five session days of `runs` (a list of (trigger, outcome, ord) for one day, the same each day), each checked at 7:25.
+    Every run prints fil=0. `fills`: "never" (no order ever fills), "next_run" (an order fills when the NEXT run journals it, so
+    at a day's check every run but the day's last has been journaled), "at_once" (all fill before the summary, fil printed = ord).
+    Returns the number of collar rows written at each day's check."""
+    path = orders_ledger(tmp_path)
+    got = []
+    for y, m, d in FIVE_DAYS:
+        stems = []
+        for n, (trigger, outcome, ord_) in enumerate(runs):
+            stem = f"os-{y}{m:02d}{d:02d}-{95500 + n * 1500:06d}"
+            printed = ord_ if fills == "at_once" else 0
+            detail = f"ord={ord_} fil={printed} batch={stem} done" if outcome == "COMPLETED" else "stopped at send"
+            add(conn, "RUN_END", trigger, outcome, utc(y, m, d, 14, 40 + n), revision_ok=1, detail=detail,
+                **({} if outcome == "COMPLETED" else dict(root_cause="run:status-stopped:send", fault_count=1)))
+            if outcome == "COMPLETED":
+                stems.append((stem, ord_))
+        # a batch is journaled once a later run of the day has run; the day's last run waits for tomorrow
+        for n, (stem, ord_) in enumerate(stems):
+            done = fills == "at_once" or (fills == "next_run" and n < len(runs) - 1)
+            put_orders(path, stem, SYMS4[:ord_] + [f"X{i}" for i in range(max(0, ord_ - 4))], filled=(SYMS4 + [f"X{i}" for i in range(8)]) if done else ())
+        before = len(collar_rows(conn))
+        rl.deadman_check(conn, BOOK, day_at(y, m, d), orders_ledger=path)
+        got.append(len(collar_rows(conn)) - before)
+        if fills == "next_run":                                                              # tomorrow's first run journals today's last run
+            for stem, ord_ in stems[-1:]:
+                db = sqlite3.connect(path)
+                for (tag,) in db.execute("SELECT tag FROM orders WHERE substr(tag, 1, ?) = ?", (len(stem) + 1, stem + "-")).fetchall():
+                    db.execute("INSERT INTO fills (tag, symbol, units, time) VALUES (?, 'S', 1, 5)", (tag,))
+                db.commit()
+                db.close()
+    return got
+
+
+COLLAR_WEEK = [
+    # id, runs of every day, how fills happen, collar rows written at each of the five checks
+    ("one-run-a-day-all-unfilled", [("0655", "COMPLETED", 4)], "never", [0, 0, 1, 1, 1]),
+    ("0655-sends-none-0710-sends-four-all-unfilled", [("0655", "COMPLETED", 0), ("0710", "COMPLETED", 4)], "never", [0, 0, 1, 1, 1]),
+    ("0655-sends-four-0710-resends-four-all-unfilled", [("0655", "COMPLETED", 4), ("0710", "COMPLETED", 4)], "never", [0, 1, 1, 1, 1]),
+    ("0710-faults-every-day-all-unfilled", [("0655", "COMPLETED", 4), ("0710", "FAULT", 0)], "never", [0, 0, 1, 1, 1]),
+    ("late-fills-always-land-by-the-next-run", [("0655", "COMPLETED", 4), ("0710", "COMPLETED", 4)], "next_run", [0, 0, 0, 0, 0]),
+    ("late-fills-with-a-small-last-run", [("0655", "COMPLETED", 4), ("0710", "COMPLETED", 1)], "next_run", [0, 0, 0, 0, 0]),
+    ("everything-fills-at-once", [("0655", "COMPLETED", 4), ("0710", "COMPLETED", 4)], "at_once", [0, 0, 0, 0, 0]),
+]
+
+
+@pytest.mark.parametrize("name,runs,fills,expected", COLLAR_WEEK, ids=[c[0] for c in COLLAR_WEEK])
+def test_the_collar_over_five_session_days_never_hides_a_real_miss_and_never_flags_a_good_day(conn, tmp_path, name, runs, fills, expected):
+    assert collar_week(conn, tmp_path, runs, fills) == expected
+
+
+def test_a_real_miss_gives_a_row_at_the_check_one_session_day_after_the_second_missed_session(conn, tmp_path):
+    got = collar_week(conn, tmp_path, [("0655", "COMPLETED", 4)], "never")
+    second_missed_session = 1                                                               # index of the second day
+    assert sum(got[:second_missed_session + 1]) == 0 and got[second_missed_session + 1] == 1
+
+
+def test_the_estimate_wording_needs_an_old_row_in_the_judged_pair_not_anywhere_in_the_history(conn, tmp_path):
+    path = orders_ledger(tmp_path)
+    session_runs(conn, 2026, 11, 16, [(4, 4)])                                              # an old-format row, long before the pair
+    put_orders(path, STEM_FRI, SYMS4)
+    put_orders(path, STEM_MON, SYMS4)
+    batch_runs(conn, *FRI20, [(STEM_FRI, 4, 0), (STEM_FRI2, 0, 0)])
+    batch_runs(conn, *MON23, [(STEM_MON, 4, 0), (STEM_MON2, 0, 0)])
+    rl.deadman_check(conn, BOOK, day_at(*MON23), orders_ledger=path)
+    assert "estimate" not in collar_rows(conn, MON)[0]["detail"] and "order ledger" in collar_rows(conn, MON)[0]["detail"]
+
+
+# ------------------------------------------------------------------------------------------------ T65: an end that two open starts could own
+
+def test_an_end_that_could_be_either_of_two_open_starts_does_not_make_the_hung_one_its_own_proof(conn):
+    start(conn, utc(2026, 11, 23, 14, 55), "0655")                                          # A takes the lock
+    start(conn, utc(2026, 11, 23, 15, 5), "0655")                                           # A' of the same trigger hangs
+    run_end(conn, utc(2026, 11, 23, 15, 20), "COMPLETED", "0655")                           # an end: A's, but nothing says so
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert prior_rows(conn, TUE) == [("FAULT", PRIOR_0655)]                                 # A' is still blocking: no self-proof
+
+
+def test_an_ambiguous_end_still_lets_a_later_run_close_the_hung_start(conn):
+    start(conn, utc(2026, 11, 23, 14, 55), "0655")
+    start(conn, utc(2026, 11, 23, 15, 5), "0655")
+    run_end(conn, utc(2026, 11, 23, 15, 20), "COMPLETED", "0655")
+    proof_run(conn, utc(2026, 11, 23, 15, 30), trigger="MANUAL")                            # started after both, completed
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert prior_rows(conn, TUE) == [("FAULT", UNREPORTED_0655)]
+
+
+def test_an_unambiguous_end_proves_every_start_before_its_own_run(conn):
+    start(conn, utc(2026, 11, 23, 14, 50), "0710")                                          # hangs
+    proof_run(conn, utc(2026, 11, 23, 14, 55), trigger="0655")                              # one open start of its trigger: its own
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert prior_rows(conn, TUE) == [("FAULT", "run:orphan-start-unreported:20261123:0710")]
+
+
+def test_the_ambiguity_rule_leaves_todays_orphan_pairing_alone(conn):
+    start(conn, utc(2026, 11, 23, 14, 0), trigger="MANUAL")                                 # hangs
+    start(conn, utc(2026, 11, 23, 14, 30), trigger="MANUAL")
+    run_end(conn, utc(2026, 11, 23, 14, 30, 5), "NOOP", trigger="MANUAL", root_cause="run:noop:lock-held")
+    assert [e["event_id"] for e in rl._pair_runs(rl.events_for(conn, MON, BOOK))[0]] == [rl.events_for(conn, MON, BOOK)[0]["event_id"]]
+    assert [e["event_id"] for e in rl._pair_runs(rl.events_for(conn, MON, BOOK), True)[0]] == [rl.events_for(conn, MON, BOOK)[1]["event_id"]]
