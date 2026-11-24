@@ -65,7 +65,7 @@ from zoneinfo import ZoneInfo
 from valedia_trader.knowledge import store
 from valedia_trader.knowledge.k3_calendar import date_only_known_at
 
-_UA = "valedia-client/1.0"          # generic: no owner, project or email
+_UA = "calendar-and-notice-reader/1.0"   # generic: what the program does; no owner, project or email
 _NY = "America/New_York"
 _DOMAIN = "K4_VENUE"
 _DIFF_PREFIX = "PENDING_RULE_DIFF:"
