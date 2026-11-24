@@ -13,7 +13,8 @@ local check of R3 (called by nothing yet).
   `owner()` runs it as the owner does: the preview, then the confirm with the code the preview printed.
 - R3: every tag this code wrote to the journal, a ticket or the state's send record must be in the ledger.
 - Outcome 4: practice runs (with and without fractional) equal cdd5371's order step, venue calls, journal, ledger,
-  summary and files, apart from the state file's layout number and its new empty table.
+  summary and files, apart from the state file's layout number and its new empty table, and the one summary key
+  `held_lock` that BR-E gave every summary of this tree (`same_but_held_lock`; it admits that key and no other).
 Nothing here opens a socket or names a real folder: every root is the test's own."""
 import contextlib
 import hashlib
@@ -1017,6 +1018,37 @@ def test_the_layout1_view_masks_only_the_layout_number_and_the_new_empty_tables(
         layout1_view(before)                                            # a layout-1 dump is not layout 2
 
 
+def same_but_held_lock(x, y, where):
+    """One run's record through cdd5371 (`x`) and through this tree (`y`, its state already seen as layout 1): every
+    part equal, except the one key BR-E added: every summary of this tree, returned and journaled, ends with
+    `held_lock` (a real bool: whether the run held the run lock), which cdd5371's never carry. Admitted, and nothing
+    else: the key must be there and a bool on this tree (a run that crashed has no summary and so none), absent on the
+    base, and without it the summary and each journal line that differs are the base's own bytes. Any other key, in
+    the summary or on a journal line, any other event's line, any other part of the record, fails."""
+    for key in x:
+        if key == "summary":
+            bs, ms = json.loads(x[key]), json.loads(y[key])
+            assert "held_lock" not in bs, (where, key)
+            held = ms.pop("held_lock", None)
+            assert type(held) is bool or (held is None and set(ms) == {"crashed"}), (where, key, held)
+            assert json.dumps(ms, sort_keys=True, default=str) == x[key], (where, key)
+        elif key == "journal":
+            assert sorted(x[key]) == sorted(y[key]), (where, key)
+            for name in x[key]:
+                bl, ml = x[key][name].split(b"\n"), y[key][name].split(b"\n")
+                assert len(bl) == len(ml), (where, name)
+                for a, c in zip(bl, ml):
+                    if a == c:
+                        continue
+                    e = json.loads(c)
+                    assert e.get("event") == "summary" and list(e)[-1] == "held_lock" and type(e["held_lock"]) is bool, \
+                        (where, name, c)
+                    assert json.dumps({k: v for k, v in e.items() if k != "held_lock"}, default=str).encode() == a, \
+                        (where, name, c)
+        else:
+            assert x[key] == y[key], (where, key)
+
+
 def test_practice_runs_equal_cdd5371_but_for_the_state_layout(tmp_path, base, capsys):
     worlds = fractional = sends = 0
     for k in range(24):
@@ -1032,8 +1064,7 @@ def test_practice_runs_equal_cdd5371_but_for_the_state_layout(tmp_path, base, ca
                 assert x.get("state") is None or x["state"]["version"] == 1
                 y = dict(y, state=layout1_view(y.get("state")))
                 assert set(x) == set(y), (seed, i)
-                for key in x:
-                    assert x[key] == y[key], (seed, kind, i, key)
+                same_but_held_lock(x, y, (seed, kind, i))
             sends += sum(1 for r in m for c in r["calls"] if c[0] == "submit")
             worlds += 1
     with capsys.disabled():
@@ -1046,6 +1077,130 @@ def test_practice_runs_equal_cdd5371_but_for_the_state_layout(tmp_path, base, ca
 
 S4A_BASE = "3fe6268"                                    # the code before this slice, read from this checkout's history
 T0 = 1_763_478_000.0                                    # 2025-11-18 10:00 in New York
+
+
+# ---- the held_lock mask admits that one key and nothing else (BR-E)
+
+def _pair(tmp_path, base, seed=5_150_000):
+    """A real run through cdd5371 and through this tree, from one seed: (base records, this tree's records with the
+    state seen as layout 1), the same way the comparison above makes them."""
+    with pytest.MonkeyPatch.context() as mp:
+        b = T._scenario(base, tmp_path / "b", seed, mp)
+    with pytest.MonkeyPatch.context() as mp:
+        m = T._scenario(osx, tmp_path / "m", seed, mp)
+    return b, [dict(y, state=layout1_view(y.get("state"))) for y in m]
+
+
+def _summary_with(record, **change):
+    out = json.loads(record["summary"])
+    for k, v in change.items():
+        if v is _GONE:
+            out.pop(k, None)
+        else:
+            out[k] = v
+    return dict(record, summary=json.dumps(out, sort_keys=True, default=str))
+
+
+_GONE = object()
+
+
+def _journal_summary_lines(record):
+    """(file name, line index, parsed line) of every summary line of the order step in a record's journal."""
+    return [(name, n, json.loads(line)) for name, raw in record["journal"].items() for n, line in enumerate(raw.split(b"\n"))
+            if line.strip() and json.loads(line).get("event") == "summary"]
+
+
+def _journal_with(record, name, n, line):
+    lines = record["journal"][name].split(b"\n")
+    lines[n] = line
+    return dict(record, journal={**record["journal"], name: b"\n".join(lines)})
+
+
+def test_the_held_lock_mask_passes_real_runs_and_each_run_said_it_with_a_bool_in_summary_and_journal(tmp_path, base):
+    b, m = _pair(tmp_path, base)
+    saw = 0
+    for x, y in zip(b, m):
+        same_but_held_lock(x, y, "real")
+        if "held_lock" in json.loads(y["summary"]):
+            assert type(json.loads(y["summary"])["held_lock"]) is bool and "held_lock" not in json.loads(x["summary"])
+            saw += 1
+        for _, _, e in _journal_summary_lines(y):
+            assert "held_lock" not in e or (type(e["held_lock"]) is bool and list(e)[-1] == "held_lock")
+    assert saw > 0 and any(e.get("held_lock") is not None for y in m for _, _, e in _journal_summary_lines(y))
+
+
+def test_the_held_lock_mask_fails_for_one_other_summary_key_that_differs_or_is_added_or_gone(tmp_path, base):
+    b, m = _pair(tmp_path, base)
+    at = next(i for i, y in enumerate(m) if json.loads(y["summary"]).get("status") == "done"
+              and "orders_sent" in json.loads(y["summary"]))
+    x, y = b[at], m[at]
+    same_but_held_lock(x, y, "whole")                                           # the pair itself is whole
+    got = json.loads(y["summary"])
+    for bad in (_summary_with(y, orders_sent=got["orders_sent"] + 1),            # another key's value differs
+                _summary_with(y, extra_key=1),                                  # another key is added beside held_lock
+                _summary_with(y, status=_GONE),                                 # a key is gone
+                _summary_with(y, held_lock=True, notices=["x"])):               # held_lock is no licence for a second key
+        with pytest.raises(AssertionError):
+            same_but_held_lock(x, bad, "bad")
+    for held in (_GONE, None, 1, 0, "true", [True], {"held": True}):             # absent, or not a real bool
+        with pytest.raises(AssertionError):
+            same_but_held_lock(x, _summary_with(y, held_lock=held), "bad")
+    same_but_held_lock(x, _summary_with(y, held_lock=True), "either bool")
+    same_but_held_lock(x, _summary_with(y, held_lock=False), "either bool")
+    with pytest.raises(AssertionError):                                         # the base never says it
+        same_but_held_lock(_summary_with(x, held_lock=True), y, "base")
+
+
+def test_the_held_lock_mask_fails_for_a_journal_line_that_differs_in_any_other_way(tmp_path, base):
+    b, m = _pair(tmp_path, base)
+    at = next(i for i, y in enumerate(m) if _journal_summary_lines(y))
+    x, y = b[at], m[at]
+    name, n, e = _journal_summary_lines(y)[-1]
+    assert type(e["held_lock"]) is bool and list(e)[-1] == "held_lock"
+    line = lambda d: json.dumps(d, default=str).encode()
+    same_but_held_lock(x, y, "whole")
+    for held in (None, 1, "true", [True]):                                      # not a bool
+        with pytest.raises(AssertionError):
+            same_but_held_lock(x, _journal_with(y, name, n, line({**e, "held_lock": held})), "bad")
+    other = {k: v for k, v in e.items() if k != "held_lock"}
+    with pytest.raises(AssertionError):                                         # held_lock first, not last
+        same_but_held_lock(x, _journal_with(y, name, n, line({"held_lock": True, **other})), "bad")
+    with pytest.raises(AssertionError):                                         # another key's value differs
+        same_but_held_lock(x, _journal_with(y, name, n, line({**other, "orders_sent": -1, "held_lock": e["held_lock"]})), "bad")
+    with pytest.raises(AssertionError):                                         # another key is added
+        same_but_held_lock(x, _journal_with(y, name, n, line({**other, "extra_key": 1, "held_lock": e["held_lock"]})), "bad")
+    with pytest.raises(AssertionError):                                         # held_lock on a line that is not a summary
+        same_but_held_lock(x, _journal_with(y, name, n, line({**e, "event": "order"})), "bad")
+    for gname, raw in x["journal"].items():                                     # the base's own line of another event,
+        for k, text in enumerate(raw.split(b"\n")):                             # with held_lock added at its end
+            if text.strip() and json.loads(text).get("event") != "summary":
+                grown = line({**json.loads(text), "held_lock": True})
+                with pytest.raises(AssertionError):
+                    same_but_held_lock(x, _journal_with(y, gname, k, grown), "bad")
+                break
+        else:
+            continue
+        break
+    else:
+        pytest.fail("the run has no journal line of another event to try")
+    for key in ("calls", "ledger", "files"):                                    # every other part is still compared whole
+        with pytest.raises(AssertionError):
+            same_but_held_lock(x, dict(y, **{key: [("changed",)]}), key)
+    with pytest.raises(AssertionError):                                         # a line more
+        same_but_held_lock(x, dict(y, journal={**y["journal"], name: y["journal"][name] + b"\n" + line(e)}), "bad")
+
+
+def test_the_held_lock_mask_lets_a_crashed_run_through_only_when_both_crashed_alike(tmp_path, base):
+    b, m = _pair(tmp_path, base)
+    x, y = b[0], m[0]
+    crashed = json.dumps({"crashed": "boom"}, sort_keys=True)
+    same_but_held_lock(dict(x, summary=crashed), dict(y, summary=crashed), "both crashed")
+    with pytest.raises(AssertionError):                                         # only this tree crashed
+        same_but_held_lock(x, dict(y, summary=crashed), "bad")
+    with pytest.raises(AssertionError):                                         # it crashed differently
+        same_but_held_lock(dict(x, summary=crashed), dict(y, summary=json.dumps({"crashed": "bang"})), "bad")
+    with pytest.raises(AssertionError):                                         # no held_lock and not a crash
+        same_but_held_lock(dict(x, summary=json.dumps({"status": "done"})), dict(y, summary=json.dumps({"status": "done"})), "bad")
 
 
 def _ledger_trades(path, trades):
