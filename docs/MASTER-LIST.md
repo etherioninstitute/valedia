@@ -619,6 +619,11 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 52 (Carbon response 52, file named Valedia_Carbon_Response51.md; NO reply, by owner's rule "only if needed"):
+  4 pre-launch checks, verified and relayed to the running big-run session (~9:40 PM). LEAD ERROR CORRECTED: the batch
+  is :522-525 (+ :564 entry point); the (order_id, anomaly) halving and Carver's live buffer are "Later (stake
+  ladder)", NOT the batch (Reply 51 section 2.1 was wrong on the Carver buffer); bid/ask only as a nullable log of an
+  existing Webull field; held_lock parse OPTIONAL in run_ledger.py (rollback-safe). Carry into Reply 52.
   Round 51 (Carbon response 51, file named Valedia_Carbon_Response50.md; reply 51 sent 2026-11-23 ~9:35 PM PST):
   tracker unchanged (5/19). Carbon's big-run design ADOPTED and written into ~/Valedia_BigRun_Brief.md (Fable 5.2
   lead, Ultracode, ~9:45 PM-6:00 AM PT): preemptive waves (W1 NOW: T65 -> p2:collar-miss merged to main, the
