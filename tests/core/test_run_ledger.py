@@ -2613,3 +2613,642 @@ def test_a_store_that_starts_empty_names_a_prior_start_written_by_the_first_comm
     assert code == 1 and PRIOR_0655 in json.loads(out)["orphans"]
     code, out = io_main(["notify", *base], T_TUE_0725, capsys)
     assert code == 1 and any(o["root_cause"] == PRIOR_0655 for o in json.loads(out)["due"])
+
+
+# ------------------------------------------------------------------------------------------------ BR-L part 1: the P2 p2:collar-miss
+
+COLLAR = "p2:collar-miss"
+
+
+def done_summary(ord_=4, filled=2, extra=None, **kw):
+    """A printed `done` summary with `ord_` sent orders (symbols S0, S1, ...) of which `filled` have a nonzero net fill."""
+    syms = [f"S{i}" for i in range(ord_)]
+    return summary("done", orders_sent=ord_, sent=[{"symbol": s, "units": 1.0, "side": "buy"} for s in syms],
+                   filled_so_far={s: 1.0 for s in syms[:filled]}, **{**(extra or {}), **kw})
+
+
+def day_at(y, m, d, h=15, mi=25):
+    return utc(y, m, d, h, mi)
+
+
+def session_runs(conn, y, m, d, runs, outcome="COMPLETED", book=BOOK):
+    """One session's runs at 6:55, 7:10, ...; each run is (ord, fil) written as the token, or None for a token-less row."""
+    for n, run in enumerate(runs):
+        detail = "done" if run is None else f"ord={run[0]} fil={run[1]} done"
+        add(conn, "RUN_END", "0655" if n == 0 else "0710", outcome, utc(y, m, d, 14, 40 + n), revision_ok=1, detail=detail, book=book)
+
+
+def collar_rows(conn, day=None, book=BOOK):
+    sql = "SELECT * FROM run_events WHERE kind = 'DEADMAN' AND root_cause = ? AND book = ?"
+    args = [COLLAR, book]
+    if day:
+        sql += " AND trade_date = ?"
+        args.append(day)
+    return [dict(r) for r in conn.execute(sql, args)]
+
+
+FRI20, MON23 = (2026, 11, 20), (2026, 11, 23)
+
+
+def two_days(conn, first, second, day1=FRI20, day2=MON23):
+    session_runs(conn, *day1, [first])
+    session_runs(conn, *day2, [second])
+    return rl.deadman_check(conn, BOOK, day_at(*day2))
+
+
+# rule 1: the tokens
+
+def test_map_run_writes_ord_and_fil_first_in_the_detail_of_a_completed_run():
+    m = rl.map_run(done_summary(4, 2), 0)
+    assert (m.outcome, m.root_cause, m.fault_count) == ("COMPLETED", None, 0)
+    assert m.detail == "ord=4 fil=2 done"
+
+
+@pytest.mark.parametrize("ord_,filled", [(0, 0), (3, 0), (3, 3), (5, 1)])
+def test_the_tokens_follow_the_summary(ord_, filled):
+    assert rl.map_run(done_summary(ord_, filled), 0).detail == f"ord={ord_} fil={filled} done"
+
+
+def test_a_zero_net_fill_is_not_filled_and_a_negative_one_is():
+    s = summary("done", orders_sent=3, sent=[{"symbol": "A"}, {"symbol": "B"}, {"symbol": "C"}],
+                filled_so_far={"A": 0.0, "B": -2.5, "C": 0})
+    assert rl.map_run(s, 0).detail == "ord=3 fil=1 done"
+
+
+def test_the_known_limits_two_legs_of_one_symbol_count_together_and_a_netted_pair_reads_unfilled():
+    legs = summary("done", orders_sent=2, sent=[{"symbol": "A", "tag": "x"}, {"symbol": "A", "tag": "x.r"}], filled_so_far={"A": 1.5})
+    assert rl.map_run(legs, 0).detail == "ord=2 fil=2 done"
+    netted = summary("done", orders_sent=2, sent=[{"symbol": "A", "side": "buy"}, {"symbol": "A", "side": "sell"}], filled_so_far={"A": 0.0})
+    assert rl.map_run(netted, 0).detail == "ord=2 fil=0 done"
+
+
+@pytest.mark.parametrize("extra", [
+    {},                                                                            # no keys at all: the older revision
+    {"orders_sent": 4, "sent": [{"symbol": "A"}] * 4},                             # no filled_so_far
+    {"orders_sent": 4, "filled_so_far": {"A": 1.0}},                               # no sent
+    {"sent": [{"symbol": "A"}], "filled_so_far": {"A": 1.0}},                      # no orders_sent
+    {"orders_sent": "4", "sent": [{"symbol": "A"}], "filled_so_far": {"A": 1.0}},
+    {"orders_sent": -1, "sent": [], "filled_so_far": {}},
+    {"orders_sent": True, "sent": [{"symbol": "A"}], "filled_so_far": {"A": 1.0}},
+    {"orders_sent": 2.0, "sent": [{"symbol": "A"}], "filled_so_far": {"A": 1.0}},
+    {"orders_sent": 1, "sent": "A", "filled_so_far": {"A": 1.0}},
+    {"orders_sent": 1, "sent": [{"symbol": "A"}], "filled_so_far": ["A"]},
+    {"orders_sent": 1, "sent": [{"symbol": "A"}], "filled_so_far": None},
+])
+def test_an_unusable_summary_gives_no_token_and_the_row_of_today(extra):
+    m = rl.map_run(summary("done", **extra), 0)
+    assert m.detail == "done" and (m.outcome, m.root_cause, m.fault_count) == ("COMPLETED", None, 0)
+
+
+def test_odd_sent_entries_and_odd_fill_values_never_raise_and_never_count():
+    s = summary("done", orders_sent=5, sent=[None, "A", {"symbol": 7}, {"nosymbol": 1}, {"symbol": "B"}],
+                filled_so_far={"A": 1.0, "B": "2", "7": 1.0})
+    assert rl.map_run(s, 0).detail == "ord=5 fil=0 done"
+
+
+@pytest.mark.parametrize("text,code", [
+    (summary("stopped", "send", orders_sent=3, sent=[{"symbol": "A"}], filled_so_far={"A": 1.0}), 2),
+    (summary("stopped", "session", reason="outside the regular session window", orders_sent=3, sent=[{"symbol": "A"}],
+             filled_so_far={"A": 1.0}), 2),
+    (summary("stopped", "session", orders_sent=3, sent=[{"symbol": "A"}], filled_so_far={"A": 1.0}), 2),
+])
+def test_only_a_completed_run_carries_the_tokens(text, code):
+    assert "ord=" not in rl.map_run(text, code).detail
+
+
+def test_the_tokens_come_before_the_faults_and_survive_a_long_fault_list():
+    faults = [f"fault-number-{n}-with-a-long-name" for n in range(30)]
+    m = rl.map_run(done_summary(15, 7, faults=faults), 0)
+    assert m.detail.startswith("ord=15 fil=7 done; faults: ") and len(m.detail) <= 300
+    assert (m.outcome, m.root_cause, m.fault_count) == ("COMPLETED", "run:faults:fault-number-0-with-a-long-name", 30)
+
+
+def test_the_tokens_survive_clean_and_a_write_to_the_store(conn):
+    m = rl.map_run(done_summary(15, 7), 0)
+    i = add(conn, "RUN_END", "0655", m.outcome, T0655, detail=m.detail, revision_ok=1)
+    assert conn.execute("SELECT detail FROM run_events WHERE event_id = ?", (i,)).fetchone()[0] == "ord=15 fil=7 done"
+
+
+def test_cli_record_run_stores_the_tokens_and_still_prints_the_same_keys(tmp_path, capsys):
+    store = tmp_path / "l.sqlite"
+    base = ["--store", str(store), "--book", BOOK]
+    code, out = io_main(["record-run", *base, "--trigger", "0655", "--exit-code", "0", "--revision-ok", "1"], T0655, capsys,
+                        stdin=done_summary(4, 1))
+    assert code == 0 and sorted(json.loads(out)) == ["event_id", "fault_count", "outcome", "root_cause"]
+    c = rl.connect(store)
+    assert rl.events_for(c, MON, BOOK)[0]["detail"] == "ord=4 fil=1 done"
+    c.close()
+
+
+# rule 2 and 3: a session, a miss, a pair
+
+def test_two_sessions_of_four_orders_with_one_fill_fire(conn):
+    written = two_days(conn, (4, 1), (4, 1))
+    rows = collar_rows(conn, MON)
+    assert len(rows) == 1 and rows[0]["event_id"] in written
+    r = rows[0]
+    assert (r["kind"], r["trigger"], r["outcome"], r["fault_count"], r["revision_ok"], r["trade_date"]) == ("DEADMAN", "0725", "WARN", 0, None, MON)
+    assert rl.classify(r) == "P2"
+    assert "2026-11-20" in r["detail"] and "2026-11-23" in r["detail"] and "estimate" in r["detail"]
+    assert r["detail"].count("fil 1 of ord 4") == 2
+
+
+@pytest.mark.parametrize("ord_,fil,fires", [
+    (3, 0, True), (3, 1, True), (3, 2, False), (3, 3, False),           # 3 orders: 1 of 3 is .33 (miss), 2 of 3 is .67 (hit)
+    (4, 1, True), (4, 2, False),                                        # exactly half is a hit: the test is `< 0.5`
+    (10, 4, True), (10, 5, False),
+])
+def test_the_half_boundary_in_both_directions(conn, ord_, fil, fires):
+    two_days(conn, (ord_, fil), (ord_, fil))
+    assert bool(collar_rows(conn, MON)) is fires
+
+
+@pytest.mark.parametrize("paused", [(0, 0), (1, 0), (1, 1), (2, 0), (2, 1), (2, 2)])
+def test_a_session_of_two_orders_or_fewer_pauses_and_neither_counts_nor_breaks_the_pair(conn, paused):
+    session_runs(conn, 2026, 11, 20, [(4, 0)])
+    session_runs(conn, 2026, 11, 23, [paused])
+    session_runs(conn, 2026, 11, 24, [(4, 0)])
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 24))
+    assert len(collar_rows(conn, "2026-11-24")) == 1
+
+
+def test_a_paused_session_that_is_today_does_not_fire_because_today_is_not_one_of_the_pair(conn):
+    session_runs(conn, 2026, 11, 20, [(4, 0)])
+    session_runs(conn, 2026, 11, 23, [(4, 0)])
+    session_runs(conn, 2026, 11, 24, [(2, 0)])
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 24))
+    assert collar_rows(conn) == []
+
+
+def test_a_hit_between_two_misses_breaks_the_pair_and_a_hit_today_fires_nothing(conn):
+    session_runs(conn, 2026, 11, 20, [(4, 0)])
+    session_runs(conn, 2026, 11, 23, [(4, 4)])
+    session_runs(conn, 2026, 11, 24, [(4, 0)])
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 24))
+    assert collar_rows(conn) == []
+    session_runs(conn, 2026, 11, 25, [(4, 0)])                          # miss, miss after the hit: now it holds
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 25))
+    assert len(collar_rows(conn, "2026-11-25")) == 1
+
+
+def test_today_must_itself_be_a_miss(conn):
+    session_runs(conn, 2026, 11, 20, [(4, 0)])
+    session_runs(conn, 2026, 11, 23, [(4, 0)])
+    session_runs(conn, 2026, 11, 24, [(4, 4)])
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 24))
+    assert collar_rows(conn) == []
+
+
+def test_a_day_with_no_completed_run_or_no_runs_at_all_is_not_today_s_pair(conn):
+    session_runs(conn, 2026, 11, 20, [(4, 0)])
+    session_runs(conn, 2026, 11, 23, [(4, 0)])
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 24))                  # Tuesday: no runs
+    assert collar_rows(conn) == []
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 23))                  # Monday itself: the pair is Fri, Mon
+    assert len(collar_rows(conn, "2026-11-23")) == 1
+
+
+@pytest.mark.parametrize("outcome,cause,fc", [("FAULT", "run:status-stopped:send", 1), ("CRASH", "run:exit-nonzero", 0),
+                                              ("ORDINARY_STOP", "run:ordinary-stop:session", 0), ("NOOP", "run:noop:lock-held", 0)])
+def test_a_day_with_no_completed_run_between_two_misses_neither_counts_nor_breaks_them(conn, outcome, cause, fc):
+    session_runs(conn, 2026, 11, 20, [(4, 0)])
+    add(conn, "RUN_END", "0655", outcome, utc(2026, 11, 23, 14, 58), root_cause=cause, fault_count=fc, revision_ok=1,
+        detail="ord=9 fil=9 stray")                                      # even a stray token on a row that is not COMPLETED is not read
+    add(conn, "SKIP", "0655", "SKIPPED", utc(2026, 11, 24, 14, 55), root_cause="gate:x")
+    session_runs(conn, 2026, 11, 25, [(4, 0)])
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 25))
+    assert len(collar_rows(conn, "2026-11-25")) == 1
+
+
+def test_a_completed_row_without_the_tokens_neither_counts_nor_breaks_the_pair(conn):
+    session_runs(conn, 2026, 11, 20, [(4, 0)])
+    session_runs(conn, 2026, 11, 23, [None])                            # the older revision's row
+    session_runs(conn, 2026, 11, 24, [(4, 0)])
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 24))
+    assert len(collar_rows(conn, "2026-11-24")) == 1
+    assert "2026-11-23" not in collar_rows(conn, "2026-11-24")[0]["detail"]
+
+
+def test_a_session_is_the_sum_of_its_completed_runs_with_tokens(conn):
+    session_runs(conn, 2026, 11, 20, [(2, 0), (2, 0)])                  # 4 orders, 0 filled: a miss though each run alone pauses
+    session_runs(conn, 2026, 11, 23, [(2, 0), None, (2, 1)])            # the token-less row adds nothing: 4 orders, 1 filled
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 23))
+    r = collar_rows(conn, MON)[0]
+    assert "fil 0 of ord 4" in r["detail"] and "fil 1 of ord 4" in r["detail"]
+
+
+def test_the_sum_can_turn_a_run_that_alone_would_miss_into_a_hit(conn):
+    session_runs(conn, 2026, 11, 20, [(4, 0)])
+    session_runs(conn, 2026, 11, 23, [(4, 0), (2, 2)])                  # 6 orders, 2 filled = .33: a miss
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 23))
+    assert len(collar_rows(conn, MON)) == 1
+    session_runs(conn, 2026, 11, 24, [(4, 0), (4, 4)])                  # 8 orders, 4 filled = .5: a hit
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 24))
+    assert collar_rows(conn, "2026-11-24") == []
+
+
+def test_only_this_books_sessions_count(conn):
+    session_runs(conn, 2026, 11, 20, [(4, 0)], book="another-book")
+    session_runs(conn, 2026, 11, 23, [(4, 0)])
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 23))
+    assert collar_rows(conn) == []
+    session_runs(conn, 2026, 11, 20, [(4, 0)])
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 23))
+    assert len(collar_rows(conn, MON)) == 1 and collar_rows(conn, book="another-book") == []
+
+
+def test_the_pair_is_the_two_latest_counted_sessions_not_adjacent_days_and_not_older_misses(conn):
+    session_runs(conn, 2026, 11, 16, [(4, 0)])
+    session_runs(conn, 2026, 11, 17, [(4, 4)])                           # a hit before the latest two: irrelevant
+    session_runs(conn, 2026, 11, 18, [(4, 0)])
+    session_runs(conn, 2026, 11, 24, [(4, 0)])                           # Wed 11-18 and Tue 11-24: far apart, nothing counted between
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 24))
+    r = collar_rows(conn, "2026-11-24")[0]
+    assert "2026-11-18" in r["detail"] and "2026-11-24" in r["detail"]
+
+
+# rule 4 and 7: once a day, never resets, nothing removed
+
+def test_a_second_check_the_same_day_writes_nothing_more_and_a_third_miss_day_writes_again(conn):
+    two_days(conn, (4, 0), (4, 0))
+    assert rl.deadman_check(conn, BOOK, day_at(*MON23)) == []
+    assert rl.deadman_check(conn, BOOK, utc(2026, 11, 23, 17, 0)) == []
+    assert len(collar_rows(conn)) == 1
+    session_runs(conn, 2026, 11, 24, [(4, 1)])
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 24))
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 24))
+    session_runs(conn, 2026, 11, 25, [(3, 0)])
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 25))
+    assert [r["trade_date"] for r in collar_rows(conn)] == [MON, "2026-11-24", "2026-11-25"]
+
+
+def test_a_later_hit_or_pause_removes_nothing_and_writes_nothing(conn):
+    two_days(conn, (4, 0), (4, 0))
+    before = count(conn)
+    session_runs(conn, 2026, 11, 24, [(4, 4)])
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 24))
+    session_runs(conn, 2026, 11, 25, [(1, 0)])
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 25))
+    assert len(collar_rows(conn)) == 1
+    assert count(conn) == before + 4                                    # two runs and two day rows came in, no collar row
+    assert [r["trade_date"] for r in collar_rows(conn)] == [MON]
+
+
+def test_the_row_is_written_by_the_dead_man_only_never_by_record_run(conn, tmp_path, capsys):
+    store = tmp_path / "cli.sqlite"
+    base = ["--store", str(store), "--book", BOOK]
+    c = rl.connect(store)
+    session_runs(c, 2026, 11, 20, [(4, 0)])
+    c.close()
+    code, out = io_main(["record-run", *base, "--trigger", "0655", "--exit-code", "0", "--revision-ok", "1"], T0655, capsys,
+                        stdin=done_summary(4, 0))
+    assert code == 0
+    c = rl.connect(store)
+    assert collar_rows(c) == []
+    c.close()
+    code, out = io_main(["deadman", *base], T1025, capsys)
+    c = rl.connect(store)
+    assert len(collar_rows(c, MON)) == 1
+    c.close()
+    assert code == 0 and json.loads(out)["recorded"] is True
+
+
+def test_nothing_is_written_before_1025_or_on_a_day_that_is_not_a_session(conn):
+    session_runs(conn, 2026, 11, 20, [(4, 0)])
+    session_runs(conn, 2026, 11, 23, [(4, 0)])
+    assert rl.deadman_check(conn, BOOK, day_at(2026, 11, 23, 15, 24)) == [] and collar_rows(conn) == []
+    session_runs(conn, 2026, 11, 28, [(4, 0)])                          # a Saturday
+    assert rl.deadman_check(conn, BOOK, day_at(2026, 11, 28)) == [] and collar_rows(conn) == []
+    assert len(rl.deadman_check(conn, BOOK, day_at(2026, 11, 23))) >= 1 and len(collar_rows(conn)) == 1
+
+
+# rule 6: the P2 path and the streak
+
+def test_classify_gives_a_p2_to_the_collar_row_only(conn):
+    base = dict(kind="DEADMAN", outcome="WARN", trigger="0725", fault_count=0, root_cause=COLLAR)
+    assert rl.classify(base) == "P2"
+    assert rl.classify({**base, "root_cause": "p2:other"}) is None and rl.classify({**base, "root_cause": None}) is None
+    assert rl.classify({**base, "outcome": "OK"}) is None
+    assert rl.classify({**base, "kind": "PREFLIGHT"}) == "P2"                      # a preflight warn is a P2 as it was (not by this cause)
+    assert rl.classify({**base, "kind": "RUN_END", "outcome": "COMPLETED"}) is None
+
+
+def test_the_alert_is_one_p2_a_day_with_the_two_dates_and_the_estimate_and_a_second_notify_sends_nothing(conn):
+    two_days(conn, (4, 1), (5, 0))
+    s = FakeSender()
+    out = notify(conn, s, day_at(*MON23))
+    p2 = [o for o in out["due"] if o["severity"] == "P2"]
+    assert len(p2) == 1 and p2[0]["root_cause"] == COLLAR and out["sent"] == 1
+    title, text = s.sent[0]
+    assert title == "P2 order step: orders missing their collar"
+    assert "2026-11-20" in text and "2026-11-23" in text and "fil 1 of ord 4" in text and "fil 0 of ord 5" in text and "estimate" in text
+    assert notify(conn, s, day_at(*MON23))["due"] == [] and len(s.sent) == 1
+
+
+def test_a_miss_day_after_the_first_alert_is_a_new_p2_on_its_own_day(conn):
+    two_days(conn, (4, 0), (4, 0))
+    s = FakeSender()
+    notify(conn, s, day_at(*MON23))
+    session_runs(conn, 2026, 11, 24, [(4, 0)])
+    rl.deadman_check(conn, BOOK, day_at(2026, 11, 24))
+    notify(conn, s, day_at(2026, 11, 24))
+    assert [t for t in titles(s) if t.startswith("P2")] == ["P2 order step: orders missing their collar"] * 2
+
+
+def test_the_collar_row_does_not_touch_the_streak_and_does_not_unclean_a_clean_day(conn):
+    two_days(conn, (4, 0), (4, 0))
+    assert len(collar_rows(conn, MON)) == 1
+    with_row = [e for e in rl.events_between(conn, BOOK, "2026-11-20", "2026-11-23")]
+    without_row = [e for e in with_row if e["root_cause"] != COLLAR]
+    assert len(with_row) == len(without_row) + 1
+    sessions = rl.sessions_between(date(2026, 11, 20), date(2026, 11, 23))
+    assert rl.streak(with_row, sessions) == rl.streak(without_row, sessions)
+    day = [e for e in with_row if e["trade_date"] == MON]
+    assert rl._judge(day) == rl._judge([e for e in day if e["root_cause"] != COLLAR])
+    cli_count, per_day = rl.streak(with_row, sessions)
+    assert per_day[-1]["date"] == MON and per_day[-1]["status"] in ("clean", "reset")
+
+
+def test_a_clean_day_stays_clean_and_the_streak_keeps_counting_with_the_row_there(conn):
+    # a day judged clean without the row (revision ok, completed) is clean with it; the streak count equals the plain one
+    session_runs(conn, 2026, 11, 20, [(4, 0)])
+    session_runs(conn, 2026, 11, 23, [(4, 0)])
+    rl.deadman_check(conn, BOOK, day_at(*MON23))
+    ev_all = rl.events_between(conn, BOOK, "2026-11-20", "2026-11-23")
+    sessions = rl.sessions_between(date(2026, 11, 20), date(2026, 11, 23))
+    n, per = rl.streak(ev_all, sessions)
+    assert n == 2 and [d["status"] for d in per if d["status"] != "paused"] == ["clean", "clean"]
+
+
+def test_the_cli_streak_is_the_same_with_the_row(tmp_path, capsys):
+    store = tmp_path / "s.sqlite"
+    base = ["--store", str(store), "--book", BOOK]
+    c = rl.connect(store)
+    session_runs(c, 2026, 11, 20, [(4, 0)])
+    session_runs(c, 2026, 11, 23, [(4, 0)])
+    c.close()
+    _, before = io_main(["streak", *base, "--since", "2026-11-20"], T1025, capsys)
+    io_main(["deadman", *base], T1025, capsys)
+    c = rl.connect(store)
+    assert len(collar_rows(c, MON)) == 1
+    c.close()
+    _, after = io_main(["streak", *base, "--since", "2026-11-20"], T1025, capsys)
+    b, a = json.loads(before), json.loads(after)
+    assert a["count"] == b["count"] and a["per_day"] == b["per_day"]
+
+
+# rule 8: silent and harmless on an empty or tiny store
+
+def test_an_empty_store_and_one_session_write_no_collar_row_and_change_nothing_deadman_wrote_before(conn):
+    first = rl.deadman_check(conn, BOOK, day_at(*MON23))                  # empty: only the day's MISSING row
+    assert len(first) == 1 and collar_rows(conn) == []
+    session_runs(conn, 2026, 11, 24, [(4, 0)])                          # one counted session
+    ids = rl.deadman_check(conn, BOOK, day_at(2026, 11, 24))
+    assert len(ids) == 1 and collar_rows(conn) == []
+    assert conn.execute("SELECT outcome FROM run_events WHERE event_id = ?", (ids[0],)).fetchone()[0] == "OK"
+
+
+def test_a_store_of_rows_without_tokens_gives_no_collar_row_and_no_error(conn):
+    for d in (16, 17, 18, 19, 20):
+        session_runs(conn, 2026, 11, d, [None])
+    session_runs(conn, 2026, 11, 23, [None, None])
+    ids = rl.deadman_check(conn, BOOK, day_at(*MON23))
+    assert collar_rows(conn) == [] and len(ids) == 1
+
+
+def test_the_cli_commands_on_an_empty_store_stay_silent_and_exit_zero_where_they_did(tmp_path, capsys):
+    base = ["--store", str(tmp_path / "e.sqlite"), "--book", BOOK]
+    assert io_main(["notify", *base], T1025, capsys) == (0, json.dumps({"dry_run": True, "due": [], "failed": 0, "gave_up": 0, "sent": 0}, sort_keys=True) + "\n")
+    assert io_main(["streak", *base, "--since", "2026-11-23"], T1025, capsys)[0] == 0
+    code, out = io_main(["deadman", *base], T0655, capsys)               # before 10:25: nothing
+    assert (code, json.loads(out)) == (0, {"recorded": False})
+
+
+def test_a_malformed_token_is_not_read(conn):
+    for day, detail in (((2026, 11, 20), "ord=4 fil=0 done"), ((2026, 11, 23), "ord=x fil=0 done")):
+        add(conn, "RUN_END", "0655", "COMPLETED", utc(*day, 14, 58), revision_ok=1, detail=detail)
+    rl.deadman_check(conn, BOOK, day_at(*MON23))
+    assert collar_rows(conn) == []
+    add(conn, "RUN_END", "0710", "COMPLETED", utc(2026, 11, 23, 15, 10), revision_ok=1, detail="note ord=4 fil=0")   # not at the start
+    rl.deadman_check(conn, BOOK, day_at(*MON23))
+    assert collar_rows(conn) == []
+
+
+# ------------------------------------------------------------------------------------------------ BR-L part 2: held_lock, and three pins
+
+def stopped_send(**extra):
+    return summary("stopped", "send", reason="the venue refused", **extra)
+
+
+HELD_KEY_MISSING = object()
+
+
+@pytest.mark.parametrize("value", [False, None, 0, 1, "true", "True", [], {}, 1.0, HELD_KEY_MISSING])
+def test_only_a_real_true_adds_the_held_lock_token_every_other_value_gives_todays_row(value):
+    plain = rl.map_run(stopped_send(), 2)
+    got = rl.map_run(stopped_send() if value is HELD_KEY_MISSING else stopped_send(held_lock=value), 2)
+    assert got == plain and not got.detail.startswith("held_lock") and got.outcome == "FAULT"
+
+
+def test_a_real_true_on_a_fault_is_kept_as_the_first_token_and_changes_nothing_else():
+    plain = rl.map_run(stopped_send(), 2)
+    got = rl.map_run(stopped_send(held_lock=True), 2)
+    assert got.detail == "held_lock=1 " + plain.detail
+    assert (got.outcome, got.root_cause, got.fault_count) == (plain.outcome, plain.root_cause, plain.fault_count) == ("FAULT", "run:status-stopped:send", 1)
+
+
+def test_the_token_is_on_every_kind_of_fault_row_and_only_there():
+    fault_cases = [
+        summary("stopped", "lock", held_lock=True),
+        summary("stopped", None, held_lock=True),
+        summary("stopped", "session", reason="the exchange calendar could not be loaded: boom", held_lock=True),
+        summary("stopped", "send", faults=["reconcile"], held_lock=True),
+    ]
+    for text in fault_cases:
+        m = rl.map_run(text, 2)
+        assert m.outcome == "FAULT" and m.detail.startswith("held_lock=1 stopped at ")
+    for text, code, outcome in [
+        (summary("done", held_lock=True), 0, "COMPLETED"),
+        (done_summary(4, 1, held_lock=True), 0, "COMPLETED"),
+        (summary("done", faults=["reconcile"], held_lock=True), 0, "COMPLETED"),
+        (summary("stopped", "session", reason="outside the regular session window", held_lock=True), 2, "NOOP"),
+        (summary("stopped", "session", reason="another order step is running", held_lock=True), 2, "NOOP"),
+        (summary("stopped", "session", reason="2026-11-22 (Sunday) is not a trading day", held_lock=True), 2, "ORDINARY_STOP"),
+        (summary("stopped", "send", held_lock=True), 1, "CRASH"),
+        (summary("stopped", "session", held_lock=True), 0, "CRASH"),
+        (summary("done", held_lock=True), 1, "CRASH"),
+        ("", 1, "CRASH"),
+    ]:
+        m = rl.map_run(text, code)
+        assert m.outcome == outcome and "held_lock" not in m.detail
+
+
+def test_a_true_on_a_completed_row_leaves_it_byte_for_byte_what_it_was():
+    assert rl.map_run(summary("done", held_lock=True), 0) == rl.map_run(summary("done"), 0)
+    assert rl.map_run(done_summary(4, 1, held_lock=True), 0) == rl.map_run(done_summary(4, 1), 0)
+
+
+def test_the_token_survives_clean_and_the_300_character_cut_with_a_long_reason():
+    long_reason = "the venue refused " + "because of a very long explanation " * 20
+    m = rl.map_run(summary("stopped", "send", reason=long_reason, held_lock=True), 2)
+    assert m.detail.startswith("held_lock=1 stopped at send: the venue refused") and len(m.detail) <= 300
+    assert rl.map_run(summary("stopped", "send", reason=long_reason), 2).detail.startswith("stopped at send: ")
+
+
+def test_the_token_is_written_to_the_store_and_the_cli_prints_the_same_keys(tmp_path, capsys):
+    store = tmp_path / "l.sqlite"
+    base = ["--store", str(store), "--book", BOOK]
+    code, out = io_main(["record-run", *base, "--trigger", "0655", "--exit-code", "2", "--revision-ok", "1"], T0655, capsys,
+                        stdin=stopped_send(held_lock=True))
+    assert code == 1 and sorted(json.loads(out)) == ["event_id", "fault_count", "outcome", "root_cause"]
+    c = rl.connect(store)
+    row = rl.events_for(c, MON, BOOK)[0]
+    c.close()
+    assert row["detail"].startswith("held_lock=1 ") and (row["outcome"], row["fault_count"]) == ("FAULT", 1)
+
+
+# rule 3: the proof
+
+def lock_row(**over):
+    row = {"kind": "RUN_END", "outcome": "FAULT", "root_cause": "run:status-stopped:send", "detail": "held_lock=1 stopped at send"}
+    row.update(over)
+    return row
+
+
+@pytest.mark.parametrize("over,expected", [
+    ({}, True),                                                       # a FAULT RUN_END whose detail starts with the token
+    ({"detail": "held_lock=1"}, True),
+    ({"detail": "stopped at send"}, False),                           # a FAULT without the token proves nothing
+    ({"detail": None}, False),
+    ({"detail": ""}, False),
+    ({"detail": "stopped at send held_lock=1"}, False),               # the first word, not a substring
+    ({"detail": "held_lock=10 x"}, False),
+    ({"detail": "held_lock=1x"}, False),
+    ({"detail": "held_lock=0 x"}, False),
+    ({"outcome": "CRASH"}, False),                                    # a CRASH never counts, token or not
+    ({"outcome": "CRASH", "root_cause": "run:exit-nonzero"}, False),
+    ({"outcome": "NOOP", "root_cause": "run:noop:lock-held"}, False), # nor the lock-held NOOP
+    ({"outcome": "NOOP", "root_cause": "run:noop:outside-window"}, True),   # as before: by its outcome and cause
+    ({"kind": "DEADMAN"}, False),
+    ({"kind": "SKIP", "outcome": "SKIPPED"}, False),
+    ({"kind": "RUN_START", "outcome": "OK"}, False),
+])
+def test_is_lock_proof_accepts_a_fault_with_the_token_and_nothing_else_new(over, expected):
+    assert rl._is_lock_proof(lock_row(**over)) is expected
+
+
+def test_the_proofs_of_t65_are_unchanged():
+    for outcome, cause in (("COMPLETED", None), ("ORDINARY_STOP", rl.ORDINARY_STOP_SESSION), ("NOOP", rl.NOOP_OUTSIDE_WINDOW)):
+        assert rl._is_lock_proof({"kind": "RUN_END", "outcome": outcome, "root_cause": cause, "detail": None})
+    for outcome, cause in (("ORDINARY_STOP", None), ("ORDINARY_STOP", "run:ordinary-stop:other"), ("FAULT", "run:status-stopped:send"),
+                           ("CRASH", "run:exit-nonzero"), ("NOOP", rl.NOOP_LOCK_HELD)):
+        assert not rl._is_lock_proof({"kind": "RUN_END", "outcome": outcome, "root_cause": cause, "detail": None})
+
+
+FAULT_TOKEN = dict(outcome="FAULT", root_cause="run:status-stopped:send", fault_count=1, detail="held_lock=1 stopped at send")
+FAULT_PLAIN = dict(outcome="FAULT", root_cause="run:status-stopped:send", fault_count=1, detail="stopped at send")
+
+
+def tuesday_end(conn, at=None, trigger="0655", **kw):
+    return add(conn, "RUN_END", trigger, kw.pop("outcome"), at or utc(2026, 11, 24, 14, 58), revision_ok=1, **kw)
+
+
+@pytest.mark.parametrize("trigger", rl.TRIGGERS)
+def test_a_fault_with_the_token_after_an_unpaired_start_closes_it_with_one_unreported_p0_for_every_trigger(conn, trigger):
+    start(conn, utc(2026, 11, 23, 14, 55), trigger)
+    tuesday_end(conn, **FAULT_TOKEN)
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    tag = f"20261123:{trigger.lower()}"
+    assert prior_rows(conn, TUE) == [("FAULT", f"run:orphan-start-unreported:{tag}")]
+    s = FakeSender()
+    out = notify(conn, s, T_TUE_0725)
+    assert len([o for o in out["due"] if o["root_cause"].startswith("run:orphan-start-unreported")]) == 1
+    rl.deadman_check(conn, BOOK, T_WED_0725)                          # no second row the next day
+    assert prior_rows(conn, WED) == [] and prior_rows(conn, TUE) == [("FAULT", f"run:orphan-start-unreported:{tag}")]
+
+
+@pytest.mark.parametrize("trigger", rl.TRIGGERS)
+def test_the_same_run_without_the_token_leaves_the_start_blocking_for_every_trigger(conn, trigger):
+    start(conn, utc(2026, 11, 23, 14, 55), trigger)
+    tuesday_end(conn, **FAULT_PLAIN)
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert prior_rows(conn, TUE) == [("FAULT", f"run:orphan-start-prior:20261123:{trigger.lower()}")]
+
+
+@pytest.mark.parametrize("kw", [
+    dict(outcome="CRASH", root_cause="run:exit-nonzero", detail="held_lock=1 exit code 1"),
+    dict(outcome="NOOP", root_cause="run:noop:lock-held", detail="held_lock=1 stopped at session"),
+])
+def test_a_crash_or_a_lock_held_noop_never_closes_a_start_even_with_the_token_written(conn, kw):
+    yesterdays_hung_start(conn)
+    tuesday_end(conn, **kw)
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert prior_rows(conn, TUE) == [("FAULT", PRIOR_0655)]
+
+
+def test_when_the_start_already_had_its_p0_a_proof_by_a_token_fault_writes_nothing_for_it(conn):
+    yesterdays_hung_start(conn)
+    rl.deadman_check(conn, BOOK, T1025)                               # Monday's own P0 for the start
+    assert ("FAULT", "run:orphan-start:0655") in deadman_rows(conn)
+    tuesday_end(conn, **FAULT_TOKEN)
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert prior_rows(conn, TUE) == []
+
+
+def test_the_opposite_of_that_without_the_token_names_the_start_again_as_a_p1(conn):
+    yesterdays_hung_start(conn)
+    rl.deadman_check(conn, BOOK, T1025)
+    tuesday_end(conn, **FAULT_PLAIN)
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert prior_rows(conn, TUE) == [("MISSING", PRIOR_0655)]
+
+
+def test_a_token_fault_in_another_book_does_not_close_this_books_start(conn):
+    yesterdays_hung_start(conn)
+    tuesday_end(conn, book="another-book", **FAULT_TOKEN)
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert prior_rows(conn, TUE) == [("FAULT", PRIOR_0655)]
+
+
+def test_a_token_fault_earlier_than_the_start_does_not_close_it_and_a_later_one_does(conn):
+    start(conn, utc(2026, 11, 23, 14, 55))
+    add(conn, "RUN_END", "0710", "FAULT", utc(2026, 11, 23, 14, 50), revision_ok=1, root_cause="run:status-stopped:send", fault_count=1,
+        detail="held_lock=1 stopped at send")                          # 5 minutes before the start
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert prior_rows(conn, TUE) == [("FAULT", PRIOR_0655)]
+    add(conn, "RUN_END", "0710", "FAULT", utc(2026, 11, 23, 15, 10), revision_ok=1, root_cause="run:status-stopped:send", fault_count=1,
+        detail="held_lock=1 stopped at send")                          # after the start
+    rl.deadman_check(conn, BOOK, T_WED_0725)
+    assert prior_rows(conn, WED) == []                                  # the P0 of Tuesday is already out: nothing new on Wednesday
+
+
+def test_a_store_written_without_any_token_behaves_as_t65_did(conn):
+    yesterdays_hung_start(conn)
+    lock_held_tuesday(conn)
+    tuesday_end(conn, outcome="FAULT", root_cause="run:status-stopped:send", fault_count=1, detail="stopped at send", trigger="0710")
+    rl.deadman_check(conn, BOOK, T_TUE_0725)
+    assert prior_rows(conn, TUE) == [("FAULT", PRIOR_0655)]
+    tuesday_end(conn, outcome="COMPLETED", at=utc(2026, 11, 24, 15, 30), trigger="0710")        # a completed run later: the lock proof of T65
+    rl.deadman_check(conn, BOOK, utc(2026, 11, 24, 16, 0))
+    assert [r for r in prior_rows(conn, TUE) if r[1].startswith("run:orphan-start-unreported")] == []   # that start already had its P0
+
+
+# rule 6: pins of the existing behaviour (no production change)
+
+def test_an_unapproved_propose_summary_is_a_completed_day_with_no_fault():
+    m = rl.map_run(summary("done", orders_sent=0, sent=[]), 0)
+    assert (m.outcome, m.root_cause, m.fault_count) == ("COMPLETED", None, 0)
+
+
+def test_the_nothing_to_propose_summary_is_a_completed_day_with_no_fault():
+    m = rl.map_run(summary("done", reason="nothing to propose", orders_sent=0, sent=[], ticket=None), 0)
+    assert (m.outcome, m.root_cause, m.fault_count) == ("COMPLETED", None, 0)
+    m = rl.map_run(summary("done"), 0)
+    assert (m.outcome, m.root_cause, m.fault_count) == ("COMPLETED", None, 0)
+
+
+def test_the_same_summaries_with_a_fault_are_completed_with_one_fault_and_its_cause():
+    for extra in ({"orders_sent": 0, "sent": []}, {"reason": "nothing to propose", "orders_sent": 0, "sent": [], "ticket": None}, {}):
+        m = rl.map_run(summary("done", faults=["reconcile"], **extra), 0)
+        assert (m.outcome, m.root_cause, m.fault_count) == ("COMPLETED", "run:faults:reconcile", 1)
+        assert rl.map_run(summary("done", **extra), 0).fault_count == 0                  # the opposite: no faults is no fault
