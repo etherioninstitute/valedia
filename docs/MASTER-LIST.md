@@ -295,7 +295,7 @@ trading (his word, 2026-11-17).
    for each run. Roadmap 5.4.
 9. **QUEUED** go-live gate reads the paper record without looking at faults or order type: tighten it (part
    of build B). Paper record today: 2 completed paper broker days, 17 fills, none fractional.
-10. **QUEUED** still to be SEEN on the practice account (roadmap 4.2, `docs/WEBULL.md`): a sale, a partial
+10. **QUEUED** (now GATE #7, the post-pin rehearsal: Carbon round 43) still to be SEEN on the practice account (roadmap 4.2, `docs/WEBULL.md`): a sale, a partial
     fill, an unfilled day order at the close, a cancel answered "not yet", one clean week.
 11. **OWNER** the first order itself: his word at the time; live commands are run by him at a terminal.
 
@@ -608,6 +608,14 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 43 (Carbon response 43, file named Valedia_Carbon_Response42.md; reply 43 sent 2026-11-23): tracker =
+  done/total + literal percent: P1 2/7 (28.6%), P2 0/4, P3 0 passed (outside the total), P4 3/8, total 5/19 (26.3%).
+  Adopted GATE #7 (post-pin rehearsal), which takes over the go-live row 10 'still to be SEEN' (no double count): one
+  scheduled paper session on the new pin, 0 faults at 6:30/6:55/7:25, live paper reads (settled cash, tradable,
+  instrument id) on real payloads, >=1 whole fill + >=1 fractional remainder + >=1 sale booked, only Valedia's orders
+  cancelled, attended confirmation run through and stopped before sending. Partial / cancel 'not yet' / EXPIRED stay
+  proven by recorded answers; live sightings are extra evidence. A fault on the new pin fails Gate #7 (fix, re-pin,
+  blind check, rerun); the 8fb509f clean week stands. Item 4 renamed 'T65 + p2:collar-miss'. Asked: Gate #7 length.
   Round 42 (Carbon response 42, file named Valedia_Carbon_Response41.md; reply 42 sent 2026-11-23): Carbon said the
   owner asked for a goal-progress tracker every round; replaced its estimates (P1 92%, rollups 75%/64%) with counted
   gate items: P1 2/6, P2 owner go-live items 0/4, P3 0 passed strategies, P4 3/8; 5 of 18 overall. Adopted the SEC
