@@ -426,16 +426,22 @@ In flight:
   during the test (5 of 5 ok, 3.82 to 3.87 s against a 3.86 s median, 0 overruns). Idle GPU 0 to 8 percent with the collector's usual spikes;
   system memory free fell from 55 to 32 percent. Other processes name `model: elephant-1-trader` (separate key: requests for `elephant-1`
   can never reach it); they own the speed they cause (a 5,605-token state takes about 5 s) and must not load a second `elephant-1`.
-- **WATCH** public pick lists as a forecaster (1.19): grading waits for the hand audit of 40 picks; test line
-  12 Dec. **BROKEN since 2026-11-17 10:07 AM PST (found 11-24 11:10 PM):** every hourly listing gets HTTP 404
-  ("Not Found" Atom feed from rss.reddit.com) for `user/sbpotdbot.rss`. 182 runs in a row, and the last thread
-  stored is 11-17. Probes on 11-24 got the same 404 for `user/sbpotdbot/.rss`, the subreddit search feed and
-  `r/sportsbook/new/.rss`, so it isn't the bot account alone; `about.json` gave 403. No alert fired.
-- **WATCH** Reddit chatter against Kalshi prices (1.20): 7 days of hand audit, then 28 days; no evaluation
-  code written yet. **BROKEN since about 11-17, same cause by timing:** `versions` has been stuck at 8324 since
-  comment slot ~2029, and every comment slot since has failed (4710 of 6736). Prices are fine. Next: find out why
-  Reddit answers 404 to unauthenticated feeds (exit IP, User-Agent, or a Reddit change), stay within the 11-13
-  terms (the public feed only; the API needs approval), and add a P2 alert on N listing failures in a row.
+- **OWNER** public pick lists as a forecaster (1.19): grading waits for the hand audit of 40 picks; test line
+  12 Dec. **BROKEN since 2026-11-17: Reddit ended its RSS feeds (cause found 11-25).** Outside reports quote its
+  9-30 r/modnews post: feeds stop 11-13, and there is "no replacement" for non-moderators. Our records date it: the
+  chatter feed's last 200 was 11-17 9:50 AM PST and its first 404 9:52 AM; the hourly listing has failed every run
+  since 10:07 AM (197 by 11-25 2:07 PM). Not the exit IP (a Comcast home address, ExpressVPN disconnected) and not
+  the User-Agent (a browser one gets the same 404). **No fix exists inside the 11-13 terms:** `.json` is blocked,
+  old.reddit needs a login, and per the same reports the Data API stopped taking new requests 10-31 (unregistered
+  apps removed from 1-12-2027, public access ends March 2027). Owner's call: API access if still possible, a paid
+  source, or retire 1.19 and 1.20. **Alert built** (branch `fix/reddit-feeds` 26b1a78, blind check PASS, its two
+  low notes fixed): P2 `picks:listing-failing` after 3 hourly runs in a row without the listing (none failed in the
+  88 runs before; network faults since last 10 min at most), run by the pick job as `alerts watch --only "pick-list
+  log" --notify`. Install staged in `valedia-deploy/staged-reddit-alert/` with a new pin `accepted-alerts-commit`.
+- **OWNER** Reddit chatter against Kalshi prices (1.20): 7 days of hand audit, then 28 days; no evaluation
+  code written yet. **BROKEN since 11-17 9:52 AM PST, same cause:** `versions` stuck at 8324; 5,059 comment slots
+  since answered 404 (plus 15 timeouts or network errors). Prices are fine. The collector still asks Reddit every 2
+  minutes (about 720 404s a day); slowing that is the lead's call. Same owner decision as 1.19.
 - **WATCH** forecast tournament (1.1, 1.2): local models and Sonnet not better than the base rate so far;
   daily forward questions since 16 Nov, only three forecasters asked.
 
