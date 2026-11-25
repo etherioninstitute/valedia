@@ -99,7 +99,9 @@ CALENDAR_ANSWER_REASON = "the exchange calendar could not answer for"   # market
 MIN_FILES = 10                                                        # a files list shorter than this is not the order path
 MAX_SUMMARY_BYTES = 16 * 1024 * 1024
 GIT_SECONDS = 60
-GATE_CHECK_SECONDS = GIT_SECONDS                                      # the gate checker runs `git` too: it gets the same time
+# The gate checker has its own whole-run deadline of 60 s. The pre-flight must outlast it, so that a slow checker reports its own
+# error (exit 5, gate:git-error) rather than the pre-flight timing out first.
+GATE_CHECK_SECONDS = GIT_SECONDS + 30
 SCHEMA_VERSION = 2                                                    # 2: the NOOP outcome (a layout-1 store would refuse it)
 
 _STAMP = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z"
