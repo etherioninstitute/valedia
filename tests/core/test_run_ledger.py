@@ -1179,7 +1179,7 @@ def test_the_gate_checker_is_run_with_the_agreed_command_and_a_safe_call(repo, t
     assert argv[0] == [str(repo["venv_python"]), "-I", str(g), "--repo", str(repo["repo"]), "--pin-file", str(repo["accepted_commit_file"]),
                        "--list-file", str(repo["files_file"]), "--min-paths", str(rl.MIN_FILES)]
     assert kw["capture_output"] is True and kw["stdin"] == subprocess.DEVNULL and not kw.get("shell")
-    assert kw["timeout"] == rl.GATE_CHECK_SECONDS and rl.GATE_CHECK_SECONDS > 60          # longer than the checker's own 60 s deadline
+    assert kw["timeout"] == rl.GATE_CHECK_SECONDS and rl.GATE_CHECK_SECONDS >= 60 + 10     # the checker's 60 s whole-run deadline, its kill wait of about 1 s, and a margin
     assert kw["env"]["LC_ALL"] == "C" and "PATH" in kw["env"]
     assert gate_argv(g)[:2] == ["--repo", str(repo["repo"])]
 
