@@ -419,9 +419,15 @@ In flight:
   system memory free fell from 55 to 32 percent. Other processes name `model: elephant-1-trader` (separate key: requests for `elephant-1`
   can never reach it); they own the speed they cause (a 5,605-token state takes about 5 s) and must not load a second `elephant-1`.
 - **WATCH** public pick lists as a forecaster (1.19): grading waits for the hand audit of 40 picks; test line
-  12 Dec.
+  12 Dec. **BROKEN since 2026-11-17 10:07 AM PST (found 11-24 11:10 PM):** every hourly listing gets HTTP 404
+  ("Not Found" Atom feed from rss.reddit.com) for `user/sbpotdbot.rss`. 182 runs in a row, and the last thread
+  stored is 11-17. Probes on 11-24 got the same 404 for `user/sbpotdbot/.rss`, the subreddit search feed and
+  `r/sportsbook/new/.rss`, so it isn't the bot account alone; `about.json` gave 403. No alert fired.
 - **WATCH** Reddit chatter against Kalshi prices (1.20): 7 days of hand audit, then 28 days; no evaluation
-  code written yet.
+  code written yet. **BROKEN since about 11-17, same cause by timing:** `versions` has been stuck at 8324 since
+  comment slot ~2029, and every comment slot since has failed (4710 of 6736). Prices are fine. Next: find out why
+  Reddit answers 404 to unauthenticated feeds (exit IP, User-Agent, or a Reddit change), stay within the 11-13
+  terms (the public feed only; the API needs approval), and add a P2 alert on N listing failures in a row.
 - **WATCH** forecast tournament (1.1, 1.2): local models and Sonnet not better than the base rate so far;
   daily forward questions since 16 Nov, only three forecasters asked.
 
