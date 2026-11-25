@@ -651,6 +651,17 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 53 (Carbon response 53, file named Valedia_Carbon_Response52.md; reply 53 sent 2026-11-24 ~10:05 PM PST):
+  ADOPTED: C+F built now in a worktree, merged after 12-01 + N=2 sessions (Wed 12-02 unassisted, Thu 12-03 cross-day
+  reconcile + Gate #7); C's T+1 keyed to the fill's trade date, same-morning fills stay T+0; quote_ts + quote_age_s on
+  journal order lines, primary-quote limit split from :318's 20 min (proposed 300 s), cross-check keeps 20 min;
+  11-23/11-24 forecast = outcome-blind skipped days (n_skipped_days=2, no catch-up); GF-C = P2 when any gated job's
+  checker is not MATCH; BTC Step 0 non-Kalshi parts before 12-03 (home IP, no network change); DNS-break exclusion =
+  slots 03:48-04:01Z 11-25, 14 decisions (5 failed rows, 9 never made); case-exact name check in gate_check.py.
+  CORRECTED Carbon: re-pins already done (8fb509f / 58ebfe2, not 70d5dfc / c2aeeb6); no commit-time hook exists.
+  DECLINED: 40-hex-only pin, checker inside its own list (circular), min 50 entries (job gates have 4-11 files).
+  Asked: F with nothing to place; wrapper change mid-week vs the count; 300 s vs 120 s; two unexplained 11-24
+  stale_data bursts (18:22Z x16, 23:27Z x11).
   Reply 52 (no new Carbon round; sent 2026-11-24 ~10 PM PST at the owner's request): big run + 11-24 morning reported.
   Session 1/5 clean (6:55 run 1 min 18 s, 14/14 filled; 7:10 XLK 169 filled at venue, status SUBMITTED at the single
   closing reconcile, so fil=0; collector peak 30.2 s vs control max 30.0 s, 0 missed; quote time not journaled).
