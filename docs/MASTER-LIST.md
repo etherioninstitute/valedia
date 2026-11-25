@@ -651,6 +651,13 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Reply 52 (no new Carbon round; sent 2026-11-24 ~10 PM PST at the owner's request): big run + 11-24 morning reported.
+  Session 1/5 clean (6:55 run 1 min 18 s, 14/14 filled; 7:10 XLK 169 filled at venue, status SUBMITTED at the single
+  closing reconcile, so fil=0; collector peak 30.2 s vs control max 30.0 s, 0 missed; quote time not journaled).
+  Corrected r36: open orders are cancelled at the NEXT run's step 4 (order_step.py:3944), not before a run ends.
+  Corrected r51 s2.1 (Carver buffer + halving = stake ladder). Found: forecast-daily (pin 70d5dfc) and picks-hourly
+  grading (pin c2aeeb6) skip since 11-23. Asked: C+F after the clean week (extra sessions / reset / after order #1);
+  quote timestamp; lost forecast days; BTC Step 0 before 12-03.
   Round 52 (Carbon response 52, file named Valedia_Carbon_Response51.md; NO reply, by owner's rule "only if needed"):
   4 pre-launch checks, verified and relayed to the running big-run session (~9:40 PM). LEAD ERROR CORRECTED: the batch
   is :522-525 (+ :564 entry point); the (order_id, anomaly) halving and Carver's live buffer are "Later (stake
