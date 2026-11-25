@@ -1122,6 +1122,169 @@ def test_the_preflight_result_can_be_recorded(conn, repo):
     assert rl.events_for(conn, MON, BOOK)[0]["outcome"] == "OK"
 
 
+# ---- the pre-flight with an external gate checker (--gate-check): steps 2 to 4 are one run of it
+
+def fake_gate(tmp_path, code=0, out="", sleep=0.0, name="gate_check.py"):
+    """A stand-in gate checker: a tiny script that writes its arguments next to itself, prints `out`, sleeps, and exits `code`."""
+    f = tmp_path / name
+    f.write_text("import json, sys, time\n"
+                 "from pathlib import Path\n"
+                 "Path(__file__).with_suffix('.argv').write_text(json.dumps(sys.argv[1:]))\n"
+                 f"print({out!r})\n"
+                 f"time.sleep({sleep!r})\n"
+                 f"sys.exit({code!r})\n")
+    return f
+
+
+def gate_argv(f):
+    return json.loads(f.with_suffix(".argv").read_text())
+
+
+class GitWatch:
+    """Records every subprocess.run of the module, so a test can say whether `git` was or was not run."""
+
+    def __init__(self, monkeypatch):
+        self.calls = []
+        real = subprocess.run
+
+        def spy(*a, **k):
+            self.calls.append((a, k))
+            return real(*a, **k)
+        monkeypatch.setattr(subprocess, "run", spy)
+
+    def ran_git(self):
+        return any(a[0][0] == "git" for a, _ in self.calls)
+
+
+@pytest.mark.parametrize("code,outcome,cause", [
+    (0, "OK", None),
+    (1, "WARN", "gate:orderpath-mismatch"),
+    (3, "WARN", "gate:no-accepted-revision"),
+    (4, "WARN", "gate:files-list-short"),
+    (5, "WARN", "gate:git-error"),
+    (2, "WARN", "gate:git-error"),
+    (7, "WARN", "gate:git-error"),
+    (255, "WARN", "gate:git-error"),
+])
+def test_the_gate_checker_exit_code_decides_the_preflight(repo, tmp_path, code, outcome, cause):
+    res = pre(repo, gate_check=fake_gate(tmp_path, code))
+    assert (res.outcome, res.root_cause) == (outcome, cause)
+
+
+def test_the_gate_checker_is_run_with_the_agreed_command_and_a_safe_call(repo, tmp_path, monkeypatch):
+    watch = GitWatch(monkeypatch)
+    g = fake_gate(tmp_path)
+    assert pre(repo, gate_check=g).outcome == "OK"
+    (argv, kw), = watch.calls
+    assert argv[0] == [str(repo["venv_python"]), "-I", str(g), "--repo", str(repo["repo"]), "--pin-file", str(repo["accepted_commit_file"]),
+                       "--list-file", str(repo["files_file"]), "--min-paths", str(rl.MIN_FILES)]
+    assert kw["capture_output"] is True and kw["stdin"] == subprocess.DEVNULL and not kw.get("shell")
+    assert kw["timeout"] >= rl.GIT_SECONDS and rl.GATE_CHECK_SECONDS >= rl.GIT_SECONDS
+    assert kw["env"]["LC_ALL"] == "C" and "PATH" in kw["env"]
+    assert gate_argv(g)[:2] == ["--repo", str(repo["repo"])]
+
+
+def test_the_gate_checker_env_goes_through_child_env(repo, tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(rl, "child_env", lambda extra=None: (seen.append(dict(extra or {})) or {"PATH": "/usr/bin:/bin", **(extra or {})}))
+    assert pre(repo, gate_check=fake_gate(tmp_path)).outcome == "OK"
+    assert seen == [{"LC_ALL": "C"}]
+
+
+def test_a_gate_checker_that_runs_too_long_is_a_git_error(repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(rl, "GATE_CHECK_SECONDS", 0.5)
+    res = pre(repo, gate_check=fake_gate(tmp_path, 0, sleep=30))
+    assert (res.outcome, res.root_cause) == ("WARN", "gate:git-error")
+
+
+def test_a_missing_gate_checker_is_a_git_error_with_its_own_sentence(repo, tmp_path):
+    res = pre(repo, gate_check=tmp_path / "nowhere.py")
+    assert (res.outcome, res.root_cause) == ("WARN", "gate:git-error") and "gate checker is missing" in res.detail
+
+
+def test_a_relative_or_directory_gate_checker_path_is_refused(repo, tmp_path, monkeypatch):
+    fake_gate(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    watch = GitWatch(monkeypatch)
+    for bad in ("gate_check.py", "./gate_check.py", "", tmp_path):
+        res = pre(repo, gate_check=bad)
+        assert (res.outcome, res.root_cause) == ("WARN", "gate:git-error") and "gate checker is missing" in res.detail
+    assert watch.calls == []
+
+
+def test_a_gate_checker_that_cannot_start_is_a_git_error(repo, tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise PermissionError("no")
+    monkeypatch.setattr(subprocess, "run", boom)
+    res = pre(repo, gate_check=fake_gate(tmp_path))
+    assert (res.outcome, res.root_cause) == ("WARN", "gate:git-error")
+
+
+def test_a_missing_venv_still_wins_and_the_gate_checker_is_not_run(repo, tmp_path, monkeypatch):
+    watch = GitWatch(monkeypatch)
+    res = pre(repo, gate_check=fake_gate(tmp_path), venv_python=tmp_path / "no-python")
+    assert res.root_cause == "env:venv-missing" and watch.calls == []
+
+
+def test_with_a_gate_checker_the_old_strip_and_git_diff_path_is_not_consulted(repo, tmp_path, monkeypatch):
+    # today's code accepts this list: the stray space is stripped and the repeated line is dropped
+    repo["files_file"].write_text("\n".join(repo["names"]) + " \n" + repo["names"][0] + "\n")
+    assert pre(repo).outcome == "OK"
+    watch = GitWatch(monkeypatch)
+    res = pre(repo, gate_check=fake_gate(tmp_path, 4))
+    assert (res.outcome, res.root_cause) == ("WARN", "gate:files-list-short")
+    res = pre(repo, gate_check=fake_gate(tmp_path, 1, name="g1.py"))
+    assert res.root_cause == "gate:orderpath-mismatch"
+    assert not watch.ran_git()
+
+
+def test_with_a_gate_checker_a_tree_edit_or_a_bad_pin_is_the_checkers_call_alone(repo, tmp_path, monkeypatch):
+    (repo["repo"] / "f03.py").write_text("x = 'edited'\n")
+    repo["accepted_commit_file"].write_text("not a hash\n")
+    assert pre(repo).root_cause == "gate:no-accepted-revision"                   # the old path warns on the pin
+    watch = GitWatch(monkeypatch)
+    res = pre(repo, gate_check=fake_gate(tmp_path, 0))
+    assert (res.outcome, res.root_cause) == ("OK", None)                         # the checker said MATCH: nothing else is asked
+    assert not watch.ran_git()
+
+
+def test_the_gate_checkers_output_is_never_copied_into_the_row(repo, tmp_path, conn):
+    noise = "SECRET-LOOKING Text with CAPS and /some/path"
+    for code in (1, 3, 4, 5):
+        res = pre(repo, gate_check=fake_gate(tmp_path, code, out=noise))
+        assert "SECRET" not in res.detail and "CAPS" not in res.detail and "/some/path" not in res.detail
+        add(conn, "PREFLIGHT", "0630", res.outcome, T0630, root_cause=res.root_cause, detail=res.detail)    # the table accepts it
+    assert count(conn) == 4
+
+
+def test_the_gate_checker_details_are_fixed_sentences(repo, tmp_path):
+    details = {code: pre(repo, gate_check=fake_gate(tmp_path, code)).detail for code in (1, 3, 4, 5)}
+    assert len(set(details.values())) == 4
+    assert "missing" in details[4] and "short" in details[4] and "malformed" in details[4]
+
+
+def test_a_holiday_is_still_ok_after_a_gate_checker_match(repo, tmp_path):
+    res = pre(repo, gate_check=fake_gate(tmp_path, 0), now=utc(2026, 11, 26, 14, 30))
+    assert (res.outcome, res.root_cause) == ("OK", rl.HOLIDAY)
+
+
+def test_a_gate_checker_warning_on_a_holiday_still_warns(repo, tmp_path):
+    res = pre(repo, gate_check=fake_gate(tmp_path, 1), now=utc(2026, 11, 26, 14, 30))
+    assert res.root_cause == "gate:orderpath-mismatch"
+
+
+def test_without_a_gate_checker_the_old_path_is_unchanged(repo, tmp_path, monkeypatch):
+    watch = GitWatch(monkeypatch)
+    assert pre(repo, gate_check=None) == pre(repo)
+    assert watch.ran_git() and all(a[0][0] == "git" for a, _ in watch.calls)
+    (repo["repo"] / "f03.py").write_text("x = 'edited'\n")
+    assert pre(repo, gate_check=None) == pre(repo) and pre(repo, gate_check=None).root_cause == "gate:orderpath-mismatch"
+    repo["files_file"].write_text("f00.py\n")
+    assert pre(repo, gate_check=None) == pre(repo) and pre(repo, gate_check=None).root_cause == "gate:files-list-short"
+    repo["accepted_commit_file"].write_text("zz\n")
+    assert pre(repo, gate_check=None) == pre(repo) and pre(repo, gate_check=None).root_cause == "gate:no-accepted-revision"
+
+
 # ------------------------------------------------------------------------------------------------ record-run
 
 def summary(status="done", stage=None, **extra):
@@ -1702,6 +1865,33 @@ def test_cli_preflight_records_an_event(tmp_path, capsys, repo):
 def test_cli_preflight_on_a_holiday_exits_zero(tmp_path, capsys, repo):
     args = ["preflight", "--repo", str(repo["repo"]), "--accepted-commit-file", str(repo["accepted_commit_file"]),
             "--files-file", str(repo["files_file"]), "--venv-python", str(repo["venv_python"])]
+    code, out = cli(args, tmp_path, now=utc(2026, 11, 26, 14, 30), capsys=capsys)
+    assert code == 0 and json.loads(out.out)["root_cause"] == "calendar:holiday"
+
+
+def test_cli_preflight_gate_check_flag_reaches_the_preflight(tmp_path, capsys, repo):
+    args = ["preflight", "--repo", str(repo["repo"]), "--accepted-commit-file", str(repo["accepted_commit_file"]),
+            "--files-file", str(repo["files_file"]), "--venv-python", str(repo["venv_python"])]
+    mismatch = fake_gate(tmp_path, 1, name="g1.py")
+    code, out = cli([*args, "--gate-check", str(mismatch)], tmp_path, now=T0630, capsys=capsys)      # a clean tree, the checker says no
+    assert code == 1 and json.loads(out.out)["root_cause"] == "gate:orderpath-mismatch"
+    assert gate_argv(mismatch)[gate_argv(mismatch).index("--min-paths") + 1] == str(rl.MIN_FILES)
+    (repo["repo"] / "f02.py").write_text("x = 'edited'\n")
+    match = fake_gate(tmp_path, 0, name="g0.py")
+    code, out = cli([*args, "--gate-check", str(match)], tmp_path, now=T0630, capsys=capsys)         # an edited tree, the checker says yes
+    assert code == 0 and json.loads(out.out)["outcome"] == "OK"
+    code, out = cli(args, tmp_path, now=T0630, capsys=capsys)                                        # without the flag: the old path
+    assert code == 1 and json.loads(out.out)["root_cause"] == "gate:orderpath-mismatch"
+    c = rl.connect(tmp_path / "cli.sqlite")
+    rows = rl.events_for(c, MON, BOOK)
+    c.close()
+    assert [r["outcome"] for r in rows] == ["WARN", "OK", "WARN"]
+
+
+def test_cli_preflight_gate_check_on_a_holiday_exits_zero(tmp_path, capsys, repo):
+    args = ["preflight", "--repo", str(repo["repo"]), "--accepted-commit-file", str(repo["accepted_commit_file"]),
+            "--files-file", str(repo["files_file"]), "--venv-python", str(repo["venv_python"]),
+            "--gate-check", str(fake_gate(tmp_path, 0))]
     code, out = cli(args, tmp_path, now=utc(2026, 11, 26, 14, 30), capsys=capsys)
     assert code == 0 and json.loads(out.out)["root_cause"] == "calendar:holiday"
 

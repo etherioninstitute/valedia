@@ -3,7 +3,7 @@
     python -m valedia_trader.core.run_ledger record     --store PATH --book BOOK --kind K --trigger T --outcome O [...]
     python -m valedia_trader.core.run_ledger record-run --store PATH --book BOOK --trigger T --exit-code N   (summary on stdin)
     python -m valedia_trader.core.run_ledger preflight  --store PATH --book BOOK --repo R --accepted-commit-file F \\
-                                                        --files-file L --venv-python P [--trigger T]
+                                                        --files-file L --venv-python P [--trigger T] [--gate-check G]
     python -m valedia_trader.core.run_ledger deadman    --store PATH --book BOOK [--wait-open] [--orders-ledger PATH]
     python -m valedia_trader.core.run_ledger notify     --store PATH --book BOOK [--mac]
     python -m valedia_trader.core.run_ledger streak     --store PATH --book BOOK --since YYYY-MM-DD
@@ -39,7 +39,9 @@ Any cause that is new, and any P0, is sent. Sending is a sender object with `sen
 core.alerts.MacNotifier for it. A send is made before it is written down, so a crash between the two sends it again
 rather than never.
 
-Nothing here makes a network call, reads a secrets file or runs a shell: the pre-flight runs `git` with an argument list.
+Nothing here makes a network call, reads a secrets file or runs a shell: the pre-flight runs `git`, or the gate checker it is
+given, with an argument list. With `--gate-check` the pre-flight asks that one checker, the same one the 6:55 run asks, instead of
+reading the pin and the list and running `git diff` itself, so the 6:30 warning and the 6:55 skip give the same answer.
 Times are UTC in the store (`YYYY-MM-DDTHH:MM:SSZ`); a day is the New York date; a trading day is an XNYS session."""
 from __future__ import annotations
 
@@ -97,6 +99,7 @@ CALENDAR_ANSWER_REASON = "the exchange calendar could not answer for"   # market
 MIN_FILES = 10                                                        # a files list shorter than this is not the order path
 MAX_SUMMARY_BYTES = 16 * 1024 * 1024
 GIT_SECONDS = 60
+GATE_CHECK_SECONDS = GIT_SECONDS                                      # the gate checker runs `git` too: it gets the same time
 SCHEMA_VERSION = 2                                                    # 2: the NOOP outcome (a layout-1 store would refuse it)
 
 _STAMP = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z"
@@ -594,17 +597,54 @@ class PreflightResult:
     detail: str
 
 
-def preflight(repo, accepted_commit_file, files_file, venv_python, now: datetime) -> PreflightResult:
+def _gate_check(gate_check, repo, accepted_commit_file, files_file, venv_python) -> PreflightResult | None:
+    """Run the external gate checker once. None when it says MATCH (exit 0); otherwise the WARN to return. The checker's own
+    output is never copied into the row: every detail here is a fixed sentence."""
+    git_error = "WARN", "gate:git-error"
+    path = Path(str(gate_check))
+    if not (path.is_absolute() and path.is_file()):
+        return PreflightResult(*git_error, "the gate checker is missing: its path is not an absolute path to a file")
+    argv = [str(venv_python), "-I", str(path), "--repo", str(repo), "--pin-file", str(accepted_commit_file),
+            "--list-file", str(files_file), "--min-paths", str(MIN_FILES)]
+    try:
+        done = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, timeout=GATE_CHECK_SECONDS,
+                              env=child_env({"LC_ALL": "C"}))
+        code = done.returncode
+    except (OSError, subprocess.SubprocessError):
+        code = -1
+    if code == 0:
+        return None
+    if code == 1:
+        return PreflightResult("WARN", "gate:orderpath-mismatch", "the order-path files differ from the accepted revision")
+    if code == 3:
+        return PreflightResult("WARN", "gate:no-accepted-revision", "the accepted commit file is missing, empty or not a commit hash")
+    if code == 4:
+        return PreflightResult("WARN", "gate:files-list-short", "the files list is missing, too short or malformed")
+    return PreflightResult(*git_error, "the gate checker could not compare the order-path files with the accepted revision")
+
+
+def preflight(repo, accepted_commit_file, files_file, venv_python, now: datetime, gate_check=None) -> PreflightResult:
     """The checks before the 6:55 run, in this order, the first failure winning. No network is used and no secrets file is read.
 
     1. the venv python is a file you can run                       env:venv-missing
     2. the accepted commit file holds a commit hash                gate:no-accepted-revision
     3. the files list has at least MIN_FILES entries               gate:files-list-short
     4. `git -C repo diff --quiet COMMIT -- FILES` finds no change  gate:orderpath-mismatch (git failing: gate:git-error)
-    5. today, New York, is a session; if not, OK with calendar:holiday (an ordinary stop)"""
+    5. today, New York, is a session; if not, OK with calendar:holiday (an ordinary stop)
+
+    With `gate_check` (an absolute path to the checker script) steps 2 to 4 are one run of that checker, the one the 6:55 run
+    uses: exit 0 goes on to step 5; 1 is gate:orderpath-mismatch, 3 gate:no-accepted-revision, 4 gate:files-list-short; any
+    other code, a timeout or a checker that is missing is gate:git-error. Without it, steps 2 to 4 are as above."""
     py = Path(venv_python)
     if not (py.is_file() and os.access(py, os.X_OK)):
         return PreflightResult("WARN", "env:venv-missing", "the venv python is not there or cannot be run")
+    if gate_check is not None:
+        warn = _gate_check(gate_check, repo, accepted_commit_file, files_file, venv_python)
+        if warn is not None:
+            return warn
+        if not is_session(new_york_date(now)):
+            return PreflightResult("OK", HOLIDAY, "the exchange is closed today")
+        return PreflightResult("OK", None, "the order-path files match the accepted revision")
     try:
         commit = Path(accepted_commit_file).read_text().strip()
     except (OSError, UnicodeDecodeError):
@@ -1191,6 +1231,7 @@ def _parser() -> argparse.ArgumentParser:
     c.add_argument("--accepted-commit-file", required=True)
     c.add_argument("--files-file", required=True)
     c.add_argument("--venv-python", required=True)
+    c.add_argument("--gate-check", help="absolute path of the gate checker: one run of it replaces the pin, list and `git diff` steps")
     c.add_argument("--trigger", default="0630", choices=TRIGGERS)
     c = command("deadman", "write the day's dead-man row when it is due")
     c.add_argument("--orders-ledger", help="the order ledger's file, read only, for the p2:collar-miss recount "
@@ -1219,7 +1260,7 @@ def _run(args, now: datetime, stdin, sender, now_fn=None, sleep_fn=None) -> int:
             _print({"event_id": i, "outcome": m.outcome, "root_cause": m.root_cause, "fault_count": m.fault_count})
             return 1 if _needs_owner(conn, i) else 0
         if args.cmd == "preflight":
-            r = preflight(args.repo, args.accepted_commit_file, args.files_file, args.venv_python, now)
+            r = preflight(args.repo, args.accepted_commit_file, args.files_file, args.venv_python, now, args.gate_check)
             i = record_event(conn, book=args.book, kind="PREFLIGHT", trigger=args.trigger, outcome=r.outcome, now=now,
                              root_cause=r.root_cause, detail=r.detail)
             _print({"event_id": i, "outcome": r.outcome, "root_cause": r.root_cause})
