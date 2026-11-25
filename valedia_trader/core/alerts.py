@@ -1,6 +1,8 @@
 """The watchdog: a fixed list of conditions that mean something has stopped, each raised once.
 
     python -m valedia_trader.core.alerts watch [--notify]     run the checks once; write each NEW alert; --notify shows it
+    python -m valedia_trader.core.alerts watch --only "pick-list log" [--notify]
+                                                              that check alone: no other check's alert is touched or shown
     python -m valedia_trader.core.alerts list                 the alerts that are open now
 
 The checks only read the trader's files (every sqlite file is opened read-only with a short timeout); the one
@@ -56,6 +58,11 @@ with `level` "cleared" and the same key is written. An alert is open while the l
     collector:heartbeat         the order-book collector's newest heartbeat is older than 10 minutes
     picks:no-end                the hourly pick-list log has no "end" line in the last 3 hours
     picks:failed                the last run in that log said "failed"
+    picks:listing-failing       P2: the last 3 runs in that log (PICKS_LISTING_FAILS) that reached Reddit each said
+                                `error: listing: ...`, or `stopped: rate_limited` with `requests: 1` (the listing itself was
+                                limited, not a later thread); a run that said neither and `requests: N`
+                                got its listing and ends the count; a run that said none of them (cut off, still going) is
+                                passed over. Clears when a run gets its listing
     journal:damaged             a damaged journal line in the last 30 days
     paper:no-entry              the paper step wrote no summary on the last trading day (the exchange calendar)
     disk:low                    under 5 GB free on the volume that holds the repository
@@ -120,7 +127,8 @@ __all__ = ["Alert", "Env", "Sender", "MacNotifier", "WatchResult", "watch", "ope
            "open_readonly", "describe", "SourceMissing", "CHECKS", "last_trading_day", "exchange_sessions", "launchctl_text",
            "parse_jobs", "read_tail", "PICKS_LOG", "is_outside_market_hours", "register_trading_file", "TradingFileError",
            "hide_order_ids", "notifications_file", "read_notifications", "notification_note", "is_practice", "is_unattended",
-           "has_unknown_mode", "read_alert_file", "withheld_note"]
+           "has_unknown_mode", "read_alert_file", "withheld_note", "PICKS_LISTING_FAILS", "listing_failure_streak",
+           "checks_named"]
 
 HEARTBEAT_MAX_AGE_S = 600.0                  # the collector writes one a minute; ten minutes without one is a stop
 PICKS_END_MAX_AGE_S = 3 * 3600.0             # the pick-list job runs every hour
@@ -129,6 +137,11 @@ DAMAGE_WINDOW_DAYS = 30
 LEDGER_MAX_AGE_SECONDS = 5 * 86400.0         # the order step reconciles first thing each run, so a reconcile that is a few days
                                              # old (a long weekend) is not a stop; the ledger's own default is 6 hours
 PICKS_LOG = "valedia-picks-hourly.log"
+PICKS_LISTING_FAILS = 3                      # hourly runs in a row whose Reddit listing did not come through. An ordinary day
+                                             # cannot reach 3: before the feed shut down (11-17) no listing failed in 88 runs and
+                                             # no comment slot in 2,041; the network faults seen since (timeouts, the 11-25 DNS
+                                             # break) last at most 10 minutes, so they reach one hourly run. A real outage is
+                                             # raised at its third run, 2 to 3 hours in.
 WEEKLY_JOB, WEEKLY_LOG, WEEKLY_MAX_AGE_S = "com.valedia.research-loop.weekly", "valedia-research-loop.log", 8 * 86400.0
 ORDERSTEP_JOB = "com.valedia.orderstep.paper"
 ORDERSTEP_AFTER = (10, 30)                   # New York time: the job's runs (09:55 and 10:10) are over by then
@@ -140,7 +153,10 @@ NEW_YORK = ZoneInfo("America/New_York")
 
 _STAMP = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"
 _END_LINE = re.compile(rf"^({_STAMP}) end$")
-_START_LINE = re.compile(rf"^{_STAMP} start$")
+_START_LINE = re.compile(rf"^({_STAMP}) start$")
+_LISTING_ERROR = re.compile(r"^error: listing:")                  # the pick-list ingest could not get the user's listing
+_LISTING_LIMITED = re.compile(r"^stopped: rate_limited$")         # ... or was told to slow down, so no thread was fetched
+_REQUESTS_LINE = re.compile(r"^requests: \d+$")                   # the ingest ran and said how many requests it made
 _WEEKLY_RUN = re.compile(r"^=== (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) weekly research loop")
 _FAILED = re.compile(r"\bfailed\b(?!:?\s*\d)", re.I)           # "failed: 0" and "failed 3 times" are counts, not a failed run
 _LONG_DIGITS = re.compile(r"(?<!\d)(?<!\d\.)\d{9,}(?!\d)(?!\.\d)")          # a number with a decimal point is a price, not an account
@@ -1212,6 +1228,31 @@ def parse_picks_log(lines: list[str]) -> tuple[float | None, str | None]:
     return last_end, failed
 
 
+def listing_failure_streak(lines: list[str]) -> tuple[int, str | None, str | None]:
+    """(the runs in a row, newest first, whose Reddit listing did not come through; the start stamp of the oldest of
+    them; the newest one's line). A run is the lines from one "start" line to the next. A run that said
+    `error: listing: ...` counts, and so does `stopped: rate_limited` beside `requests: 1` (the listing itself was
+    limited: ingest follows no thread after that; after more requests the limit hit a thread). A run that said
+    `requests: N` and neither got its listing and ends the count; a run that said none of these (cut off, or still
+    going) is passed over."""
+    runs: list[tuple[str, list[str]]] = []
+    for line in lines:
+        m = _START_LINE.match(line)
+        if m:
+            runs.append((m.group(1), []))
+        elif runs:
+            runs[-1][1].append(line)
+    n, since, newest = 0, None, None
+    for stamp, body in reversed(runs):
+        listing_only = "requests: 1" in body
+        bad = next((ln for ln in body if _LISTING_ERROR.match(ln) or (listing_only and _LISTING_LIMITED.match(ln))), None)
+        if bad is not None:
+            n, since, newest = n + 1, stamp, newest or bad
+        elif any(_REQUESTS_LINE.match(ln) for ln in body):
+            break
+    return n, since, newest
+
+
 def check_picks(env: Env) -> CheckResult:
     out = CheckResult()
     log = Path(env.logs_dir) / PICKS_LOG
@@ -1219,7 +1260,13 @@ def check_picks(env: Env) -> CheckResult:
         out.alerts.append(Alert("picks:no-end", "warning", "The hourly pick-list log has no end line",
                                 f"The log {PICKS_LOG} is missing."))
         return out
-    last_end, failed = parse_picks_log(read_tail(log))
+    lines = read_tail(log)
+    last_end, failed = parse_picks_log(lines)
+    streak, since, newest = listing_failure_streak(lines)
+    if streak >= PICKS_LISTING_FAILS:
+        out.alerts.append(Alert("picks:listing-failing", "warning",
+                                f"P2: the Reddit pick listing failed {PICKS_LISTING_FAILS} or more hourly runs in a row",
+                                f"{streak} runs in a row since {since}; the newest said: {newest}"))
     if last_end is None or env.now - last_end > PICKS_END_MAX_AGE_S:
         seen = f"the last end line is from {iso(last_end)}" if last_end is not None else "the log has no end line"
         out.alerts.append(Alert("picks:no-end", "warning", "The hourly pick-list job has not finished in 3 hours", seen + "."))
@@ -1344,10 +1391,11 @@ CHECKS: list[tuple[str, tuple[str, ...], Callable[[Env], CheckResult]]] = [
 HELD_WITH = {"shared stops": ("step-stopped:", "practice-stopped:")}
 
 
-def run_checks(env: Env) -> tuple[list[Alert], list[str], list[str], list[str]]:
-    """(the alerts that are true now, keys held, key prefixes held, failures). A check that raises holds its whole prefix."""
+def run_checks(env: Env, checks=None) -> tuple[list[Alert], list[str], list[str], list[str]]:
+    """(the alerts that are true now, keys held, key prefixes held, failures). A check that raises holds its whole prefix.
+    `checks` is a part of CHECKS (default: all of it)."""
     alerts, held, held_prefixes, failures = [], [], [], []
-    for name, prefixes, fn in CHECKS:
+    for name, prefixes, fn in (CHECKS if checks is None else checks):
         try:
             r = fn(env)
         except Exception as exc:
@@ -1481,10 +1529,24 @@ class WatchResult:
     withheld: int = 0                                      # old lines of the alert file that are not alerts (see `_replay`)
 
 
-def watch(env: Env, senders=(), path=None) -> WatchResult:
+def checks_named(names) -> list:
+    """The CHECKS entries with these names, in CHECKS order. Raises ValueError for a name that is not one of them."""
+    known = {name for name, _, _ in CHECKS}
+    unknown = sorted(set(names) - known)
+    if unknown:
+        raise ValueError(f"no check is named {', '.join(unknown)}")
+    return [c for c in CHECKS if c[0] in set(names)]
+
+
+def watch(env: Env, senders=(), path=None, only=None) -> WatchResult:
     """Run every check once, write the new alerts and the cleared ones, then give each new alert to each sender. The alert file is
     locked from the read of the open alerts to the write: the checks are given the alerts open at that moment (a check that clears
-    only on evidence later than the alert reads them), and no other watch can write between."""
+    only on evidence later than the alert reads them), and no other watch can write between.
+
+    `only` (names of CHECKS) runs those checks alone, for a job that watches its own condition: an alert of any other check
+    is neither raised, nor cleared, nor given to a sender, nor returned as open; it stays in the file exactly as it was."""
+    chosen = CHECKS if only is None else checks_named(only)
+    ours = tuple(p for _, prefixes, _ in chosen for p in prefixes)
     path = Path(path) if path else alerts_file(env.root)
     register_trading_file(env)
     now = iso(env.now)
@@ -1497,7 +1559,7 @@ def watch(env: Env, senders=(), path=None) -> WatchResult:
         open_map, _, withheld = _replay(data)
         env._cache["open_alerts"] = dict(open_map)
         env._cache.pop("shared_view", None)                # a view cached by an earlier check or watch was built without these open alerts
-        produced, held, held_prefixes, failures = run_checks(env)
+        produced, held, held_prefixes, failures = run_checks(env) if only is None else run_checks(env, chosen)
         by_key = {}
         for a in produced:                                 # two checks, or two labels, that clean to one key are one alert
             by_key.setdefault(a.key, a)
@@ -1505,7 +1567,7 @@ def watch(env: Env, senders=(), path=None) -> WatchResult:
         raised = [a for a in produced if a.key not in open_map]
         gone = [e for k, e in open_map.items()
                 if k not in by_key and k not in held and not any(k.startswith(p) for p in held_prefixes)
-                and any(k.startswith(p) for _, prefixes, _ in CHECKS for p in prefixes)]
+                and k.startswith(ours)]
         for e in gone:
             cleared.append(Alert(e["key"], CLEARED, "Cleared: " + str(e.get("title", "")), "The condition is no longer true."))
         lines = [json.dumps({"time": now, "level": a.level, "key": a.key, "title": a.title, "detail": a.detail,
@@ -1520,6 +1582,8 @@ def watch(env: Env, senders=(), path=None) -> WatchResult:
         for a in raised:
             open_map[a.key] = {"time": now, "level": a.level, "key": a.key, "title": a.title, "detail": a.detail,
                                **({"evidence": a.evidence} if a.evidence else {})}
+        if only is not None:                               # another check's alert is not this watch's to show or report
+            open_map = {k: e for k, e in open_map.items() if k.startswith(ours)}
         shown = _notify(open_map, senders, notifications_file(env.root) if path == alerts_file(env.root) else path.with_name("notifications.jsonl"),
                         now, failures)
     return WatchResult(raised, cleared, list(open_map.values()), failures, shown, withheld)
@@ -1584,6 +1648,8 @@ def main(argv=None, env: Env | None = None, out=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     w = sub.add_parser("watch", help="run the checks once and write the new alerts")
     w.add_argument("--notify", action="store_true", help="show one macOS notification for each new alert")
+    w.add_argument("--only", action="append", choices=[name for name, _, _ in CHECKS], metavar="CHECK",
+                   help="run this check alone (may be given more than once); no other check's alert is touched or shown")
     sub.add_parser("list", help="print the open alerts")
     args = ap.parse_args(argv)
     env = env or Env.default(args.root)
@@ -1598,7 +1664,7 @@ def main(argv=None, env: Env | None = None, out=None) -> int:
             rows, withheld = read_alert_file(alerts_file(env.root))
             _show(rows, out, read_notifications(notifications_file(env.root)), withheld)
             return 1 if rows else 0
-        result = watch(env, senders=[MacNotifier()] if args.notify else [])
+        result = watch(env, senders=[MacNotifier()] if args.notify else [], only=args.only)
     except Exception as exc:
         print(f"the watch failed: {describe(exc)}", file=sys.stderr)
         return 2
