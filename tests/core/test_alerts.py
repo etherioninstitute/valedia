@@ -200,6 +200,25 @@ def no_end_on(w): w.write_picks_log(end_ago=3 * 3600 + 5)
 def no_end_off(w): w.write_picks_log(end_ago=600)
 def failed_on(w): w.write_picks_log(end_ago=600, extra=["schedule failed (see picks-hourly.err)"])
 def failed_off(w): w.write_picks_log(end_ago=600, extra=["schedule stored"])
+
+# one hourly run each, oldest first: F the listing failed, L the listing was rate limited, S the listing came, T the
+# listing came and a later thread was rate limited, N said nothing (cut off)
+LISTING_404 = "error: listing: the skill script exited 2: HTTP 404 for https://www.reddit.com/user/examplebot.rss?limit=50"
+RUN_BODY = {"F": ["requests: 1", "threads followed: 0", "new threads: 0", "new comment versions: 0", LISTING_404, "stopped: error"],
+            "L": ["requests: 1", "threads followed: 0", "new threads: 0", "new comment versions: 0", "stopped: rate_limited"],
+            "S": ["requests: 2", "threads followed: 1", "new threads: 0", "new comment versions: 8"],
+            "T": ["requests: 3", "threads followed: 1", "new threads: 0", "new comment versions: 2", "stopped: rate_limited"],
+            "N": []}
+
+
+def write_runs(w, outcomes):
+    lines, n = [], len(outcomes)
+    for i, o in enumerate(outcomes):
+        start = NOW - 600 - 300 - (n - 1 - i) * 3600                 # an hour apart; the newest ended ten minutes ago
+        lines += [f"{iso(start)} start", *RUN_BODY[o], "parsed: 0", "failed: 0", "schedule stored", f"{iso(start + 300)} end"]
+    (w.logs / "valedia-picks-hourly.log").write_text("\n".join(lines) + "\n")
+def listing_on(w): write_runs(w, "SFFF")
+def listing_off(w): write_runs(w, "SFFFS")
 def damage_on(w):
     with (w.root / "journal" / "2026-11-12.jsonl").open("a") as fh:
         fh.write('{"type": "decision", "br\n')
@@ -227,6 +246,7 @@ CONDITIONS = {
     "collector heartbeat": (beat_on, beat_off, "collector:heartbeat"),
     "no end line": (no_end_on, no_end_off, "picks:no-end"),
     "pick run failed": (failed_on, failed_off, "picks:failed"),
+    "pick listing failing": (listing_on, listing_off, "picks:listing-failing"),
     "damaged journal line": (damage_on, damage_off, "journal:damaged"),
     "paper step missing": (paper_on, paper_off, "paper:no-entry"),
     "disk low": (disk_on, disk_off, "disk:low"),
@@ -381,6 +401,94 @@ def test_a_huge_log_is_read_from_its_end(world):
     old = f"{iso(NOW - 99999)} start\nschedule failed\n{iso(NOW - 99990)} end\n" * 40000
     log.write_text(old + f"{iso(NOW - 600)} start\nschedule stored\n{iso(NOW - 500)} end\n")
     assert watch(world).raised == []
+
+
+# ---------------------------------------------------------------- the pick listing failing hour after hour (1.19)
+
+@pytest.mark.parametrize("outcomes, expect", [
+    ("SFF", False),            # two in a row: below the threshold
+    ("SFFF", True),            # the third in a row
+    ("FFF", True),             # a log whose tail starts inside the streak
+    ("SFFFS", False),          # a run that got its listing ends it
+    ("SFFSF", False),          # three, but not in a row
+    ("SFFNF", True),           # a run cut off before it said anything neither counts nor ends the count
+    ("SLLF", True),            # a run whose listing was told to slow down did not get through either
+    ("SFFTF", False),          # a run whose listing came and a later thread was rate limited ends the count
+    ("TFFF", True),            # ... and only that: the three after it still count
+    ("SNNN", False),           # runs that said nothing are not failures
+    ("SSSS", False),
+])
+def test_the_listing_alert_needs_three_runs_in_a_row_without_the_listing(world, outcomes, expect):
+    assert al.PICKS_LISTING_FAILS == 3
+    write_runs(world, outcomes)
+    r = watch(world)
+    assert ("picks:listing-failing" in keys(r)) is expect, outcomes
+    assert "picks:failed" not in keys(r)                              # "failed: 0" in every run is a count
+
+
+def test_the_listing_alert_says_how_many_runs_since_when_and_what_the_newest_said(world):
+    write_runs(world, "SFFFF")
+    watch(world)
+    (line,) = [x for x in world.lines() if x["key"] == "picks:listing-failing"]
+    oldest = iso(NOW - 600 - 300 - 3 * 3600)
+    assert line["level"] == "warning" and line["title"].startswith("P2")
+    assert line["detail"].startswith(f"4 runs in a row since {oldest};") and "HTTP 404" in line["detail"]
+
+
+def test_the_streak_ignores_lines_before_the_first_start_line_of_the_tail():
+    lines = ["requests: 2", LISTING_404, f"{iso(NOW - 3600)} start", LISTING_404, f"{iso(NOW - 3500)} end",
+             f"{iso(NOW - 60)} start", "requests: 1", "stopped: rate_limited"]
+    assert al.listing_failure_streak(lines) == (2, iso(NOW - 3600), "stopped: rate_limited")
+    assert al.listing_failure_streak([]) == (0, None, None)
+
+
+def test_a_watch_of_one_check_neither_clears_nor_shows_nor_reports_another_checks_alert(world):
+    halt_on(world)
+    assert keys(watch(world)) == ["switch:halt"]                      # open, from a full watch
+    halt_off(world)
+    listing_on(world)
+    got = []
+
+    class Phone:
+        def send(self, alert):
+            got.append(alert.key)
+
+    r = watch(world, senders=[Phone()], only=["pick-list log"])
+    assert keys(r) == ["picks:listing-failing"] and r.cleared == []
+    assert [e["key"] for e in r.open] == ["picks:listing-failing"] and got == ["picks:listing-failing"]
+    assert [x["key"] for x in world.lines()] == ["switch:halt", "picks:listing-failing"]
+    full = watch(world)                                                # a full watch still clears it
+    assert [c.key for c in full.cleared] == ["switch:halt"]
+
+
+def test_a_watch_of_one_check_does_not_raise_another_checks_alert_and_clears_its_own(world):
+    halt_on(world)
+    listing_on(world)
+    r = watch(world, only=["pick-list log"])
+    assert keys(r) == ["picks:listing-failing"] and [x["key"] for x in world.lines()] == ["picks:listing-failing"]
+    listing_off(world)
+    r = watch(world, only=["pick-list log"])
+    assert [c.key for c in r.cleared] == ["picks:listing-failing"] and r.open == [] and r.raised == []
+
+
+def test_only_names_a_check_that_exists(world):
+    with pytest.raises(ValueError):
+        watch(world, only=["no such check"])
+    with pytest.raises(SystemExit) as e:
+        al.main(["watch", "--only", "no such check"], env=world.env())
+    assert e.value.code == 2 and world.lines() == []
+
+
+def test_main_watch_only_the_pick_list_check(world, monkeypatch):
+    spy = Spy()
+    monkeypatch.setattr(al.subprocess, "run", spy)
+    halt_on(world)
+    listing_on(world)
+    assert al.main(["watch", "--only", "pick-list log", "--notify"], env=world.env()) == 1
+    assert [x["key"] for x in world.lines()] == ["picks:listing-failing"]
+    assert [c[0] for c in spy.calls] == ["osascript"]                 # one notification, and no launchctl: no job check ran
+    listing_off(world)
+    assert al.main(["watch", "--only", "pick-list log"], env=world.env()) == 0      # the halt file is not this watch's
 
 
 def test_the_last_trading_day_comes_from_the_exchange_calendar(world):
