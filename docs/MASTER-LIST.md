@@ -73,6 +73,14 @@ No prediction-market strategy has passed; no real event order until one does.
 
 ## 1. In flight today (2026-11-17)
 
+- **DONE 2026-11-25 9:12 AM PST** Strict gate, first live use and the operator tools. The 6:30 AM pre-flight
+  was OK and the 6:55 AM paper order step passed `gate_check.py` (no skip; XLV sell 14, 2 fills, fault 0).
+  GF-E (five job gates list the code each job runs) was installed 11-24 10:40 PM. GF-D (repin, rollback and
+  rehearse assert the gate with the same checker) was ACCEPTED after 15 rounds: 61 tests, a plant for each
+  guard. The last two blind checks found no code defect. Declined, in the ledger: a symlink race at the
+  temp-file name that needs a hostile local process. **NEXT** GF-C (a P2 alert when any gated job's checker
+  is not MATCH), and the Reddit pick-list fix (1.19, 1.20).
+
 - **DONE 2026-11-17 20:30 PST** T51 fractional orders, build A (practice path only; live fractions stay
   refused): four slices, one blind check, merged (main `5d944d4`), 2,601 tests pass on main, the order-step
   job gate moved. **NEXT** the practice proof in market hours, then build B (section 2).
