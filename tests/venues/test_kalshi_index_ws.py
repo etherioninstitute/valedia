@@ -488,6 +488,19 @@ def test_backoff_restarts_after_every_connection_that_delivered_data(tmp_path, c
     assert summary["ticks"] == 3 and summary["reconnects"] == 6 and len(connect.calls) == 7
 
 
+@pytest.mark.parametrize("reply", [
+    {"type": "subscribed", "id": 1, "msg": {"channel": "cfbenchmarks_value", "sid": 1}},
+    {"id": 1, "type": "error", "msg": {"code": 6, "msg": "Already subscribed"}},
+    {"type": "ok", "id": 1},
+])
+def test_a_reply_without_a_tick_does_not_restart_the_backoff(tmp_path, creds, reply):
+    # The server takes the handshake, answers, and closes, three times: the wait must keep doubling.
+    outcomes = [FakeWS([j(reply)]) for _ in range(3)]
+    summary, _, sleeps = run(tmp_path, outcomes, creds)
+    assert sleeps.values == [1.0, 2.0, 4.0]
+    assert summary["ticks"] == 0
+
+
 def test_backoff_doubles_to_a_sixty_second_cap():
     assert [kis.backoff_delay(n) for n in range(1, 10)] == [1, 2, 4, 8, 16, 32, 60, 60, 60]
 

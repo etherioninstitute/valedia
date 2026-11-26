@@ -429,7 +429,7 @@ class _Run:
         self.last_seq: dict[int, int] = {}
         self.signatures: set[str] = set()
         self.done = False
-        self._got_data = False      # did the current (or latest) connection deliver at least one frame?
+        self._got_data = False      # did the current (or latest) connection store at least one tick?
 
     # -- bookkeeping
     def summary(self) -> dict:
@@ -485,6 +485,7 @@ class _Run:
             self._count_seq(tick.sid, tick.seq)
             self.store.append(tick, kind)
             self.ticks += 1
+            self._got_data = True       # only a stored tick restarts the backoff, not a reply or an error
         elif kind in _INDEXLIST_TYPES:
             pass        # the reply to an `indexlist` request: it carries no tick
         elif kind == "error":
@@ -517,7 +518,6 @@ class _Run:
                     raw = await ws.recv()
             except TimeoutError:
                 continue
-            self._got_data = True
             self.handle(raw)
 
     async def _one_connection(self) -> None:
