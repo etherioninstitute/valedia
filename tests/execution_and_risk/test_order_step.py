@@ -8157,6 +8157,8 @@ def _t34_same_but(b, m, keys, where, skip=(), counts=None):
                     e = json.loads(y)
                     extra = [k for k in e if k in keys]
                     assert extra and e.get("event") == "summary" and list(e)[-len(extra):] == extra, (where, name)
+                    caps = {k: e[k] for k in CF_C_KEYS if k in e}   # CF-C: the journaled summaries too, the same
+                    assert cf_c_strip(caps) is not None, (where, name, caps)   # strict check as the returned one
                     assert json.dumps({k: v for k, v in e.items() if k not in keys}, default=str).encode() == x, (where, name)
         elif key == "state" and isinstance(b[key], dict) and b[key].get("version") == 1:
             assert _t51c_layout1_view(m[key]) == b[key], (where, key)   # T51c S3: layout 2, its new table empty
