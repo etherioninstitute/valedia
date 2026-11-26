@@ -404,6 +404,56 @@ def test_decimal_precision_is_kept(tmp_path, creds):
     assert lines(tmp_path)[0]["value"] == big
 
 
+BIG = 10 ** 300
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda m: m.update(seq=BIG),
+    lambda m: m.update(seq=2 ** 63),
+    lambda m: m.update(seq=-1),
+    lambda m: m.update(sid=BIG),
+    lambda m: m.update(sid=2 ** 63),
+    lambda m: m.update(sid=-1),
+    lambda m: m.update(sending_ts_ms=BIG),
+    lambda m: m["msg"].update(received_at=BIG),
+    lambda m: m["msg"].update(data=j({"time": BIG, "value": "1"})),
+    lambda m: m["msg"]["avg_60s_data"].update(window_size=BIG),
+    lambda m: m["msg"]["avg_60s_data"].update(window_size=10 ** 6 + 1),
+    lambda m: m["msg"]["avg_60s_data"].update(window_size=-1),
+    lambda m: m["msg"]["avg_60s_data"].update(window_start_ts_ms=BIG),
+    lambda m: m["msg"]["avg_60s_data"].update(window_end_ts_exclusive=BIG),
+])
+def test_parse_refuses_out_of_range_whole_numbers(mutate):
+    msg = value_msg()
+    mutate(msg)
+    with pytest.raises(kis.MalformedFrame):
+        kis.parse_value_message(msg)
+
+
+def test_the_largest_allowed_numbers_still_parse():
+    msg = value_msg(seq=2 ** 63 - 1, sid=2 ** 63 - 1)
+    msg["msg"]["avg_60s_data"]["window_size"] = 10 ** 6
+    tick = kis.parse_value_message(msg)
+    assert tick.seq == tick.sid == 2 ** 63 - 1 and tick.avg_60s.window_size == 10 ** 6
+
+
+def test_an_out_of_range_number_is_counted_and_skipped_in_a_run(tmp_path, creds):
+    script = [j(value_msg(seq=BIG)), j(value_msg(seq=1)), KeyboardInterrupt()]
+    summary, _, _ = run(tmp_path, [FakeWS(script)], creds)
+    assert summary["malformed"] == 1 and summary["ticks"] == 1 and summary["reconnects"] == 0
+    assert all(len(str(r["seq"])) < 20 for r in lines(tmp_path))
+
+
+@pytest.mark.parametrize("code, kept", [(6, 6), (-5, -5), (2 ** 31 - 1, 2 ** 31 - 1), (-2 ** 31, -2 ** 31),
+                                        (2 ** 31, None), (-2 ** 31 - 1, None), (10 ** 4000, None), ("E6", "E6"),
+                                        (1.5, None), (True, None)])
+def test_an_error_code_is_kept_only_when_it_is_a_small_int(tmp_path, creds, code, kept):
+    script = [j({"id": 1, "type": "error", "msg": {"code": code, "msg": "m"}}), KeyboardInterrupt()]
+    summary, _, _ = run(tmp_path, [FakeWS(script)], creds)
+    assert summary["errors"] == [{"kind": "server_error", "code": kept, "message": "m"}]
+    assert len(json.dumps(summary)) < 300
+
+
 @pytest.mark.parametrize("mutate", [
     lambda m: m.update(type="other"),
     lambda m: m["msg"].update(data="not json"),

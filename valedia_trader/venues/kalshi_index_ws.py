@@ -75,6 +75,9 @@ BACKOFF_CAP_S = 60.0
 JITTER_FRACTION = 0.25      # a delay is shortened by up to this share, so the doubling never passes the cap
 POLL_S = 1.0                # the longest the reader waits for one frame before it re-checks its deadline
 MAX_ERRORS_KEPT = 100
+MAX_SEQ = 2 ** 63 - 1       # the largest sid or seq accepted
+MAX_WINDOW_SIZE = 10 ** 6
+MAX_CODE = 2 ** 31 - 1      # the largest error code kept
 
 
 # ------------------------------------------------------------------ errors
@@ -293,6 +296,13 @@ def _to_int(x: Any) -> int:
     raise MalformedFrame("a whole number was expected")
 
 
+def _bounded(x: Any, lo: int, hi: int) -> int:
+    n = _to_int(x)
+    if not lo <= n <= hi:
+        raise MalformedFrame("a whole number is out of range")
+    return n
+
+
 def _to_decimal(x: Any) -> Decimal:
     if isinstance(x, bool) or not isinstance(x, (str, int, Decimal)):
         raise MalformedFrame("a decimal string was expected")     # a float is refused: it has already lost digits
@@ -310,9 +320,9 @@ def _to_decimal(x: Any) -> Decimal:
 def _parse_window(node: Any) -> WindowAvg:
     if not isinstance(node, dict):
         raise MalformedFrame("a window average must be an object")
-    return WindowAvg(value=_to_decimal(node.get("value")), window_size=_to_int(node.get("window_size")),
-                     window_start_ts_ms=_to_int(node.get("window_start_ts_ms")),
-                     window_end_ts_exclusive=_to_int(node.get("window_end_ts_exclusive")))
+    return WindowAvg(value=_to_decimal(node.get("value")), window_size=_bounded(node.get("window_size"), 0, MAX_WINDOW_SIZE),
+                     window_start_ts_ms=_check_ms(_to_int(node.get("window_start_ts_ms"))),
+                     window_end_ts_exclusive=_check_ms(_to_int(node.get("window_end_ts_exclusive"))))
 
 
 def _check_ms(ms: int) -> int:
@@ -353,9 +363,9 @@ def parse_value_message(obj: Any) -> IndexTick:
         value=_to_decimal(raw.get("value")),
         source_time_ms=_check_ms(_to_int(raw.get("time"))),
         received_at_ms=_check_ms(_to_int(msg.get("received_at"))),
-        sending_ts_ms=None if sending is None else _to_int(sending),
-        sid=_to_int(obj.get("sid")),
-        seq=_to_int(obj.get("seq")),
+        sending_ts_ms=None if sending is None else _check_ms(_to_int(sending)),
+        sid=_bounded(obj.get("sid"), 0, MAX_SEQ),
+        seq=_bounded(obj.get("seq"), 0, MAX_SEQ),
         avg_60s=None if avg_60 is None else _parse_window(avg_60),
         last_15min_avg=None if last_15 is None else _parse_window(last_15),
         data=data,
@@ -496,7 +506,7 @@ class _Run:
             body = obj.get("msg") if isinstance(obj.get("msg"), dict) else {}
             code = body.get("code")
             message = body.get("msg", body.get("message"))
-            self._record_error("server_error", code=code if _is_int(code) or isinstance(code, str) else None,
+            self._record_error("server_error", code=code if (_is_int(code) and -MAX_CODE - 1 <= code <= MAX_CODE) or isinstance(code, str) else None,
                                message=message if isinstance(message, str) else None)
         # `subscribed`, `ok` and any other type carry no tick: nothing to record
 
