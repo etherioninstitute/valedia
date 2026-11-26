@@ -38,6 +38,7 @@ from valedia_trader.execution_and_risk import order_step as osx
 from valedia_trader.venues import webull as _wb
 from test_order_step import CAL, GENEROUS, Booked, LiveVenue, Second, StandIn, live_world, lpropose, ny, paper, \
     ticket_world
+from test_order_step import every_lot_settled  # noqa: F401  (CF-C: the fixture, for the tests that name it)
 from test_fractional_legs import book_without, dec, todays_units
 
 FUNDS = ("SPY", "QQQ", "IWM", "TLT", "GLD")
@@ -339,6 +340,7 @@ def drive(w, rng, kind, counts):
 
 
 @pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_r3_every_order_of_a_fractional_practice_run_has_the_ruled_shape_over_seeded_worlds(tmp_path, kind):
     counts = Counts()
     for k in range(WORLDS_PER_KIND):

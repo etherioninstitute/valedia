@@ -24,6 +24,7 @@ from decimal import Decimal as D
 import pytest
 
 import test_order_step as T
+from test_order_step import every_lot_settled  # noqa: F401  (CF-C: the fixture, for the tests that name it)
 from valedia_trader.core import alerts
 from valedia_trader.execution_and_risk import order_step as osx
 from valedia_trader.execution_and_risk import stake_ladder
@@ -473,6 +474,7 @@ def test_a_purchase_filled_in_the_run_whose_position_the_venue_reports_late_is_s
     assert out["status"] == "done" and "faults" not in out and "reconcile_pending" not in out, out
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: it sells lots bought the same day; the cap: test_sale_cap.py
 def test_a_sale_whose_holding_falls_before_its_status_says_filled_is_set_aside_not_a_fault(mk):
     w = mk(Lag())
     w.open_book()

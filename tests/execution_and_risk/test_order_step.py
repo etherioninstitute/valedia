@@ -61,6 +61,8 @@ class StandIn:
         self.cancel_answer = "cancel requested"
         self.fill_at_once = 0.0                      # share of each accepted order filled at once
         self.raise_on = set()
+        self.sellable_calls = []                     # CF-C: kept apart from `calls`, so the pinned call lists stand
+        self.sellable_answer = {}                    # CF-C: a symbol's sellable answer given as is (an exception raised)
 
     def _maybe_raise(self, method):
         if method in self.raise_on:
@@ -123,6 +125,22 @@ class StandIn:
         self.calls.append(("cash", None))
         self._maybe_raise("cash")
         return {"cash": self.cash_value, "settled_cash": None, "buying_power": None, "currency": "USD"}
+
+    def sellable(self, symbol):
+        """CF-C: Webull's rule (venues/webull.py "Selling"): the holding less the unfilled remainder of every open sell."""
+        self.sellable_calls.append(symbol)
+        if "sellable" in self.raise_on:                  # not _maybe_raise: a random venue's draws stay as they were
+            raise ConnectionError("sellable is down")
+        if symbol in self.sellable_answer:
+            answer = self.sellable_answer[symbol]
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+        held = self.held.get(symbol, 0.0)
+        for o in self.book.values():
+            if o["symbol"] == symbol and o["units"] < 0 and o["state"] in ("open", "partly_filled"):
+                held -= abs(o["units"]) - o["filled"]
+        return max(held, 0.0)
 
     def cancel(self, tag):
         self.calls.append(("cancel", tag))
@@ -407,6 +425,7 @@ def test_a_run_that_outlasts_the_window_leaves_the_rest_over(world):
 
 # ---- outcome 4: the broker book, the baseline
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_the_baseline_is_recorded_once_never_sold_and_never_counted_as_owned(world):
     world.venue.held = {"SPY": 7.0, "OWN": 2.0}
     world.venue.fill_at_once = 1.0
@@ -539,6 +558,7 @@ def test_opposite_orders_of_two_strategies_in_one_fund_net_to_one_order_or_none(
     assert out["status"] == "done" and w2.orders() == [] and w2.venue.submits() == []
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_the_parts_follow_each_strategys_own_fills(world):
     world.venue.fill_at_once = 1.0
     world.paper = paper({"a": {"SPY": 6.0}, "b": {"SPY": 4.0}})
@@ -615,6 +635,7 @@ def test_rounding_is_toward_zero_whole_shares_or_five_decimals():
             osx.round_units(bad)
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_differences_are_rounded_toward_zero_and_a_sale_never_exceeds_the_broker_book(world):
     world.venue.held = {"SPY": 100.0}                                     # the owner's: never sold
     world.venue.fill_at_once = 1.0
@@ -676,6 +697,7 @@ def test_equity_is_the_venues_cash_plus_every_holding_at_the_quotes(world):
     assert out["status"] == "stopped" and out["stage"] == "prices" and "no usable quote for OWN" in out["reason"]
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_a_halt_file_refuses_everything_and_a_latch_refuses_new_risk_only(world):
     world.venue.fill_at_once = 1.0
     world.paper = paper({"a": {"SPY": 10.0}})
@@ -742,6 +764,7 @@ def test_an_unusable_limits_file_refuses_every_order_with_its_own_error(world):
 
 # ---- outcome 10: order of sending, cash, the day's cap
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_sales_go_first_then_purchases_largest_value_first(world):
     world.venue.fill_at_once = 1.0
     world.paper = paper({"a": {"SPY": 2.0, "TLT": 30.0}})
@@ -802,6 +825,7 @@ def test_limit_prices_round_to_the_cent_on_the_cautious_side():
     assert osx.limit_price(0, 100.0) is None
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_each_order_is_a_day_limit_order_through_the_ledger_with_its_parts_and_one_batch_per_run(world):
     world.venue.fill_at_once = 1.0
     world.prices["SPY"] = 123.456
@@ -3210,6 +3234,7 @@ def test_a_quote_asked_for_again_during_the_approve_is_the_one_compared_with_the
     assert tw.venue.submits() == []
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_an_order_the_risk_gate_now_refuses_is_dropped_and_a_reducing_sale_still_goes(tw):
     tw.venue.held = {}
     tw.paper = paper({"a": {"SPY": 4.0}})
@@ -3610,6 +3635,39 @@ def test_the_ticket_file_refuses_a_file_that_is_not_its_own(tmp_path):
     assert osx.TicketBook(tmp_path / "t.sqlite").layout() == osx.TICKET_LAYOUT
 
 
+CF_C_KEYS = ("sale_caps", "sales_left_unsettled")   # CF-C: the summary keys a run with a sale adds (just before held_lock)
+
+
+def cf_c_strip(summary):
+    """CF-C: take `sale_caps` and `sales_left_unsettled` out of `summary` (a dict, changed in place) when both are
+    there, well formed and held nothing back: every cap's `units` equal to its `wanted` (a sale below 0) and no unit
+    left unsettled. Returns the summary, or None when they are there and are not so (one alone included)."""
+    present = [k for k in CF_C_KEYS if k in summary]
+    if not present:
+        return summary
+    caps, left = summary.pop("sale_caps", None), summary.pop("sales_left_unsettled", None)
+    if len(present) != 2 or not isinstance(caps, dict) or not caps or left != {}:
+        return None
+    for c in caps.values():
+        if not (isinstance(c, dict) and "why" not in c and type(c.get("wanted")) is float and c["wanted"] < 0
+                and c.get("units") == c["wanted"] and c.get("cap") is not None and c["cap"] >= -c["wanted"]):
+            return None
+    return summary
+
+
+@pytest.fixture
+def every_lot_settled():
+    """CF-C, for a test of something other than the sale cap: every lot of the book whose trade date can be
+    established counts as settled (the real book_settled_units, asked for a day far ahead), so a sale is bounded by
+    the book and the account's sellable quantity alone, as before the cap. Its own MonkeyPatch, so a scenario's
+    monkeypatch.undo() leaves it in place. The cap itself is tested in test_sale_cap.py."""
+    real = osx.book_settled_units
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(osx, "book_settled_units",
+                   lambda fills, orders, entries, calendar, day: real(fills, orders, entries, calendar, "9999-12-31"))
+        yield
+
+
 @pytest.fixture(scope="module")
 def base_osx(tmp_path_factory):
     """The order step of T22a's base commit, from git, loaded under its own name."""
@@ -3833,6 +3891,7 @@ def _scenario(mod, tmp, seed, monkeypatch, whole_only=False):
 
 
 @pytest.mark.parametrize("seed_block", range(6))
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_a_run_without_the_new_flags_is_the_base_byte_for_byte_over_generated_scenarios(tmp_path, monkeypatch, base_osx,
                                                                                         seed_block):
     """50 scenarios per block, 300 in all, each driven through the base and through this revision."""
@@ -5676,6 +5735,7 @@ def _flow_scenario(mod, tmp, seed, monkeypatch, whole_only=False):
 
 
 @pytest.mark.parametrize("seed_block", range(6))
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_without_live_the_scheduled_run_and_the_paper_ticket_flow_are_t22bs_base_byte_for_byte(tmp_path, monkeypatch,
                                                                                                t22b_base, seed_block):
     """50 scenarios per block, 300 in all, each driven through T22b's base and through this revision."""
@@ -5814,6 +5874,7 @@ def test_t32_the_targets_function_follows_only_the_names_given_on_their_own_shar
                                               H26: {"SPY": 24.0 * 0.3, "TLT": 60.0 * 0.3}}       # book, on the equity
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_t32_what_an_unfollowed_strategy_holds_at_the_broker_is_sold_to_zero_and_attributed_to_it(world):
     world.venue.fill_at_once = 1.0
     world.paper = two_book()
@@ -6074,6 +6135,7 @@ def t32_base(tmp_path_factory):
 
 
 @pytest.mark.parametrize("seed_block", range(6))
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_t32_without_a_follow_list_the_step_is_its_bases_byte_for_byte(tmp_path, monkeypatch, t32_base, seed_block):
     """50 scenarios per block, 300 in all, of the scheduled run and the paper ticket flow, through 76295f7 and here."""
     sends = 0
@@ -6610,6 +6672,7 @@ def t22d1_base(tmp_path_factory):
 
 
 @pytest.mark.parametrize("seed_block", range(2))
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_t22d1_practice_runs_are_the_bases_byte_for_byte(tmp_path, monkeypatch, t22d1_base, seed_block):
     """25 scenarios per block, 50 in all (each 4 to 8 runs: scheduled, propose, approve, wrong numbers, kills, partial
     fills, refusals), through 7c2ec4a and here: venue calls, summaries, journal lines, ledger, state and tickets."""
@@ -6678,6 +6741,7 @@ def _live_flow(mod, tmp, seed, monkeypatch):
 
 
 @pytest.mark.parametrize("seed_block", range(2))
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_t22d1_live_runs_that_meet_none_of_the_five_are_the_bases_apart_from_the_marks_asked(tmp_path, monkeypatch,
                                                                                             t22d1_base, seed_block):
     """25 scenarios per block, 50 in all, of up to six live runs each, through 7c2ec4a and here."""
@@ -8070,7 +8134,7 @@ def _t34_same_but(b, m, keys, where, skip=(), counts=None):
     T34b-3: what it adds (`_t34b3_undo`) is taken out of `m` first, counted in `counts`."""
     m = _t34b3_undo(b, m, counts)
     added = {}
-    keys = (*keys, "held_lock")                          # BR-E: every summary of this revision says whether the run held
+    keys = (*keys, *CF_C_KEYS, "held_lock")              # BR-E: every summary of this revision says whether the run held
     for key in b:                                        # the lock; the earlier revisions' never do, and it is the last key
         if key in skip:
             continue
@@ -8078,6 +8142,8 @@ def _t34_same_but(b, m, keys, where, skip=(), counts=None):
             bs, ms = json.loads(b[key]), json.loads(m[key])
             added = {k: ms.pop(k) for k in keys if k in ms and k not in bs}
             held = added.pop("held_lock", None)          # always there, a real bool (a crashed run has no summary at all)
+            caps = {k: added.pop(k) for k in CF_C_KEYS if k in added}   # CF-C: every lot settled (every_lot_settled),
+            assert cf_c_strip(caps) is not None, (where, caps)            # so no cap ever held a unit back
             assert type(held) is bool or "crashed" in ms, (where, key)
             assert json.dumps(ms, sort_keys=True, default=str) == b[key], (where, key)
         elif key == "journal":
@@ -8150,6 +8216,7 @@ def t34b2_base(tmp_path_factory):
 
 
 @pytest.mark.parametrize("seed_block", range(6))
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_t34b2_practice_runs_are_the_bases_but_for_faults_where_a_fault_marks_them(tmp_path, monkeypatch, t34b2_base,
                                                                                    seed_block):
     """50 scenarios per block, 300 in all, of the scheduled run and the paper ticket flow (kills, partial fills,
@@ -8265,6 +8332,7 @@ def _t34_live_scenario(mod, base_mod, tmp, seed, monkeypatch, venue=None, before
 
 
 @pytest.mark.parametrize("seed_block", range(6))
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_t34b2_live_runs_send_a_subset_of_the_bases_orders_and_the_same_without_a_day_stop(tmp_path, monkeypatch,
                                                                                          t34b2_base, seed_block):
     """50 scenarios per block, 300 in all, each of two or three New York days with losses, walls and paper records
@@ -8279,7 +8347,7 @@ def test_t34b2_live_runs_send_a_subset_of_the_bases_orders_and_the_same_without_
             if not r["stop"]:                                                           # and without a day stop, the same
                 assert r["mine"] == r["base"] and mine_lines == base_lines, where
                 assert r["status"][0] == r["status"][1] and r["status"][2] == r["status"][3], (where, r["status"])
-            assert set(r["added"]) <= {*T34B2_LIVE_KEYS, "held_lock"} and "ceiling" in r["added"], (where, r["added"])   # BR-E: held_lock
+            assert set(r["added"]) <= {*T34B2_LIVE_KEYS, *CF_C_KEYS, "held_lock"} and "ceiling" in r["added"], (where, r["added"])   # BR-E: held_lock
             stats["runs"] += 1
             stats["stopped days"] += r["stop"]
             stats["fewer sent"] += r["mine"] != r["base"]
@@ -8402,6 +8470,7 @@ def test_t34b3_every_limit_the_order_step_can_send_is_a_whole_number_of_cents():
 
 @pytest.mark.parametrize("side", ["buy", "sell"])
 @pytest.mark.parametrize("off, fault", [(0.0, False), (1.0, False), (1.0 + 2e-9, True), (20.0, True)])
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_t34b3_the_limit_band_is_one_part_in_a_million_of_the_limit_at_its_exact_edge(tmp_path, side, off, fault):
     # E and ruling 14: `off` in units of LIMIT_SAME x limit through the limit; 1.0 is the edge (LIMIT_EDGE: no breach);
     # 20 is 0.004 on 202 or 0.0039 on 196, a breach now, inside the half cent the old band allowed
@@ -8984,6 +9053,7 @@ def _t34b3_ledger(dump, counts=None):
 
 
 @pytest.mark.parametrize("seed_block", range(6))
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_t34b3_practice_runs_equal_the_bases_but_for_the_allowed_differences(tmp_path, monkeypatch, t34b3_base, seed_block):
     """50 scenarios per block, 300 in all (the scheduled run and the paper ticket flow, kills, partial fills, refusals,
     outages), through ed4d96f and here: venue calls, journal lines, ledger, state and tickets equal but for what T34b-3
@@ -9058,6 +9128,7 @@ class _T34b3Live(LiveVenue):
 
 
 @pytest.mark.parametrize("seed_block", range(6))
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_t34b3_live_runs_against_the_base_subset_equal_and_the_same_cap_marks(tmp_path, monkeypatch, t34b3_base,
                                                                               seed_block):
     """50 live scenarios per block, 300 in all, every run made from the same inputs through ed4d96f and here, with
@@ -9095,7 +9166,7 @@ def test_t34b3_live_runs_against_the_base_subset_equal_and_the_same_cap_marks(tm
                     assert b.get("stage") == "reconcile" and m["orders_sent"] == b["orders_sent"] == 0, where
                 else:
                     assert r["status"][0] == r["status"][1] and r["status"][2] == r["status"][3], (where, r["status"])
-                assert set(r["added"]) <= {"notices", "cap_refs", "held_lock"}, (where, r["added"])   # BR-E: held_lock, always there
+                assert set(r["added"]) <= {"notices", "cap_refs", *CF_C_KEYS, "held_lock"}, (where, r["added"])   # BR-E: held_lock, always there
             else:
                 stats["runs after a notice"] += 1
                 stats["runs sending more than the base after a notice"] += bool(r["mine"] - r["base"])

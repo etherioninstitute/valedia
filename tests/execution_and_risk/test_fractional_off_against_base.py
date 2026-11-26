@@ -38,6 +38,12 @@ What is masked, and why (nothing else is):
   the quote the order was priced from, ISO 8601 in UTC, and its age then, a real number from -QUOTE_MAX_AHEAD_SECONDS
   to PRIMARY_QUOTE_MAX_AGE_SECONDS): such a line, with the two taken out, must be the base's own line. On any other
   line, out of place, malformed or out of range, they are a difference (`test_r2_m5_...`).
+- M6 (CF-C) the two summary keys `sale_caps` and `sales_left_unsettled` that a run of this tree with a sale gives,
+  just before `held_lock`. This tree's side counts every lot of its book as settled (side_main: the real
+  book_settled_units asked for a day far ahead), so its sales are bounded as the base's are; the two keys are then
+  admitted in the returned summary and on journal summary lines only, absent on the base, with no unit held back
+  (`sales_left_unsettled` empty, each cap's `units` its `wanted`); otherwise they are a difference (`_m6_strip`).
+  The cap itself is tested in test_sale_cap.py.
 - M2 (the order ledger's layout: 33ace6f wrote layout 3, this tree layout 4) and M3 (the order step's state file's
   layout: 33ace6f wrote layout 1, this tree layout 2) are REMOVED. 75a51f5 writes layout 4 and layout 2 as this tree
   does, so the ledger file and the state file are compared byte for byte like every other file; a difference in
@@ -74,7 +80,7 @@ from valedia_trader.data_and_fees import second_quote
 from valedia_trader.execution_and_risk import order_step as osx
 from valedia_trader.execution_and_risk import orders as _orders
 from valedia_trader.venues import webull as _wb
-from test_order_step import Booked, GENEROUS, LiveVenue, _run_with, live_world, paper, ticket_world
+from test_order_step import Booked, CF_C_KEYS, GENEROUS, LiveVenue, _run_with, cf_c_strip, live_world, paper, ticket_world
 
 BASE = "75a51f5"
 # What may differ between the base and this tree: the modules T51 build B changes on purpose, each for a reason, and
@@ -195,6 +201,10 @@ def side_main(spec_path):
     second_quote.second_opinion = tripwire
     if hasattr(osx, "_load_second_source"):
         osx._load_second_source = tripwire
+    if hasattr(osx, "book_settled_units"):                               # M6 (CF-C): every lot of the book settled
+        real_settled = osx.book_settled_units
+        osx.book_settled_units = lambda fills, orders, entries, calendar, day: real_settled(fills, orders, entries,
+                                                                                            calendar, "9999-12-31")
     if spec["cent"]:                                                     # the sanity pair: one input off by a cent
         real = osx.limit_price
         osx.limit_price = lambda *a, **k: round(real(*a, **k) - 0.01, 2)
@@ -474,6 +484,8 @@ def _summary_same_but_held_lock(b, m):
         return b == m
     if "held_lock" in bs or type(ms.pop("held_lock", None)) is not bool:
         return False
+    if any(k in bs for k in M6_KEYS) or _m6_strip(ms) is None:
+        return False
     return json.dumps(ms, sort_keys=True, default=str) == b
 
 
@@ -501,9 +513,16 @@ def _journal_same_but_held_lock(b, m):
         if not (isinstance(e, dict) and e.get("event") == "summary" and list(e)[-1] == "held_lock"
                 and type(e["held_lock"]) is bool):
             return False
-        if json.dumps({k: v for k, v in e.items() if k != "held_lock"}, default=str).encode() != x:
+        e = {k: v for k, v in e.items() if k != "held_lock"}
+        if list(e)[-len(M6_KEYS):] == list(M6_KEYS) and _m6_strip(e) is None:
+            return False
+        if json.dumps(e, default=str).encode() != x:
             return False
     return True
+
+
+M6_KEYS = CF_C_KEYS                                  # M6: the keys, and their check, are test_order_step's
+_m6_strip = cf_c_strip
 
 
 M5_KEYS = ("quote_ts", "quote_age_s")

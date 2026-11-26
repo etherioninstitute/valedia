@@ -265,7 +265,7 @@ def _hold_ten_bought(world, owner=5.0):
 def test_a_sale_read_as_filled_books_one_fill_with_its_fee_and_the_book_falls_by_the_sold_units(world):
     _hold_ten_bought(world)
     world.paper = tos.paper({"a": {PAID: 4.0}})
-    world.later()
+    world.next_day()                                      # CF-C: the 10 bought settle T+1; the sale waits for them
     out = world.run()
     assert out["status"] == "done" and out["orders_sent"] == 1 and out["sent"][0]["side"] == "sell" and out["sent"][0]["units"] == -6.0
     sale = world.tags()[1]
@@ -286,12 +286,26 @@ def test_a_sale_read_as_filled_books_one_fill_with_its_fee_and_the_book_falls_by
     assert plain_runs(world) == []
 
 
+def test_cf_c_a_sale_of_lots_bought_the_same_day_waits_for_them_to_settle_whatever_the_adapter_allows(world):
+    """CF-C through the real adapter: its sellable() allows the whole holding (the owner's 5 and the book's 10, no open
+    sell), but the book's 10 were bought today and settle T+1, so the cap is 0 and nothing is placed."""
+    _hold_ten_bought(world)
+    placed = len(world.desk.placed())
+    world.paper = tos.paper({"a": {PAID: 4.0}})
+    world.later()
+    out = world.run()
+    assert out["status"] == "done" and out["orders_sent"] == 0 and len(world.desk.placed()) == placed, out
+    assert out["sale_caps"] == {PAID: {"cap": 0.0, "book_settled": 0.0, "account_sellable": 15.0, "wanted": -6.0,
+                                       "units": 0.0}}, out
+    assert out["sales_left_unsettled"] == {PAID: 6.0} and world.book() == {PAID: 10.0}
+
+
 def test_a_sale_is_never_more_than_the_book_holds_and_the_adapter_refuses_more_than_held_before_any_call(world):
     """The opposite: the paper book wants out of everything; the order step sells the 10 it bought, not the owner's 5 on
     top. And the real adapter, asked directly to sell more than the account holds, refuses before any call is made."""
     _hold_ten_bought(world)
     world.paper = tos.paper({"a": {}})
-    world.later()
+    world.next_day()                                      # CF-C: the 10 bought settle T+1; the sale waits for them
     out = world.run()
     assert out["status"] == "done" and out["orders_sent"] == 1 and out["sent"][0]["units"] == -10.0
     placed = len(world.desk.placed())

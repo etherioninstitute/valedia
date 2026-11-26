@@ -1438,6 +1438,55 @@ def test_an_open_crypto_sell_reserves_the_crypto_holding(tmp_path):
     assert v.submit("BTC-USD", -0.4, "t2")["status"] == "accepted" and len(client.placed()) == 1
 
 
+# ---- CF-C: sellable(), the account's sellable quantity the order step's sale cap reads (read-only)
+
+def test_sellable_is_the_holding_less_open_sells_by_the_rule_the_sale_check_applies(tmp_path):
+    v, client = _seller(tmp_path, "10", _open_sell("c-1", "3"), _open_sell("c-2", "4", filled="1"),
+                        _open_sell("c-3", "5", side="BUY"), _open_sell("c-4", "5", symbol="QQQ"))
+    assert v.sellable("SPY") == 4.0                                          # 10 - 3 - (4 - 1); the buy and QQQ: nothing
+    assert client.placed() == [] and len(_opens(client)) == 1                 # read-only: nothing placed
+    with pytest.raises(wb.NotTransmitted, match="long-only"):
+        v.submit("SPY", -4.5, "t")                                            # the sale check agrees with it
+    assert v.submit("SPY", -4.0, "t2")["status"] == "accepted"
+    assert v.sellable("SPY") == 0.0                                           # the 4 sent are in flight: never below 0
+
+
+def test_sellable_rounds_down_to_the_step_and_reads_the_crypto_row(tmp_path):
+    v, _ = _seller(tmp_path, "7.123456789", _open_sell("c-1", "0.1"))
+    assert v.sellable("SPY") == 7.02345                                       # the equity step: five decimals, down
+    v, _ = _seller(tmp_path, "1", _open_sell("c-1", "0.6", symbol="BTCUSD", kind="CRYPTO"), symbol="BTCUSD", kind="CRYPTO")
+    assert abs(v.sellable("BTC-USD") - 0.4) < 1e-12
+    v, _ = _seller(tmp_path, "10", symbol="QQQ")
+    assert v.sellable("SPY") == 0.0                                           # not held: nothing to sell
+
+
+def test_sellable_raises_when_a_read_fails_or_an_open_sell_cannot_be_read(tmp_path):
+    client = FakeClient(positions=[{"symbol": "SPY", "instrument_type": "EQUITY", "quantity": "10"}],
+                        open_pages={None: ServerError("SYSTEM_BUSY", "business error", 500)})
+    v = wb.WebullVenue(KEY, SECRET, client=client, confirmation_file=tmp_path / "x.json")
+    with pytest.raises(wb.WebullError):
+        v.sellable("SPY")
+    v, _ = _seller(tmp_path, "10", _open_sell("c-1", "junk"))
+    with pytest.raises(wb.WebullError):
+        v.sellable("SPY")
+
+
+@pytest.mark.parametrize("bad", ["", "KXT:yes", None, 5])
+def test_sellable_refuses_a_name_that_is_not_a_plain_symbol_before_any_read(tmp_path, bad):
+    v, client = _seller(tmp_path, "10")
+    with pytest.raises(wb.WebullError, match="nothing was read"):
+        v.sellable(bad)
+    assert client.calls == []
+
+
+def test_an_events_venue_gives_no_sellable_quantity(tmp_path):
+    client = FakeClient(account_class="EVENTS_CASH")
+    v = wb.WebullVenue(KEY, SECRET, client=client, account_class="EVENTS_CASH", confirmation_file=CONF(tmp_path))
+    with pytest.raises(wb.WebullError, match="Events venue"):
+        v.sellable("SPY")
+    assert client.calls == []
+
+
 def test_a_buy_makes_no_open_order_read(tmp_path):
     v, client = _seller(tmp_path, "10", _open_sell("c-1", "10"))
     assert v.submit("SPY", 5.0, "t")["status"] == "accepted"

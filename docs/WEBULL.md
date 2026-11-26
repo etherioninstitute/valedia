@@ -155,6 +155,10 @@ cancelled; the account ended with no open order and no holding):
   shares were accepted as limit orders; a market order for 0.5 filled.
 - **One holding, one row:** two fills of the same fund read as one row with the summed quantity.
 - **Selling more than held** is refused by the adapter before anything is sent.
+- **No settled quantity for shares.** A position row (recorded on the paper cash account, 2026-11-25) carries
+  only `quantity` among its units: no sellable, available or settled figure. The balance does carry `settled_cash`
+  and `unsettled_cash`. So the order step caps a sale (CF-C) at the smaller of the book's own settled lots (T+1 from
+  each lot's trade date) and the adapter's `sellable()` (the holding less open sells and sales in flight).
 - **Cash after a sale.** Webull adds the proceeds to `cash` and `buying_power` at once; `settled_cash` does not
   rise the same day (and a purchase lowers it at once). The order step spends against `cash`. In a cash account
   that allows buying with unsettled proceeds; before live trading it must spend against settled cash (roadmap 4.8).

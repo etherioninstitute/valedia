@@ -85,7 +85,10 @@ Reading orders and cash (added 2026-11-12). "SDK" means webull-openapi-python-sd
 * account_v2.get_account_balance(account_id): SDK trade/trade/v2/account_info_v2.py:36, GET
   /trading/assets/balances/get. Docs /apis/docs/reference/account-balance: total_asset_currency,
   total_cash_balance, and account_currency_assets [{currency, cash_balance, settled_cash, buying_power, ...}],
-  all strings.
+  all strings. Recorded on the test environment's stock (cash) account, 2026-11-25 after the close: the one
+  account_currency_assets entry carries settled_cash and unsettled_cash (with cash_balance, buying_power,
+  night_trading_buying_power, option_buying_power, net_liquidation_value, market_value, day_profit_loss and
+  unrealized_profit_loss), so cash() there gives a settled_cash.
 * Token: the SDK writes its access token in plain text (token, expiry, status, one per line) to token.txt in a
   directory chosen as: ApiClient.set_token_dir (SDK core/client.py:171-172, read by ClientInitializer.init_token
   via get_token_dir, SDK core/http/initializer/client_initializer.py:60), else $WEBULL_OPENAPI_TOKEN_DIR, else
@@ -108,10 +111,15 @@ Reading orders and cash (added 2026-11-12). "SDK" means webull-openapi-python-sd
   the page's example row is symbol "AAPL", instrument_type "OPTION", quantity "1". Only a row whose
   instrument_type is exactly EQUITY or CRYPTO is a holding (positions()); every other row, one with no, an
   empty or an unrecognised instrument_type included, is reported apart (other_positions()) and licenses no sale.
+  Recorded on the test environment's stock account, 2026-11-25: a row has exactly cost, cost_price, currency,
+  day_profit_loss, day_realized_profit_loss, instrument_type, last_price, market_value, position_id, proportion,
+  quantity, symbol, unrealized_profit_loss and unrealized_profit_loss_rate, all strings. There is no sellable,
+  available or settled quantity: the venue cannot tell settled units from unsettled ones.
 * Selling: what may be sold is the holding minus the unfilled remainder of every open sell for the same symbol
   and instrument type, read with open_orders() in the same submit, before the order call, minus (T22d-2 B3) the whole
   quantity of every sale this venue object sent and has not yet seen settled that the list does not show (the list
-  may lag): see _in_flight_reserved for what clears such a reservation.
+  may lag): see _in_flight_reserved for what clears such a reservation. sellable() gives that same figure, read-only,
+  for the order step's settled-quantity sale cap (CF-C).
 * Production (T22d-2 B2): an order is sent only with a limit price, a finite number above zero, checked before any
   call; the test environment still takes market orders.
 * Numbers: every number Webull sends is read with one rule: absent, unreadable, too large for a float (a huge
@@ -195,7 +203,8 @@ environment's Events Cash account the same day, by raw SDK calls (none of it doc
   venue object from its own submit): another ticker or outcome is an error, never a fill. Its fee is the one fee
   entry's actual_value (plus commission.actual_commission when given), and only once something has filled: the entry
   present on an accepted, unfilled order is not a fee paid.
-* cash() there gives the buying power as `cash` and settled_cash None (not given).
+* cash() there (an Events venue only) gives the buying power as `cash` and settled_cash None: the Events account's
+  balance has no cash line. The stock account's balance does carry settled_cash (see account_v2 above).
 * Settlement (a contract held to the result leaving the account without an order) is not handled here.
 """
 from __future__ import annotations
@@ -2064,6 +2073,26 @@ class WebullVenue:
         kind, sym = ("CRYPTO" if _is_crypto(symbol) else "EQUITY"), symbol.upper()
         qty = holdings.get((kind, sym))
         return _decimal(qty) if qty is not None else Decimal(0)
+
+    @_public
+    def sellable(self, symbol: str) -> float:
+        """CF-C: the quantity of `symbol` a sale may draw on now, by the very rule submit's long-only check applies (the
+        notes' "Selling"): the holding (_held) less the unfilled remainder of every open sell of it and every sale of it
+        this object sent and has not seen settled (_reserved_by_open_sells), rounded down to the quantity step, and
+        never below 0. Open orders are read first, then the holding, as _check_sale reads them. Read-only: nothing is
+        placed, reserved or cancelled, and submit still makes its own check at the order call. Webull gives no settled
+        or sellable quantity of its own (the position row has none: recorded 2026-11-25), so this figure cannot tell
+        settled units from unsettled ones. A failed read raises WebullError, as the check does. An Events venue, and a
+        name that is not a plain non-empty str or holds a colon, raise WebullError before anything is read."""
+        if self._events:
+            raise WebullError("an Events venue gives no sellable quantity here; nothing was read")
+        if type(symbol) is not str or not symbol or ":" in symbol:
+            raise WebullError("the symbol must be a plain stock or crypto symbol; nothing was read")
+        step = Decimal(1).scaleb(-QUANTITY_STEP_DECIMALS["crypto" if _is_crypto(symbol) else "equity"])
+        reserved = self._reserved_by_open_sells(symbol)                   # open sells first, then the holding
+        held = self._held(symbol)
+        free = (held - reserved).quantize(step, rounding=ROUND_FLOOR)
+        return float(max(free, Decimal(0)))
 
     def _reserved_by_open_sells(self, symbol: str) -> Decimal:
         """The unfilled remainder of every open sell for `symbol` and its instrument type: total minus filled, or

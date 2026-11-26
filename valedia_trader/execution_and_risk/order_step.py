@@ -63,8 +63,20 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
                  position above MAX_UNITS in size is unusable too (the baseline is not recorded; a broker book that
                  large stops the run).
  7. differences  target minus broker book, rounded toward zero (whole shares, or FRACTIONAL_DECIMALS decimals with
-                 `fractional`); a sale never exceeds the broker book; less than the paper trader's smallest trade
-                 is dropped. The strategies' parts of each order sum to it exactly (order_parts).
+                 `fractional`); a sale never exceeds the broker book, nor (CF-C) its settled-quantity cap: the
+                 smaller of the book's settled units of the fund (book_settled_units: the ledger's OWN lots whose
+                 settlement day, T+1 on the run's exchange calendar from the New York day the lot's DAY order was
+                 sent, has come; a lot whose trade date cannot be established is unsettled; the owner's own units at
+                 the account are never in it) and the account's sellable quantity (the venue's `sellable`, read
+                 once per sale; Webull: the holding less open sells and sales in flight). A sale over the cap is cut
+                 to it, toward zero to the run's step (a fractional run's split never sells beyond it, its zero
+                 rule included); a cap of 0, or one either input of which cannot be had (fail closed: 0), sends
+                 nothing for that fund and the run skips it with the reason. The summary's `sale_caps` gives, per
+                 sale, the cap, its two inputs (`book_settled`, `account_sellable`), the units wanted and the units
+                 kept, and `why` when an input failed; `sales_left_unsettled` the units each cap held back. A run
+                 with no sale has neither key. The account holding less than the book counts as its own still stops
+                 the run at the reconcile (step 4), before any cap is worked out. Less than the paper trader's
+                 smallest trade is dropped. The strategies' parts of each order sum to it exactly (order_parts).
  8. risk gate    risk_gate.check_order against the broker account as it is at that moment, priced at the quotes in
                  hand (equity = the venue's cash as read plus every holding, the baseline and the broker book with
                  this run's fills so far, at its latest usable quote, so a quote asked for again in step 10 prices
@@ -321,6 +333,7 @@ SESSION_AFTER_OPEN = pd.Timedelta(minutes=5)      # 09:35 on a 09:30 open
 SESSION_BEFORE_CLOSE = pd.Timedelta(minutes=15)   # 15:45 on a 16:00 close, 12:45 on a 13:00 half-day
 QUOTE_MAX_AGE_SECONDS = 20 * 60                   # a quote read at all (holdings valued, owner marks) at most this old
 PRIMARY_QUOTE_MAX_AGE_SECONDS = 300               # CF-Q2: the quote an order is priced from at most this old (step 10)
+SETTLEMENT_SEARCH_DAYS = 14                       # CF-C: a lot's settlement day (T+1) looked for this many days on, at most
 QUOTE_MAX_AHEAD_SECONDS = 60                      # a quote stamped later than this after now is not believed
 QUOTE_ASK_GAP_SECONDS = 60                        # a holding is not asked for again sooner than this in one run
 MAX_CASH = 1e12                                   # cash and equity outside 0 to this are unusable, like a non-finite one
@@ -2354,16 +2367,97 @@ def _split_number(x, name: str, low: float, high: float, low_ok: bool) -> Decima
     return Decimal(repr(v))
 
 
-def split_difference(difference, quote, side: str, held) -> Split:
+# ---- CF-C: the settled-quantity sale cap (pure; the run's _sale_cap uses it)
+
+def lot_trade_day(fill: dict, order: dict | None) -> str | None:
+    """CF-C: the New York trade date (YYYY-MM-DD) of the lot a purchase fill row opened, or None when it cannot be
+    established. Every order the order step sends is a DAY order for the regular session, so it can execute only on
+    the New York day it was sent (`sent_at`); that day is the fill's own trade date, whenever a reconcile saw the fill
+    (the fill row's `time` is the moment the ledger recorded it, never the trade date: a 15:58 fill first seen at the
+    next morning's reconcile is still of the day before). None, so the lot counts as unsettled (fail closed), when the
+    order is not known, its `sent_at` is not a finite time, or the fill row's time is not a finite time at or after
+    it."""
+    if not isinstance(order, dict):
+        return None
+    sent, seen = _as_float(order.get("sent_at")), _as_float(fill.get("time"))
+    if sent is None or seen is None or seen < sent:
+        return None
+    return _ny_day(sent)
+
+
+def settlement_day(calendar, trade_day: str) -> str | None:
+    """CF-C: the day a lot traded on `trade_day` settles: T+1 on the exchange's trading calendar, the first session
+    after the trade date (a half day is a session, so it settles; a holiday is not). None when `trade_day` is not a
+    session, or the calendar cannot answer (the lot then counts as unsettled)."""
+    try:
+        day = pd.Timestamp(trade_day)
+        if not calendar.is_session(str(day.date())):
+            return None
+        for k in range(1, SETTLEMENT_SEARCH_DAYS + 1):
+            nxt = str((day + pd.Timedelta(days=k)).date())
+            if calendar.is_session(nxt):
+                return nxt
+    except Exception:
+        return None
+    return None
+
+
+def book_settled_units(fills, orders, entries, calendar, day: str) -> dict[str, float]:
+    """CF-C: per symbol, the units of the book's OWN lots that have settled on the New York day `day`: every purchase
+    fill row whose lot's settlement day (settlement_day of lot_trade_day) is on or before `day`, less every sale fill
+    row and every owner's `units_out` in full, each `split` multiplying what came before it, walked in the book's own
+    order (book_figures: by time, a fill before an entry of the same time, then by id). A sale is taken from the
+    settled lots first, so the figure is the least the settled holding can be; it is then held between 0 and the
+    book's units. Only this ledger's fills and the owner's entries count: units the owner holds by hand at the
+    account are never in it. A lot whose trade date or settlement cannot be established is unsettled. Pure."""
+    by_tag = {o["tag"]: o for o in orders}
+    settles: dict[str, str | None] = {}
+    steps = [((_dec(f["time"], "a fill's time"), 0, int(f.get("id") or 0)), "fill", f) for f in fills]
+    steps += [((_dec(e["time"], "an entry's time"), 1, int(e["id"])), "entry", e) for e in entries]
+    settled: dict[str, Decimal] = {}
+    held: dict[str, Decimal] = {}
+    with localcontext() as ctx:
+        ctx.prec = _BOOK_PREC
+        for _, what, x in sorted(steps, key=lambda s: s[0]):
+            sym = x["symbol"] if what == "fill" or x.get("kind") in ("units_out", "split") else None
+            if sym is None:
+                continue
+            s, h = settled.get(sym, Decimal(0)), held.get(sym, Decimal(0))
+            if what == "fill":
+                u = _dec(x["units"], f"the units of fill row {x.get('id')}")
+                h += u
+                if u < 0:
+                    s += u
+                else:
+                    trade = lot_trade_day(x, by_tag.get(x["tag"]))
+                    if trade is not None and trade not in settles:
+                        settles[trade] = settlement_day(calendar, trade)
+                    on = settles.get(trade) if trade is not None else None
+                    if on is not None and on <= day:
+                        s += u
+            elif x["kind"] == "units_out":
+                out = _dec(x["units"], f"entry {x['id']}'s units")
+                s, h = s - out, h - out
+            else:
+                ratio = _dec(x["ratio"], f"entry {x['id']}'s ratio")
+                s, h = s * ratio, h * ratio
+            settled[sym], held[sym] = s, h
+    return {sym: float(max(Decimal(0), min(settled[sym], max(held[sym], Decimal(0))))) for sym in settled}
+
+
+def split_difference(difference, quote, side: str, held, cap=None) -> Split:
     """T51 R1: one fund's difference between target and the ledger's own book, in units, split into a whole-share
     LIMIT leg and a MARKET remainder leg by QUANTITY, at the judged `quote`. A pure function: it reads nothing but
     its arguments and the module's constants, and writes nothing.
 
     `difference` is target less `held` (signed, not zero); `side` is "buy" or "sell" and must agree with its sign;
-    `held` is the LEDGER'S OWN holding (never the baseline, never the venue's). The rule, exact in Decimal:
-      (i)   a sale is capped at `held`, and the difference is rounded toward zero to FRACTIONAL_DECIMALS decimals;
+    `held` is the LEDGER'S OWN holding (never the baseline, never the venue's); `cap` (CF-C, optional) the most a
+    sale may sell (the run's settled-quantity sale cap), None for no cap beyond `held`. The rule, exact in Decimal:
+      (i)   a sale is capped at `held` (and at `cap` when given), and the difference is rounded toward zero to
+            FRACTIONAL_DECIMALS decimals;
       (ii)  a target (held + difference) of LESS THAN ONE SHARE worth less than FRACTIONAL_MIN_VALUE at the quote is
-            a target of zero: the holding (itself under one share) is sold as far as the minimum allows; a target of
+            a target of zero: the holding (itself under one share) is sold as far as the minimum allows, never more
+            than `cap`; a target of
             one share or more is never changed by this rule (T51 addendum 3), so a purchase never yields a sale leg
             and a sale never a purchase leg;
       (iii) a = |rounded difference|, W = floor(a), r = a - W;
@@ -2372,12 +2466,14 @@ def split_difference(difference, quote, side: str, held) -> Split:
             is held back as the residual (never a fault).
     Refuses in words (OrderStepError) a difference, quote or holding that is not a plain finite number, a
     difference of zero or above MAX_UNITS in size, a quote not above zero or above MAX_QUOTE_PRICE, a holding below
-    zero or above MAX_UNITS, and a side that is not "buy" or "sell" or disagrees with the difference."""
+    zero or above MAX_UNITS, a cap that is not None or a plain finite number from 0 to MAX_UNITS, and a side that is
+    not "buy" or "sell" or disagrees with the difference."""
     with localcontext() as ctx:
         ctx.prec = 100                                     # every product below is exact
         d = _split_number(difference, "difference", -MAX_UNITS, MAX_UNITS, True)
         q = _split_number(quote, "quote", 0.0, MAX_QUOTE_PRICE, False)
         h = _split_number(held, "held (the ledger's own holding)", 0.0, MAX_UNITS, True)
+        limit = h if cap is None else min(h, _split_number(cap, "cap (the sale cap)", 0.0, MAX_UNITS, True))
         if d == 0:
             raise OrderStepError("the split's difference is zero: there is nothing to split")
         if side not in ("buy", "sell") or type(side) is not str:
@@ -2386,14 +2482,14 @@ def split_difference(difference, quote, side: str, held) -> Split:
             raise OrderStepError(f"the split's side {side!r} disagrees with the difference {d} "
                                  f"(a {'purchase' if d > 0 else 'sale'}); nothing is split")
         step = Decimal(1).scaleb(-FRACTIONAL_DECIMALS)
-        rounded = max(d, -h).quantize(step, rounding=ROUND_DOWN)
+        rounded = max(d, -limit).quantize(step, rounding=ROUND_DOWN)
         why = []
         target = h + d
         target_value = target * q
         zeroed = target < 1 and target_value < FRACTIONAL_MIN_VALUE   # T51 addendum 3: one share or more never zeroed
         effective = rounded
         if zeroed:
-            effective = (-h).quantize(step, rounding=ROUND_DOWN)
+            effective = (-limit).quantize(step, rounding=ROUND_DOWN)
             why.append(f"the target of less than one share is worth {target_value.quantize(CENT, rounding=ROUND_DOWN)}, "
                        f"less than the minimum of {FRACTIONAL_MIN_VALUE}, and is taken as zero")
         size = abs(effective)
@@ -3776,6 +3872,9 @@ class _Run:
         self.wall: float | None = None                   # ... the limits' max_daily_loss_pct as this run loaded them
         self.day_stop: dict | None = None                # T34b-2 (S2, S4, live): set, the run is in the day stop
         self.residuals: list[dict] = []                  # T51 R1 (fractional): what each fund's split held back
+        self.sale_caps: dict[str, dict] = {}             # CF-C: each sale's settled-quantity cap and its two inputs
+        self.sales_left_unsettled: dict[str, float] = {}  # CF-C: the units of each sale its cap held back
+        self._settled_book: tuple[dict, str | None] | None = None   # CF-C: the book's settled units, worked out once
         self.whole_passed: dict[str, float] = {}         # T51 R4: fund -> its LIMIT leg's units accepted (proposed) this run
         self.whole_fate: dict[str, str] = {}             # T51 A3 (a): fund -> what became of its LIMIT leg that did not pass
         self.second_load = None                          # T51 ruling C: practice, fractional: how to load the second source
@@ -5710,6 +5809,50 @@ class _Run:
         return cash
 
     # -- 7
+    def _sale_cap(self, sym: str) -> tuple[float, float, float | None, str | None]:
+        """CF-C: (cap, book settled, account sellable, why) for a sale of `sym`: the cap is the smaller of the book's
+        settled units of it (book_settled_units on the run's calendar and New York day, worked out once a run) and
+        the quantity the account lets a sale draw on (the venue's `sellable`, read once per sale). Either one that
+        cannot be had makes the cap 0 (fail closed), and `why` says which: a venue without `sellable`, one whose read
+        raises or gives anything but a finite number from 0 to MAX_UNITS, or a book whose figures cannot be read."""
+        if self._settled_book is None:
+            try:
+                got = book_settled_units(self.ledger.fills(), self.ledger.orders(), self.entries, self.calendar, self.day)
+                self._settled_book = (got, None)
+            except Exception as exc:
+                self._settled_book = ({}, f"the book's settled units could not be worked out: {_local_error(exc)}")
+        figures, why = self._settled_book
+        settled = float(figures.get(sym, 0.0))
+        account = None
+        try:
+            answer = self.venue.sellable(sym)
+            account = None if isinstance(answer, bool) else _as_float(answer)
+            if account is None or not 0.0 <= account <= MAX_UNITS:
+                account = None
+                why = why or "the account's sellable quantity is not a finite number from 0 to the largest size"
+        except Exception as exc:
+            why = why or f"the account's sellable quantity could not be read: {_venue_error(exc)}"
+        cap = 0.0 if why is not None or account is None else min(settled, account)
+        return cap, settled, account, why
+
+    def _capped_sale(self, sym: str, units: float) -> tuple[float | None, float]:
+        """CF-C: a sale of `units` (below 0) cut to its cap (_sale_cap), rounded toward zero to the run's step; the
+        cap and its inputs go into the summary's `sale_caps`, the units held back into `sales_left_unsettled`. A sale
+        cut to nothing is skipped with the reason and gives (None, cap); otherwise (the units, cap)."""
+        cap, settled, account, why = self._sale_cap(sym)
+        cut = round_units(max(units, -cap), self.fractional)
+        self.sale_caps[sym] = {"cap": cap, "book_settled": settled, "account_sellable": account, "wanted": units,
+                               "units": cut, **({"why": why} if why is not None else {})}
+        if cut != units:
+            self.sales_left_unsettled[sym] = float(Decimal(repr(cut)) - Decimal(repr(units)))
+        if abs(cut) > UNITS_EPS:
+            return cut, cap
+        inputs = f"the book's settled units {settled:g}, the account's sellable quantity " + \
+            ("not known" if account is None else f"{account:g}")
+        self.skipped.append({"symbol": sym, "units": units, "reason": f"the sale cap is {cap:g} ({inputs}"
+                                                                     f"{'; ' + why if why else ''}): nothing is sold"})
+        return None, cap
+
     def _differences(self, book, per_strategy, prices, why_not, min_value) -> list[dict]:
         holdings = strategy_holdings(self.ledger.orders())
         out = []
@@ -5729,8 +5872,13 @@ class _Run:
                 self.skipped.append({"symbol": sym, "reason": "crypto is not traded by the order step"})
                 continue
             units = round_units(delta, self.fractional)
+            cap = None
             if units < 0:
                 units = round_units(max(units, -max(owned, 0.0)), self.fractional)   # a sale never exceeds the book
+                if units < 0:                            # CF-C: ... nor its settled-quantity cap
+                    units, cap = self._capped_sale(sym, units)
+                    if units is None:
+                        continue
             if abs(units) <= UNITS_EPS:
                 continue
             if sym in clash:                             # refused before anything is sent for either fund
@@ -5760,7 +5908,7 @@ class _Run:
                 if not netted:
                     raise OrderError("no strategy has a part in this order")
                 if self.fractional:                      # T51 R4: the split decides the legs, and nothing else
-                    split = split_difference(delta, quote, "buy" if delta > 0 else "sell", max(owned, 0.0))
+                    split = split_difference(delta, quote, "buy" if delta > 0 else "sell", max(owned, 0.0), cap=cap)
                     if float(split.difference) != units:
                         raise OrderStepError(f"the split's difference {split.difference} is not the order step's "
                                              f"{units!r}")
@@ -6384,6 +6532,9 @@ class _Run:
                 summary["working_stop"] = dict(self.working_stop)
             if self.day_stop is not None:
                 summary["day_stop"] = dict(self.day_stop)
+        if self.sale_caps:                               # CF-C: each sale's cap, its two inputs, the units it held back
+            summary["sale_caps"] = {sym: dict(c) for sym, c in sorted(self.sale_caps.items())}
+            summary["sales_left_unsettled"] = dict(sorted(self.sales_left_unsettled.items()))
         summary["held_lock"] = bool(self._locked)        # BR-E: always the last key; False for a stop before the lock
         try:
             if not self._locked:                         # stopped before the lock: returned (and printed) only

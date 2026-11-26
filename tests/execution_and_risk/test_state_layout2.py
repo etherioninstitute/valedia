@@ -38,6 +38,7 @@ from valedia_trader.execution_and_risk.order_step import OrderStepError, OrderSt
 from valedia_trader.research_loop import cli
 from valedia_trader.research_loop import paper as _paper
 import test_order_step as T
+from test_order_step import CF_C_KEYS, cf_c_strip, every_lot_settled  # noqa: F401  (CF-C)
 
 BASE = "cdd5371"
 VENUE = "webull-test-cash"
@@ -1027,13 +1028,16 @@ def same_but_held_lock(x, y, where):
     base, and without it the summary and each journal line that differs are the base's own bytes. Any other key, in
     the summary or on a journal line, any other event's line, any other part of the record, fails. CF-Q2 adds one
     more: an `order` line of this tree ends with `quote_ts` (ISO 8601, UTC) and `quote_age_s` (a real number within
-    -QUOTE_MAX_AHEAD_SECONDS to PRIMARY_QUOTE_MAX_AGE_SECONDS), and with the two taken out it is the base's line."""
+    -QUOTE_MAX_AHEAD_SECONDS to PRIMARY_QUOTE_MAX_AGE_SECONDS), and with the two taken out it is the base's line.
+    CF-C adds the summary keys `sale_caps` and `sales_left_unsettled` (this tree's side counts every lot of its book
+    settled, every_lot_settled): admitted just before `held_lock` when no cap held a unit back (cf_c_strip)."""
     for key in x:
         if key == "summary":
             bs, ms = json.loads(x[key]), json.loads(y[key])
             assert "held_lock" not in bs, (where, key)
             held = ms.pop("held_lock", None)
             assert type(held) is bool or (held is None and set(ms) == {"crashed"}), (where, key, held)
+            assert not any(k in bs for k in CF_C_KEYS) and cf_c_strip(ms) is not None, (where, key)   # CF-C
             assert json.dumps(ms, sort_keys=True, default=str) == x[key], (where, key)
         elif key == "journal":
             assert sorted(x[key]) == sorted(y[key]), (where, key)
@@ -1052,12 +1056,15 @@ def same_but_held_lock(x, y, where):
                         continue
                     assert e.get("event") == "summary" and list(e)[-1] == "held_lock" and type(e["held_lock"]) is bool, \
                         (where, name, c)
-                    assert json.dumps({k: v for k, v in e.items() if k != "held_lock"}, default=str).encode() == a, \
-                        (where, name, c)
+                    e.pop("held_lock")
+                    if list(e)[-len(CF_C_KEYS):] == list(CF_C_KEYS):              # CF-C: just before held_lock
+                        assert cf_c_strip(e) is not None, (where, name, c)
+                    assert json.dumps(e, default=str).encode() == a, (where, name, c)
         else:
             assert x[key] == y[key], (where, key)
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: this tree's side counts every lot settled; the cap: test_sale_cap.py
 def test_practice_runs_equal_cdd5371_but_for_the_state_layout(tmp_path, base, capsys):
     worlds = fractional = sends = 0
     for k in range(24):

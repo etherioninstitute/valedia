@@ -19,6 +19,7 @@ import pytest
 
 from valedia_trader.execution_and_risk import order_step as osx
 from test_order_step import Booked, GENEROUS, approve, live_world, paper, propose, ticket_rows, ticket_world
+from test_order_step import every_lot_settled  # noqa: F401  (CF-C: the fixture, for the tests that name it)
 
 PRICES = [0.37, 3.3, 7.77, 20.0, 55.5, 101.25, 500.0]
 SIZES = [0.0, 0.0, 0.004, 0.2, 1.0 / 3, 0.37, 1.0, 1.5, 2.5, 3.99999, 7.3, 12.5, 2.004]
@@ -229,6 +230,7 @@ def test_two_legs_of_one_fund_carry_two_tags_and_the_journal_keys_order_and_fill
     assert w.book() == {"SPY": 2.5}
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_a_target_taken_as_zero_sells_the_ledgers_whole_holding_each_strategy_its_own_part(tmp_path):
     w = leg_world(tmp_path / "w", fill=1.0)
     w.prices["IWM"] = 2.0

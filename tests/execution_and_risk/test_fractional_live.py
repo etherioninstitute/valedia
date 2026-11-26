@@ -24,6 +24,7 @@ from valedia_trader.execution_and_risk import go_live as gl
 from valedia_trader.execution_and_risk import order_step as osx
 from valedia_trader.execution_and_risk import orders
 from test_order_step import paper
+from test_order_step import every_lot_settled  # noqa: F401  (CF-C: the fixture, for the tests that name it)
 from test_fractional_legs import leg_world
 
 
@@ -73,6 +74,7 @@ def buy_then_sell(w, buy=True, sell=True, settle=True):
     return outs
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_b1_the_reading_is_the_two_items_and_nothing_less(tmp_path):
     w = practice_world(tmp_path / "w")
     w.ledger().close()                                    # an empty practice ledger: the reading says what is missing
@@ -94,6 +96,7 @@ def test_b1_the_reading_is_the_two_items_and_nothing_less(tmp_path):
     assert "both" in p.words() and "purchase" in p.words() and "sale" in p.words()
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_b1_a_sale_alone_or_a_purchase_alone_is_not_the_proof(tmp_path):
     w = practice_world(tmp_path / "sale")
     w.paper = paper({"a": {"SPY": 3.0}})                  # the book buys whole shares only: no remainder purchase
@@ -107,6 +110,7 @@ def test_b1_a_sale_alone_or_a_purchase_alone_is_not_the_proof(tmp_path):
     assert (p.purchases, p.sales, p.ok) == (0, 1, False), p
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_b1_the_fills_own_reconcile_is_not_the_next_one_so_nothing_counts_until_one_more_reconcile_ran(tmp_path):
     w = practice_world(tmp_path / "w")
     buy_then_sell(w, settle=False)
@@ -208,6 +212,7 @@ def test_b1_a_layout3_row_never_counts_and_reading_it_writes_nothing(tmp_path):
     raw.close()
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_b1_reading_writes_nothing_and_creates_nothing_and_a_missing_or_damaged_record_is_said_in_words(tmp_path):
     w = practice_world(tmp_path / "w")
     p = proof(w)                                          # no ledger file yet, no journal
@@ -225,6 +230,7 @@ def test_b1_reading_writes_nothing_and_creates_nothing_and_a_missing_or_damaged_
     assert "refus" in p.words() or "cannot" in p.words()
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_b1_over_seeded_practice_records_the_reading_equals_an_oracle_that_counts_the_orders_directly(tmp_path):
     """Seeded practice worlds (purchases, sales, partial fills, refusals, a day's run twice): the reading's counts
     equal a count made from the ledger and journal by hand."""
@@ -363,6 +369,7 @@ def frac_world(mkl, consent=True, proof=(True, True), target=12.5, conf=None):
     return lw
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_b3_with_every_lock_a_live_run_sends_the_limit_leg_and_the_remainder_as_a_market_order_by_quantity(mkl):
     lw = frac_world(mkl)
     out = lw.propose(fractional=True)
@@ -406,6 +413,7 @@ def test_b2_a_consent_that_is_not_json_true_holds_the_remainder_in_words_and_the
 
 @pytest.mark.parametrize("proof, missing", [((False, False), ("PURCHASE", "SALE")), ((True, False), ("SALE",)),
                                             ((False, True), ("PURCHASE",))])
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_b1_a_practice_record_missing_a_side_holds_the_remainder_and_says_what_is_missing(mkl, proof, missing):
     lw = frac_world(mkl, proof=proof)
     if proof == (False, False):
@@ -461,6 +469,7 @@ def test_the_live_summary_is_journaled_with_the_openings_words(mkl):
     assert summary["live_fractions"] == out["live_fractions"] and summary["live_fractions"]["open"] is False
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_b3_the_ticket_made_with_fractions_is_refused_by_an_approval_without_them_and_the_reverse(mkl):
     lw = frac_world(mkl)
     out = lw.propose(fractional=True)
@@ -479,6 +488,7 @@ def test_b2_taking_the_consent_back_between_propose_and_approve_refuses_the_appr
     assert "changed" in refused["reason"] or "owner's files" in refused["reason"], refused
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_b3_a_live_remainder_is_judged_by_the_confirmations_caps_like_a_whole_leg(mkl):
     lw = frac_world(mkl, target=0.5, conf={CONSENT: True, "max_order_value": 200})
     out = lw.propose(fractional=True)
@@ -501,6 +511,7 @@ def remainders(out):
     return [e for e in out.get("ticket", {}).get("orders", []) if e.get("leg") == "remainder"]
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_b4_a_first_live_run_sends_one_market_remainder_and_holds_the_others_as_first_contact_residuals(mkl):
     lw = frac_world(mkl)
     lw.paper = paper({"a": MANY})
@@ -523,6 +534,7 @@ def test_b4_a_first_live_run_sends_one_market_remainder_and_holds_the_others_as_
         led.close()
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_b4_the_rule_ends_after_a_live_remainder_has_filled_and_reconciled_cleanly_in_the_live_record(mkl):
     lw = frac_world(mkl)
     lw.paper = paper({"a": MANY})
@@ -545,6 +557,7 @@ def test_b4_the_rule_ends_after_a_live_remainder_has_filled_and_reconciled_clean
     assert sorted(s["symbol"] for s in lw.venue.limitless()) == ["IWM", "QQQ", "SPY", "TLT"]    # the first one, then these
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_b4_a_live_remainder_that_did_not_reconcile_cleanly_does_not_end_the_rule(mkl):
     lw = frac_world(mkl)
     lw.paper = paper({"a": MANY})
@@ -694,6 +707,7 @@ def test_b5_a_leg_whose_quote_was_just_asked_for_in_the_same_second_is_not_asked
     assert left["collar"] == "quote_age" and asks == [["SPY"], ["SPY"]], (asks, left)   # the start, and the leg's own refresh
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_b5_it_applies_to_a_live_remainder_leg_too(mkl):
     def asks_of_spy(slow):
         lw = frac_world(mkl, target=0.5)
@@ -751,6 +765,7 @@ def seeded_world(mkl, rng):
     return lw, {"consent": consent, "proof": proof, "fractional": fractional, "open": holds and fractional}
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_the_safety_property_over_seeded_live_worlds_no_order_without_a_limit_unless_every_lock_holds(mkl):
     limitless = whole = worlds_open = worlds_shut = 0
     for k in range(48):
@@ -794,6 +809,7 @@ def test_the_safety_property_over_seeded_live_worlds_no_order_without_a_limit_un
 
 # ---- B3: the shared book's figures, the reconcile and the day stop handle units with five decimals
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_b3_a_five_decimal_live_purchase_and_sale_are_exact_in_the_book_the_reconcile_and_the_nav(mkl):
     lw = frac_world(mkl, target=0.43859)
     out = lw.propose(fractional=True)
@@ -840,6 +856,7 @@ def test_b3_a_five_decimal_live_purchase_and_sale_are_exact_in_the_book_the_reco
         led.close()
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_b3_the_day_stop_reads_the_loss_of_a_five_decimal_holding_to_the_last_digit(mkl):
     lw = frac_world(mkl, target=0.43859)
     out = lw.propose(fractional=True)
@@ -1024,6 +1041,7 @@ def test_f6_a_second_or_more_since_the_last_ask_and_a_quote_past_120_seconds_is_
 
 # ---- T51 B repair F4: a leg put back for its re-ask is not counted twice against max_capital
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_f4_a_live_buy_judged_again_after_its_re_ask_counts_once_against_max_capital(mkl, monkeypatch):
     """The book holds 19 SPY (9,500 at its marks) under a max_capital of 10,000. A remainder purchase of 0.5 (252.50 at its
     collar price) fits once (9,752.50) and not twice (10,005.00). A minute passes while the leg is judged, so it is asked
@@ -1144,6 +1162,7 @@ def test_r2_2_a_newer_quote_still_past_120_seconds_is_not_asked_for_a_third_time
 
 # ---- T51 B repair2 (4): what refuses an approval whose opening changed since its ticket
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_r2_4_a_ticket_made_with_a_shut_opening_is_refused_by_its_fractional_mark_when_the_proof_appears(mkl):
     lw = frac_world(mkl, proof=(False, False))
     out = lw.propose(fractional=True)                                 # shut: no practice proof; the ticket carries no mark
@@ -1167,6 +1186,7 @@ def test_r2_4_a_ticket_made_with_an_open_opening_is_refused_when_the_owner_takes
     assert "fractional units" not in refused["reason"]
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_r2_4_a_ticket_made_with_an_open_opening_is_refused_by_its_mark_when_the_proof_goes_while_the_files_stay(mkl):
     lw = frac_world(mkl)
     out = lw.propose(fractional=True)
@@ -1191,6 +1211,7 @@ def test_r3_1_a_leg_the_refresh_already_asked_for_is_not_asked_again_by_the_re_a
     assert asks == [["SPY"], ["SPY"]], asks                            # the run's first ask and the refresh's: no third
 
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_r3_1_the_same_in_a_live_run_with_the_clock_moving_in_the_second_source(mkl):
     def asks_in_the_approval(old):
         lw = frac_world(mkl, target=0.5)
@@ -1215,6 +1236,7 @@ def test_r3_1_the_same_in_a_live_run_with_the_clock_moving_in_the_second_source(
 
 # ---- T51 B repair3 (3): on an approval the first-contact leg is the fund of the ticket's remainder line
 
+@pytest.mark.usefixtures("every_lot_settled")   # CF-C: its sales are of lots bought the same day; the cap: test_sale_cap.py
 def test_r3_3_an_approval_picks_the_ticket_remainder_funds_leg_even_when_a_move_reorders_the_least_value(mkl):
     lw = frac_world(mkl)
     lw.prices["IWM"] = 200.4                                           # IWM 0.1 x 200.4 = 20.04; GLD 0.08 x 250 = 20.00

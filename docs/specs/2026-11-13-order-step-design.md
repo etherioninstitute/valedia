@@ -52,7 +52,10 @@ Any failure in steps 1 to 6 means no order is sent in this run; the reason is jo
    order is judged; an older one is asked for again, as the 20-minute rule did. See the order step's docstring.)
 7. **Differences.** `delta = target - broker book`. Rounded toward zero to whole shares (fractional units are
    an option, off by default until the test environment has shown how Webull takes them). A sale never
-   exceeds the broker book's units. A difference worth less than the paper trader's smallest trade is dropped.
+   exceeds the broker book's units. (Since CF-C a sale is also capped at the smaller of the book's settled units,
+   its own lots T+1 on the exchange calendar from each lot's New York trade date, and the account's sellable
+   quantity; a cap of zero sends nothing for that fund; the summary's `sale_caps` gives each cap and its inputs.)
+   A difference worth less than the paper trader's smallest trade is dropped.
 8. **Risk gate, again.** Each order passes `risk_gate.check_order` against the broker account as it is now:
    equity (cash plus holdings at the quotes), the day's loss against the equity recorded at the last run, the
    fall from the recorded peak, positions held. The latch and halt files are honoured.
