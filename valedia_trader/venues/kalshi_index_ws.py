@@ -34,7 +34,7 @@ import random
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -67,6 +67,7 @@ _INDEX_RE = re.compile(r"[A-Z0-9_]{2,32}")        # matched with fullmatch: `^[A
 _QUIET_LOGGER = logging.getLogger(__name__ + ".websocket")
 _QUIET_LOGGER.setLevel(logging.WARNING)
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 STORE_PREFIX = "kalshi_index_ticks-"
 _REPO_ROOT = Path(__file__).resolve().parents[2]   # the folder that holds the `valedia_trader` package
 
@@ -272,11 +273,13 @@ class IndexTick:
     last_15min_avg: WindowAvg | None
     data: str
 
-    def as_json(self, channel: str | None = None) -> dict:
+    def as_json(self, channel: str | None = None, local_receipt_ms: int | None = None) -> dict:
+        """The JSONL row. `local_receipt_ms` is when this process received the frame (None when not known)."""
         row = {"index_id": self.index_id, "value": _dec_str(self.value), "source_time_ms": self.source_time_ms,
                "received_at_ms": self.received_at_ms, "sending_ts_ms": self.sending_ts_ms, "sid": self.sid,
                "seq": self.seq, "avg_60s": self.avg_60s.as_json() if self.avg_60s else None,
-               "last_15min_avg": self.last_15min_avg.as_json() if self.last_15min_avg else None, "data": self.data}
+               "last_15min_avg": self.last_15min_avg.as_json() if self.last_15min_avg else None, "data": self.data,
+               "local_receipt_ms": local_receipt_ms}
         if channel:
             row["channel"] = channel
         return row
@@ -406,9 +409,9 @@ class TickStore:
         day = datetime.fromtimestamp(received_at_ms // 1000, timezone.utc).strftime("%Y-%m-%d")
         return self.folder / f"{STORE_PREFIX}{day}.jsonl"
 
-    def append(self, tick: IndexTick, channel: str | None = None) -> Path:
+    def append(self, tick: IndexTick, channel: str | None = None, local_receipt_ms: int | None = None) -> Path:
         path = self.path_for(tick.received_at_ms)
-        line = json.dumps(tick.as_json(channel), separators=(",", ":"), sort_keys=True)
+        line = json.dumps(tick.as_json(channel, local_receipt_ms), separators=(",", ":"), sort_keys=True)
         try:
             self.folder.mkdir(parents=True, exist_ok=True)
             with open(path, "a", encoding="utf-8") as fh:
@@ -483,8 +486,15 @@ class _Run:
             raise NaiveClock("the clock must return a timezone-aware datetime")
         return self.max_seconds - (now - self.start).total_seconds()
 
+    def _receipt_ms(self) -> int:
+        """Unix ms UTC of now on the injected clock (the one the gate uses); a naive clock is refused."""
+        now = self.clock()
+        if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+            raise NaiveClock("the clock must return a timezone-aware datetime")
+        return (now - _EPOCH) // timedelta(milliseconds=1)
+
     # -- one frame in
-    def handle(self, raw: Any) -> None:
+    def handle(self, raw: Any, local_receipt_ms: int | None = None) -> None:
         try:
             text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
             obj = json.loads(text)
@@ -502,7 +512,7 @@ class _Run:
                 self.malformed += 1
                 return
             self._count_seq(tick.sid, tick.seq)
-            self.store.append(tick, kind)
+            self.store.append(tick, kind, local_receipt_ms)
             self.ticks += 1
             self._got_data = True       # only a stored tick restarts the backoff, not a reply or an error
         elif kind in _INDEXLIST_TYPES:
@@ -535,7 +545,8 @@ class _Run:
                     raw = await ws.recv()
             except TimeoutError:
                 continue
-            self.handle(raw)
+            received = self._receipt_ms()       # read right after recv returns, before any parsing
+            self.handle(raw, received)
 
     async def _one_connection(self) -> None:
         self._got_data = False
@@ -569,7 +580,7 @@ class _Run:
                 await self._one_connection()
             except (KeyboardInterrupt, asyncio.CancelledError):
                 break           # Ctrl-C reaches asyncio.run as a cancellation; the socket is already closed
-            except StoreError:
+            except (StoreError, NaiveClock):        # a broken clock or store is not a network fault: stop, do not retry
                 raise
             except Exception as exc:    # noqa: BLE001 - a close, a refused handshake or a network error: back off and retry
                 self._record_exception(exc)

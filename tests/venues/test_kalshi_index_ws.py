@@ -831,3 +831,68 @@ def test_the_live_connect_passes_a_logger_that_ignores_a_host_wide_debug(monkeyp
     finally:
         for n, level in old.items():
             logging.getLogger(n).setLevel(level)
+
+
+# ------------------------------------------------------------------ the local receipt time
+
+def _ms(dt):
+    return int(dt.timestamp() * 1000)
+
+
+def test_each_row_stores_the_exact_local_receipt_ms_from_the_injected_clock(tmp_path, creds):
+    start = AFTER + timedelta(milliseconds=123)
+    clock = StepClock(start=start, step=1.0)
+    script = [j(value_msg(seq=1)), j(value_msg(seq=2, with_15min=True)), KeyboardInterrupt()]
+    run(tmp_path, [FakeWS(script)], creds, clock=clock)
+    rows = lines(tmp_path)
+    # clock readings: 0 the gate, 1 the connect headers, 2 and 3 the two frames (taken right after recv returns)
+    assert [r["local_receipt_ms"] for r in rows] == [_ms(start) + 2000, _ms(start) + 3000]
+    assert all(type(r["local_receipt_ms"]) is int for r in rows)
+    # every other field is as before
+    expected = kis.parse_value_message(value_msg(seq=2, with_15min=True)).as_json("cfbenchmarks_value")
+    expected.pop("local_receipt_ms")
+    got = dict(rows[1])
+    got.pop("local_receipt_ms")
+    assert got == expected
+
+
+def test_local_receipt_is_exact_to_the_millisecond_not_float_rounded(tmp_path, creds):
+    start = datetime(2026, 12, 5, 12, 0, 0, 1000, tzinfo=UTC)       # .001 s: a float product can land one ms low
+    run(tmp_path, [FakeWS([j(value_msg(seq=1)), KeyboardInterrupt()])], creds, clock=StepClock(start=start, step=0.0))
+    assert lines(tmp_path)[0]["local_receipt_ms"] == (start - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1)
+
+
+def test_the_receipt_time_is_taken_before_parsing(tmp_path, creds):
+    order = []
+    clock = StepClock()
+    real_parse = kis.parse_value_message
+
+    def spy(obj):
+        order.append(("parse", clock.calls))
+        return real_parse(obj)
+
+    import unittest.mock as mock
+    with mock.patch.object(kis, "parse_value_message", spy):
+        run(tmp_path, [FakeWS([j(value_msg(seq=1)), KeyboardInterrupt()])], creds, clock=clock)
+    assert order == [("parse", 3)]        # gate, connect headers, receipt: three readings before the parse
+
+
+def test_parse_output_and_the_store_default_are_unchanged_without_a_receipt(tmp_path):
+    tick = kis.parse_value_message(value_msg())
+    assert not hasattr(tick, "local_receipt_ms")
+    path = kis.TickStore(tmp_path / "ticks").append(tick)
+    row = json.loads(path.read_text())
+    assert row["local_receipt_ms"] is None and row["seq"] == 42 and "channel" not in row
+
+
+def test_a_naive_clock_after_the_gate_still_raises(tmp_path, creds):
+    calls = []
+
+    def clock():
+        calls.append(1)
+        return AFTER if len(calls) <= 2 else datetime(2027, 1, 1)
+
+    with pytest.raises(Exception, match="timezone-aware"):
+        kis.stream(tmp_path / "ticks", clock=clock, connect=FakeConnect([FakeWS([j(value_msg(seq=1))])]),
+                   credentials=creds, sleep=Sleeps())
+    assert lines(tmp_path) == []
