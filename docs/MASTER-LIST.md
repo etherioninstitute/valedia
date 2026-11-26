@@ -324,6 +324,8 @@ morning. On `main`:
 - **WATCH** if Webull ever answers EXPIRED (never seen): for an open order the new code books any partial fill, sends
   no cancel for it and may send a new order for the rest; for an order already held as finished it is a reconcile
   anomaly and the run stops (no test covers that second path). The lead to decide whether the second is wanted.
+  Checked 2026-11-25 7:05 PM PST, read only: 0 EXPIRED in all four sandbox order stores (50 orders, 53 fills). A
+  code-review watch, not an event, so unrelated to the 11-24 Deeper/DNS interruption.
 - **DONE 11-24 3:39 PM** (529b235, merge of `fix/collar-late-fill`; outside the pin, both gates clean after): the
   false `p2:collar-miss` (a late fill read as unfilled; seen 11-24, the 7:10 run's `ord=1 fil=0`). The 7:25 check now
   judges only sessions a later run has settled, counted in full from the order ledger (read only, before the write
@@ -677,6 +679,12 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 55 Q4 follow-up (2026-11-25 ~7:10 PM PST; owner's "Yes, add it"): reply 56 called Q4 done, but Carbon meant the
+  POOLING draft. Now added there, on branch docs/pooling-test-draft only (b953343, fb17866, 6e28318; unmerged, unlocked):
+  stale_data = a real-time abstention excluded under rule 1, never imputed; its count and share reported beside the
+  score; 31 rows (1 on 11-19, bursts 15 + 11 on 11-24 with cause unknown, 4 in the DNS window), all unforced, in-force
+  battery, no answers; the reads listed under "Reads recorded outside the master list". Two blind checks PASS_WITH_NOTES,
+  every note fixed. Tell Carbon in Friday's reply.
   Round 55 addendum 3 (Carbon file "Valedia_Carbon_Reply55 Add 3.md"; NO reply, Carbon asked none): closes the paper
   thread. Two of my reply-56 claims CORRECTED by Carbon and checked in the PDFs: MemOnce's 25.0 MB IS in the paper
   (the 128K-1M blocks of its table and "near-constant 25 MB" in the text; 20.0 MB is the 32K block), and the DCA PDF
