@@ -431,6 +431,13 @@ passing idea can trade at once.
     and a REST passthrough with history also exist.
     - Needs a Kalshi API key (the owner's) and a read on Kalshi's host, so after 12-03 only.
     - Its data terms are not yet read.
+    - Signing already exists: legacy `src/kalshi_auth.py` (RSA-PSS, REST only). The key id comes from env
+      `KALSHI_API_KEY_ID`; the private key lives at `~/.hermes/secrets/kalshi_private_key.pem` (present, 0600,
+      not opened).
+    - No Kalshi websocket exists anywhere in the code. Plan: a small read-only client in `valedia_trader` that
+      reuses the same signing, with no order calls.
+    - Legacy `src/latency_arb.py` reads Coinbase's websocket, which Coinbase's 2026-08-07 terms bar for this use.
+      Never revive it as is.
 
 ## 4. Finding what makes money (tests and ideas)
 
