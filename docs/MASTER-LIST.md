@@ -426,7 +426,11 @@ In flight:
   during the test (5 of 5 ok, 3.82 to 3.87 s against a 3.86 s median, 0 overruns). Idle GPU 0 to 8 percent with the collector's usual spikes;
   system memory free fell from 55 to 32 percent. Other processes name `model: elephant-1-trader` (separate key: requests for `elephant-1`
   can never reach it); they own the speed they cause (a 5,605-token state takes about 5 s) and must not load a second `elephant-1`.
-- **OWNER** public pick lists as a forecaster (1.19): grading waits for the hand audit of 40 picks; test line
+- **RETIRED 2026-11-25 ~5:50 PM PST** (owner's yes, Carbon round 55) public pick lists as a forecaster (1.19):
+  `picks-hourly.sh` no longer runs the listing, parse or wiki export (backup `picks-hourly.sh.before-retire-listing`);
+  the store check, grading (schedule/match, its gate) and the pick-list watch still run. The old hourly log is set
+  aside as `valedia-picks-hourly.log.before-retire-2026-11-25` so the 199-run streak leaves the alert. Later, under
+  K-2: GDELT / Wikimedia pageviews (Carbon r55). History below. Was: grading waits for the hand audit of 40 picks; test line
   12 Dec. **BROKEN since 2026-11-17: Reddit ended its RSS feeds (cause found 11-25).** Outside reports quote its
   9-30 r/modnews post: feeds stop 11-13, and there is "no replacement" for non-moderators. Our records date it: the
   chatter feed's last 200 was 11-17 9:50 AM PST and its first 404 9:52 AM; the hourly listing has failed every run
@@ -438,7 +442,9 @@ In flight:
   low notes fixed): P2 `picks:listing-failing` after 3 hourly runs in a row without the listing (none failed in the
   88 runs before; network faults since last 10 min at most), run by the pick job as `alerts watch --only "pick-list
   log" --notify`. Install staged in `valedia-deploy/staged-reddit-alert/` with a new pin `accepted-alerts-commit`.
-- **OWNER** Reddit chatter against Kalshi prices (1.20): 7 days of hand audit, then 28 days; no evaluation
+- **RETIRED 2026-11-25 ~5:40 PM PST** (owner's yes, Carbon round 55) Reddit chatter against Kalshi prices (1.20):
+  `com.valedia.chatter-collector` booted out and disabled (its Kalshi game-price slots stopped with it; the order-book
+  collector is separate and untouched). History below. Was: 7 days of hand audit, then 28 days; no evaluation
   code written yet. **BROKEN since 11-17 9:52 AM PST, same cause:** `versions` stuck at 8324; 5,059 comment slots
   since answered 404 (plus 15 timeouts or network errors). Prices are fine. The collector still asks Reddit every 2
   minutes (about 720 404s a day); slowing that is the lead's call. Same owner decision as 1.19.
