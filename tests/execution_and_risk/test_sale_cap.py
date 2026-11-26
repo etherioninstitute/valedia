@@ -8,6 +8,7 @@ sells' remainders and in-flight sales). A sale over the cap is cut to it (toward
 sends nothing and says so; the summary gives each sale's cap and its two inputs."""
 from decimal import Decimal
 
+import exchange_calendars
 import pandas as pd
 import pytest
 
@@ -16,6 +17,7 @@ from test_order_step import CAL, World, ny, paper
 from test_shared_run import SW, no_network  # noqa: F401  (no_network: the shared world's autouse guard)
 
 SYM = "SPY"
+WIDE = exchange_calendars.get_calendar("XNYS", start="2015-01-01", end="2030-12-31")  # CAL ends a year on
 
 
 def bought(tmp, when="2026-11-24 10:00", units=10.0, held=None):
@@ -57,6 +59,39 @@ def test_a_calendar_that_cannot_answer_leaves_the_lot_unsettled():
     assert osx.settlement_day(Broken(), "2026-11-24") is None
 
 
+@pytest.mark.parametrize("trade, settles", [
+    ("2026-10-09", "2026-10-13"),    # Columbus Day Mon 10-12 is an XNYS session but not a settlement day
+    ("2026-10-12", "2026-10-13"),    # a lot traded on Columbus Day itself (a session) settles the Tuesday
+    ("2026-11-10", "2026-11-12"),    # Veterans Day Wed 11-11: NYSE trades, nothing settles
+    ("2026-11-11", "2026-11-12"),    # a lot traded on Veterans Day itself settles the next day
+    ("2029-11-09", "2029-11-13"),    # Veterans Day Sun 11-11 is observed Mon 11-12
+    ("2028-11-09", "2028-11-10"),    # Veterans Day Sat 11-11: not moved, Friday 11-10 still settles
+    ("2027-06-17", "2027-06-21"),    # Juneteenth Sat 06-19: XNYS is closed Fri 06-18 (the Fed is not), so Monday
+    ("2021-12-30", "2021-12-31"),    # New Year's Day Sat 2022-01-01: XNYS open Fri 12-31 and it settles (not moved)
+    ("2018-11-09", "2018-11-13")])   # Veterans Day Sun 2018-11-11 observed Mon 11-12, an XNYS session
+def test_a_lot_settles_on_the_first_session_after_its_trade_date_that_is_also_a_settlement_day(trade, settles):
+    assert WIDE.is_session(settles)
+    assert osx.settlement_day(WIDE, trade) == settles
+
+
+@pytest.mark.parametrize("day, holiday", [
+    ("2026-01-01", True), ("2026-01-19", True), ("2026-01-12", False),     # New Year's Day; MLK Day: 3rd Mon Jan
+    ("2026-02-16", True), ("2026-02-09", False),                           # Washington's Birthday: 3rd Mon Feb
+    ("2026-05-25", True), ("2026-05-18", False),                           # Memorial Day: last Mon May
+    ("2027-05-31", True), ("2027-05-24", False),                           # last Mon May on the 31st
+    ("2026-06-19", True), ("2026-07-03", False),                           # Juneteenth; Sat Jul 4 not moved to Fri
+    ("2027-07-05", True), ("2027-07-02", False),                           # Sun Jul 4 observed Mon; Friday is not
+    ("2026-09-07", True), ("2026-10-12", True), ("2026-10-05", False),     # Labor Day: 1st Mon Sep; Columbus: 2nd Mon
+    ("2026-11-11", True), ("2026-11-26", True), ("2026-11-19", False),     # Veterans Day; Thanksgiving: 4th Thu Nov
+    ("2028-11-10", False), ("2029-11-12", True),                           # Veterans Day Sat: Fri open; Sun: Mon off
+    ("2027-06-18", False), ("2021-12-31", False),                          # Sat Juneteenth, Sat New Year: Fri open
+    ("2022-06-20", True), ("2022-12-26", True),                            # Sun Juneteenth, Sun Christmas: Mon off
+    ("2026-12-25", True), ("2026-12-24", False), ("2026-11-27", False)])   # Christmas; its eve and Black Friday settle
+def test_the_settlement_holidays_are_the_federal_reserves_with_sunday_moved_to_monday_and_saturday_not_moved(day,
+                                                                                                            holiday):
+    assert osx.us_settlement_holiday(day) is holiday
+
+
 def order(tag, sent):
     return {"tag": tag, "sent_at": sent}
 
@@ -91,6 +126,12 @@ def test_a_sale_and_an_owners_units_out_are_taken_from_the_settled_lots_first_an
                {"id": 3, "time": ny("2026-11-24 13:00"), "kind": "cash_in", "amount": 5.0}]
     assert osx.book_settled_units(fills, orders, entries, CAL, "2026-11-24") == {SYM: (6.0 - 2.0 - 1.0) * 2}
     assert osx.book_settled_units(fills, orders, entries, CAL, "2026-11-25") == {SYM: (10.0 - 2.0 - 1.0) * 2}
+
+
+def test_a_lot_bought_the_day_before_veterans_day_is_unsettled_on_it_and_settled_the_day_after():
+    lot = ([fill(1, "b-SPY", 10.0, ny("2026-11-10 10:01"))], [order("b-SPY", ny("2026-11-10 10:00"))], [])
+    assert osx.book_settled_units(*lot, CAL, "2026-11-11") == {SYM: 0.0}     # NYSE trades 11-11, nothing settles
+    assert osx.book_settled_units(*lot, CAL, "2026-11-12") == {SYM: 10.0}
 
 
 def test_the_settled_units_never_go_below_zero():

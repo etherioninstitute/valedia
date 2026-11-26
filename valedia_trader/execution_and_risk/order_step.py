@@ -65,8 +65,9 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
  7. differences  target minus broker book, rounded toward zero (whole shares, or FRACTIONAL_DECIMALS decimals with
                  `fractional`); a sale never exceeds the broker book, nor (CF-C) its settled-quantity cap: the
                  smaller of the book's settled units of the fund (book_settled_units: the ledger's OWN lots whose
-                 settlement day, T+1 on the run's exchange calendar from the New York day the lot's DAY order was
-                 sent, has come; a lot whose trade date cannot be established is unsettled; the owner's own units at
+                 settlement day, T+1 from the New York day the lot's DAY order was sent (the first day after the
+                 trade date that is both an exchange session and a settlement day: not a US settlement holiday),
+                 has come; a lot whose trade date cannot be established is unsettled; the owner's own units at
                  the account are never in it) and the account's sellable quantity (the venue's `sellable`, read
                  once per sale; Webull: the holding less open sells and sales in flight). A sale over the cap is cut
                  to it, toward zero to the run's step (a fractional run's split never sells beyond it, its zero
@@ -304,7 +305,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, Decimal, DecimalException, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Callable
@@ -2385,17 +2386,46 @@ def lot_trade_day(fill: dict, order: dict | None) -> str | None:
     return _ny_day(sent)
 
 
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """The n-th `weekday` (Monday 0) of the month; n = -1 is the last one."""
+    if n > 0:
+        first = date(year, month, 1)
+        return first + timedelta(days=(weekday - first.weekday()) % 7 + 7 * (n - 1))
+    last = date(year + month // 12, month % 12 + 1, 1) - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def us_settlement_holiday(day) -> bool:
+    """CF-C2: is `day` (a date or YYYY-MM-DD) a US settlement holiday? Source: the Federal Reserve's holiday schedule
+    (the Fed's 11 holidays); DTCC follows it for US equities, so on such a day nothing settles even when NYSE trades
+    (Columbus Day, Veterans Day). A fixed-date holiday on a Sunday is observed the following Monday; one on a Saturday
+    is NOT moved: the Friday before is a settlement day (the Fed is open; unlike pandas' nearest_workday). Pure."""
+    d = pd.Timestamp(day).date()
+    y = d.year
+    fixed = [date(y, 1, 1), date(y, 6, 19), date(y, 7, 4), date(y, 11, 11), date(y, 12, 25)]
+    observed = {f + timedelta(days=1) if f.weekday() == 6 else f for f in fixed}
+    observed |= {_nth_weekday(y, 1, 0, 3),     # Martin Luther King Jr. Day: 3rd Monday of January
+                 _nth_weekday(y, 2, 0, 3),     # Washington's Birthday: 3rd Monday of February
+                 _nth_weekday(y, 5, 0, -1),    # Memorial Day: last Monday of May
+                 _nth_weekday(y, 9, 0, 1),     # Labor Day: 1st Monday of September
+                 _nth_weekday(y, 10, 0, 2),    # Columbus Day: 2nd Monday of October
+                 _nth_weekday(y, 11, 3, 4)}    # Thanksgiving: 4th Thursday of November
+    return d in observed
+
+
 def settlement_day(calendar, trade_day: str) -> str | None:
-    """CF-C: the day a lot traded on `trade_day` settles: T+1 on the exchange's trading calendar, the first session
-    after the trade date (a half day is a session, so it settles; a holiday is not). None when `trade_day` is not a
-    session, or the calendar cannot answer (the lot then counts as unsettled)."""
+    """CF-C: the day a lot traded on `trade_day` settles: T+1, the first day after the trade date that is both an
+    exchange session and a settlement day (CF-C2: a session on the exchange's calendar that is not a US settlement
+    holiday, us_settlement_holiday; a half day is a session, so it settles; an exchange holiday, or a Columbus or
+    Veterans Day the exchange trades on, is not). None when `trade_day` is not a session, or the calendar cannot
+    answer (the lot then counts as unsettled)."""
     try:
         day = pd.Timestamp(trade_day)
         if not calendar.is_session(str(day.date())):
             return None
         for k in range(1, SETTLEMENT_SEARCH_DAYS + 1):
             nxt = str((day + pd.Timedelta(days=k)).date())
-            if calendar.is_session(nxt):
+            if calendar.is_session(nxt) and not us_settlement_holiday(nxt):
                 return nxt
     except Exception:
         return None
@@ -2404,7 +2434,8 @@ def settlement_day(calendar, trade_day: str) -> str | None:
 
 def book_settled_units(fills, orders, entries, calendar, day: str) -> dict[str, float]:
     """CF-C: per symbol, the units of the book's OWN lots that have settled on the New York day `day`: every purchase
-    fill row whose lot's settlement day (settlement_day of lot_trade_day) is on or before `day`, less every sale fill
+    fill row whose lot's settlement day (settlement_day of lot_trade_day: the first day after the trade date that is
+    both an exchange session and a settlement day) is on or before `day`, less every sale fill
     row and every owner's `units_out` in full, each `split` multiplying what came before it, walked in the book's own
     order (book_figures: by time, a fill before an entry of the same time, then by id). A sale is taken from the
     settled lots first, so the figure is the least the settled holding can be; it is then held between 0 and the
