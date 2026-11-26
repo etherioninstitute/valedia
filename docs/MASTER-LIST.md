@@ -677,6 +677,16 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 55 addendum 2 (Carbon file "Valedia_Claude_Reply55 Add 2.md"; reply 56 sent 2026-11-25 ~6:55 PM PST):
+  tracker 6/19, clean week 2/5 now unconditional. CORRECTED myself: r55 Q1-Q5 were answered in Carbon's round 55
+  (Response53.md; all adopted: 0-order 12-02 counts, 11-25 counts, 300 s, stale_data exclusion, 1.19/1.20 retired);
+  memory/ stores are NOT all under 50 MB (orderbook_loop 612 MB, chatter 335 MB, company_facts 59 MB); the 11-24
+  18:22 burst is 15 rows, not 16. Q4 done: stale_data rows have no answers so clarifications 1/37 already leave them
+  unscored (31 since 11-19, none with answers); note + both bursts cause=unknown in the locked collector test doc
+  (a8ecd5b, wording 86f3d8e). Carbon's C note (venue holding >= book) already exists (order_step.py ~:194, ~:4209);
+  builder told to test that C keeps it ahead of the cap. Papers read via pdftotext: TTC code public (NVlabs), Linux
+  guest, no Mac numbers; QueryLM 35% trigram = seed data only; MemOnce 0.87 s vs 1.38 s at 32K, 20.0 MB (not 25),
+  no code repo named in the paper; DCA rejection unchanged. No questions; next reply after Fri 7:25 AM.
   Round 55 addendum (Carbon response 54, four owner-shared papers; reply 55 sent 2026-11-25 ~6:40 PM PST): tracker
   unchanged 6/19 (31.6%). DeepCrossAttention rejected; IDEA-1 narrowed (test-slot scratch is on the internal disk and
   a clone cannot cross volumes; kept: cp -c for SSD-to-SSD copies of quiescent stores only, .backup for stores in use;
@@ -1458,13 +1468,19 @@ run beside MiroFish and Elephant-1):
   is in flight.
 - **IDEA** (Carbon r55 addendum, after 12-03) copies of a quiescent store within NIMROD_SSD use `cp -c` (APFS
   clone, near-zero writes) instead of a byte copy; a store in use is copied with SQLite `.backup`, never cloned.
-  Not for test-slot (its scratch is on the internal disk). TTC (NVIDIA CoW sandboxes): watch for public code, rehearsal
-  and coding sandboxes only.
+  Not for test-slot (its scratch is on the internal disk). The collector's store is never quiescent while it runs
+  (.backup only); chatter.sqlite (335 MB) is quiescent since 11-25. TTC (NVIDIA CoW sandboxes): code public
+  (github NVlabs/TimeTravelContainer) but a Linux guest with no Mac numbers; low-priority spike after 12-03 for
+  Linux-style test runners only.
 - **IDEA** (Carbon r55 addendum) counterfactual gate: the first model route that reads contract rules, regulation or
   tax text must follow the supplied text on 20 of 20 public-text fixtures with a key rule inverted, before it earns
-  its seat. Text retrieval, if ever built: SQLite FTS5 first, no vector daemon unless FTS5 fails a measured test.
-- **IDEA** (Carbon r55 addendum, after 12-03) MemOnce: once adapter weights are public, test on MLX while the
-  collector is paused against FTS5 retrieval; adopt only if it passes the counterfactual gate with less memory.
+  its seat; graded by deterministic field equality, never a model judge; expect small local models to fail it.
+  Text retrieval, if ever built: SQLite FTS5 first (no trigram filter on retrieval), no vector daemon unless FTS5
+  fails a measured test.
+- **IDEA** (Carbon r55 addendum, after 12-03) MemOnce: once code or weights are public, and only for an offline task
+  over 64K-128K tokens where FTS5 top-chunk retrieval (16K or fewer) has failed (it is slower than the base model at
+  32K), port to MLX (a real port, not a setting) and test while the collector is paused; adopt only if it passes the
+  counterfactual gate with less memory.
   Never inside K-1, K-3, K-4 or K-7.
 
 ## 13. Waiting on the owner (each by name)
