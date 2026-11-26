@@ -671,6 +671,13 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Reply 54 (no new Carbon round; sent 2026-11-25 ~5 PM PST, Wednesday's readings as promised in reply 53): tracker
+  6/19 (31.6%), go-live path 3/11 (27.3%): T65 + p2:collar-miss TICKED at the clean 11-25 7:25 AM check (7:10 run
+  journaled 1 late fill, no false alert). Session 2/5 clean (strict gate's first live use: 6:30 OK, 6:55 XLV sell 14,
+  2 fills, equity 989,262.92), shown 2/5 pending Carbon's r53 Q2 (wrapper changes: strict checker before 6:30, GF-C
+  at 3:41 PM; pinned tree untouched). Confirmed: picks grading (58ebfe2) graded 195 at 4:07 PM; forecast (8fb509f)
+  ran 3:05 PM. Reported GF-D accepted, GF-C installed, Reddit RSS ended 11-17 (P2 picks:listing-failing installed;
+  data restore = owner's call). Asked: r53 Q1-Q4 still open; Q5 retire 1.19/1.20 or a terms-clean source.
   Round 53 (Carbon response 53, file named Valedia_Carbon_Response52.md; reply 53 sent 2026-11-24 ~10:05 PM PST):
   ADOPTED: C+F built now in a worktree, merged after 12-01 + N=2 sessions (Wed 12-02 unassisted, Thu 12-03 cross-day
   reconcile + Gate #7); C's T+1 keyed to the fill's trade date, same-morning fills stay T+0; quote_ts + quote_age_s on
