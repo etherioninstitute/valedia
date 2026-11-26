@@ -286,3 +286,18 @@ def test_in_the_shared_run_an_unrecorded_hand_sale_stops_it_at_shortfall_before_
     out = w.shared()
     assert out["status"] == "stopped" and out["stage"] == "shortfall", out
     assert "submit" not in w.venue.names() and w.venue.sellable_calls == [] and "sale_caps" not in out, out
+
+
+def test_the_shared_runs_book_figures_for_its_purchase_budget_are_judged_on_its_own_calendar(tmp_path, monkeypatch,
+                                                                                            capsys):
+    w = SW(tmp_path / "w", monkeypatch, capsys)
+    w.open_book()
+    real, calendars = osx.book_figures, []
+
+    def spy(*a, **k):
+        calendars.append(k.get("calendar"))
+        return real(*a, **k)
+    monkeypatch.setattr(osx, "book_figures", spy)
+    out = w.shared()
+    assert out["status"] == "done", out
+    assert CAL in calendars                                          # CF-C3: _book_look (usable_cash) gets the run's

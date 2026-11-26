@@ -213,7 +213,9 @@ run at stage `shortfall` (a skipped session for the ladder); the baseline is nev
 come first and the book's value at them is the capital (`--capital` is refused); a held fund far from its last
 `book_nav` mark stops at `marks`; the position limit, the count of positions, the day's loss and the drawdown are the
 book's (the loss and the drawdown on the value per unit, from `book_nav`; the old `equity` table is neither read nor
-written); purchases are bounded by the book's usable cash too; a ticket binds the book's value.
+written); purchases are bounded by the book's usable cash too (R8a: its cash less the proceeds of its sales not yet
+settled, each settling on the first day after its trade date that is both an exchange session and a settlement day, on
+the run's own calendar); a ticket binds the book's value.
 In live mode (S4d: the command line takes `--live` only with `--shared`, and never a capital) the same run holds, with
 lock 1's `max_capital` binding the book's value at its UPPER bound (stage `lock`, before any order), the day stop
 judged on the loss of the value per unit, a live ticket marked shared as well, and the state file's counters read from
@@ -722,8 +724,11 @@ class BookFigures:
     """The book's own figures (R4). `cash` is the cautious figure, `cash_low`; `cash_low` and `cash_high` bound the
     cash (None: no bound on that side), equal when every price and fee is known and an order's fee total and its rows'
     fees agree within REL_TOL (`cash_bounded` False; otherwise the bounds hold both fee figures). `usable_cash`
-    (R8a) is `cash_low` less the proceeds (at that bound) of the book's sales with a fill on the given New York day
-    or later, which are unsettled until the next session. `value` is `cash_low` plus every unit at its mark (None
+    (R8a) is `cash_low` less the proceeds (at that bound) of the book's sales not settled on the given New York day:
+    a sale settles on its settlement day (CF-C3: settlement_day of lot_trade_day, the first day after the New York day
+    its DAY order was sent that is both an exchange session and a settlement day), and one any of whose fill rows has
+    no trade date or settlement day that can be established, or ANY sale when no calendar is given, is unsettled (fail
+    closed). `value` is `cash_low` plus every unit at its mark (None
     when the cash has no lower bound or a symbol held has no mark: `unmarked`); `value_high` is the same at
     `cash_high`. `units_outstanding` are the book's units issued and redeemed by the owner's entries;
     `value_per_unit` is `value` over them (None with none outstanding). `fees_taken_as_none` counts the purchases
@@ -809,11 +814,12 @@ def _fee_window_closed(o: dict, now: float) -> bool:
     return at < now - LEDGER_RECHECK_SECONDS
 
 
-def book_figures(fills, orders, entries, marks, day: str, *, now: float) -> BookFigures:
+def book_figures(fills, orders, entries, marks, day: str, *, now: float, calendar=None) -> BookFigures:
     """T51c S2 (R4, R5, R8a): the book's figures from this ledger's own `fills` and `orders` rows (as
     OrderLedger.fills() and .orders() give them), the owner's `entries` (as the state file holds them, each with the
     figures next_entry gave it) and `marks` {symbol: price}; `day` is today's New York day (YYYY-MM-DD), for the
-    unsettled proceeds of R8a; `now` is the present time in seconds on that day (addendum 7, R22: the reading `day`
+    unsettled proceeds of R8a, judged on `calendar` (the run's exchange calendar; CF-C3: a sale's proceeds are usable
+    from its settlement day on, and with no calendar no sale's are: the most cautious figure); `now` is the present time in seconds on that day (addendum 7, R22: the reading `day`
     was taken from; one that is not a finite reading on `day` is refused), against which each order's recheck window
     is judged. Pure: it reads no file, clock, venue or global (the window's length is the ledger's own
     `recheck_seconds` default), and the order in which rows are given changes nothing (fills and entries are taken by
@@ -854,6 +860,7 @@ def book_figures(fills, orders, entries, marks, day: str, *, now: float) -> Book
         low: Decimal | None = Decimal(0)
         high: Decimal | None = Decimal(0)
         today_low = Decimal(0)
+        settles: dict[str, str | None] = {}       # CF-C3: each trade day's settlement day, asked of the calendar once
         none_taken = 0
         bounded: list[str] = []
         opened: list[str] = []                    # R32: the lines of orders that leave a bound OPEN (not merely bounded)
@@ -890,8 +897,8 @@ def book_figures(fills, orders, entries, marks, day: str, *, now: float) -> Book
                 least = priced + open_units * (bound or 0)
                 low = None if low is None else low + least
                 high = None if high is None or open_units > 0 else high + priced
-                if any(_ny_day(r.get("time")) is None or _ny_day(r.get("time")) >= day for r in rs):
-                    today_low += least
+                if calendar is None or any(_unsettled_on(day, r, o, calendar, settles) for r in rs):
+                    today_low += least       # CF-C3: proceeds not settled on `day` (fail closed) are not usable
             fees = sum((_dec(r["fee"], f"the fee of fill row {r.get('id')}") for r in rs if r.get("fee") is not None),
                        Decimal(0))
             fees_least = fees_most = fees                # addendum 5 (R17): the order's total and its rows' sum as a
@@ -2432,6 +2439,19 @@ def settlement_day(calendar, trade_day: str) -> str | None:
     except Exception:
         return None
     return None
+
+
+def _unsettled_on(day: str, fill: dict, order: dict | None, calendar, settles: dict) -> bool:
+    """CF-C3: has the sale `fill` row (of `order`) NOT settled on the New York day `day`? True when its trade date
+    (lot_trade_day) or its settlement day (settlement_day) cannot be established, or the settlement day is after
+    `day`. `settles` caches settlement days by trade day."""
+    trade = lot_trade_day(fill, order)
+    if trade is None:
+        return True
+    if trade not in settles:
+        settles[trade] = settlement_day(calendar, trade)
+    on = settles[trade]
+    return on is None or on > day
 
 
 def book_settled_units(fills, orders, entries, calendar, day: str) -> dict[str, float]:
@@ -4284,7 +4304,8 @@ class _Run:
 
     def _book_look(self, marks: dict) -> BookFigures:
         """The book's figures at the marks in hand, from the ledger as it is now; the value must be known."""
-        figures = book_figures(self.ledger.fills(), self.ledger.orders(), self.entries, marks, self.day, now=self._now())
+        figures = book_figures(self.ledger.fills(), self.ledger.orders(), self.entries, marks, self.day, now=self._now(),
+                               calendar=self.calendar)    # CF-C3: last_fig's usable_cash bounds the run's purchases
         if figures.value is None or figures.value_per_unit is None:
             why = _value_unknown_why(figures) if figures.value is None else "no units outstanding"
             raise _Stop("prices", f"the book's value is not known ({why}); nothing more is sent")

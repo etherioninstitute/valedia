@@ -13,6 +13,8 @@ import sqlite3
 import time
 from decimal import Decimal as D
 
+import exchange_calendars
+import pandas as pd
 import pytest
 
 from valedia_trader.execution_and_risk import order_step as osx
@@ -26,6 +28,7 @@ NOW = T0 + 600                          # the present time handed to book_figure
 YESTERDAY_T = T0 - 86_400.0
 SEEDS = range(60)
 TINY = D("1e-40")
+CAL = exchange_calendars.get_calendar("XNYS")
 
 
 @pytest.fixture(autouse=True)
@@ -188,14 +191,55 @@ def test_stake_entry_moves_units_not_nav():
 # ---- R8a: the cash usable for purchases today
 
 
+def sent(o, t):
+    return {**o, "sent_at": t}
+
+
 def test_usable_cash_leaves_out_the_proceeds_of_todays_sales():
-    o = [order("s1-SPY", "SPY", -2.0, limit=99.0, fee=0.0), order("s0-QQQ", "QQQ", -1.0, limit=50.0, fee=0.0)]
+    o = [sent(order("s1-SPY", "SPY", -2.0, limit=99.0, fee=0.0), T0 - 60),
+         sent(order("s0-QQQ", "QQQ", -1.0, limit=50.0, fee=0.0), YESTERDAY_T - 60)]
     f = [fill(1, "s1-SPY", "SPY", -2.0, 100.0, fee=0.0, t=T0), fill(2, "s0-QQQ", "QQQ", -1.0, 50.0, fee=0.0, t=YESTERDAY_T)]
-    fig = book_figures(f, o, [opening("1000")], {"SPY": 100.0, "QQQ": 50.0}, DAY, now=NOW)
+    fig = book_figures(f, o, [opening("1000")], {"SPY": 100.0, "QQQ": 50.0}, DAY, now=NOW, calendar=CAL)
     assert fig.cash == D("1000") + D("200.0") + D("50.0")
-    assert fig.usable_cash == D("1000") + D("50.0")              # yesterday's proceeds count, today's do not
-    tomorrow = book_figures(f, o, [opening("1000")], {"SPY": 100.0, "QQQ": 50.0}, "2025-11-19", now=NOW + 86_400)
+    assert fig.usable_cash == D("1000") + D("50.0")              # Monday's proceeds settled Tuesday, today's have not
+    tomorrow = book_figures(f, o, [opening("1000")], {"SPY": 100.0, "QQQ": 50.0}, "2025-11-19", now=NOW + 86_400,
+                            calendar=CAL)
     assert tomorrow.usable_cash == tomorrow.cash
+
+
+# ---- CF-C3: a sale's proceeds are usable from its settlement day (T+1 on the calendar, settlement holidays skipped)
+
+def ny_t(text):
+    return pd.Timestamp(text, tz="America/New_York").timestamp()
+
+
+def usable_after_sale(sold_at, day, calendar=CAL, with_sent=True):
+    """The usable cash on `day` (at 10:00 New York) of a book of 1000 that sold 2 SPY at 100 at `sold_at`."""
+    t = ny_t(sold_at)
+    o = order("s-SPY", "SPY", -2.0, limit=99.0, fee=0.0)
+    o = sent(o, t - 60) if with_sent else o
+    opened = entry(1, t - 3600, book_figures([], [], [], {}, DAY, now=NOW), "cash_in", amount=D("1000"))
+    fig = book_figures([fill(1, "s-SPY", "SPY", -2.0, 100.0, fee=0.0, t=t)], [o], [opened], {"SPY": 100.0}, day,
+                       now=ny_t(f"{day} 10:00"), calendar=calendar)
+    assert fig.cash == D("1200.0")
+    return fig.usable_cash
+
+
+@pytest.mark.parametrize("sold_at, unsettled_on, settled_on", [
+    ("2026-10-09 11:00", "2026-10-12", "2026-10-13"),    # Fri sale: Columbus Day Mon is a session, nothing settles
+    ("2026-11-10 11:00", "2026-11-11", "2026-11-12"),    # Tue sale: Veterans Day Wed, NYSE trades, nothing settles
+    ("2026-11-16 11:00", "2026-11-16", "2026-11-17")])   # an ordinary Monday sale settles Tuesday
+def test_a_sales_proceeds_are_usable_only_from_its_settlement_day(sold_at, unsettled_on, settled_on):
+    assert usable_after_sale(sold_at, unsettled_on) == D("1000")
+    assert usable_after_sale(sold_at, settled_on) == D("1200.0")
+
+
+def test_a_sale_whose_trade_date_is_not_known_is_never_usable():
+    assert usable_after_sale("2026-11-16 11:00", "2026-12-31", with_sent=False) == D("1000")   # no sent_at: unsettled
+
+
+def test_with_no_calendar_no_sales_proceeds_are_usable():
+    assert usable_after_sale("2026-11-16 11:00", "2026-11-24", calendar=None) == D("1000")      # the cautious figure
 
 
 # ---- owner entries in the figures
