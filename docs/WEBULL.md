@@ -302,8 +302,8 @@ order step's module notes.)
 usual):
 - `clock`: only from 30 minutes after the open to 30 minutes before the close (`MARKET_AFTER_OPEN`,
   `MARKET_BEFORE_CLOSE`; a half-day's close as the calendar has it), judged again at the moment of sending;
-- `quote_age`: its quote at most 120 seconds old at the moment of sending (`MARKET_QUOTE_MAX_AGE_SECONDS`; LIMIT legs keep
-  their 20 minutes), judged again at the moment of sending. In one judgment of a MARKET leg there is at most ONE ask of its
+- `quote_age`: its quote at most 120 seconds old at the moment of sending (`MARKET_QUOTE_MAX_AGE_SECONDS`; every leg,
+  LIMIT or MARKET, is priced from a quote at most `PRIMARY_QUOTE_MAX_AGE_SECONDS` old), judged again at the moment of sending. In one judgment of a MARKET leg there is at most ONE ask of its
   quote beyond the quote in hand when the judgment starts, and that count includes the ask the judgment's own refresh
   makes when the quote in hand is already older than 120 seconds. So: if the refresh asked, nothing asks again; if it did
   not (the quote was fresh when judging began) and the quote has passed 120 seconds by the moment the collar is about to

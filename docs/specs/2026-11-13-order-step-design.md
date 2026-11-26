@@ -48,6 +48,8 @@ Any failure in steps 1 to 6 means no order is sent in this run; the reason is jo
    book's equity, so the scale is 1.
 6. **Prices.** A quote for every symbol with a difference, from an injected quote function, with its time.
    A quote older than 20 minutes, missing, or not a positive finite number: no order for that symbol.
+   (Since CF-Q2 the quote an order is priced from must be at most `PRIMARY_QUOTE_MAX_AGE_SECONDS` old when the
+   order is judged; an older one is asked for again, as the 20-minute rule did. See the order step's docstring.)
 7. **Differences.** `delta = target - broker book`. Rounded toward zero to whole shares (fractional units are
    an option, off by default until the test environment has shown how Webull takes them). A sale never
    exceeds the broker book's units. A difference worth less than the paper trader's smallest trade is dropped.

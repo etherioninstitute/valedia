@@ -593,10 +593,12 @@ def test_a_quote_that_is_stale_missing_or_not_a_positive_finite_number_means_no_
     assert [s["symbol"] for s in out["skipped"]] == ["SPY"] and world.entries("no_quote")[-1]["symbol"] == "SPY"
 
 
-def test_quotes_exactly_twenty_minutes_old_or_given_as_times_with_a_zone_are_used(world):
+def test_quotes_exactly_at_the_primary_limit_or_given_as_times_with_a_zone_are_used(world):
+    # CF-Q2: was "exactly twenty minutes old"; an order is now priced only from a quote at most
+    # PRIMARY_QUOTE_MAX_AGE_SECONDS old, so the edge case moved there
     world.paper = paper({"a": {"SPY": 10.0, "QQQ": 5.0, "IWM": 1.0}})
-    world.quote_age["SPY"] = 20 * 60
-    world.quote_override["QQQ"] = {"price": 400.0, "time": pd.Timestamp("2026-11-13 09:55", tz="America/New_York")}
+    world.quote_age["SPY"] = osx.PRIMARY_QUOTE_MAX_AGE_SECONDS
+    world.quote_override["QQQ"] = {"price": 400.0, "time": pd.Timestamp("2026-11-13 09:55", tz="America/New_York")}   # 300 s
     world.quote_override["IWM"] = (200.0, pd.Timestamp("2026-11-13 14:58", tz="UTC").to_pydatetime())
     world.run()
     assert units_sent(world) == {"SPY": 10.0, "QQQ": 5.0, "IWM": 1.0}
@@ -1191,10 +1193,10 @@ def _slow_venue(world, minutes, after_first=None):
 
 def test_a_quote_that_ages_past_the_limit_while_the_run_sends_is_asked_for_again(world):
     world.paper = paper({"a": {"SPY": 1.0, "QQQ": 1.0, "IWM": 1.0}})          # sent SPY, QQQ, IWM (largest value first)
-    _slow_venue(world, 15, after_first=lambda: world.prices.update(IWM=210.0))
-    out = world.run()
+    _slow_venue(world, 3.75, after_first=lambda: world.prices.update(IWM=210.0))   # CF-Q2: 15 minutes against the old
+    out = world.run()                                                          # 20, scaled to the primary 300 s
     assert out["status"] == "done" and out["orders_sent"] == 3
-    assert world.quote_calls == [["IWM", "QQQ", "SPY"], ["IWM"]]               # QQQ at 16 minutes is still good; IWM at 31 is not
+    assert world.quote_calls == [["IWM", "QQQ", "SPY"], ["IWM"]]               # QQQ at 285 s is still good; IWM at 510 is not
     by = {o["symbol"]: o for o in world.orders()}
     assert (by["SPY"]["reference_price"], by["QQQ"]["reference_price"]) == (500.0, 400.0)
     assert (by["IWM"]["reference_price"], by["IWM"]["limit_price"]) == (210.0, 212.1)   # the limit comes from the quote in hand
@@ -1218,7 +1220,7 @@ def test_a_quote_asked_for_again_that_is_unusable_leaves_its_order_over(world, a
                 world.quote_override["IWM"] = (float("nan"), world.clock.t)
         return first(symbols)
     world.quotes = quotes
-    _slow_venue(world, 15)
+    _slow_venue(world, 3.75)                                                   # CF-Q2: scaled to the primary limit
     out = world.run()
     assert out["status"] == "done" and out["orders_sent"] == 2 and len(world.quote_calls) == 2
     assert [x["symbol"] for x in out["left_over"]] == ["IWM"] and out["left_over"][0]["reason"].startswith("the quote is older than")
@@ -1881,8 +1883,8 @@ def test_the_bounds_are_named_constants():
 
 def test_a_slow_risk_gate_never_leaves_a_quote_older_than_the_limit_at_intend(world, monkeypatch):
     world.paper = paper({"a": {"SPY": 1.0, "QQQ": 1.0}})
-    world.quote_age.update(SPY=600.0, QQQ=600.0)
-    stamped, first = {}, world.quotes
+    world.quote_age.update(SPY=150.0, QQQ=150.0)                             # CF-Q2: 600 s and a 15-minute gate against
+    stamped, first = {}, world.quotes                                        # the old 20, scaled to the primary 300 s
 
     def quotes(symbols):
         out = first(symbols)
@@ -1895,7 +1897,7 @@ def test_a_slow_risk_gate_never_leaves_a_quote_older_than_the_limit_at_intend(wo
     real_gate = osx.risk_gate.check_order
 
     def slow_gate(*a, **k):
-        world.clock.t += 15 * 60
+        world.clock.t += 225
         return real_gate(*a, **k)
     monkeypatch.setattr(osx.risk_gate, "check_order", slow_gate)
     ages = []
@@ -1904,7 +1906,7 @@ def test_a_slow_risk_gate_never_leaves_a_quote_older_than_the_limit_at_intend(wo
         real = led.intend
         led.intend = lambda tag, sym, *a, **k: ages.append(world.clock.t - stamped[sym]) or real(tag, sym, *a, **k)
     out = world.run(patch=watch)
-    assert out["orders_sent"] == 2 and ages and max(ages) <= osx.QUOTE_MAX_AGE_SECONDS
+    assert out["orders_sent"] == 2 and ages and max(ages) <= osx.PRIMARY_QUOTE_MAX_AGE_SECONDS
 
 
 def test_a_slow_environment_read_never_lets_submit_once_begin_after_the_window(world):
@@ -1975,14 +1977,14 @@ def test_a_quote_asked_for_again_is_judged_by_the_risk_gate(world):
 
 def test_a_slow_environment_read_after_the_gate_sends_the_order_back_for_a_fresh_quote(world, monkeypatch):
     world.paper = paper({"a": {"SPY": 1.0}})
-    world.quote_age["SPY"] = 600.0
+    world.quote_age["SPY"] = 150.0                      # CF-Q2: 600 s and an 11-minute read against the old 20, scaled
     stamped = _stamping(world, after_first=lambda s: world.quote_age.update(SPY=60.0))
     slow = {"on": False}
 
     class V(StandIn):                                   # slow to read; a plain str by static lookup (rev 6)
         def __getattribute__(self, name):
             if name == "environment" and slow["on"]:
-                world.clock.t += 11 * 60
+                world.clock.t += 165
                 slow["on"] = False                      # once: a later slow read is rev 6's last look, below
             return super().__getattribute__(name)
     world.venue = V()
@@ -1991,7 +1993,7 @@ def test_a_slow_environment_read_after_the_gate_sends_the_order_back_for_a_fresh
     seen, patch = _intends(world)
     out = world.run(patch=patch)
     assert out["orders_sent"] == 1 and len(world.quote_calls) == 2
-    assert all(t - stamped[sym] <= osx.QUOTE_MAX_AGE_SECONDS for sym, _, _, t in seen)
+    assert all(t - stamped[sym] <= osx.PRIMARY_QUOTE_MAX_AGE_SECONDS for sym, _, _, t in seen)
 
 
 def test_a_quote_that_goes_stale_twice_while_the_order_is_checked_leaves_it_over(world, monkeypatch):
@@ -2730,7 +2732,8 @@ def test_a_holding_with_no_fresh_quote_is_asked_again_at_most_once_a_minute(worl
 
 
 def test_a_holding_is_asked_again_after_a_minute(world, monkeypatch):
-    _held_stale_world(world, 150.0, monkeypatch, again_age=1100.0)       # usable when asked, too old 100 s later
+    _held_stale_world(world, 80.0, monkeypatch, again_age=1150.0)        # usable when asked, too old 50 s later (CF-Q2:
+                                                                         # a 150 s gate aged the orders' own quotes past 300)
     world.paper = paper({"a": {"QQQ": 1.0, "IWM": 1.0}}, equity=1_000_000.0)
     out = world.run()
     assert out["orders_sent"] == 2 and sum(1 for q in world.quote_calls[1:] if "SPY" in q) == 2
@@ -5550,7 +5553,7 @@ def test_once_a_reading_is_past_the_expiry_no_later_reading_makes_the_ticket_liv
     tw.clock = BackClock(tw.clock.t)
     _, number = _proposed(tw, {"a": {"SPY": 10.0, "QQQ": 5.0, "IWM": 4.0}})
     (ticket,) = ticket_rows(tw, "tickets")
-    tw.clock.t = ticket["expires"] - 300
+    tw.clock.t = ticket["expires"] - 200                 # CF-Q2: was 300; see the report
     log = []
     real = osx._Run._ticket_expired
 
@@ -6534,12 +6537,27 @@ def test_t22d1_a_fifteen_symbol_book_asks_once_per_symbol_in_the_usual_run(tmp_p
     assert sorted(c["symbol"] for c in w.second.calls) == list(FIFTEEN)
 
 
+def _own_answered_fresh(w, stale_age):
+    """CF-Q2: the world's quotes, every answer `stale_age` seconds old except, after the run's first ask, the first
+    symbol asked, which is answered 60 s old: the order's own quote, asked first by the refresh, must be at most
+    PRIMARY_QUOTE_MAX_AGE_SECONDS old to price its order, while a holding's goes stale past QUOTE_MAX_AGE_SECONDS."""
+    real, seen = w.quotes, []
+
+    def quotes(symbols):
+        for k, s in enumerate(symbols):
+            w.quote_age[s] = 60.0 if seen and k == 0 else stale_age
+        seen.append(list(symbols))
+        return real(symbols)
+    w.quotes = quotes
+
+
 def test_t22d1_a_slow_fifteen_symbol_run_asks_once_per_symbol_per_quote_and_no_more(tmp_path):
     w = _fifteen_world(tmp_path / "w")
     number = lpropose(w)["ticket_number"]
     w.later(0.1)
     for s in FIFTEEN:
         w.quote_age[s] = 19.5 * 60                                 # every quote goes stale after each slow submit
+    _own_answered_fresh(w, 19.5 * 60)                              # CF-Q2: but each order's own, asked first, fresh
     real, answered = w.quotes, []
 
     def quotes(symbols):                                           # every answer a new quote, a cent higher
@@ -6556,7 +6574,10 @@ def test_t22d1_a_slow_fifteen_symbol_run_asks_once_per_symbol_per_quote_and_no_m
     asked = [(c["symbol"], c["price"]) for c in w.second.calls]
     assert len(asked) == len(set(asked))                           # never the same quote twice
     assert _Counter(asked) == _Counter(answered)                   # every quote answered, once
-    assert len(asked) == 15 + 14 * 15                              # 225: every holding again before each later order
+    # CF-Q2: was 15 + 14 * 15 (225). Every order's own quote is now asked (it is older than the primary limit) and
+    # answered fresh, so it is no longer stale as a holding: the k-th order asks its own and the 14 - k holdings
+    # still unordered (the first order asks its own alone, the holdings then 19.6 minutes old)
+    assert len(asked) == 15 + 1 + sum(15 - k for k in range(1, 15))     # 121
 
 
 # ---- outcome 6: nothing else moves (practice runs byte for byte; live runs apart from the marks asked)
@@ -7695,6 +7716,7 @@ def test_t34b2_the_day_stop_trips_at_the_look_where_the_loss_first_reaches_the_w
     w.later(1)
     for s in ("OWN", "IWM", "TLT", "GLD"):
         w.quote_age[s] = 19.5 * 60                                    # stale after the first send: asked again
+    _own_answered_fresh(w, 19.5 * 60)                                 # CF-Q2: each order's own, asked first, fresh
 
     def own_falls(w):
         w.prices["OWN"] = own_after
@@ -7982,7 +8004,9 @@ def _t34b3_undo(b, m, counts=None):
     `counts`: the `verdict` field at the end of a fill line (with `judged_avg` and `judged_on` before it), the `notice`
     and `verdict` lines, the summary keys
     `notices` and `cap_refs`, and the stage `venue_read` where `b` stopped at `reconcile` (with its reason, in the
-    returned summary, the summary line and the stopped line). Anything else is left for the caller to find."""
+    returned summary, the summary line and the stopped line). CF-Q2: also the `quote_ts` and `quote_age_s` fields at
+    the end of an order line, judged first (UTC; an age within PRIMARY_QUOTE_MAX_AGE_SECONDS). Anything else is left
+    for the caller to find."""
     def bump(kind):
         if counts is not None:
             counts[kind] = counts.get(kind, 0) + 1
@@ -8014,6 +8038,13 @@ def _t34b3_undo(b, m, counts=None):
                             if k in e:
                                 e.pop(k)
                                 bump(f"{k} field")
+                        line = json.dumps(e, default=str).encode()
+                    elif e.get("event") == "order" and list(e)[-2:] == ["quote_ts", "quote_age_s"]:
+                        age = e.pop("quote_age_s")               # CF-Q2: the priced quote's time and age, at the end of
+                        when = pd.Timestamp(e.pop("quote_ts"))   # every order line; judged, then taken out
+                        assert when.tzinfo is not None and when.utcoffset() == pd.Timedelta(0), when
+                        assert -osx.QUOTE_MAX_AHEAD_SECONDS <= age <= osx.PRIMARY_QUOTE_MAX_AGE_SECONDS, age
+                        bump("quote_ts field")
                         line = json.dumps(e, default=str).encode()
                     elif e.get("event") == "summary" and any(k in e for k in T34B3_KEYS):
                         line = json.dumps({k: v for k, v in e.items() if k not in T34B3_KEYS}, default=str).encode()

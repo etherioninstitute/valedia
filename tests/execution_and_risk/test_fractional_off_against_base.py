@@ -34,6 +34,10 @@ What is masked, and why (nothing else is):
   tree and a real bool, absent on the base, last on a journal line, and the summary or line is otherwise the base's own
   text. Any other key, in either direction, any other event's line, or a `held_lock` that is missing or not a bool on this
   tree is a difference. The tests `test_r2_m4_...` show both sides of this.
+- M5 (CF-Q2) the two keys `quote_ts` and `quote_age_s` that end every journal `order` line of this tree (the time of
+  the quote the order was priced from, ISO 8601 in UTC, and its age then, a real number from -QUOTE_MAX_AHEAD_SECONDS
+  to PRIMARY_QUOTE_MAX_AGE_SECONDS): such a line, with the two taken out, must be the base's own line. On any other
+  line, out of place, malformed or out of range, they are a difference (`test_r2_m5_...`).
 - M2 (the order ledger's layout: 33ace6f wrote layout 3, this tree layout 4) and M3 (the order step's state file's
   layout: 33ace6f wrote layout 1, this tree layout 2) are REMOVED. 75a51f5 writes layout 4 and layout 2 as this tree
   does, so the ledger file and the state file are compared byte for byte like every other file; a difference in
@@ -41,7 +45,7 @@ What is masked, and why (nothing else is):
 - Random ids are NOT masked: the batch ids and the state file's account key (os.urandom) and the ticket numbers
   (secrets.randbelow) are drawn on both sides from the same seeded source, so they must be equal too.
 Every other file (ledger, state, ticket file, the live owner's files, the limits file) is compared byte for byte, and
-every other byte of a journal file is compared (apart from M1 and M4).
+every other byte of a journal file is compared (apart from M1, M4 and M5).
 
 A sanity pair shows the comparison can fail: two different worlds, and one world with a single input changed by a
 cent, are each reported as different.
@@ -50,6 +54,7 @@ Nothing here opens a socket or reaches the real second price source (the autouse
 import hashlib
 import io
 import json
+import math
 import os
 import pickle
 import random
@@ -60,6 +65,7 @@ import subprocess
 import sys
 import tarfile
 import zlib
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -487,12 +493,31 @@ def _journal_same_but_held_lock(b, m):
             e = json.loads(y)
         except ValueError:
             return False
+        if isinstance(e, dict) and e.get("event") == "order" and list(e)[-2:] == ["quote_ts", "quote_age_s"]:
+            if not (_m5_fields_ok(e) and json.dumps({k: v for k, v in e.items() if k not in M5_KEYS},
+                                                     default=str).encode() == x):
+                return False
+            continue
         if not (isinstance(e, dict) and e.get("event") == "summary" and list(e)[-1] == "held_lock"
                 and type(e["held_lock"]) is bool):
             return False
         if json.dumps({k: v for k, v in e.items() if k != "held_lock"}, default=str).encode() != x:
             return False
     return True
+
+
+M5_KEYS = ("quote_ts", "quote_age_s")
+
+
+def _m5_fields_ok(e):
+    """M5: an order line's `quote_ts` is ISO 8601 text in UTC and its `quote_age_s` a real number in its range."""
+    ts, age = e["quote_ts"], e["quote_age_s"]
+    try:
+        when = datetime.fromisoformat(ts) if type(ts) is str else None
+    except ValueError:
+        when = None
+    return (when is not None and when.utcoffset() == timedelta(0) and type(age) in (int, float) and math.isfinite(age)
+            and -osx.QUOTE_MAX_AHEAD_SECONDS <= age <= osx.PRIMARY_QUOTE_MAX_AGE_SECONDS)
 
 
 def differences(b_runs, m_runs):
@@ -686,3 +711,37 @@ def test_r2_m4_held_lock_on_a_line_of_another_event_and_every_other_part_of_the_
     other = next(r for r, (how, _) in sorted(m["files"].items()) if how == "bytes")     # a file that is not a journal
     assert (0, other) in differences([b], [dict(m, files={**m["files"], other: ("bytes", m["files"][other][1] + b"x")})])
     assert differences([b], [dict(m, files={r: v for r, v in m["files"].items() if r != other})])[0][1][0] == "file names"
+
+
+# ---- M5 (CF-Q2): the order line's quote time and age, and nothing beside them
+
+def _order_line(snap):
+    for rel, (how, data) in sorted(snap["files"].items()):
+        if how == "journal":
+            for n, text in enumerate(data.split(b"\n")):
+                if text.strip() and json.loads(text).get("event") == "order":
+                    return rel, n, json.loads(text)
+    pytest.fail("the run journaled no order line")
+
+
+def test_r2_m5_the_quote_time_and_age_end_every_order_line_and_nothing_else_is_admitted(sides):
+    b, m = _first_done(sides)
+    rel, n, e = _order_line(m)
+    assert list(e)[-2:] == list(M5_KEYS) and differences([b], [m]) == []
+    line = lambda d: json.dumps(d, default=str).encode()
+    other = {k: v for k, v in e.items() if k not in M5_KEYS}
+    for good in (0.0, 1.5, osx.PRIMARY_QUOTE_MAX_AGE_SECONDS, -osx.QUOTE_MAX_AHEAD_SECONDS):
+        assert differences([b], [_put_line(m, rel, n, line({**other, "quote_ts": e["quote_ts"], "quote_age_s": good}))]) == []
+    ts = e["quote_ts"]
+    for bad in ({**other, "quote_ts": ts, "quote_age_s": osx.PRIMARY_QUOTE_MAX_AGE_SECONDS + 0.001},
+                {**other, "quote_ts": ts, "quote_age_s": True}, {**other, "quote_ts": ts, "quote_age_s": "1"},
+                {**other, "quote_ts": ts, "quote_age_s": float("nan")},
+                {**other, "quote_ts": ts.replace("+00:00", "-05:00"), "quote_age_s": e["quote_age_s"]},
+                {**other, "quote_ts": "not a time", "quote_age_s": e["quote_age_s"]},
+                {**other, "quote_ts": 1.0, "quote_age_s": e["quote_age_s"]},
+                {"quote_ts": ts, "quote_age_s": e["quote_age_s"], **other},           # not at the line's end
+                {**other, "quote_age_s": e["quote_age_s"], "quote_ts": ts},           # the two the other way round
+                {**other, "units": -1, "quote_ts": ts, "quote_age_s": e["quote_age_s"]},   # another key differs
+                {**other, "extra": 1, "quote_ts": ts, "quote_age_s": e["quote_age_s"]},    # a key beside them
+                {**other, "event": "fill", "quote_ts": ts, "quote_age_s": e["quote_age_s"]}):  # not an order line
+        assert (0, rel) in differences([b], [_put_line(m, rel, n, line(bad))]), bad

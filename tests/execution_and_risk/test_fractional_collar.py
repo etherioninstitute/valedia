@@ -183,7 +183,7 @@ def test_b2_the_second_source_is_asked_once_on_the_quote_the_market_leg_is_sent_
 
 # ---- B1: the quote's age at the moment of sending
 
-@pytest.mark.parametrize("age, sent", [(60.0, True), (120.0, True), (121.0, False), (1199.0, False)])
+@pytest.mark.parametrize("age, sent", [(60.0, True), (120.0, True), (121.0, False), (299.0, False)])   # CF-Q2: was 1199
 def test_b1_a_market_legs_quote_older_than_120_seconds_holds_it_back_and_its_limit_leg_goes(tmp_path, age, sent):
     w = collar_world(tmp_path / "w")
     w.quote_age["SPY"] = age                                          # asked again: the venue's quote is that old
@@ -211,7 +211,7 @@ def test_b1_a_market_leg_whose_quote_ages_past_120_seconds_after_its_checks_is_n
 
 def test_b1_a_market_leg_asks_for_a_fresher_quote_and_is_sent_on_it(tmp_path):
     w = collar_world(tmp_path / "w")
-    w.quote_age["SPY"] = 600.0                                        # fine for the LIMIT leg, too old for MARKET
+    w.quote_age["SPY"] = 250.0                                        # fine for the LIMIT leg, too old for MARKET (CF-Q2: was 600)
     ask_again_at(w, 501.0)
     out = w.run(fractional=True)
     b = out["batch"]

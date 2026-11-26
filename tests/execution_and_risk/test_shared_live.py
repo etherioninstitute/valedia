@@ -1321,6 +1321,7 @@ def test_an_in_run_reprice_failure_leaves_the_summary_with_the_figures_of_the_ro
     lw.later(1)
     for symbol in ("SPY", "QQQ"):
         lw.quote_age[symbol] = 19.5 * 60                  # fresh now, stale after the first send: asked again
+    T._own_answered_fresh(lw, 19.5 * 60)                  # CF-Q2: each order's own quote, asked first, answered fresh
     T._later_submit(lw, 2, then=lambda w: w.prices.update(SPY=520.0))      # the held fund moves between the two orders
     real_reprice = osx.OrderStepState.reprice_book_nav
 

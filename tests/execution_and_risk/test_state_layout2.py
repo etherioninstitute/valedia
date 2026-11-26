@@ -26,6 +26,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from decimal import Decimal as D
 from pathlib import Path
 
@@ -1024,7 +1025,9 @@ def same_but_held_lock(x, y, where):
     `held_lock` (a real bool: whether the run held the run lock), which cdd5371's never carry. Admitted, and nothing
     else: the key must be there and a bool on this tree (a run that crashed has no summary and so none), absent on the
     base, and without it the summary and each journal line that differs are the base's own bytes. Any other key, in
-    the summary or on a journal line, any other event's line, any other part of the record, fails."""
+    the summary or on a journal line, any other event's line, any other part of the record, fails. CF-Q2 adds one
+    more: an `order` line of this tree ends with `quote_ts` (ISO 8601, UTC) and `quote_age_s` (a real number within
+    -QUOTE_MAX_AHEAD_SECONDS to PRIMARY_QUOTE_MAX_AGE_SECONDS), and with the two taken out it is the base's line."""
     for key in x:
         if key == "summary":
             bs, ms = json.loads(x[key]), json.loads(y[key])
@@ -1041,6 +1044,12 @@ def same_but_held_lock(x, y, where):
                     if a == c:
                         continue
                     e = json.loads(c)
+                    if e.get("event") == "order" and list(e)[-2:] == ["quote_ts", "quote_age_s"]:   # CF-Q2
+                        age, when = e.pop("quote_age_s"), datetime.fromisoformat(e.pop("quote_ts"))
+                        assert when.utcoffset() == timedelta(0) and type(age) in (int, float), (where, name, c)
+                        assert -osx.QUOTE_MAX_AHEAD_SECONDS <= age <= osx.PRIMARY_QUOTE_MAX_AGE_SECONDS, (where, name, c)
+                        assert json.dumps(e, default=str).encode() == a, (where, name, c)
+                        continue
                     assert e.get("event") == "summary" and list(e)[-1] == "held_lock" and type(e["held_lock"]) is bool, \
                         (where, name, c)
                     assert json.dumps({k: v for k, v in e.items() if k != "held_lock"}, default=str).encode() == a, \

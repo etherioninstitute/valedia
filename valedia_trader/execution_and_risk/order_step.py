@@ -54,7 +54,8 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
                  and is judged with the locks, before anything is read from the account.
  6. prices       one quote per symbol with its time; older than QUOTE_MAX_AGE_SECONDS, missing, a time whose
                  timestamp() is not finite or raises, or a price not above 0 or above MAX_QUOTE_PRICE: no order for
-                 that symbol. The venue's cash, and the broker equity (cash
+                 that symbol (a quote older than PRIMARY_QUOTE_MAX_AGE_SECONDS values a holding but never prices an
+                 order: step 10 asks for it again). The venue's cash, and the broker equity (cash
                  plus holdings at the quotes), must be finite numbers from 0 to MAX_CASH; the venue's settled cash,
                  when it gives one (the key present and not None), a finite number from 0 to MAX_CASH and at most
                  the cash plus SETTLED_ABOVE_CASH (a cent); and every held symbol must
@@ -70,8 +71,8 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
                  the account too; before each call every holding whose quote in hand is older than
                  QUOTE_MAX_AGE_SECONDS is asked for again, in the same single ask as the order's own quote, but not
                  within QUOTE_ASK_GAP_SECONDS of its last ask in the run (the order's own quote is always asked when
-                 too old), so a run makes at most 1 + 2 requests per order considered; when a holding still has no
-                 usable fresh quote the account cannot be priced: an order that adds risk is left over with that
+                 older than PRIMARY_QUOTE_MAX_AGE_SECONDS), so a run makes at most 1 + 2 requests per order
+                 considered; when a holding still has no usable fresh quote the account cannot be priced: an order that adds risk is left over with that
                  reason, a sale that reduces risk is still judged, the stale holding kept at its last usable price;
                  the day's loss against the equity recorded at the last run on an earlier day; the
                  fall from the peak of the earlier runs and this equity; positions held), latch and halt files
@@ -90,20 +91,23 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
                  summary also gives the `cash` and `settled_cash` read; at most max_orders_per_day sent in one New
                  York day across runs. What is not sent is journaled, not queued.
 10. send         an order above MAX_UNITS in size is left over, never sent. For each other order, in this order:
-                  a. the quote's age on the clock: older than QUOTE_MAX_AGE_SECONDS, the quote function is asked
-                     once more for that symbol (with the holdings of step 8, in one ask), and an unusable answer
-                     leaves the order over;
+                  a. the quote's age on the clock: older than PRIMARY_QUOTE_MAX_AGE_SECONDS (the quote an order is
+                     priced from; a holding's limit stays QUOTE_MAX_AGE_SECONDS), the quote function is asked once
+                     more for that symbol (with the holdings of step 8, in one ask), and an answer that is unusable
+                     or itself older than PRIMARY_QUOTE_MAX_AGE_SECONDS leaves the order over;
                   b. the risk gate, at that quote (the limit price, order value, cash check and position value all
                      come from it);
                   c. the environment and host read;
-                  d. the quote's age again: too old, back to (a) once; too old the second time, the order is left
-                     over. What is sent always uses the quote of the last round's (b), the one the gate judged;
+                  d. the quote's age again (PRIMARY_QUOTE_MAX_AGE_SECONDS): too old, back to (a) once; too old the
+                     second time, the order is left over. What is sent always uses the quote of the last round's (b), the one the gate judged;
                   e. the window check, then ledger.intend;
                   f. the environment and host read; a last look: the quote's age once more, the halt file and (for an
                      order that adds risk) the latch file; the window check again, then ledger.submit_once.
                  Nothing that can take time sits between a window check and the call it guards; an order failing the
                  last look or the second window check stays `intended`, never sent, and is reported left over with
-                 the reason. A day limit order in the regular session. A refusal is journaled and the run goes on;
+                 the reason. A day limit order in the regular session. Each `order` line of the journal carries
+                 `quote_ts`, the time of the quote it was priced from (ISO 8601, UTC), and `quote_age_s`, that quote's
+                 age in seconds on the clock reading of (d) that judged it. A refusal is journaled and the run goes on;
                  an unknown outcome stops the run at once. Nothing a venue or the quote function returns or raises makes the run raise: it becomes a
                  stop or a left-over order, in the order step's own words.
 11. after        reconcile once more, journal the fills, return and journal a summary.
@@ -315,7 +319,8 @@ NOT_SENT = (NotTransmitted, OrderRejected)        # the adapter's answers that m
 NEW_YORK = "America/New_York"
 SESSION_AFTER_OPEN = pd.Timedelta(minutes=5)      # 09:35 on a 09:30 open
 SESSION_BEFORE_CLOSE = pd.Timedelta(minutes=15)   # 15:45 on a 16:00 close, 12:45 on a 13:00 half-day
-QUOTE_MAX_AGE_SECONDS = 20 * 60
+QUOTE_MAX_AGE_SECONDS = 20 * 60                   # a quote read at all (holdings valued, owner marks) at most this old
+PRIMARY_QUOTE_MAX_AGE_SECONDS = 300               # CF-Q2: the quote an order is priced from at most this old (step 10)
 QUOTE_MAX_AHEAD_SECONDS = 60                      # a quote stamped later than this after now is not believed
 QUOTE_ASK_GAP_SECONDS = 60                        # a holding is not asked for again sooner than this in one run
 MAX_CASH = 1e12                                   # cash and equity outside 0 to this are unusable, like a non-finite one
@@ -2625,16 +2630,27 @@ def _quote_time(t) -> float | None:
     return None
 
 
-def _read_quote(raw, now: float) -> tuple[float | None, float | None, str | None]:
-    """(price, time, None) for a usable quote, else (None, None, why), in the order step's own words. Never raises,
+def _age_words(seconds: float) -> str:
+    """CF-Q2: an age limit in words, whole minutes when it is whole minutes ("5 minutes"), else seconds."""
+    return f"{seconds // 60:g} minutes" if seconds % 60 == 0 else f"{seconds:g} seconds"
+
+
+def _iso_utc(seconds: float) -> str:
+    """CF-Q2: an instant in seconds as ISO 8601 in UTC (the journal's quote_ts)."""
+    return datetime.fromtimestamp(seconds, timezone.utc).isoformat()
+
+
+def _read_quote(raw, now: float, max_age: float = QUOTE_MAX_AGE_SECONDS) -> tuple[float | None, float | None, str | None]:
+    """(price, time, None) for a usable quote (at most `max_age` old: QUOTE_MAX_AGE_SECONDS, or for the quote an order
+    is priced from PRIMARY_QUOTE_MAX_AGE_SECONDS), else (None, None, why), in the order step's own words. Never raises,
     whatever the quote's methods do."""
     try:
-        return _read_quote_unguarded(raw, now)
+        return _read_quote_unguarded(raw, now, max_age)
     except Exception:
         return None, None, "the quote could not be read"
 
 
-def _read_quote_unguarded(raw, now: float) -> tuple[float | None, float | None, str | None]:
+def _read_quote_unguarded(raw, now: float, max_age: float = QUOTE_MAX_AGE_SECONDS) -> tuple[float | None, float | None, str | None]:
     if raw is None:
         return None, None, "no quote"
     try:
@@ -2651,8 +2667,8 @@ def _read_quote_unguarded(raw, now: float) -> tuple[float | None, float | None, 
     if t is None:
         return None, None, "the quote's time is not usable"
     age = now - t
-    if age > QUOTE_MAX_AGE_SECONDS:
-        return None, None, f"the quote is {age / 60:.1f} minutes old, more than {QUOTE_MAX_AGE_SECONDS // 60}"
+    if age > max_age:
+        return None, None, f"the quote is {age / 60:.1f} minutes old, more than {max_age / 60:g}"
     if age < -QUOTE_MAX_AHEAD_SECONDS:
         return None, None, f"the quote is stamped {-age:.0f} s after now"
     return price, t, None
@@ -5598,21 +5614,23 @@ class _Run:
         return prices, why_not
 
     def _quote_fresh(self, sym: str, max_age: float = QUOTE_MAX_AGE_SECONDS, now: float | None = None) -> bool:
-        """Whether the quote in hand for `sym` is within `max_age` (QUOTE_MAX_AGE_SECONDS; a MARKET leg's
-        MARKET_QUOTE_MAX_AGE_SECONDS) on the clock now, or on the reading `now` when given."""
+        """Whether the quote in hand for `sym` is within `max_age` (QUOTE_MAX_AGE_SECONDS for a holding; the order's
+        own quote PRIMARY_QUOTE_MAX_AGE_SECONDS; a MARKET leg's collar MARKET_QUOTE_MAX_AGE_SECONDS) on the clock now, or
+        on the reading `now` when given."""
         t, now = self.quote_times.get(sym), (self._now() if now is None else now)
         return t is not None and -QUOTE_MAX_AHEAD_SECONDS <= now - t <= max_age
 
     def _refresh(self, sym: str, quote: float, held: dict, in_hand: dict,
                  market: bool = False) -> tuple[float | None, str | None, list[str]]:
         """At most one ask of the quote function before an order is judged: the order's own symbol when its quote in
-        hand is older than QUOTE_MAX_AGE_SECONDS (always: it is the quote the order is judged and sent on), and every
-        holding whose quote in hand is too old and was last asked for QUOTE_ASK_GAP_SECONDS or more ago. Returns
+        hand is older than PRIMARY_QUOTE_MAX_AGE_SECONDS (always: it is the quote the order is priced, judged and sent
+        on; the answer is usable only within that same age), and every holding whose quote in hand is older than
+        QUOTE_MAX_AGE_SECONDS and was last asked for QUOTE_ASK_GAP_SECONDS or more ago. Returns
         (the order's quote, None, the holdings still without a fresh quote), or (None, why, []) when the order's own
         quote asked for again is not usable. Usable answers go into `in_hand` with their times. T51 R5 (B1): a MARKET
         leg (`market`) also asks for its own symbol when its quote is older than MARKET_QUOTE_MAX_AGE_SECONDS and takes
         the answer only when it is usable and newer; otherwise it keeps the quote in hand (the collar then judges it)."""
-        own = not self._quote_fresh(sym)
+        own = not self._quote_fresh(sym, PRIMARY_QUOTE_MAX_AGE_SECONDS)
         fresher = market and not own and not self._quote_fresh(sym, MARKET_QUOTE_MAX_AGE_SECONDS)
         now = self._now()
         holdings = [s for s, u in sorted(held.items()) if u > UNITS_EPS and s != sym and not self._quote_fresh(s)
@@ -5633,10 +5651,10 @@ class _Run:
             if price is not None:
                 self.quote_times[s], in_hand[s] = t, price
         if own:
-            old = f"the quote is older than {QUOTE_MAX_AGE_SECONDS // 60} minutes"
+            old = f"the quote is older than {_age_words(PRIMARY_QUOTE_MAX_AGE_SECONDS)}"
             if failed is not None:
                 return None, f"{old} and asking for it again failed: {_venue_error(failed)}", []
-            price, t, why = _read_quote(raw.get(sym), now)
+            price, t, why = _read_quote(raw.get(sym), now, PRIMARY_QUOTE_MAX_AGE_SECONDS)
             if price is None:
                 return None, f"{old} and the quote asked for again is not usable: {why}", []
             self.quote_times[sym], quote = t, price
@@ -5994,14 +6012,15 @@ class _Run:
                     self._leave(c, words[purchases_stopped], collar="value" if market else None)   # T51 R5 (B5)
                     break
                 self._check_environment()                # 3. the environment and host, read again
-                if self._quote_fresh(sym):               # 4. the quote still fresh on the clock: judged at it
-                    judged = (quote, limit, order, cost)
+                priced_at = self._now()                  # CF-Q2: the moment the order is priced, on the clock
+                if self._quote_fresh(sym, PRIMARY_QUOTE_MAX_AGE_SECONDS, priced_at):   # 4. the quote still fresh: judged at it
+                    judged = (quote, limit, order, cost, self.quote_times[sym], priced_at)
                     break
                 if round_ == 2:                          # ... stale again: back to 1 once, then left over
                     self._leave(c, "the quote went stale again while the order was checked")
             if judged is None:
                 continue
-            quote, limit, order, cost = judged
+            quote, limit, order, cost, quote_t, priced_at = judged
             if self.mode == "approve":                   # the ticket: live, the same size, the quote within its band
                 why = self._ticket_check(c, quote)
                 if why is not None:
@@ -6123,7 +6142,8 @@ class _Run:
                     entry["limit_price"], entry["collar_price"] = None, limit
                 entry["order_type"], entry["leg"] = c["order_type"], c["leg"]
             self.sent.append(entry)
-            self._write({"event": "order", **entry, "state": outcome})
+            self._write({"event": "order", **entry, "state": outcome,   # CF-Q2, at the line's end: the quote's own
+                         "quote_ts": _iso_utc(quote_t), "quote_age_s": round(priced_at - quote_t, 3)})   # time, its age priced
             self._ticket_note(c, "sent", tag=tag)
 
     def _equity(self, cash: float, held: dict, in_hand: dict) -> float:
@@ -6136,7 +6156,7 @@ class _Run:
     def _last_look(self, sym: str, reduces: bool) -> str | None:
         """Why an intended order may not be sent after all (its quote is too old now, the halt file or, for an order
         that adds risk, the latch has appeared), or None. A file that cannot be looked at counts as there."""
-        if not self._quote_fresh(sym):
+        if not self._quote_fresh(sym, PRIMARY_QUOTE_MAX_AGE_SECONDS):
             return "the quote went stale before the order was sent"
         if _present(self.halt_file):
             return "the operator halt file is there at the last look before sending"
