@@ -66,7 +66,9 @@ CLOSE_AFTER_MS = 10_000     # and the close record is refused before close + 10 
 CLOSE_WINDOW_SIZE = 60      # the close tick is the first tick whose 15-minute windowed average has window_size 60
 SETTLE_QUANTUM = Decimal("0.01")
 SETTLE_ROUNDING = ROUND_HALF_EVEN
-FILE_SLACK_MS = 60_000      # files are dated by receipt, ticks chosen by source time: read the neighbouring day too
+RECEIPT_MARGIN_MS = 120_000  # receipt time vs source time skew allowed for: which day files to open, and where to stop
+READ_BLOCK_BYTES = 65_536   # the adapter reads each file backwards from its end in blocks of this size
+MAX_LINE_BYTES = 1_048_576  # a line longer than this is not a tick row: it is skipped without being held in memory
 
 
 class NotYetEnabled(RuntimeError):
@@ -292,32 +294,91 @@ def _check_span(t_from_ms: Any, t_to_ms: Any) -> tuple[int, int]:
     return a, b
 
 
+def _load_line(raw: bytes) -> Any:
+    try:
+        return json.loads(raw.decode("utf-8", errors="replace"), parse_float=Decimal)
+    except (ValueError, RecursionError):
+        return None
+
+
+def _rows_backwards(path: Path, stop_before_ms: int) -> tuple[list, bool]:
+    """The file's parseable rows, newest line first, read from the end in blocks of READ_BLOCK_BYTES.
+
+    It stops after a block whose rows that carry a whole `received_at_ms` are all received before stop_before_ms
+    (the file is append-only, in write order, which tracks receipt to within seconds). Returns (rows, stopped).
+    A line split across two blocks counts in the block where it completes.
+    """
+    rows: list = []
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        pos = fh.tell()
+        tail = b""            # the start of a line whose end has been read already
+        oversized = False     # the line being assembled is longer than MAX_LINE_BYTES: drop it
+        while pos > 0:
+            size = min(READ_BLOCK_BYTES, pos)
+            pos -= size
+            fh.seek(pos)
+            chunk = fh.read(size)
+            parts = chunk.split(b"\n")
+            if oversized:
+                if len(parts) == 1:
+                    continue              # still inside the oversized line
+                joined, oversized = parts[:-1], False    # the last part is the oversized line's start: dropped
+            else:
+                joined = parts[:-1] + [parts[-1] + tail]   # the last part completes the line carried from after
+            if pos > 0:
+                tail, lines = joined[0], joined[1:]
+                if len(tail) > MAX_LINE_BYTES:
+                    tail, oversized = b"", True
+            else:
+                tail, lines = b"", joined
+            timed = old = 0
+            for raw in reversed(lines):
+                if not raw.strip() or len(raw) > MAX_LINE_BYTES:
+                    continue
+                row = _load_line(raw)
+                if row is None:
+                    continue
+                rows.append(row)
+                recv = _whole(row.get("received_at_ms")) if isinstance(row, dict) else None
+                if recv is not None:
+                    timed += 1
+                    old += recv < stop_before_ms
+            if timed and old == timed:
+                return rows, True
+    return rows, False
+
+
 def read_tick_files(tick_folder, t_from_ms: int, t_to_ms: int, *, clock: Callable[[], datetime]) -> list[dict]:
     """The tick-store rows whose source time is in [t_from_ms, t_to_ms], in file order, malformed lines skipped.
 
-    It reads `<tick_folder>/kalshi_index_ticks-YYYY-MM-DD.jsonl` for every UTC day the span (widened by
-    FILE_SLACK_MS each side, because a file is dated by receipt) touches; a missing file is no rows. Files only.
+    The files are `<tick_folder>/kalshi_index_ticks-YYYY-MM-DD.jsonl`, one per UTC day of receipt; a missing file is
+    no rows. Only the span is read: each file is read backwards from its end, newest day first, and reading stops at
+    the first block whose rows were all received more than RECEIPT_MARGIN_MS before t_from_ms, so the day before
+    is opened only when the span (less the margin) reaches into it. Files only.
     """
     _gate(clock)
     _check_folder(tick_folder)
     a, b = _check_span(t_from_ms, t_to_ms)
-    first = datetime.fromtimestamp((a - FILE_SLACK_MS) // 1000, timezone.utc).date()
-    last = datetime.fromtimestamp((b + FILE_SLACK_MS) // 1000, timezone.utc).date()
-    out: list[dict] = []
-    day = first
-    while day <= last:
+    stop_before = a - RECEIPT_MARGIN_MS
+    day = datetime.fromtimestamp((b + RECEIPT_MARGIN_MS) // 1000, timezone.utc).date()
+    first = datetime.fromtimestamp(stop_before // 1000, timezone.utc).date()
+    per_day: list[list] = []                       # newest day first, each day's rows in file order
+    while day >= first:
         path = Path(tick_folder) / f"{TICK_FILE_PREFIX}{day.isoformat()}.jsonl"
         if path.is_file():
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    try:
-                        row = json.loads(line, parse_float=Decimal)
-                    except (ValueError, RecursionError):
-                        continue
-                    tick = _parse_tick_row(row)
-                    if tick is not None and a <= tick.source_ms <= b:
-                        out.append(row)
-        day += timedelta(days=1)
+            rows, stopped = _rows_backwards(path, stop_before)
+            rows.reverse()
+            per_day.append(rows)
+            if stopped:
+                break
+        day -= timedelta(days=1)
+    out: list[dict] = []
+    for rows in reversed(per_day):
+        for row in rows:
+            tick = _parse_tick_row(row)
+            if tick is not None and a <= tick.source_ms <= b:
+                out.append(row)
     return out
 
 

@@ -785,6 +785,140 @@ def test_adapter_reads_what_the_index_client_writes(tmp_path):
     no_float_lines(out)
 
 
+# ---------------------------------------------------------------- the adapter reads only the span
+
+def _full_scan(folder: Path, a: int, b: int) -> list[dict]:
+    """The reference: every line of every day file the span (widened by the margin) touches, then the same filter."""
+    first = datetime.fromtimestamp((a - L.RECEIPT_MARGIN_MS) // 1000, UTC).date()
+    last = datetime.fromtimestamp((b + L.RECEIPT_MARGIN_MS) // 1000, UTC).date()
+    out, day = [], first
+    while day <= last:
+        path = folder / f"kalshi_index_ticks-{day.isoformat()}.jsonl"
+        if path.is_file():
+            for line in path.read_bytes().split(b"\n"):
+                try:
+                    row = json.loads(line.decode("utf-8", errors="replace"), parse_float=Decimal)
+                except ValueError:
+                    continue
+                tick = L._parse_tick_row(row)
+                if tick is not None and a <= tick.source_ms <= b:
+                    out.append(row)
+        day += timedelta(days=1)
+    return out
+
+
+class _Counted:
+    """Wraps a file object and counts the bytes its read() returns."""
+    def __init__(self, fh, log, path):
+        self.fh, self.log, self.path = fh, log, str(path)
+
+    def read(self, *a):
+        data = self.fh.read(*a)
+        self.log.append((self.path, len(data)))
+        return data
+
+    def __getattr__(self, name):
+        return getattr(self.fh, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return self.fh.__exit__(*exc)
+
+
+@pytest.fixture
+def counted(monkeypatch):
+    log = []
+    real_open = open
+    monkeypatch.setattr(L, "open", lambda p, *a, **k: _Counted(real_open(p, *a, **k), log, p), raising=False)
+    return log
+
+
+def _midnight_store(folder: Path, M: int) -> list[dict]:
+    """1 Hz ticks from M - 1800 s to M + 1800 s, filed by UTC receipt day, written out of order by up to 60 s,
+    with malformed lines between them."""
+    import random
+    rng = random.Random(7)
+    rows = [tick_row(M + 1000 * k, seq=k + 2000, recv=M + 1000 * k + rng.choice((20, 900, 1500))) for k in
+            range(-1800, 1801)]
+    rows.append(tick_row(M - 100, seq=1, recv=M + 50))           # sourced on one day, received on the next
+    rows.sort(key=lambda r: r["received_at_ms"])
+    shuffled = []
+    for i in range(0, len(rows), 60):                            # write order differs from receipt by < 60 s
+        chunk = rows[i:i + 60]
+        rng.shuffle(chunk)
+        shuffled += chunk
+    junk = ["{truncated", "", "[1,2]", "null", "\x00\x01 binary", json.dumps({"received_at_ms": "x"})]
+    for n, row in enumerate(shuffled):
+        day = datetime.fromtimestamp(row["received_at_ms"] // 1000, UTC).date().isoformat()
+        _write(folder, day, [row] + ([junk[n % len(junk)]] if n % 37 == 0 else []))
+    return rows
+
+
+SPANS = [(-300_000, 0), (-10_000, 10_000), (600_000, 900_000), (-1_800_000, 1_800_000), (60_000, 100_000),
+         (-5_000_000, -4_000_000), (4_000_000, 5_000_000), (1_799_000, 1_800_000), (-1_800_000, -1_790_000)]
+
+
+@pytest.mark.parametrize("block", [None, 512, 4096])
+def test_backward_reader_matches_the_full_scan(tmp_path, monkeypatch, block):
+    if block is not None:
+        monkeypatch.setattr(L, "READ_BLOCK_BYTES", block)
+    M = int(datetime(2026, 12, 5, 0, 0, 0, tzinfo=UTC).timestamp() * 1000)
+    _midnight_store(tmp_path, M)
+    clk = lambda: at(M / 1000 + 7200)
+    for lo, hi in SPANS:
+        got = read_tick_files(tmp_path, M + lo, M + hi, clock=clk)
+        assert got == _full_scan(tmp_path, M + lo, M + hi), (lo, hi)
+    assert len(read_tick_files(tmp_path, M - 300_000, M, clock=clk)) == 302      # 301 ticks plus the late one
+
+
+def test_backward_reader_stops_early_and_opens_the_day_before_only_when_needed(tmp_path, counted):
+    M = int(datetime(2026, 12, 5, 0, 0, 0, tzinfo=UTC).timestamp() * 1000)
+    _midnight_store(tmp_path, M)
+    clk = lambda: at(M / 1000 + 7200)
+    today = str(tmp_path / "kalshi_index_ticks-2026-12-05.jsonl")
+    before = str(tmp_path / "kalshi_index_ticks-2026-12-04.jsonl")
+    # a span far after midnight: the day before is never opened, and today's file is read only near its end
+    read_tick_files(tmp_path, M + 1_500_000, M + 1_800_000, clock=clk)
+    assert {p for p, _ in counted} == {today}
+    assert sum(n for _, n in counted) < os.path.getsize(today) / 2
+    # a span just after midnight: today's file to its start, and the day before only from its end, briefly
+    counted.clear()
+    read_tick_files(tmp_path, M + 60_000, M + 100_000, clock=clk)
+    read_before = sum(n for p, n in counted if p == before)
+    assert 0 < read_before <= 2 * L.READ_BLOCK_BYTES and read_before < os.path.getsize(before)
+
+
+def test_backward_reader_skips_an_oversized_line(tmp_path, monkeypatch):
+    monkeypatch.setattr(L, "READ_BLOCK_BYTES", 1024)
+    monkeypatch.setattr(L, "MAX_LINE_BYTES", 4096)
+    M = int(datetime(2026, 12, 5, 6, 0, 0, tzinfo=UTC).timestamp() * 1000)
+    rows = [tick_row(M + 1000 * k, seq=k) for k in range(40)]
+    _write(tmp_path, "2026-12-05", rows[:20] + ["x" * 20_000] + rows[20:30] + ["{" + "y" * 5000] + rows[30:])
+    got = read_tick_files(tmp_path, M, M + 39_000, clock=lambda: at(M / 1000 + 60))
+    assert got == rows == _full_scan(tmp_path, M, M + 39_000)
+
+
+def test_backward_reader_reads_a_bounded_number_of_bytes_on_a_large_file(tmp_path, counted):
+    D0 = int(datetime(2026, 12, 6, 0, 0, 10, tzinfo=UTC).timestamp() * 1000)
+    n = 100_000
+    path = tmp_path / "kalshi_index_ticks-2026-12-06.jsonl"
+    with open(path, "w", encoding="utf-8") as fh:
+        for k in range(n):                                       # 2 Hz, about 13.9 hours, one UTC day
+            row = dict(tick_row(D0 + 500 * k, seq=k), avg_60s=None)
+            fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+    end = D0 + 500 * (n - 1)
+    got = read_tick_files(tmp_path, end - 300_000, end, clock=lambda: at(end / 1000 + 60))
+    read = sum(b for _, b in counted)
+    size = os.path.getsize(path)
+    path.unlink()
+    assert len(got) == 601 and got[0]["seq"] == n - 601 and got[-1]["seq"] == n - 1
+    print(f"bounded read: {read} bytes of a {size}-byte file, {n} rows")
+    assert read < 512 * 1024, read                               # budget: 512 KiB, against a file of about 30 MB
+    assert size > 50 * read
+
+
 # ---------------------------------------------------------------- no float anywhere
 
 def test_no_float_in_any_written_record(tmp_path):
