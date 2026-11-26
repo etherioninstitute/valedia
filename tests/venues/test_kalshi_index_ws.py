@@ -344,6 +344,57 @@ def test_parse_without_the_fifteen_minute_average_or_sending_time():
     assert tick.last_15min_avg is None and tick.sending_ts_ms is None and tick.avg_60s is not None
 
 
+def value_msg_5hz(seq=7, sid=2, received_at=RECV, value="68000.12"):
+    """The 5 Hz message: the 1 Hz envelope with the type changed and no averages."""
+    obj = value_msg(seq=seq, sid=sid, received_at=received_at, value=value)
+    obj["type"] = "cfbenchmarks_value_5hz"
+    del obj["msg"]["avg_60s_data"]
+    return obj
+
+
+def test_a_one_hertz_message_without_avg_60s_data_is_malformed(tmp_path, creds):
+    msg = value_msg()
+    del msg["msg"]["avg_60s_data"]
+    with pytest.raises(kis.MalformedFrame):
+        kis.parse_value_message(msg)
+    msg["msg"]["avg_60s_data"] = None
+    with pytest.raises(kis.MalformedFrame):
+        kis.parse_value_message(msg)
+    gone = value_msg(seq=2)
+    del gone["msg"]["avg_60s_data"]
+    summary, _, _ = run(tmp_path, [FakeWS([j(gone), j(value_msg(seq=3)), KeyboardInterrupt()])], creds)
+    assert summary["malformed"] == 1 and summary["ticks"] == 1 and len(lines(tmp_path)) == 1
+
+
+def test_the_five_hertz_message_parses_with_no_avg_60s():
+    tick = kis.parse_value_message(value_msg_5hz())
+    assert tick.avg_60s is None and tick.last_15min_avg is None
+    assert tick.index_id == "BRTI" and tick.value == Decimal("68000.12")
+    assert (tick.sid, tick.seq) == (2, 7) and tick.received_at_ms == RECV and tick.source_time_ms == RECV - 20
+    assert tick.sending_ts_ms == RECV + 5
+
+
+def test_the_five_hertz_message_takes_the_fifteen_minute_average_when_present():
+    msg = value_msg_5hz()
+    msg["msg"]["last_60s_windowed_average_15min"] = {
+        "value": "67999.50000000", "window_size": 60, "window_start_ts_ms": RECV - 60000,
+        "window_end_ts_exclusive": RECV}
+    tick = kis.parse_value_message(msg)
+    assert tick.avg_60s is None
+    assert tick.last_15min_avg == kis.WindowAvg(Decimal("67999.50000000"), 60, RECV - 60000, RECV)
+
+
+def test_a_five_hertz_stream_records_ticks_and_both_index_list_replies_are_handled(tmp_path, creds):
+    script = [j({"type": "cfbenchmarks_value_indexlist", "msg": {"index_ids": ["BRTI"]}}),
+              j({"type": "cfbenchmarks_value_5hz_indexlist", "msg": {"index_ids": ["BRTI"]}}),
+              j(value_msg_5hz(seq=1)), j(value_msg_5hz(seq=2)), KeyboardInterrupt()]
+    summary, _, _ = run(tmp_path, [FakeWS(script)], creds, channel="cfbenchmarks_value_5hz")
+    assert summary["ticks"] == 2 and summary["malformed"] == 0 and summary["errors"] == []
+    rows = lines(tmp_path)
+    assert [r["channel"] for r in rows] == ["cfbenchmarks_value_5hz"] * 2
+    assert rows[0]["avg_60s"] is None and rows[0]["last_15min_avg"] is None and rows[0]["value"] == "68000.12"
+
+
 def test_decimal_precision_is_kept(tmp_path, creds):
     big = "68000.123456789012345678"
     run(tmp_path, [FakeWS([j(value_msg(value=big)), KeyboardInterrupt()])], creds)
@@ -364,6 +415,7 @@ def test_decimal_precision_is_kept(tmp_path, creds):
     lambda m: m["msg"].update(received_at="x"),
     lambda m: m["msg"].update(received_at=10 ** 30),
     lambda m: m["msg"]["avg_60s_data"].update(value="abc"),
+    lambda m: m["msg"].pop("avg_60s_data"),
     lambda m: m.pop("seq"),
     lambda m: m.update(sid=True),
     lambda m: m.update(msg=[]),

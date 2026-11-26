@@ -58,6 +58,7 @@ ALLOWED_CHANNELS = frozenset({CHANNEL_VALUE, CHANNEL_VALUE_5HZ})
 ALLOWED_ACTIONS = frozenset({"subscribe_indices", "unsubscribe_indices", "indexlist"})
 _ACTIONS_WITH_INDICES = frozenset({"subscribe_indices", "unsubscribe_indices"})
 _VALUE_TYPES = frozenset({CHANNEL_VALUE, CHANNEL_VALUE_5HZ})
+_INDEXLIST_TYPES = frozenset({CHANNEL_VALUE + "_indexlist", CHANNEL_VALUE_5HZ + "_indexlist"})
 _INDEX_RE = re.compile(r"[A-Z0-9_]{2,32}")        # matched with fullmatch: `^[A-Z0-9_]{2,32}$` without the newline slip
 
 STORE_PREFIX = "kalshi_index_ticks-"
@@ -338,6 +339,8 @@ def parse_value_message(obj: Any) -> IndexTick:
     sending = obj.get("sending_ts_ms")
     avg_60 = msg.get("avg_60s_data")
     last_15 = msg.get("last_60s_windowed_average_15min")
+    if obj["type"] == CHANNEL_VALUE and avg_60 is None:
+        raise MalformedFrame("avg_60s_data is always present on this channel")     # the 5 Hz message has none
     return IndexTick(
         index_id=index_id,
         value=_to_decimal(raw.get("value")),
@@ -475,6 +478,8 @@ class _Run:
             self._count_seq(tick.sid, tick.seq)
             self.store.append(tick, kind)
             self.ticks += 1
+        elif kind in _INDEXLIST_TYPES:
+            pass        # the reply to an `indexlist` request: it carries no tick
         elif kind == "error":
             body = obj.get("msg") if isinstance(obj.get("msg"), dict) else {}
             code = body.get("code")
@@ -483,7 +488,7 @@ class _Run:
                                message=message if isinstance(message, str) else None)
         elif not isinstance(kind, str):
             self.malformed += 1
-        # `subscribed`, `ok`, `cfbenchmarks_value_indexlist` and any other type carry no tick: nothing to record
+        # `subscribed`, `ok` and any other type carry no tick: nothing to record
 
     def _count_seq(self, sid: int, seq: int) -> None:
         last = self.last_seq.get(sid)
