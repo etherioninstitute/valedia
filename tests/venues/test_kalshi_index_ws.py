@@ -857,7 +857,7 @@ def test_each_row_stores_the_exact_local_receipt_ms_from_the_injected_clock(tmp_
 
 
 def test_local_receipt_is_exact_to_the_millisecond_not_float_rounded(tmp_path, creds):
-    start = datetime(2026, 12, 5, 12, 0, 0, 1000, tzinfo=UTC)       # .001 s: a float product can land one ms low
+    start = datetime(2026, 12, 5, 12, 0, 0, 999999, tzinfo=UTC)     # .999999 s: a rounded ms would be one ms high
     run(tmp_path, [FakeWS([j(value_msg(seq=1)), KeyboardInterrupt()])], creds, clock=StepClock(start=start, step=0.0))
     assert lines(tmp_path)[0]["local_receipt_ms"] == (start - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1)
 
