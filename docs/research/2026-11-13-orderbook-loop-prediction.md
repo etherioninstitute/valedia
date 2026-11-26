@@ -565,3 +565,22 @@ requests to the same model instance. The instance answers one request at a time,
 behind them: its first eight decisions took 4.7 to 8.7 seconds (median 7.3) against 3.7 when the instance is
 otherwise idle; all eight are ok and none is late. The session that runs that program has been told. A call that
 passes the 10 second limit would be a `late` row like any other, and would be said here.
+
+## `stale_data` rows, and two bursts on 24 November (written at 02:45 UTC on 26 November, 18:45 PST on 25 November; no answer has been scored)
+
+This note states how the rule above already treats these rows. It changes no rule.
+
+A `stale_data` row is written without asking the model: at the decision instant, the market's newest stored
+snapshot is missing, older than the staleness limit, or an invalid book. Such a row has no answers. Under
+clarifications 1 and 37, only an ordinary row with answers is scored, so every `stale_data` row in the whole test
+period is left unscored. The same rule applies to every row, whatever its cause. A `stale_data` row is never given
+an imputed answer such as 0.50, and nothing takes its place. The result will report the count and share of
+`stale_data` rows beside the score. Counted read-only in the store at 02:43 UTC on 26 November: 31 `stale_data` rows
+since 19 November 00:00 UTC, none with answers.
+
+Two bursts on 24 November, recorded now with **cause = unknown**:
+
+- 18:22 to 18:25 UTC: 15 rows (one slot each minute, 18:22:00 to 18:25:00).
+- 23:27 to 23:32 UTC: 11 rows.
+
+If a cause is found later, only this descriptive tag may change. Which rows are scored does not change.
