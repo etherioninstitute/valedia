@@ -68,7 +68,8 @@ def test_a_calendar_that_cannot_answer_leaves_the_lot_unsettled():
     ("2028-11-09", "2028-11-10"),    # Veterans Day Sat 11-11: not moved, Friday 11-10 still settles
     ("2027-06-17", "2027-06-21"),    # Juneteenth Sat 06-19: XNYS is closed Fri 06-18 (the Fed is not), so Monday
     ("2021-12-30", "2021-12-31"),    # New Year's Day Sat 2022-01-01: XNYS open Fri 12-31 and it settles (not moved)
-    ("2018-11-09", "2018-11-13")])   # Veterans Day Sun 2018-11-11 observed Mon 11-12, an XNYS session
+    ("2018-11-09", "2018-11-13"),    # Veterans Day Sun 2018-11-11 observed Mon 11-12, an XNYS session
+    ("2020-06-18", "2020-06-19")])   # Fri 2020-06-19 settles: the Fed first observed Juneteenth in 2022
 def test_a_lot_settles_on_the_first_session_after_its_trade_date_that_is_also_a_settlement_day(trade, settles):
     assert WIDE.is_session(settles)
     assert osx.settlement_day(WIDE, trade) == settles
@@ -86,6 +87,7 @@ def test_a_lot_settles_on_the_first_session_after_its_trade_date_that_is_also_a_
     ("2028-11-10", False), ("2029-11-12", True),                           # Veterans Day Sat: Fri open; Sun: Mon off
     ("2027-06-18", False), ("2021-12-31", False),                          # Sat Juneteenth, Sat New Year: Fri open
     ("2022-06-20", True), ("2022-12-26", True),                            # Sun Juneteenth, Sun Christmas: Mon off
+    ("2020-06-19", False), ("2023-06-19", True),                           # Juneteenth before 2022 not a holiday; Mon 2023
     ("2026-12-25", True), ("2026-12-24", False), ("2026-11-27", False)])   # Christmas; its eve and Black Friday settle
 def test_the_settlement_holidays_are_the_federal_reserves_with_sunday_moved_to_monday_and_saturday_not_moved(day,
                                                                                                             holiday):

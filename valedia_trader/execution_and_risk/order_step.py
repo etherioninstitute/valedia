@@ -2402,7 +2402,9 @@ def us_settlement_holiday(day) -> bool:
     is NOT moved: the Friday before is a settlement day (the Fed is open; unlike pandas' nearest_workday). Pure."""
     d = pd.Timestamp(day).date()
     y = d.year
-    fixed = [date(y, 1, 1), date(y, 6, 19), date(y, 7, 4), date(y, 11, 11), date(y, 12, 25)]
+    fixed = [date(y, 1, 1), date(y, 7, 4), date(y, 11, 11), date(y, 12, 25)]
+    if y >= 2022:                              # Juneteenth: the Federal Reserve Banks first observed it in 2022
+        fixed.append(date(y, 6, 19))
     observed = {f + timedelta(days=1) if f.weekday() == 6 else f for f in fixed}
     observed |= {_nth_weekday(y, 1, 0, 3),     # Martin Luther King Jr. Day: 3rd Monday of January
                  _nth_weekday(y, 2, 0, 3),     # Washington's Birthday: 3rd Monday of February
