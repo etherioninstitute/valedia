@@ -33,7 +33,7 @@ import os
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
+from decimal import ROUND_HALF_EVEN, Context, Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any
 
@@ -498,11 +498,35 @@ def _check_folder(folder: Any) -> None:
             raise ValueError("folder must be outside the repository")
 
 
-def _check_window(window: Window) -> None:
-    if not (math.isfinite(window.open_ts) and math.isfinite(window.close_ts)) or window.close_ts <= window.open_ts:
+WINDOW_TS_MAX_S = 4_102_444_800   # 2100-01-01 00:00 UTC: a window time above this is refused
+_TS_CONTEXT = Context(prec=40, rounding=ROUND_HALF_EVEN)   # local: the caller's decimal context cannot change a check
+
+
+def _window_ms(ts, name: str) -> int:
+    """A window time as exact integer ms, or ValueError.
+
+    One rule: type exactly int or float (no bool, subclass, Decimal, numpy scalar or str); finite;
+    0 <= ts <= WINDOW_TS_MAX_S; a whole number of milliseconds, tested exactly in a local decimal context
+    (Decimal(repr(ts)) for a float, Decimal(ts) for an int). The ms value comes from that same Decimal.
+    """
+    if type(ts) not in (int, float):
+        raise ValueError(f"a window's {name} must be an int or a float, got {type(ts).__name__}")
+    if not math.isfinite(ts) or not (0 <= ts <= WINDOW_TS_MAX_S):
+        raise ValueError(f"a window's {name} must be finite and in [0, {WINDOW_TS_MAX_S}], got {ts!r}")
+    with localcontext(_TS_CONTEXT):
+        ms = (Decimal(repr(ts)) if type(ts) is float else Decimal(ts)) * 1000
+        if ms != ms.to_integral_value():
+            raise ValueError(f"a window's {name} must be a whole number of milliseconds, got {ts!r}")
+        return int(ms)
+
+
+def _check_window(window: Window) -> int:
+    """Check the window's times; return close_ms, exact."""
+    open_ms = _window_ms(window.open_ts, "open_ts")
+    close_ms = _window_ms(window.close_ts, "close_ts")
+    if close_ms <= open_ms:
         raise ValueError("a window must open before it closes")
-    if (Decimal(repr(window.close_ts)) * 1000) % 1 != 0:      # so close_ms is exact, never rounded
-        raise ValueError(f"a window's close_ts must be a whole number of milliseconds, got {window.close_ts!r}")
+    return close_ms
 
 
 def _read_rows(read_ticks: Callable, window: Window, t_from_ms: int, t_to_ms: int) -> tuple[list, str | None]:
@@ -621,9 +645,9 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
     _check_folder(folder)
     if not callable(read_ticks):
         raise ValueError("read_ticks must be a callable")
-    _check_window(window)
-    close_ms = _ms(window.close_ts)
-    # exact integer microseconds, by the base class's own subtraction: a datetime subclass cannot vote on the wait
+    close_ms = _check_window(window)               # exact, from the same Decimal the check used
+    # exact integer microseconds: the subtraction and the comparison are the base class's, not the clock's; the
+    # clock's utcoffset is still trusted, as in the date gate
     elapsed_us = datetime.__sub__(entered, _EPOCH) // timedelta(microseconds=1)
     if elapsed_us < (close_ms + CLOSE_WAIT_MS) * 1000:
         raise CloseNotReached(f"{window.window_ticker}: the close record waits until close + {CLOSE_WAIT_MS} ms")

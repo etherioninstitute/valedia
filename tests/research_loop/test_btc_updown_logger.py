@@ -1662,17 +1662,36 @@ def test_the_close_wait_ignores_a_datetime_subclass_s_own_comparisons(tmp_path):
     assert len(lines(tmp_path)) == 1
 
 
-def test_a_close_ts_that_is_not_a_whole_millisecond_is_refused(tmp_path):
+class _LyingFloat(float):
+    def __repr__(self): return "1796379300.0"
+
+
+def test_a_close_ts_that_is_not_a_plain_whole_millisecond_number_is_refused(tmp_path):
+    from decimal import localcontext
     w = window(0)
-    C = w.close_ts
-    assert C == int(C)
-    bad = Window(window_ticker=w.window_ticker, open_ts=w.open_ts, close_ts=C + 0.0004, floor_strike=w.floor_strike)
-    with pytest.raises(ValueError, match="whole number of milliseconds"):
-        log_close(tmp_path, bad, clock=lambda: at(C + 195.0), read_ticks=Spy([]))
-    with pytest.raises(ValueError, match="whole number of milliseconds"):
-        run(tmp_path, bad)
-    for ok in (C, C + 0.001):
-        L._check_window(Window(window_ticker=w.window_ticker, open_ts=w.open_ts, close_ts=ok, floor_strike=w.floor_strike))
-    milli = Window(window_ticker=w.window_ticker, open_ts=w.open_ts, close_ts=C + 0.001, floor_strike=w.floor_strike)
-    rec = log_close(tmp_path, milli, clock=lambda: at(C + 195.0), read_ticks=Spy([]))
-    assert rec["close_ms"] == int(C) * 1000 + 1
+    C = int(w.close_ts)
+    assert C == w.close_ts
+
+    def win(close_ts):
+        return Window(window_ticker=w.window_ticker, open_ts=w.open_ts, close_ts=close_ts, floor_strike=w.floor_strike)
+
+    for bad in (Decimal(C), True, _LyingFloat(C + 0.0004), float("nan"), float("inf"), -1, 4_102_444_801, 1e24,
+                C + 0.0004):
+        spy = Spy(_close_rows(w, "1.00"))
+        with pytest.raises(ValueError):
+            log_close(tmp_path, win(bad), clock=lambda: at(C + 195.0), read_ticks=spy)
+        with pytest.raises(ValueError):
+            run(tmp_path, win(bad))
+        assert spy.calls == [], bad
+    assert lines(tmp_path) == []
+    for prec in (None, 5):
+        for ok, want in ((C, C * 1000), (float(C), C * 1000), (C + 0.001, C * 1000 + 1)):
+            if prec is None:
+                got = L._check_window(win(ok))
+            else:
+                with localcontext() as ctx:
+                    ctx.prec = prec
+                    got = L._check_window(win(ok))
+            assert type(got) is int and got == want, (prec, ok)
+    rec = log_close(tmp_path, win(C + 0.001), clock=lambda: at(C + 195.0), read_ticks=Spy([]))
+    assert rec["close_ms"] == C * 1000 + 1
