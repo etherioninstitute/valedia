@@ -1411,35 +1411,31 @@ def writes(monkeypatch):
     return seen
 
 
-def test_liar_clock_before_the_instant_is_refused_everywhere(tmp_path):
+def _refused_as_a_subclass_everywhere(tmp_path, reading: datetime) -> None:
+    w = window(0)
+    t, b, tp = Spy(series(tstar_ms(w))), Spy(BOOK), Spy([])
+    budget = TapeBudget(3)
+    with pytest.raises(NaiveClock, match="not a subclass"):
+        log_window(tmp_path / "w", w, clock=lambda: reading, read_ticks=t, read_book=b)
+    with pytest.raises(NaiveClock, match="not a subclass"):
+        log_tape(tmp_path / "t", w, posted=True, read_tape=tp, clock=lambda: reading, budget=budget)
+    with pytest.raises(NaiveClock, match="not a subclass"):
+        log_close(tmp_path / "c", w, clock=lambda: reading, read_ticks=t)
+    with pytest.raises(NaiveClock, match="not a subclass"):
+        dry_run(tmp_path / "d", lambda: reading, [Fixture(w, series(tstar_ms(w)), BOOK)])
+    with pytest.raises(NaiveClock, match="not a subclass"):
+        read_tick_files(tmp_path, 0, 1, clock=lambda: reading)
+    with pytest.raises(NaiveClock, match="not a subclass"):
+        check_enabled(lambda: reading)
+    assert t.calls == [] and b.calls == [] and tp.calls == [] and budget.used == 0
+    assert not tmp_path.exists() or list(tmp_path.iterdir()) == []
+
+
+def test_a_comparison_liar_clock_is_refused_everywhere_before_or_after_the_instant(tmp_path):
     early = _liar(EF.timestamp() - 1.0, lie_early=False)
     assert isinstance(early, datetime) and early.timestamp() < EF.timestamp()
-    w = window(0)
-    t, b, tp = Spy(series(tstar_ms(w))), Spy(BOOK), Spy([])
-    with pytest.raises(NotYetEnabled):
-        log_window(tmp_path / "w", w, clock=lambda: early, read_ticks=t, read_book=b)
-    with pytest.raises(NotYetEnabled):
-        log_tape(tmp_path / "t", w, posted=True, read_tape=tp, clock=lambda: early, budget=TapeBudget(3))
-    with pytest.raises(NotYetEnabled):
-        log_close(tmp_path / "c", w, clock=lambda: early, read_ticks=t)
-    with pytest.raises(NotYetEnabled):
-        dry_run(tmp_path / "d", lambda: early, [Fixture(w, series(tstar_ms(w)), BOOK)])
-    with pytest.raises(NotYetEnabled):
-        check_enabled(lambda: early)
-    assert t.calls == [] and b.calls == [] and tp.calls == []
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_liar_clock_at_the_instant_is_allowed_everywhere(tmp_path):
-    at_instant = _liar(EF.timestamp(), lie_early=True)
-    w = window(0)
-    t, b, tp = Spy(series(tstar_ms(w))), Spy(BOOK), Spy([])
-    rec = log_window(tmp_path / "w", w, clock=lambda: at_instant, read_ticks=t, read_book=b)
-    assert rec["status"] == "OK" and len(t.calls) == 1 and len(b.calls) == 1
-    assert log_tape(tmp_path / "t", w, posted=True, read_tape=tp, clock=lambda: at_instant,
-                    budget=TapeBudget(3)) is not None and len(tp.calls) == 1
-    assert len(dry_run(tmp_path / "d", lambda: at_instant, [Fixture(w, series(tstar_ms(w)), BOOK)])) == 1
-    assert check_enabled(lambda: at_instant) is None
+    _refused_as_a_subclass_everywhere(tmp_path / "a", early)
+    _refused_as_a_subclass_everywhere(tmp_path / "b", _liar(EF.timestamp() + 900.0, lie_early=True))
 
 
 def test_dry_run_before_the_instant_refuses_even_with_no_fixtures(tmp_path):
@@ -1646,21 +1642,14 @@ class _NeverBefore(datetime):
     def __ge__(self, other): return True
 
 
-def test_the_close_wait_ignores_a_datetime_subclass_s_own_comparisons(tmp_path):
+def test_a_close_wait_liar_is_refused_at_the_clock_check(tmp_path):
     w = window(0)
     spy = Spy(_close_rows(w, "100.00"))
-    liar = _NeverBefore.fromtimestamp(w.close_ts + 100.0, tz=UTC)
-    assert not (liar < at(w.close_ts + 190.0))                                   # it lies
-    with pytest.raises(CloseNotReached):
-        log_close(tmp_path, w, clock=lambda: liar, read_ticks=spy)
-    s = at(w.close_ts + 190.0) - timedelta(microseconds=1)
-    short = _NeverBefore(s.year, s.month, s.day, s.hour, s.minute, s.second, s.microsecond, tzinfo=UTC)
-    assert short.microsecond == 999_999
-    with pytest.raises(CloseNotReached):                                          # 1 microsecond short
-        log_close(tmp_path, w, clock=lambda: short, read_ticks=spy)
+    for ts in (w.close_ts + 100.0, w.close_ts + 190.0, w.close_ts + 500.0):
+        liar = _NeverBefore.fromtimestamp(ts, tz=UTC)
+        with pytest.raises(NaiveClock, match="not a subclass"):
+            log_close(tmp_path, w, clock=lambda: liar, read_ticks=spy)
     assert spy.calls == [] and lines(tmp_path) == []
-    log_close(tmp_path, w, clock=lambda: _NeverBefore.fromtimestamp(w.close_ts + 190.0, tz=UTC), read_ticks=spy)
-    assert len(lines(tmp_path)) == 1
 
 
 class _LyingFloat(float):
@@ -1752,17 +1741,104 @@ def _claims_after(true_value: datetime) -> _ClaimsAfter:
     return _ClaimsAfter(t.year, t.month, t.day, t.hour, t.minute, t.second, t.microsecond, tzinfo=UTC)
 
 
-def test_the_date_gate_uses_the_base_class_arithmetic_not_the_clock_s_own(tmp_path):
+class _LyingTz(datetime):
+    """A datetime subclass that lies through its tzinfo property."""
+    @property
+    def tzinfo(self):
+        return timezone(timedelta(hours=-23))
+
+
+def test_every_lying_subclass_clock_is_refused_at_the_clock_check(tmp_path):
     liar = _claims_after(EF - ONE_S)                                              # truly one second before
     assert liar.timestamp() > EF.timestamp() and liar > EF                       # it lies
+    _refused_as_a_subclass_everywhere(tmp_path / "a", liar)
+    _refused_as_a_subclass_everywhere(tmp_path / "b", _claims_after(EF + timedelta(days=2)))
+    t = (EF - ONE_S).astimezone(UTC)
+    tz_liar = _LyingTz(t.year, t.month, t.day, t.hour, t.minute, t.second, tzinfo=UTC)
+    assert tz_liar.tzinfo != UTC                                                  # it lies
+    _refused_as_a_subclass_everywhere(tmp_path / "c", tz_liar)
+
+
+def test_every_fake_clock_reading_in_this_file_is_exactly_a_datetime():
     w = window(0)
-    ticks, book, tape = Spy([]), Spy(None), Spy([])
-    with pytest.raises(NotYetEnabled):
-        log_window(tmp_path, w, clock=lambda: liar, read_ticks=ticks, read_book=book)
-    with pytest.raises(NotYetEnabled):
-        log_close(tmp_path, w, clock=lambda: liar, read_ticks=ticks)
-    with pytest.raises(NotYetEnabled):
-        log_tape(tmp_path, w, posted=True, read_tape=tape, clock=lambda: liar, budget=TapeBudget(1))
-    with pytest.raises(NotYetEnabled):
-        read_tick_files(tmp_path, 0, 1, clock=lambda: liar)
-    assert ticks.calls == book.calls == tape.calls == [] and lines(tmp_path) == []
+    for reading in (EF, EF - ONE_S, at(w.close_ts + 195.0), SeqClock([EF])()):
+        assert type(reading) is datetime
+
+
+# ---------------------------------------------------------------- the tape filter: exact row times
+
+def _tape_window_off_a_whole_second() -> Window:
+    w = window(0)
+    open_ts = w.open_ts + 0.123
+    return Window(window_ticker="KXBTC15M-TESTTAPE", open_ts=open_ts, close_ts=open_ts + 900.0, floor_strike=1.0)
+
+
+def test_tape_rows_at_exactly_the_requested_float_bounds_are_both_kept(tmp_path):
+    w = _tape_window_off_a_whole_second()
+    asked = []
+
+    def read_tape(window, t_from, t_to):
+        asked.append((t_from, t_to))
+        return [{"trade_id": "lo", "created_ts": t_from}, {"trade_id": "hi", "created_ts": t_to},
+                {"trade_id": "below", "created_ts": t_from - 0.001}, {"trade_id": "above", "created_ts": t_to + 0.001}]
+
+    out = log_tape(tmp_path, w, posted=True, read_tape=read_tape, clock=lambda: at(w.open_ts + 400.0),
+                   budget=TapeBudget(1))
+    assert type(asked[0][0]) is float and type(asked[0][1]) is float
+    assert [r["trade_id"] for r in out["rows"]] == ["lo", "hi"]
+
+
+def test_a_malformed_tape_row_time_is_skipped_never_raised_on(tmp_path):
+    w = window(0)
+    t = w.open_ts + 310.0
+    bad_times = ["x", None, True, float("nan"), float("inf"), -1, 4_102_444_801, 10 ** 400, Decimal(int(t))]
+    raw = [{"trade_id": f"b{i}", "created_ts": v} for i, v in enumerate(bad_times)]
+    raw += ["not a dict", {"trade_id": "no time"}, {"trade_id": "ok", "created_ts": t}]
+    out = log_tape(tmp_path, w, posted=True, read_tape=Spy(raw), clock=lambda: at(w.open_ts + 400.0),
+                   budget=TapeBudget(1))
+    assert [r["trade_id"] for r in out["rows"]] == ["ok"] and out["n_rows"] == 1
+
+
+def test_the_tape_is_unchanged_under_a_caller_context_that_traps_float_operations(tmp_path):
+    from decimal import FloatOperation, localcontext
+    w = _tape_window_off_a_whole_second()
+    rows = lambda: [{"trade_id": "a", "created_ts": w.open_ts + 300.0}, {"trade_id": "b", "created_ts": w.open_ts + 330},
+                    {"trade_id": "c", "created_ts": w.open_ts + 361.0}]
+    clock = lambda: at(w.open_ts + 400.0)
+    plain = log_tape(tmp_path / "a", w, posted=True, read_tape=lambda *a: rows(), clock=clock, budget=TapeBudget(1))
+    with localcontext() as ctx:
+        ctx.traps[FloatOperation] = True
+        trapped = log_tape(tmp_path / "b", w, posted=True, read_tape=lambda *a: rows(), clock=clock,
+                           budget=TapeBudget(1))
+    assert trapped == plain and [r["trade_id"] for r in plain["rows"]] == ["a", "b"]
+    assert lines(tmp_path / "a") == lines(tmp_path / "b")
+
+
+def test_the_tape_budget_is_taken_only_after_every_check_before_the_read(tmp_path, monkeypatch):
+    w = window(0)
+    good_clock = lambda: at(w.open_ts + 400.0)
+    budget, tape = TapeBudget(5), Spy([])
+    bad_window = Window(window_ticker=w.window_ticker, open_ts=w.open_ts, close_ts=w.close_ts + 0.0004)
+    cases = [
+        (NotYetEnabled, dict(folder=tmp_path, window=w, clock=lambda: EF - ONE_S, read_tape=tape)),
+        (NaiveClock, dict(folder=tmp_path, window=w, clock=lambda: datetime(2027, 1, 1), read_tape=tape)),
+        (ValueError, dict(folder="", window=w, clock=good_clock, read_tape=tape)),
+        (ValueError, dict(folder=tmp_path, window=w, clock=good_clock, read_tape=None)),
+        (ValueError, dict(folder=tmp_path, window=bad_window, clock=good_clock, read_tape=tape)),
+        (LateWindow, dict(folder=tmp_path, window=w, clock=lambda: at(w.close_ts), read_tape=tape)),
+    ]
+    for exc, kw in cases:
+        with pytest.raises(exc):
+            log_tape(kw["folder"], kw["window"], posted=True, read_tape=kw["read_tape"], clock=kw["clock"],
+                     budget=budget)
+        assert budget.used == 0 and tape.calls == [], exc
+    log_tape(tmp_path, w, posted=True, read_tape=tape, clock=good_clock, budget=budget)
+    assert budget.used == 1 and len(tape.calls) == 1
+
+
+def test_num_is_none_for_an_int_beyond_float_range_never_an_overflow(tmp_path):
+    assert L._num(10 ** 400) is None and L._num(-(10 ** 400)) is None and L._num(10 ** 300) == float(10 ** 300)
+    w = window(0)
+    huge = Window(window_ticker=w.window_ticker, open_ts=w.open_ts, close_ts=w.close_ts, floor_strike=10 ** 400)
+    rec, _, _ = run(tmp_path, huge)
+    assert rec["floor_strike"] is None

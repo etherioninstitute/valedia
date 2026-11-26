@@ -173,8 +173,8 @@ def _resolve_credentials(source: Any) -> Credentials:
 def _gate(clock: Callable[[], datetime]) -> datetime:
     """ONE clock reading, checked against ENABLED_FROM and returned. Runs before any credential or connect."""
     now = clock()
-    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
-        raise NaiveClock("the clock must return a timezone-aware datetime")
+    if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:    # no subclass: it could lie
+        raise NaiveClock("the clock must return a timezone-aware datetime (exactly a datetime, not a subclass)")
     # the base class's arithmetic, with the clock's utcoffset trusted (not the clock's own timestamp())
     if datetime.timestamp(now) < ENABLED_FROM.timestamp():
         raise NotYetEnabled(f"disabled until {ENABLED_FROM.isoformat()}")
@@ -490,8 +490,8 @@ class _Run:
     def _receipt_ms(self) -> int:
         """Unix ms UTC of now on the injected clock (the one the gate uses); a naive clock is refused."""
         now = self.clock()
-        if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
-            raise NaiveClock("the clock must return a timezone-aware datetime")
+        if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:    # no subclass: it could lie
+            raise NaiveClock("the clock must return a timezone-aware datetime (exactly a datetime, not a subclass)")
         # the base class's arithmetic, with the clock's utcoffset trusted (not the clock's own __sub__)
         return datetime.__sub__(now, _EPOCH) // timedelta(milliseconds=1)
 

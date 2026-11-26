@@ -146,9 +146,11 @@ class TapeBudget:
 # ------------------------------------------------------------------ the date check
 
 def _now(clock: Callable[[], datetime]) -> datetime:
+    """One clock reading: exactly a datetime (no subclass, which could lie through its own methods or its tzinfo
+    property) and timezone-aware, else NaiveClock. The base-class arithmetic below then stands on a real datetime."""
     now = clock()
-    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
-        raise NaiveClock("the clock must return a timezone-aware datetime")
+    if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:
+        raise NaiveClock("the clock must return a timezone-aware datetime (exactly a datetime, not a subclass)")
     return now
 
 
@@ -169,9 +171,15 @@ def check_enabled(clock: Callable[[], datetime]) -> None:
 # ------------------------------------------------------------------ numbers
 
 def _num(x: Any) -> float | None:
-    """A finite number as a float, else None (so no NaN or infinity ever reaches the file)."""
-    if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x):
-        return float(x)
+    """A finite number as a float, else None (so no NaN or infinity ever reaches the file); an int beyond float
+    range is None too, never an OverflowError."""
+    if isinstance(x, (int, float)) and not isinstance(x, bool):
+        try:
+            f = float(x)
+        except OverflowError:
+            return None
+        if math.isfinite(f):
+            return f
     return None
 
 
@@ -535,6 +543,17 @@ def _window_ms(ts, name: str) -> int:
         return int(ms)
 
 
+def _exact_s(x: Any) -> Decimal | None:
+    """A row time in seconds as an exact Decimal by the window-time rule (type exactly int or float, finite,
+    0 <= x <= WINDOW_TS_MAX_S; Decimal(repr(x)) for a float, Decimal(x) for an int), else None: a malformed time."""
+    if type(x) not in (int, float):
+        return None
+    if (type(x) is float and not math.isfinite(x)) or not (0 <= x <= WINDOW_TS_MAX_S):
+        return None
+    with localcontext(_TS_CONTEXT):
+        return Decimal(repr(x)) if type(x) is float else Decimal(x)
+
+
 def _check_window(window: Window) -> tuple[int, int]:
     """Check the window's times; return (open_ms, close_ms), exact."""
     open_ms = _window_ms(window.open_ts, "open_ts")
@@ -742,8 +761,12 @@ def log_tape(folder, window: Window, *, posted: bool, read_tape: Callable, clock
     written_at = datetime.timestamp(written)
     if _clock_us(written) >= close_ms * 1000:
         raise LateWindow(f"{window.window_ticker} closed before its tape could be written")
-    rows = [r for r in raw if isinstance(r, dict) and _num(r.get("created_ts")) is not None
-            and t_from <= r["created_ts"] <= t_to]
+    rows = []
+    with localcontext(_TS_CONTEXT):                # Decimal against Decimal only, in the module's own context
+        for r in raw:
+            ts = _exact_s(r.get("created_ts")) if isinstance(r, dict) else None
+            if ts is not None and t_from <= ts <= t_to:   # a malformed row or row time is skipped, never raised on
+                rows.append(r)
     record = {"kind": "tape", "schema_version": SCHEMA_VERSION, "window_ticker": window.window_ticker,
               "t_from": t_from, "t_to": t_to, "written_at": written_at, "n_rows": len(rows), "rows": rows,
               "tape_error": tape_error}

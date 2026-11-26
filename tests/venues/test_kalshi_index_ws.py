@@ -18,7 +18,7 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedOK, InvalidStatus
 from websockets.http11 import Response
 
-from valedia_trader.research_loop.btc_updown_logger import ENABLED_FROM, NotYetEnabled
+from valedia_trader.research_loop.btc_updown_logger import ENABLED_FROM, NaiveClock, NotYetEnabled
 from valedia_trader.venues import kalshi_index_ws as kis
 
 KEY_ID = "TEST-KEY-ID"
@@ -919,21 +919,44 @@ def _claims_after(true_value):
     return _ClaimsAfter(t.year, t.month, t.day, t.hour, t.minute, t.second, t.microsecond, tzinfo=UTC)
 
 
-def test_the_gate_and_the_receipt_use_the_base_class_arithmetic_not_the_clock_s_own(tmp_path, monkeypatch, creds):
+class _LyingTz(datetime):
+    """A datetime subclass that lies through its tzinfo property."""
+    @property
+    def tzinfo(self):
+        return timezone(timedelta(hours=-23))
+
+
+def test_every_lying_subclass_clock_is_refused_at_the_gate_with_no_credential_read_and_no_connect(tmp_path,
+                                                                                                  monkeypatch):
     liar = _claims_after(ENABLED_FROM - timedelta(seconds=1))                     # truly one second before
     assert liar.timestamp() > ENABLED_FROM.timestamp() and liar > ENABLED_FROM   # it lies
-    reads, connect = [], FakeConnect([FakeWS([])])
+    t = AFTER.astimezone(UTC)
+    tz_liar = _LyingTz(t.year, t.month, t.day, t.hour, t.minute, t.second, tzinfo=UTC)
+    reads = []
     monkeypatch.setattr(kis, "load_credentials", lambda *a, **k: reads.append("default") or pytest.fail("read"))
-    with pytest.raises(NotYetEnabled):
-        kis.stream(tmp_path / "ticks", clock=lambda: liar, connect=connect, credentials=None, sleep=Sleeps())
-    with pytest.raises(NotYetEnabled):
-        kis.stream(tmp_path / "ticks", clock=lambda: liar, connect=connect,
-                   credentials=lambda: reads.append("injected"), sleep=Sleeps())
-    assert connect.calls == [] and reads == [] and not (tmp_path / "ticks").exists()
-    # after the gate, the receipt ms of such a clock is its true value
-    true_after = AFTER + timedelta(milliseconds=456)
-    after_liar = _claims_after(true_after)
-    run(tmp_path, [FakeWS([j(value_msg(seq=1)), KeyboardInterrupt()])], creds, clock=lambda: after_liar)
-    want = (true_after - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1)
-    assert (after_liar - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1) != want   # it lies
-    assert lines(tmp_path)[0]["local_receipt_ms"] == want
+    for reading in (liar, _claims_after(AFTER), tz_liar):
+        connect = FakeConnect([FakeWS([])])
+        with pytest.raises(NaiveClock, match="not a subclass"):
+            kis.stream(tmp_path / "ticks", clock=lambda: reading, connect=connect, credentials=None, sleep=Sleeps())
+        with pytest.raises(NaiveClock, match="not a subclass"):
+            kis.stream(tmp_path / "ticks", clock=lambda: reading, connect=connect,
+                       credentials=lambda: reads.append("injected"), sleep=Sleeps())
+        assert connect.calls == []
+    assert reads == [] and not (tmp_path / "ticks").exists()
+
+
+def test_a_subclass_reading_at_receipt_is_refused_and_no_row_is_written(tmp_path, creds):
+    real = StepClock(start=AFTER, step=0.0)
+    readings = iter([real(), real()])                     # the gate and the connect headers read a real datetime
+    clock = lambda: next(readings, _claims_after(AFTER + timedelta(milliseconds=456)))
+    connect = FakeConnect([FakeWS([j(value_msg(seq=1)), KeyboardInterrupt()])])
+    with pytest.raises(NaiveClock, match="not a subclass"):          # connected, then refused at the receipt
+        kis.stream(tmp_path / "ticks", clock=clock, connect=connect, credentials=creds, sleep=Sleeps())
+    assert len(connect.calls) == 1 and lines(tmp_path) == []
+    with pytest.raises(NaiveClock, match="not a subclass"):
+        kis._gate(lambda: _claims_after(AFTER))
+
+
+def test_every_fake_clock_reading_in_this_file_is_exactly_a_datetime():
+    for reading in (ENABLED_FROM, AFTER, ENABLED_FROM - timedelta(seconds=1), StepClock()()):
+        assert type(reading) is datetime
