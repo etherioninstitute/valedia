@@ -454,6 +454,11 @@ passing idea can trade at once.
     funds); Carbon says 11 of the 15 book ETFs are absent from the exchange file (UNVERIFIED, check before use).
     Carbon's C check found a REAL DEFECT: T+1 counted XNYS sessions only, so Columbus Day and Veterans Day (NYSE
     open, no settlement) settled a lot a day early. Fix CF-C2 in build on fix/c-f.
+  - 2026-11-26 BUILT AND MERGED: the receipt time (1f15396: every tick row has local_receipt_ms) and the logger
+    rewired to BRTI only (1dcf16d: composite, trim, subset, SKIP_FEED and LMAX removed; SCHEMA_VERSION 2; the file
+    reader counts bad rows as malformed). Blind verifications passed; tests 153/147/38. C fixed and accepted on
+    fix/c-f (CF-C2 settlement holidays, CF-C3 usable cash from the settlement day); merge after the 12-01 session.
+    First live run after 12-03: check the close-window semantics and the malformed count.
 
 ## 4. Finding what makes money (tests and ideas)
 
