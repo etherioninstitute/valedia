@@ -957,6 +957,19 @@ def test_a_subclass_reading_at_receipt_is_refused_and_no_row_is_written(tmp_path
         kis._gate(lambda: _claims_after(AFTER))
 
 
+def test_a_subclass_reading_at_the_deadline_check_is_refused_socket_closed_no_row(tmp_path, creds):
+    real = StepClock(start=AFTER, step=0.0)
+    readings = iter([real(), real()])                     # the gate and the connect headers read a real datetime
+    clock = lambda: next(readings, _claims_after(AFTER + timedelta(seconds=1)))
+    ws = FakeWS([j(value_msg(seq=1)), KeyboardInterrupt()])
+    connect = FakeConnect([ws])
+    with pytest.raises(NaiveClock, match="not a subclass"):          # the first deadline read, before any recv
+        kis.stream(tmp_path / "ticks", clock=clock, connect=connect, credentials=creds, sleep=Sleeps(),
+                   max_seconds=30.0)
+    assert len(connect.calls) == 1 and ws.closed and lines(tmp_path) == []
+    assert len(ws.script) == 2                                       # refused before recv was ever called
+
+
 def test_every_fake_clock_reading_in_this_file_is_exactly_a_datetime():
     for reading in (ENABLED_FROM, AFTER, ENABLED_FROM - timedelta(seconds=1), StepClock()()):
         assert type(reading) is datetime

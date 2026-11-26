@@ -739,6 +739,9 @@ def log_tape(folder, window: Window, *, posted: bool, read_tape: Callable, clock
 
     Not posted: no read, no budget spent, nothing written (returns None). Posted: one budgeted read, and a
     refusal once the budget is used up. The logger does not decide whether an order was posted.
+    Counts: `n_rows` is the rows kept (== len(rows)); `n_tape_rows_malformed` is the rows skipped as malformed (not
+    a dict, or a created_ts that is not an exact-type int or float, finite and in range). The record has no
+    rows-read count, so it states no read identity; a well-formed row outside [t*, t* + 60 s] is not counted.
     """
     entered = _gate(clock)
     _check_folder(folder)
@@ -761,15 +764,17 @@ def log_tape(folder, window: Window, *, posted: bool, read_tape: Callable, clock
     written_at = datetime.timestamp(written)
     if _clock_us(written) >= close_ms * 1000:
         raise LateWindow(f"{window.window_ticker} closed before its tape could be written")
-    rows = []
+    rows, n_malformed = [], 0
     with localcontext(_TS_CONTEXT):                # Decimal against Decimal only, in the module's own context
         for r in raw:
             ts = _exact_s(r.get("created_ts")) if isinstance(r, dict) else None
-            if ts is not None and t_from <= ts <= t_to:   # a malformed row or row time is skipped, never raised on
+            if ts is None:
+                n_malformed += 1                   # a malformed row or row time is skipped and counted, never raised on
+            elif t_from <= ts <= t_to:
                 rows.append(r)
     record = {"kind": "tape", "schema_version": SCHEMA_VERSION, "window_ticker": window.window_ticker,
               "t_from": t_from, "t_to": t_to, "written_at": written_at, "n_rows": len(rows), "rows": rows,
-              "tape_error": tape_error}
+              "n_tape_rows_malformed": n_malformed, "tape_error": tape_error}
     _append(folder, record)
     return _jsonable(record)
 

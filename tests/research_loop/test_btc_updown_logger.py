@@ -1797,6 +1797,9 @@ def test_a_malformed_tape_row_time_is_skipped_never_raised_on(tmp_path):
     out = log_tape(tmp_path, w, posted=True, read_tape=Spy(raw), clock=lambda: at(w.open_ts + 400.0),
                    budget=TapeBudget(1))
     assert [r["trade_id"] for r in out["rows"]] == ["ok"] and out["n_rows"] == 1
+    assert out["n_tape_rows_malformed"] == len(bad_times) + 2                     # + "not a dict" and "no time"
+    saved = lines(tmp_path)[0]
+    assert saved["n_rows"] == len(saved["rows"]) == 1 and saved["n_tape_rows_malformed"] == 11
 
 
 def test_the_tape_is_unchanged_under_a_caller_context_that_traps_float_operations(tmp_path):

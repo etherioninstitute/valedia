@@ -483,9 +483,10 @@ class _Run:
         if self.max_seconds is None:
             return None
         now = self.clock()
-        if not isinstance(now, datetime) or now.tzinfo is None:
-            raise NaiveClock("the clock must return a timezone-aware datetime")
-        return self.max_seconds - (now - self.start).total_seconds()
+        if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:    # no subclass: it could lie
+            raise NaiveClock("the clock must return a timezone-aware datetime (exactly a datetime, not a subclass)")
+        # the base class's arithmetic, with the clock's utcoffset trusted; self.start is the gate's exact reading
+        return self.max_seconds - datetime.__sub__(now, self.start).total_seconds()
 
     def _receipt_ms(self) -> int:
         """Unix ms UTC of now on the injected clock (the one the gate uses); a naive clock is refused."""
