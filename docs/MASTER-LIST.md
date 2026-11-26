@@ -420,6 +420,17 @@ passing idea can trade at once.
     - Kraken, Bitstamp and Crypto.com: terms not found or unclear; Crypto.com bars automated means.
     - The constituent-subset SLOT stays OPEN. Owner's call: licensed BRTI data from CF Benchmarks, or another
       design. Carbon to be told 11-27.
+  - Correction, same day: LMAX Digital does have a free public API (docs.lmax.com/public-data-api).
+    - Endpoint: public-data-api.london-digital.lmax.com/v1/ticker/btc-usd answered 200.
+    - Rate: 1 request a second per IP; going over means 429s for up to an hour.
+    - Terms: no terms found on its docs page or lmax.com, beyond "freely available".
+  - itBit: suspended by CF Benchmarks itself, as the index administrator, on 2026-07-27, and removed 2026-08-27
+    after Paxos retired the platform. Source: CF Benchmarks' removal notice, via a search summary.
+  - NEW OPTION: Kalshi's own authenticated websocket channel `cfbenchmarks_value` streams BRTI itself, about once
+    a second. In each quarter-hour's final minute it adds the 60-second average before the close. A 5 Hz channel
+    and a REST passthrough with history also exist.
+    - Needs a Kalshi API key (the owner's) and a read on Kalshi's host, so after 12-03 only.
+    - Its data terms are not yet read.
 
 ## 4. Finding what makes money (tests and ideas)
 
