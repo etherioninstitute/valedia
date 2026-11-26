@@ -403,6 +403,23 @@ passing idea can trade at once.
   is PARKED until priority 1 (section 0 item 4), so building it needs his word to unpark. 2026-11-23 OWNER: not
   parked, use the guide's methods for BTC Up/Down (Carbon had advised parking). Test shape per round 49 (forward
   only, after 12-03). NEXT step: Step 0 = Webull probe for KXBTC15M + the series' rules page.
+  2026-11-25 STEP 0, NON-KALSHI PARTS:
+  - Webull: the read-only probe ran in the test environment with Kalshi stubbed out (zero Kalshi requests).
+    KXBTC15M is listed: 89 markets, 86 tradable (OC), price steps 0.001 and 0.01. KXBTCD and KXBTC are listed too;
+    CRYPTO holds 17 series. Live-environment listing unverified.
+  - Webull fee: $0.02 a contract each way. Source: dimers.com, a third party; Webull's own pages are silent.
+  - Hours: Webull says crypto event contracts trade Mon-Fri, 8 AM to 6 PM ET. Whether the 15-minute markets follow
+    those hours is OPEN.
+  - BRTI constituents: CF Benchmarks list v13.7 (2026-08-24), 7 active exchanges: Bitstamp, Coinbase, Kraken,
+    Gemini, Bullish (USDC), Crypto.com, LMAX. itBit was suspended 2026-07-27. LMAX has no public feed.
+  - BLOCKER, data terms (read directly):
+    - Coinbase (2026-08-07) bars, even for internal use, building indexes or benchmarks, valuing derivatives, and
+      using the data to "benchmark, or otherwise improve" any "automated system".
+    - Gemini bars using its data to "price" any "financial contract" or in any "index".
+    - So the logger's trimmed-median composite, used to price Kalshi contracts, conflicts with both.
+    - Kraken, Bitstamp and Crypto.com: terms not found or unclear; Crypto.com bars automated means.
+    - The constituent-subset SLOT stays OPEN. Owner's call: licensed BRTI data from CF Benchmarks, or another
+      design. Carbon to be told 11-27.
 
 ## 4. Finding what makes money (tests and ideas)
 
