@@ -438,6 +438,22 @@ passing idea can trade at once.
       reuses the same signing, with no order calls.
     - Legacy `src/latency_arb.py` reads Coinbase's websocket, which Coinbase's 2026-08-07 terms bar for this use.
       Never revive it as is.
+  - 2026-11-26 BUILT AND MERGED (895bf30): `valedia_trader/venues/kalshi_index_ws.py`, a read-only BRTI client.
+    Send guard = the two cfbenchmarks channels only; date gate = the logger's ENABLED_FROM (12-04), before any key
+    read; RSA-PSS DIGEST_LENGTH signing; backoff restarts only after a stored tick. Two blind verifications passed.
+    Follow-up in flight: bound huge ints. First live run after 12-03, with `indexlist` to confirm BRTI entitlement.
+  - 2026-11-26 CARBON ROUND 58 RULINGS: Q1 yes, BRTI via Kalshi is the logger's only price input; DROP LMAX (terms
+    unclear, and BRTI already includes it). Pins: t* = open + 300 s with local receipt time, sending_ts_ms,
+    received_at, seq, cf_source_ts_ms (stale if t* minus it is over 3 s), brti_raw = data.value, avg_60s as
+    metadata; at the close, last_60s_windowed_average_15min rounded to 2 dp as the estimate, Kalshi's settled
+    market as the score. Q2: ROC3, RANGE5 and z_dist from brti_raw (never avg_60s), thresholds FROZEN; skip unless
+    at least 270 ticks in [t*-300 s, t*], a tick within 3 s of t*-180 s, and no gap over 5 s. Q3 (stocks 2nd source):
+    read terms in order Webull OpenAPI, Alpaca Basic, Databento; Tiingo free excluded (bars retention). Q4: halts =
+    SEC 12(k) suspensions + Webull's live `tradable` only; daily bars wait on Databento (owner item 20). Q5: K-1 =
+    SEC company_tickers_exchange.json UNION company_tickers_mf.json (+ N-CEN ETF.tsv to tell ETFs from mutual
+    funds); Carbon says 11 of the 15 book ETFs are absent from the exchange file (UNVERIFIED, check before use).
+    Carbon's C check found a REAL DEFECT: T+1 counted XNYS sessions only, so Columbus Day and Veterans Day (NYSE
+    open, no settlement) settled a lot a day early. Fix CF-C2 in build on fix/c-f.
 
 ## 4. Finding what makes money (tests and ideas)
 
