@@ -1910,3 +1910,24 @@ def test_every_tape_row_is_counted_in_exactly_one_field(tmp_path):
     log_tape(tmp_path / "e", w, posted=True, read_tape=broken, clock=lambda: at(w.open_ts + 400.0), budget=TapeBudget(1))
     err = lines(tmp_path / "e")[0]
     assert err["n_tape_rows_read"] == err["n_rows"] == err["n_tape_rows_outside_span"] == 0 and err["tape_error"]
+
+
+def test_a_non_ascii_digit_string_is_not_a_whole_number_and_the_row_is_skipped(tmp_path):
+    for bad in ("²", "١٢", "-²", "１２"):
+        assert L._whole(bad) is None
+    assert L._whole("12") == 12 and L._whole("-12") == -12
+    w = window(0)
+    T = tstar_ms(w)
+    tick_dir = tmp_path / "ticks"
+    tick_dir.mkdir()
+    good = series(T, n=300)
+    bad_rows = [dict(tick_row(T - 500), received_at_ms="²"), dict(tick_row(T - 400), received_at_ms="١٢")]
+    day = datetime.fromtimestamp(T / 1000, UTC).strftime("%Y-%m-%d")
+    _write(tick_dir, day, good[:150] + bad_rows + good[150:])
+    got = read_tick_files(tick_dir, T - 300_000, T, clock=lambda: EF)          # no exception; both skipped
+    assert len(got) == 300 and all(r["received_at_ms"] not in ("²", "١٢") for r in got)
+    rec = log_window(tmp_path / "log", w, clock=lambda: EF, read_ticks=tick_file_reader(tick_dir, clock=lambda: EF),
+                     read_book=Spy(BOOK))
+    assert rec["n_rows_read"] == 300 and rec["n_rows_malformed"] == 0 and rec["tick_error"] is None
+    direct, _, _ = run(tmp_path / "direct", w, ticks=good + bad_rows)             # given to the logger directly
+    assert direct["n_rows_malformed"] == 2 and direct["n_rows_read"] == 302

@@ -1006,3 +1006,16 @@ def test_a_subclass_at_any_one_client_reading_is_refused_with_a_clean_close_and_
         assert state["calls"] == n, n                                     # refused at that reading, none after it
         assert len(lines(folder)) == state["held"][n - 1], n
         assert (connect.calls == []) if n <= 3 else ws.closed, n          # gate, loop deadline, headers; then closed
+
+
+def test_the_connect_header_timestamp_is_the_exact_ms_of_the_clock_reading(tmp_path, creds, rsa_key):
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    for i, dt in enumerate((datetime(2026, 12, 5, 12, 0, 0, 987654, tzinfo=UTC),
+                            datetime(2026, 12, 5, 4, 0, 0, 654321, tzinfo=timezone(timedelta(hours=-8))))):
+        _, connect, _ = run(tmp_path / str(i), [FakeWS([])], creds, clock=lambda dt=dt: dt)
+        want = str((dt - epoch) // timedelta(milliseconds=1))
+        h = connect.calls[0][1]["additional_headers"]
+        assert h["KALSHI-ACCESS-TIMESTAMP"] == want
+        rsa_key.public_key().verify(
+            base64.b64decode(h["KALSHI-ACCESS-SIGNATURE"]), f"{want}GET{kis.WS_PATH}".encode(),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())

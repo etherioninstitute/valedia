@@ -197,12 +197,14 @@ def _dec(x: Any) -> Decimal:
 
 
 def _whole(x: Any) -> int | None:
-    """A whole number (int, or a string of digits), else None. A float or a boolean is not one."""
+    """A whole number (int, or a string of ASCII digits), else None. A float or a boolean is not one, and neither is
+    a string of other Unicode digits ("²", "١٢"), which int() would refuse or misread."""
     if isinstance(x, bool):
         return None
     if isinstance(x, int):
         return x
-    if isinstance(x, str) and 0 < len(x) <= 19 and (x.isdigit() or (x[0] == "-" and x[1:].isdigit())):
+    if (isinstance(x, str) and 0 < len(x) <= 19 and x.isascii()
+            and (x.isdigit() or (x[0] == "-" and x[1:].isdigit()))):
         return int(x)
     return None
 

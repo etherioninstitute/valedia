@@ -121,7 +121,7 @@ The same measures with the fee at zero; with the maker fee at the Step-0 read ra
 ## Limits, stated now
 
 - Kalshi's public data is read slowly here, beside the collector that uses the same host; snapshots and tape pages stay far below the collector's rate (ML 347-348, 648).
-- The input is BRTI as Kalshi streams it; the close record's estimate is not the outcome (Kalshi's settled market is), and how often the two differ is measured, not assumed. The index client's rows carry no local receipt time yet, so that field of the record is empty until they do.
+- The input is BRTI as Kalshi streams it; the close record's estimate is not the outcome (Kalshi's settled market is), and how often the two differ is measured, not assumed. The index client's rows carry `local_receipt_ms` (main 1f15396), so the record logs it; `local_receipt_note` is logged only for a row without it.
 - Paper fills assume the ask at t* (Rule 1) and the virtual queue plus tape (Rule 2); neither is a real fill.
 - The settlement text and fee data are read at Step 0 from Kalshi's own pages and may change; any change is dated and recorded, and it is not a change of this rule.
 
