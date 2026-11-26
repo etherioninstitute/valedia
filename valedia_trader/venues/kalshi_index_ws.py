@@ -291,7 +291,7 @@ def _to_int(x: Any) -> int:
         raise MalformedFrame("a whole number was expected")
     if isinstance(x, int):
         return x
-    if isinstance(x, str) and re.fullmatch(r"-?[0-9]{1,18}", x):
+    if isinstance(x, str) and re.fullmatch(r"-?[0-9]{1,19}", x):
         return int(x)
     raise MalformedFrame("a whole number was expected")
 
@@ -320,12 +320,17 @@ def _to_decimal(x: Any) -> Decimal:
 def _parse_window(node: Any) -> WindowAvg:
     if not isinstance(node, dict):
         raise MalformedFrame("a window average must be an object")
+    start = _check_ms(_to_int(node.get("window_start_ts_ms")))
+    end = _check_ms(_to_int(node.get("window_end_ts_exclusive")))
+    if end <= start:
+        raise MalformedFrame("a window must end after it starts")
     return WindowAvg(value=_to_decimal(node.get("value")), window_size=_bounded(node.get("window_size"), 0, MAX_WINDOW_SIZE),
-                     window_start_ts_ms=_check_ms(_to_int(node.get("window_start_ts_ms"))),
-                     window_end_ts_exclusive=_check_ms(_to_int(node.get("window_end_ts_exclusive"))))
+                     window_start_ts_ms=start, window_end_ts_exclusive=end)
 
 
 def _check_ms(ms: int) -> int:
+    if ms < 0:
+        raise MalformedFrame("a timestamp is out of range")
     try:
         datetime.fromtimestamp(ms // 1000, timezone.utc)
     except (OverflowError, OSError, ValueError):
