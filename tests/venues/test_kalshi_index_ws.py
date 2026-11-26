@@ -430,6 +430,35 @@ def test_parse_refuses_out_of_range_whole_numbers(mutate):
         kis.parse_value_message(msg)
 
 
+@pytest.mark.parametrize("mutate", [
+    lambda m: m.update(sending_ts_ms=-1),
+    lambda m: m["msg"].update(received_at=-1),
+    lambda m: m["msg"].update(data=j({"time": -1, "value": "1"})),
+    lambda m: m["msg"]["avg_60s_data"].update(window_start_ts_ms=-1),
+    lambda m: m["msg"]["avg_60s_data"].update(window_end_ts_exclusive=-1),
+    lambda m: m["msg"]["avg_60s_data"].update(window_end_ts_exclusive=m["msg"]["avg_60s_data"]["window_start_ts_ms"]),
+    lambda m: m["msg"]["avg_60s_data"].update(window_end_ts_exclusive=m["msg"]["avg_60s_data"]["window_start_ts_ms"] - 1),
+    lambda m: m.update(seq=str(2 ** 63)),
+    lambda m: m.update(sid=str(2 ** 63)),
+    lambda m: m.update(seq="-1"),
+])
+def test_parse_refuses_negative_times_empty_windows_and_big_string_numbers(mutate):
+    msg = value_msg()
+    mutate(msg)
+    with pytest.raises(kis.MalformedFrame):
+        kis.parse_value_message(msg)
+
+
+def test_the_largest_string_sid_and_seq_are_accepted_like_the_int():
+    top = str(2 ** 63 - 1)
+    assert len(top) == 19
+    tick = kis.parse_value_message(value_msg(seq=top, sid=top))
+    assert tick.seq == tick.sid == 2 ** 63 - 1
+    zero = value_msg(seq=0, sid=0, received_at=20)
+    zero["msg"]["avg_60s_data"].update(window_start_ts_ms=0, window_end_ts_exclusive=1)
+    assert kis.parse_value_message(zero).source_time_ms == 0      # zero is the lowest time allowed
+
+
 def test_the_largest_allowed_numbers_still_parse():
     msg = value_msg(seq=2 ** 63 - 1, sid=2 ** 63 - 1)
     msg["msg"]["avg_60s_data"]["window_size"] = 10 ** 6
