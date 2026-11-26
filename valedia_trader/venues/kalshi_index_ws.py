@@ -34,7 +34,7 @@ import random
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -67,6 +67,7 @@ _INDEX_RE = re.compile(r"[A-Z0-9_]{2,32}")        # matched with fullmatch: `^[A
 _QUIET_LOGGER = logging.getLogger(__name__ + ".websocket")
 _QUIET_LOGGER.setLevel(logging.WARNING)
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 STORE_PREFIX = "kalshi_index_ticks-"
 _REPO_ROOT = Path(__file__).resolve().parents[2]   # the folder that holds the `valedia_trader` package
 
@@ -75,6 +76,9 @@ BACKOFF_CAP_S = 60.0
 JITTER_FRACTION = 0.25      # a delay is shortened by up to this share, so the doubling never passes the cap
 POLL_S = 1.0                # the longest the reader waits for one frame before it re-checks its deadline
 MAX_ERRORS_KEPT = 100
+MAX_SEQ = 2 ** 63 - 1       # the largest sid or seq accepted
+MAX_WINDOW_SIZE = 10 ** 6
+MAX_CODE = 2 ** 31 - 1      # the largest error code kept
 
 
 # ------------------------------------------------------------------ errors
@@ -269,11 +273,13 @@ class IndexTick:
     last_15min_avg: WindowAvg | None
     data: str
 
-    def as_json(self, channel: str | None = None) -> dict:
+    def as_json(self, channel: str | None = None, local_receipt_ms: int | None = None) -> dict:
+        """The JSONL row. `local_receipt_ms` is when this process received the frame (None when not known)."""
         row = {"index_id": self.index_id, "value": _dec_str(self.value), "source_time_ms": self.source_time_ms,
                "received_at_ms": self.received_at_ms, "sending_ts_ms": self.sending_ts_ms, "sid": self.sid,
                "seq": self.seq, "avg_60s": self.avg_60s.as_json() if self.avg_60s else None,
-               "last_15min_avg": self.last_15min_avg.as_json() if self.last_15min_avg else None, "data": self.data}
+               "last_15min_avg": self.last_15min_avg.as_json() if self.last_15min_avg else None, "data": self.data,
+               "local_receipt_ms": local_receipt_ms}
         if channel:
             row["channel"] = channel
         return row
@@ -288,9 +294,16 @@ def _to_int(x: Any) -> int:
         raise MalformedFrame("a whole number was expected")
     if isinstance(x, int):
         return x
-    if isinstance(x, str) and re.fullmatch(r"-?[0-9]{1,18}", x):
+    if isinstance(x, str) and re.fullmatch(r"-?[0-9]{1,19}", x):
         return int(x)
     raise MalformedFrame("a whole number was expected")
+
+
+def _bounded(x: Any, lo: int, hi: int) -> int:
+    n = _to_int(x)
+    if not lo <= n <= hi:
+        raise MalformedFrame("a whole number is out of range")
+    return n
 
 
 def _to_decimal(x: Any) -> Decimal:
@@ -310,12 +323,17 @@ def _to_decimal(x: Any) -> Decimal:
 def _parse_window(node: Any) -> WindowAvg:
     if not isinstance(node, dict):
         raise MalformedFrame("a window average must be an object")
-    return WindowAvg(value=_to_decimal(node.get("value")), window_size=_to_int(node.get("window_size")),
-                     window_start_ts_ms=_to_int(node.get("window_start_ts_ms")),
-                     window_end_ts_exclusive=_to_int(node.get("window_end_ts_exclusive")))
+    start = _check_ms(_to_int(node.get("window_start_ts_ms")))
+    end = _check_ms(_to_int(node.get("window_end_ts_exclusive")))
+    if end <= start:
+        raise MalformedFrame("a window must end after it starts")
+    return WindowAvg(value=_to_decimal(node.get("value")), window_size=_bounded(node.get("window_size"), 0, MAX_WINDOW_SIZE),
+                     window_start_ts_ms=start, window_end_ts_exclusive=end)
 
 
 def _check_ms(ms: int) -> int:
+    if ms < 0:
+        raise MalformedFrame("a timestamp is out of range")
     try:
         datetime.fromtimestamp(ms // 1000, timezone.utc)
     except (OverflowError, OSError, ValueError):
@@ -353,9 +371,9 @@ def parse_value_message(obj: Any) -> IndexTick:
         value=_to_decimal(raw.get("value")),
         source_time_ms=_check_ms(_to_int(raw.get("time"))),
         received_at_ms=_check_ms(_to_int(msg.get("received_at"))),
-        sending_ts_ms=None if sending is None else _to_int(sending),
-        sid=_to_int(obj.get("sid")),
-        seq=_to_int(obj.get("seq")),
+        sending_ts_ms=None if sending is None else _check_ms(_to_int(sending)),
+        sid=_bounded(obj.get("sid"), 0, MAX_SEQ),
+        seq=_bounded(obj.get("seq"), 0, MAX_SEQ),
         avg_60s=None if avg_60 is None else _parse_window(avg_60),
         last_15min_avg=None if last_15 is None else _parse_window(last_15),
         data=data,
@@ -391,9 +409,9 @@ class TickStore:
         day = datetime.fromtimestamp(received_at_ms // 1000, timezone.utc).strftime("%Y-%m-%d")
         return self.folder / f"{STORE_PREFIX}{day}.jsonl"
 
-    def append(self, tick: IndexTick, channel: str | None = None) -> Path:
+    def append(self, tick: IndexTick, channel: str | None = None, local_receipt_ms: int | None = None) -> Path:
         path = self.path_for(tick.received_at_ms)
-        line = json.dumps(tick.as_json(channel), separators=(",", ":"), sort_keys=True)
+        line = json.dumps(tick.as_json(channel, local_receipt_ms), separators=(",", ":"), sort_keys=True)
         try:
             self.folder.mkdir(parents=True, exist_ok=True)
             with open(path, "a", encoding="utf-8") as fh:
@@ -468,8 +486,15 @@ class _Run:
             raise NaiveClock("the clock must return a timezone-aware datetime")
         return self.max_seconds - (now - self.start).total_seconds()
 
+    def _receipt_ms(self) -> int:
+        """Unix ms UTC of now on the injected clock (the one the gate uses); a naive clock is refused."""
+        now = self.clock()
+        if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+            raise NaiveClock("the clock must return a timezone-aware datetime")
+        return (now - _EPOCH) // timedelta(milliseconds=1)
+
     # -- one frame in
-    def handle(self, raw: Any) -> None:
+    def handle(self, raw: Any, local_receipt_ms: int | None = None) -> None:
         try:
             text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
             obj = json.loads(text)
@@ -487,7 +512,7 @@ class _Run:
                 self.malformed += 1
                 return
             self._count_seq(tick.sid, tick.seq)
-            self.store.append(tick, kind)
+            self.store.append(tick, kind, local_receipt_ms)
             self.ticks += 1
             self._got_data = True       # only a stored tick restarts the backoff, not a reply or an error
         elif kind in _INDEXLIST_TYPES:
@@ -496,7 +521,7 @@ class _Run:
             body = obj.get("msg") if isinstance(obj.get("msg"), dict) else {}
             code = body.get("code")
             message = body.get("msg", body.get("message"))
-            self._record_error("server_error", code=code if _is_int(code) or isinstance(code, str) else None,
+            self._record_error("server_error", code=code if (_is_int(code) and -MAX_CODE - 1 <= code <= MAX_CODE) or isinstance(code, str) else None,
                                message=message if isinstance(message, str) else None)
         # `subscribed`, `ok` and any other type carry no tick: nothing to record
 
@@ -520,7 +545,8 @@ class _Run:
                     raw = await ws.recv()
             except TimeoutError:
                 continue
-            self.handle(raw)
+            received = self._receipt_ms()       # read right after recv returns, before any parsing
+            self.handle(raw, received)
 
     async def _one_connection(self) -> None:
         self._got_data = False
@@ -554,7 +580,7 @@ class _Run:
                 await self._one_connection()
             except (KeyboardInterrupt, asyncio.CancelledError):
                 break           # Ctrl-C reaches asyncio.run as a cancellation; the socket is already closed
-            except StoreError:
+            except (StoreError, NaiveClock):        # a broken clock or store is not a network fault: stop, do not retry
                 raise
             except Exception as exc:    # noqa: BLE001 - a close, a refused handshake or a network error: back off and retry
                 self._record_exception(exc)

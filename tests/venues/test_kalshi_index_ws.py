@@ -404,6 +404,85 @@ def test_decimal_precision_is_kept(tmp_path, creds):
     assert lines(tmp_path)[0]["value"] == big
 
 
+BIG = 10 ** 300
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda m: m.update(seq=BIG),
+    lambda m: m.update(seq=2 ** 63),
+    lambda m: m.update(seq=-1),
+    lambda m: m.update(sid=BIG),
+    lambda m: m.update(sid=2 ** 63),
+    lambda m: m.update(sid=-1),
+    lambda m: m.update(sending_ts_ms=BIG),
+    lambda m: m["msg"].update(received_at=BIG),
+    lambda m: m["msg"].update(data=j({"time": BIG, "value": "1"})),
+    lambda m: m["msg"]["avg_60s_data"].update(window_size=BIG),
+    lambda m: m["msg"]["avg_60s_data"].update(window_size=10 ** 6 + 1),
+    lambda m: m["msg"]["avg_60s_data"].update(window_size=-1),
+    lambda m: m["msg"]["avg_60s_data"].update(window_start_ts_ms=BIG),
+    lambda m: m["msg"]["avg_60s_data"].update(window_end_ts_exclusive=BIG),
+])
+def test_parse_refuses_out_of_range_whole_numbers(mutate):
+    msg = value_msg()
+    mutate(msg)
+    with pytest.raises(kis.MalformedFrame):
+        kis.parse_value_message(msg)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda m: m.update(sending_ts_ms=-1),
+    lambda m: m["msg"].update(received_at=-1),
+    lambda m: m["msg"].update(data=j({"time": -1, "value": "1"})),
+    lambda m: m["msg"]["avg_60s_data"].update(window_start_ts_ms=-1),
+    lambda m: m["msg"]["avg_60s_data"].update(window_end_ts_exclusive=-1),
+    lambda m: m["msg"]["avg_60s_data"].update(window_end_ts_exclusive=m["msg"]["avg_60s_data"]["window_start_ts_ms"]),
+    lambda m: m["msg"]["avg_60s_data"].update(window_end_ts_exclusive=m["msg"]["avg_60s_data"]["window_start_ts_ms"] - 1),
+    lambda m: m.update(seq=str(2 ** 63)),
+    lambda m: m.update(sid=str(2 ** 63)),
+    lambda m: m.update(seq="-1"),
+])
+def test_parse_refuses_negative_times_empty_windows_and_big_string_numbers(mutate):
+    msg = value_msg()
+    mutate(msg)
+    with pytest.raises(kis.MalformedFrame):
+        kis.parse_value_message(msg)
+
+
+def test_the_largest_string_sid_and_seq_are_accepted_like_the_int():
+    top = str(2 ** 63 - 1)
+    assert len(top) == 19
+    tick = kis.parse_value_message(value_msg(seq=top, sid=top))
+    assert tick.seq == tick.sid == 2 ** 63 - 1
+    zero = value_msg(seq=0, sid=0, received_at=20)
+    zero["msg"]["avg_60s_data"].update(window_start_ts_ms=0, window_end_ts_exclusive=1)
+    assert kis.parse_value_message(zero).source_time_ms == 0      # zero is the lowest time allowed
+
+
+def test_the_largest_allowed_numbers_still_parse():
+    msg = value_msg(seq=2 ** 63 - 1, sid=2 ** 63 - 1)
+    msg["msg"]["avg_60s_data"]["window_size"] = 10 ** 6
+    tick = kis.parse_value_message(msg)
+    assert tick.seq == tick.sid == 2 ** 63 - 1 and tick.avg_60s.window_size == 10 ** 6
+
+
+def test_an_out_of_range_number_is_counted_and_skipped_in_a_run(tmp_path, creds):
+    script = [j(value_msg(seq=BIG)), j(value_msg(seq=1)), KeyboardInterrupt()]
+    summary, _, _ = run(tmp_path, [FakeWS(script)], creds)
+    assert summary["malformed"] == 1 and summary["ticks"] == 1 and summary["reconnects"] == 0
+    assert all(len(str(r["seq"])) < 20 for r in lines(tmp_path))
+
+
+@pytest.mark.parametrize("code, kept", [(6, 6), (-5, -5), (2 ** 31 - 1, 2 ** 31 - 1), (-2 ** 31, -2 ** 31),
+                                        (2 ** 31, None), (-2 ** 31 - 1, None), (10 ** 4000, None), ("E6", "E6"),
+                                        (1.5, None), (True, None)])
+def test_an_error_code_is_kept_only_when_it_is_a_small_int(tmp_path, creds, code, kept):
+    script = [j({"id": 1, "type": "error", "msg": {"code": code, "msg": "m"}}), KeyboardInterrupt()]
+    summary, _, _ = run(tmp_path, [FakeWS(script)], creds)
+    assert summary["errors"] == [{"kind": "server_error", "code": kept, "message": "m"}]
+    assert len(json.dumps(summary)) < 300
+
+
 @pytest.mark.parametrize("mutate", [
     lambda m: m.update(type="other"),
     lambda m: m["msg"].update(data="not json"),
@@ -752,3 +831,68 @@ def test_the_live_connect_passes_a_logger_that_ignores_a_host_wide_debug(monkeyp
     finally:
         for n, level in old.items():
             logging.getLogger(n).setLevel(level)
+
+
+# ------------------------------------------------------------------ the local receipt time
+
+def _ms(dt):
+    return int(dt.timestamp() * 1000)
+
+
+def test_each_row_stores_the_exact_local_receipt_ms_from_the_injected_clock(tmp_path, creds):
+    start = AFTER + timedelta(milliseconds=123)
+    clock = StepClock(start=start, step=1.0)
+    script = [j(value_msg(seq=1)), j(value_msg(seq=2, with_15min=True)), KeyboardInterrupt()]
+    run(tmp_path, [FakeWS(script)], creds, clock=clock)
+    rows = lines(tmp_path)
+    # clock readings: 0 the gate, 1 the connect headers, 2 and 3 the two frames (taken right after recv returns)
+    assert [r["local_receipt_ms"] for r in rows] == [_ms(start) + 2000, _ms(start) + 3000]
+    assert all(type(r["local_receipt_ms"]) is int for r in rows)
+    # every other field is as before
+    expected = kis.parse_value_message(value_msg(seq=2, with_15min=True)).as_json("cfbenchmarks_value")
+    expected.pop("local_receipt_ms")
+    got = dict(rows[1])
+    got.pop("local_receipt_ms")
+    assert got == expected
+
+
+def test_local_receipt_is_exact_to_the_millisecond_not_float_rounded(tmp_path, creds):
+    start = datetime(2026, 12, 5, 12, 0, 0, 999999, tzinfo=UTC)     # .999999 s: a rounded ms would be one ms high
+    run(tmp_path, [FakeWS([j(value_msg(seq=1)), KeyboardInterrupt()])], creds, clock=StepClock(start=start, step=0.0))
+    assert lines(tmp_path)[0]["local_receipt_ms"] == (start - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1)
+
+
+def test_the_receipt_time_is_taken_before_parsing(tmp_path, creds):
+    order = []
+    clock = StepClock()
+    real_parse = kis.parse_value_message
+
+    def spy(obj):
+        order.append(("parse", clock.calls))
+        return real_parse(obj)
+
+    import unittest.mock as mock
+    with mock.patch.object(kis, "parse_value_message", spy):
+        run(tmp_path, [FakeWS([j(value_msg(seq=1)), KeyboardInterrupt()])], creds, clock=clock)
+    assert order == [("parse", 3)]        # gate, connect headers, receipt: three readings before the parse
+
+
+def test_parse_output_and_the_store_default_are_unchanged_without_a_receipt(tmp_path):
+    tick = kis.parse_value_message(value_msg())
+    assert not hasattr(tick, "local_receipt_ms")
+    path = kis.TickStore(tmp_path / "ticks").append(tick)
+    row = json.loads(path.read_text())
+    assert row["local_receipt_ms"] is None and row["seq"] == 42 and "channel" not in row
+
+
+def test_a_naive_clock_after_the_gate_still_raises(tmp_path, creds):
+    calls = []
+
+    def clock():
+        calls.append(1)
+        return AFTER if len(calls) <= 2 else datetime(2027, 1, 1)
+
+    with pytest.raises(Exception, match="timezone-aware"):
+        kis.stream(tmp_path / "ticks", clock=clock, connect=FakeConnect([FakeWS([j(value_msg(seq=1))])]),
+                   credentials=creds, sleep=Sleeps())
+    assert lines(tmp_path) == []
