@@ -62,8 +62,10 @@ SKIP_WARMUP_OR_GAP = "SKIP_WARMUP_OR_GAP"
 SKIP_NO_BOOK = "SKIP_NO_BOOK"
 
 # The close record: the settlement estimate from the close tick.
-CLOSE_BEFORE_MS = 60_000    # the close span is [close - 60 s, close + 10 s]
-CLOSE_AFTER_MS = 10_000     # and the close record is refused before close + 10 s, so the span is complete
+CLOSE_BEFORE_MS = 60_000    # the close span is [close - 60 s, close + 10 s] by source time
+CLOSE_AFTER_MS = 10_000     # the record is refused before close + CLOSE_AFTER_MS + LATE_MAX_MS (= close + 70 s):
+                            # a valid tick may be received up to LATE_MAX_MS after its source time, so by then
+                            # every valid tick of the span can have arrived
 CLOSE_WINDOW_SIZE = 60      # a close candidate: window_size 60 and this quarter's last-minute bounds (see log_close)
 SETTLE_QUANTUM = Decimal("0.01")
 SETTLE_ROUNDING = ROUND_HALF_EVEN
@@ -253,14 +255,19 @@ def _parse_tick_row(row: Any) -> _Tick | None:
                  local_receipt_ms=local, avg_60s=avg, last_15min_avg=last15)
 
 
-def _ticks_in(rows: Iterable, t_from_ms: int, t_to_ms: int) -> tuple[list[_Tick], dict]:
-    """Valid ticks with source time in [t_from_ms, t_to_ms], one per source time (the first received), in time order.
+def _ticks_in(rows: Iterable, t_from_ms: int, t_to_ms: int,
+              conflicts: list | None = None) -> tuple[list[_Tick], dict]:
+    """Valid ticks with source time in [t_from_ms, t_to_ms], one per source time, in time order.
 
     Valid: a well-formed BRTI `cfbenchmarks_value` row whose Kalshi `received_at` is within LATE_MAX_MS of its
     source time (either way); a row that is not is counted as late and never used.
+    Rows are grouped by source time. A group whose rows are all the same tick (equal value, avg_60s and
+    last_15min_avg, compared parsed) keeps the first received; the rest count in `n_duplicates_dropped`. A group
+    whose rows differ in any of those is dropped whole and counted in `n_conflicting_source_times` (fail closed);
+    if `conflicts` is given, the dropped rows are appended to it.
     """
     counts = {"n_rows_read": 0, "n_rows_malformed": 0, "n_rows_late": 0, "n_rows_outside_span": 0,
-              "n_duplicates_dropped": 0}
+              "n_duplicates_dropped": 0, "n_conflicting_source_times": 0}
     kept: list[_Tick] = []
     for row in rows:
         counts["n_rows_read"] += 1
@@ -274,12 +281,23 @@ def _ticks_in(rows: Iterable, t_from_ms: int, t_to_ms: int) -> tuple[list[_Tick]
         else:
             kept.append(tick)
     kept.sort(key=lambda t: (t.source_ms, t.received_at_ms, t.seq))
-    out: list[_Tick] = []
+    groups: list[list[_Tick]] = []
     for tick in kept:
-        if out and out[-1].source_ms == tick.source_ms:
-            counts["n_duplicates_dropped"] += 1        # a repeated source time is the same tick, not another one
-            continue
-        out.append(tick)
+        if groups and groups[-1][0].source_ms == tick.source_ms:
+            groups[-1].append(tick)
+        else:
+            groups.append([tick])
+    out: list[_Tick] = []
+    for group in groups:
+        first = group[0]
+        if all((t.value, t.avg_60s, t.last_15min_avg) == (first.value, first.avg_60s, first.last_15min_avg)
+               for t in group[1:]):
+            counts["n_duplicates_dropped"] += len(group) - 1   # a repeated source time is the same tick
+            out.append(first)
+        else:
+            counts["n_conflicting_source_times"] += 1          # two different ticks at one source time: use neither
+            if conflicts is not None:
+                conflicts.extend(group)
     return out, counts
 
 
@@ -528,6 +546,8 @@ def log_window(folder, window: Window, *, clock: Callable[[], datetime], read_ti
     """Read the ticks and the book once each, write one window record before the window closes, return it.
 
     `read_ticks(window, t_from_ms, t_to_ms)` returns tick-store rows; it is asked for [t* - 300 s, t*] by source time.
+    It runs live, before the close, and records what was known then: ticks not yet received at the call are not in
+    the record, by design (no look-ahead).
     Order: date check first (whatever the other arguments), then argument checks, then the readers, then the
     record. A window already closed, or closed while being read, is refused and writes nothing.
     """
@@ -582,9 +602,11 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
     A close candidate is a valid tick in [close - 60 s, close + 10 s] whose `last_60s_windowed_average_15min` is
     THIS quarter's last minute: window_size 60, window_start_ts_ms == close - 60 s, window_end_ts_exclusive == close.
     The estimate is the first candidate's value (by source time) rounded to 2 dp, ROUND_HALF_EVEN; if the
-    candidates' values disagree it is None ("close_candidates_disagree": fail closed). A window_size-60 average with
-    other bounds is counted (`n_close_wrong_window`) and never used. It is an estimate only: the authoritative
-    outcome is Kalshi's settled market, read later, offline.
+    candidates' values disagree, or a source time dropped as conflicting held a row that would be a candidate, it is
+    None ("close_candidates_disagree": fail closed). A window_size-60 average with other bounds is counted
+    (`n_close_wrong_window`) and never used. Refused (CloseNotReached) before close + CLOSE_AFTER_MS + LATE_MAX_MS,
+    so every valid tick of the span can have arrived. It is an estimate only: the authoritative outcome is Kalshi's
+    settled market, read later, offline.
     """
     entered = _gate(clock)
     _check_folder(folder)
@@ -592,19 +614,31 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
         raise ValueError("read_ticks must be a callable")
     _check_window(window)
     close_ms = _ms(window.close_ts)
-    if _ms(entered.timestamp()) < close_ms + CLOSE_AFTER_MS:
-        raise CloseNotReached(f"{window.window_ticker}: the close span ends at close + {CLOSE_AFTER_MS} ms")
+    if _ms(entered.timestamp()) < close_ms + CLOSE_AFTER_MS + LATE_MAX_MS:
+        raise CloseNotReached(f"{window.window_ticker}: the close record waits until close + "
+                              f"{CLOSE_AFTER_MS + LATE_MAX_MS} ms, so every valid tick of the span can have arrived")
     t_from, t_to = close_ms - CLOSE_BEFORE_MS, close_ms + CLOSE_AFTER_MS
     rows, tick_error = _read_rows(read_ticks, window, t_from, t_to)
     written_at = _gate(clock).timestamp()
-    ticks, counts = _ticks_in(rows, t_from, t_to)
-    full = [t for t in ticks if t.last_15min_avg is not None and t.last_15min_avg["window_size"] == CLOSE_WINDOW_SIZE]
-    candidates = [t for t in full if t.last_15min_avg["window_start_ts_ms"] == close_ms - CLOSE_BEFORE_MS
-                  and t.last_15min_avg["window_end_ts_exclusive"] == close_ms]
-    agree = len({t.last_15min_avg["value"] for t in candidates}) <= 1
+    conflicting: list[_Tick] = []
+    ticks, counts = _ticks_in(rows, t_from, t_to, conflicting)
+
+    def is_full(t: _Tick) -> bool:
+        return t.last_15min_avg is not None and t.last_15min_avg["window_size"] == CLOSE_WINDOW_SIZE
+
+    def is_candidate(t: _Tick) -> bool:
+        return (is_full(t) and t.last_15min_avg["window_start_ts_ms"] == close_ms - CLOSE_BEFORE_MS
+                and t.last_15min_avg["window_end_ts_exclusive"] == close_ms)
+
+    full = [t for t in ticks if is_full(t)]
+    candidates = [t for t in full if is_candidate(t)]
+    n_conflicting_candidates = sum(1 for t in conflicting if is_candidate(t))
+    agree = n_conflicting_candidates == 0 and len({t.last_15min_avg["value"] for t in candidates}) <= 1
     close_tick = candidates[0] if candidates else None
     avg = close_tick.last_15min_avg if close_tick is not None else None
-    if close_tick is None:
+    if n_conflicting_candidates:
+        estimate, reason = None, "close_candidates_disagree"   # a conflicting row would have been a candidate
+    elif close_tick is None:
         estimate, reason = None, ("tick_reader_error" if tick_error else "no_close_tick")
     elif not agree:
         estimate, reason = None, "close_candidates_disagree"
@@ -621,7 +655,7 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
             "sending_ts_ms": close_tick.sending_ts_ms, "seq": close_tick.seq,
             "local_receipt_ms": close_tick.local_receipt_ms, "last_60s_windowed_average_15min": avg},
         "n_close_candidates": len(candidates), "n_close_wrong_window": len(full) - len(candidates),
-        "close_candidates_agree": agree,
+        "n_close_conflicting_candidates": n_conflicting_candidates, "close_candidates_agree": agree,
         "outcome_source": "Kalshi settled market (result, expiration_value), read later, offline",
         **counts, "tick_error": tick_error,
     }
