@@ -580,7 +580,7 @@ since 19 November 00:00 UTC, none with answers.
 
 Two bursts on 24 November, recorded now with **cause = unknown**:
 
-- 18:22 to 18:25 UTC: 15 rows (one slot each minute, 18:22:00 to 18:25:00).
+- 18:22 to 18:25 UTC: 15 rows (the slots of 18:22:00 to 18:25:00, several markets in each).
 - 23:27 to 23:32 UTC: 11 rows.
 
 If a cause is found later, only this descriptive tag may change. Which rows are scored does not change.
