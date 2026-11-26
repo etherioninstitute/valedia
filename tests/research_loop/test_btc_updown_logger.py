@@ -1599,9 +1599,10 @@ def test_a_wrong_bounds_row_first_and_a_right_candidate_second_is_a_conflict(tmp
     assert rec["n_close_conflicting_candidates"] == 1 and rec["n_close_candidates"] == 0
 
 
-def _reconciles(rec: dict, n_kept: int) -> bool:
-    return rec["n_rows_read"] == (rec["n_rows_malformed"] + rec["n_rows_late"] + rec["n_rows_outside_span"] + n_kept
-                                  + rec["n_duplicates_dropped"] + rec["n_conflicting_rows"])
+def _reconciles(rec: dict) -> bool:
+    """The count identity, from the record's own fields only."""
+    return rec["n_rows_read"] == (rec["n_rows_malformed"] + rec["n_rows_late"] + rec["n_rows_outside_span"]
+                                  + rec["n_ticks_kept"] + rec["n_duplicates_dropped"] + rec["n_conflicting_rows"])
 
 
 def test_the_row_counts_reconcile_over_every_kind_of_row(tmp_path):
@@ -1620,9 +1621,8 @@ def test_the_row_counts_reconcile_over_every_kind_of_row(tmp_path):
     assert (rec["n_rows_malformed"], rec["n_rows_late"], rec["n_rows_outside_span"]) == (1, 1, 1)
     assert rec["n_duplicates_dropped"] == 2 and rec["n_conflicting_source_times"] == 1
     assert rec["n_conflicting_rows"] == 3 and len(rec["series"]) == 299 and rec["n_rows_read"] == 307
-    assert _reconciles(rec, len(rec["series"]))
-    ticks2, counts = L._ticks_in(ticks + extra, T - 300_000, T)
-    assert counts["n_rows_read"] == 307 and _reconciles(counts, len(ticks2))
+    assert rec["n_ticks_kept"] == len(rec["series"]) == 299 and _reconciles(rec)
+    assert _reconciles(lines(tmp_path)[0])                                        # and as written
 
 
 def test_the_close_record_carries_conflicting_rows_and_reconciles(tmp_path):
@@ -1633,5 +1633,46 @@ def test_the_close_record_carries_conflicting_rows_and_reconciles(tmp_path):
     rows.append(dict(rows[31], seq=5001))                                         # an equal duplicate
     rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
     assert rec["n_conflicting_rows"] == 2 and rec["n_duplicates_dropped"] == 1
-    ticks, _ = L._ticks_in(rows, C - 60_000, C + 10_000)
-    assert _reconciles(rec, len(ticks)) and rec["n_rows_read"] == 38
+    assert rec["n_rows_read"] == 38 and rec["n_ticks_kept"] == 35 and _reconciles(rec)
+    assert _reconciles(lines(tmp_path)[0])
+
+
+class _NeverBefore(datetime):
+    """A datetime subclass whose comparisons always say "not before"."""
+    def __lt__(self, other): return False
+    def __le__(self, other): return False
+    def __gt__(self, other): return True
+    def __ge__(self, other): return True
+
+
+def test_the_close_wait_ignores_a_datetime_subclass_s_own_comparisons(tmp_path):
+    w = window(0)
+    spy = Spy(_close_rows(w, "100.00"))
+    liar = _NeverBefore.fromtimestamp(w.close_ts + 100.0, tz=UTC)
+    assert not (liar < at(w.close_ts + 190.0))                                   # it lies
+    with pytest.raises(CloseNotReached):
+        log_close(tmp_path, w, clock=lambda: liar, read_ticks=spy)
+    s = at(w.close_ts + 190.0) - timedelta(microseconds=1)
+    short = _NeverBefore(s.year, s.month, s.day, s.hour, s.minute, s.second, s.microsecond, tzinfo=UTC)
+    assert short.microsecond == 999_999
+    with pytest.raises(CloseNotReached):                                          # 1 microsecond short
+        log_close(tmp_path, w, clock=lambda: short, read_ticks=spy)
+    assert spy.calls == [] and lines(tmp_path) == []
+    log_close(tmp_path, w, clock=lambda: _NeverBefore.fromtimestamp(w.close_ts + 190.0, tz=UTC), read_ticks=spy)
+    assert len(lines(tmp_path)) == 1
+
+
+def test_a_close_ts_that_is_not_a_whole_millisecond_is_refused(tmp_path):
+    w = window(0)
+    C = w.close_ts
+    assert C == int(C)
+    bad = Window(window_ticker=w.window_ticker, open_ts=w.open_ts, close_ts=C + 0.0004, floor_strike=w.floor_strike)
+    with pytest.raises(ValueError, match="whole number of milliseconds"):
+        log_close(tmp_path, bad, clock=lambda: at(C + 195.0), read_ticks=Spy([]))
+    with pytest.raises(ValueError, match="whole number of milliseconds"):
+        run(tmp_path, bad)
+    for ok in (C, C + 0.001):
+        L._check_window(Window(window_ticker=w.window_ticker, open_ts=w.open_ts, close_ts=ok, floor_strike=w.floor_strike))
+    milli = Window(window_ticker=w.window_ticker, open_ts=w.open_ts, close_ts=C + 0.001, floor_strike=w.floor_strike)
+    rec = log_close(tmp_path, milli, clock=lambda: at(C + 195.0), read_ticks=Spy([]))
+    assert rec["close_ms"] == int(C) * 1000 + 1

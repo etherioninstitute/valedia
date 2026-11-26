@@ -268,8 +268,8 @@ def _ticks_in(rows: Iterable, t_from_ms: int, t_to_ms: int,
     last_15min_avg, compared parsed) keeps the first received; the rest count in `n_duplicates_dropped`. A group
     whose rows differ in any of those is dropped whole and counted in `n_conflicting_source_times` (fail closed);
     if `conflicts` is given, the dropped rows are appended to it; `n_conflicting_rows` counts those rows.
-    The counts reconcile: n_rows_read == n_rows_malformed + n_rows_late + n_rows_outside_span + len(returned ticks)
-    + n_duplicates_dropped + n_conflicting_rows.
+    The counts reconcile: n_rows_read == n_rows_malformed + n_rows_late + n_rows_outside_span + n_ticks_kept
+    + n_duplicates_dropped + n_conflicting_rows, where n_ticks_kept is the number of ticks returned.
     """
     counts = {"n_rows_read": 0, "n_rows_malformed": 0, "n_rows_late": 0, "n_rows_outside_span": 0,
               "n_duplicates_dropped": 0, "n_conflicting_source_times": 0, "n_conflicting_rows": 0}
@@ -304,6 +304,7 @@ def _ticks_in(rows: Iterable, t_from_ms: int, t_to_ms: int,
             counts["n_conflicting_rows"] += len(group)
             if conflicts is not None:
                 conflicts.extend(group)
+    counts["n_ticks_kept"] = len(out)
     return out, counts
 
 
@@ -500,6 +501,8 @@ def _check_folder(folder: Any) -> None:
 def _check_window(window: Window) -> None:
     if not (math.isfinite(window.open_ts) and math.isfinite(window.close_ts)) or window.close_ts <= window.open_ts:
         raise ValueError("a window must open before it closes")
+    if (Decimal(repr(window.close_ts)) * 1000) % 1 != 0:      # so close_ms is exact, never rounded
+        raise ValueError(f"a window's close_ts must be a whole number of milliseconds, got {window.close_ts!r}")
 
 
 def _read_rows(read_ticks: Callable, window: Window, t_from_ms: int, t_to_ms: int) -> tuple[list, str | None]:
@@ -620,7 +623,9 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
         raise ValueError("read_ticks must be a callable")
     _check_window(window)
     close_ms = _ms(window.close_ts)
-    if entered < _EPOCH + timedelta(milliseconds=close_ms + CLOSE_WAIT_MS):    # exact: aware datetimes, no rounding
+    # exact integer microseconds, by the base class's own subtraction: a datetime subclass cannot vote on the wait
+    elapsed_us = datetime.__sub__(entered, _EPOCH) // timedelta(microseconds=1)
+    if elapsed_us < (close_ms + CLOSE_WAIT_MS) * 1000:
         raise CloseNotReached(f"{window.window_ticker}: the close record waits until close + {CLOSE_WAIT_MS} ms")
     t_from, t_to = close_ms - CLOSE_BEFORE_MS, close_ms + CLOSE_AFTER_MS
     rows, tick_error = _read_rows(read_ticks, window, t_from, t_to)
