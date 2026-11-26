@@ -539,7 +539,7 @@ def test_late_ticks_are_excluded_from_the_close_record_too(tmp_path):
     C = int(round(w.close_ts * 1000))
     rows = _close_rows(w, "100.00")
     rows[30] = dict(rows[30], received_at_ms=rows[30]["source_time_ms"] + 61_000)     # the k = 0 candidate, late
-    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 75.0), read_ticks=Spy(rows))
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
     assert rec["n_rows_late"] == 1 and rec["close_tick"]["cf_source_ts_ms"] == C + 1000
 
 
@@ -756,13 +756,13 @@ def test_close_never_uses_the_previous_quarters_average(tmp_path):
     rows = _close_rows(w, None)
     for i in range(0, 36):                         # every tick in the span still carries the last quarter's average
         rows[i] = dict(rows[i], last_15min_avg=_avg("555.55", C - 960_000, C - 900_000))
-    rec = log_close(tmp_path / "a", w, clock=lambda: at(w.close_ts + 75.0), read_ticks=Spy(rows))
+    rec = log_close(tmp_path / "a", w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
     assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "no_close_tick"
     assert rec["n_close_wrong_window"] == 36 and rec["n_close_candidates"] == 0
     # opposite: this quarter's average arriving later in the span is used, the stale ones still rejected
     for i in range(31, 36):
         rows[i] = dict(rows[i], last_15min_avg=_avg("100.005", C - 60_000, C))
-    rec2 = log_close(tmp_path / "b", w, clock=lambda: at(w.close_ts + 75.0), read_ticks=Spy(rows))
+    rec2 = log_close(tmp_path / "b", w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
     assert rec2["settlement_estimate"] == "100.00" and rec2["close_tick"]["cf_source_ts_ms"] == C + 1000
     assert rec2["n_close_wrong_window"] == 31 and rec2["n_close_candidates"] == 5
 
@@ -773,7 +773,7 @@ def test_close_bounds_off_by_one_are_rejected(tmp_path, start_off, end_off):
     C = int(round(w.close_ts * 1000))
     rows = _close_rows(w, None)
     rows[30] = dict(rows[30], last_15min_avg=_avg("100.00", C - 60_000 + start_off, C + end_off))
-    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 75.0), read_ticks=Spy(rows))
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
     assert rec["settlement_estimate"] is None and rec["n_close_wrong_window"] == 1
     assert rec["settlement_estimate_reason"] == "no_close_tick"
 
@@ -782,7 +782,7 @@ def test_close_candidates_that_disagree_give_none(tmp_path):
     w = window(0)
     rows = _close_rows(w, "100.00")
     rows[33] = dict(rows[33], last_15min_avg=dict(rows[33]["last_15min_avg"], value="100.01"))
-    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 75.0), read_ticks=Spy(rows))
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
     assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "close_candidates_disagree"
     assert rec["close_candidates_agree"] is False and rec["n_close_candidates"] == 6
     assert rec["close_tick"] is not None                       # the first candidate is still recorded, as metadata
@@ -790,7 +790,7 @@ def test_close_candidates_that_disagree_give_none(tmp_path):
 
 def test_close_estimate_rounds_half_even_on_a_half_cent(tmp_path):
     w = window(0)
-    after = lambda: at(w.close_ts + 75.0)
+    after = lambda: at(w.close_ts + 195.0)
     for i, (raw, want) in enumerate((("100000.125", "100000.12"), ("100000.135", "100000.14"),
                                      ("100000.1251", "100000.13"), ("99999.995", "100000.00"))):
         rec = log_close(tmp_path / str(i), w, clock=after, read_ticks=Spy(_close_rows(w, raw)))
@@ -807,7 +807,7 @@ def test_close_estimate_rounds_half_even_on_a_half_cent(tmp_path):
 
 def test_close_estimate_absent_gives_none_and_a_reason(tmp_path):
     w = window(0)
-    after = lambda: at(w.close_ts + 75.0)
+    after = lambda: at(w.close_ts + 195.0)
     none_at_all = log_close(tmp_path / "a", w, clock=after, read_ticks=Spy(_close_rows(w, None)))
     assert none_at_all["settlement_estimate"] is None and none_at_all["settlement_estimate_reason"] == "no_close_tick"
     assert none_at_all["close_tick"] is None
@@ -827,9 +827,11 @@ def test_close_record_asks_for_its_span_and_waits_for_it(tmp_path):
     C = int(round(w.close_ts * 1000))
     spy = Spy(_close_rows(w, "100.00"))
     with pytest.raises(CloseNotReached):
-        log_close(tmp_path, w, clock=lambda: at(w.close_ts + 69.999), read_ticks=spy)
+        log_close(tmp_path, w, clock=lambda: at(w.close_ts + 189.999), read_ticks=spy)
+    with pytest.raises(CloseNotReached):                          # exact: 1 microsecond short is refused, not rounded
+        log_close(tmp_path, w, clock=lambda: at(w.close_ts + 190.0) - timedelta(microseconds=1), read_ticks=spy)
     assert spy.calls == [] and lines(tmp_path) == []
-    log_close(tmp_path, w, clock=lambda: at(w.close_ts + 70.0), read_ticks=spy)
+    log_close(tmp_path, w, clock=lambda: at(w.close_ts + 190.0), read_ticks=spy)
     assert spy.calls == [(w, C - 60_000, C + 10_000)]
 
 
@@ -1050,8 +1052,8 @@ def test_no_float_in_any_written_record(tmp_path):
     folder = tmp_path / "all"
     run(folder, w)
     run(folder, window(1), ticks=[], book=None)
-    log_close(folder, w, clock=lambda: at(w.close_ts + 75.0), read_ticks=Spy(_close_rows(w, "100000.125")))
-    log_close(folder, w, clock=lambda: at(w.close_ts + 75.0), read_ticks=Spy([]))
+    log_close(folder, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(_close_rows(w, "100000.125")))
+    log_close(folder, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy([]))
     tape = [{"trade_id": "t1", "created_ts": w.open_ts + 301.5, "yes_price": 0.51, "count": 3.0}]
     log_tape(folder, w, posted=True, read_tape=Spy(tape), clock=lambda: at(w.open_ts + 400.0), budget=TapeBudget(1))
     recs = no_float_lines(folder)
@@ -1314,7 +1316,7 @@ def test_log_window_reads_the_clock_exactly_twice(tmp_path):
 
 def test_log_close_refuses_when_the_clock_steps_back_before_the_instant_at_write_time(tmp_path):
     w = window(0)
-    after = at(w.close_ts + 75.0)
+    after = at(w.close_ts + 195.0)
     with pytest.raises(NotYetEnabled):
         log_close(tmp_path, w, clock=SeqClock([after, EF - ONE_S]), read_ticks=Spy(_close_rows(w, "1.00")))
     assert lines(tmp_path) == []
@@ -1368,7 +1370,7 @@ def test_empty_or_current_directory_folder_is_refused_after_the_date(tmp_path, m
     with pytest.raises(ValueError):
         log_tape(bad, w, posted=True, read_tape=Spy([]), clock=lambda: at(w.open_ts + 400.0), budget=TapeBudget(2))
     with pytest.raises(ValueError):
-        log_close(bad, w, clock=lambda: at(w.close_ts + 75.0), read_ticks=t)
+        log_close(bad, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=t)
     with pytest.raises(ValueError):
         dry_run(bad, lambda: EF, [Fixture(w, series(tstar_ms(w)), BOOK)])
     assert t.calls == [] and b.calls == [] and list(tmp_path.iterdir()) == []
@@ -1463,7 +1465,7 @@ def _refused_everywhere(folder, writes):
     with pytest.raises(ValueError):
         log_tape(folder, w, posted=True, read_tape=tp, clock=lambda: at(w.open_ts + 400.0), budget=TapeBudget(2))
     with pytest.raises(ValueError):
-        log_close(folder, w, clock=lambda: at(w.close_ts + 75.0), read_ticks=t)
+        log_close(folder, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=t)
     with pytest.raises(ValueError):
         dry_run(folder, lambda: EF, [Fixture(w, series(tstar_ms(w)), BOOK)])
     with pytest.raises(ValueError):
@@ -1513,7 +1515,7 @@ def test_an_absolute_folder_outside_the_repository_is_accepted(tmp_path):
     assert log_tape(tmp_path / "t", w, posted=True, read_tape=tp, clock=lambda: at(w.open_ts + 400.0),
                     budget=TapeBudget(2)) is not None
     assert len(dry_run(tmp_path / "d", lambda: EF, [Fixture(w, series(tstar_ms(w)), BOOK)])) == 1
-    log_close(tmp_path / "c", w, clock=lambda: at(w.close_ts + 75.0), read_ticks=Spy(_close_rows(w, "1.00")))
+    log_close(tmp_path / "c", w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(_close_rows(w, "1.00")))
     assert all(len(lines(tmp_path / n)) == 1 for n in ("w", "t", "d", "c"))
     out_link = tmp_path / "outlink"
     out_link.symlink_to(tmp_path / "w", target_is_directory=True)
@@ -1580,7 +1582,7 @@ def test_conflicting_close_candidates_at_one_source_time_give_none(tmp_path):
     C = int(round(w.close_ts * 1000))
     rows = _close_rows(w, "100.10")
     rows.append(dict(rows[30], seq=5000, last_15min_avg=_avg("999.99", C - 60_000, C)))   # k = 0, other value
-    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 75.0), read_ticks=Spy(rows))
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
     assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "close_candidates_disagree"
     assert rec["close_candidates_agree"] is False and rec["n_close_conflicting_candidates"] == 2
     assert rec["n_conflicting_source_times"] == 1
@@ -1592,6 +1594,44 @@ def test_a_wrong_bounds_row_first_and_a_right_candidate_second_is_a_conflict(tmp
     first = tick_row(C, seq=1, recv=C + 20, last15=_avg("555.55", C - 960_000, C - 900_000))
     second = tick_row(C, seq=2, recv=C + 20, last15=_avg("100.10", C - 60_000, C))
     rows = [r for r in _close_rows(w, None) if r["source_time_ms"] != C] + [first, second]
-    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 75.0), read_ticks=Spy(rows))
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
     assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "close_candidates_disagree"
     assert rec["n_close_conflicting_candidates"] == 1 and rec["n_close_candidates"] == 0
+
+
+def _reconciles(rec: dict, n_kept: int) -> bool:
+    return rec["n_rows_read"] == (rec["n_rows_malformed"] + rec["n_rows_late"] + rec["n_rows_outside_span"] + n_kept
+                                  + rec["n_duplicates_dropped"] + rec["n_conflicting_rows"])
+
+
+def test_the_row_counts_reconcile_over_every_kind_of_row(tmp_path):
+    w = window(0)
+    T = tstar_ms(w)
+    ticks = series(T, n=300)
+    extra = [
+        {"index_id": "BRTI", "value": "x"},                                       # malformed
+        tick_row(T - 2000, "777.00", seq=7001, recv=T - 2000 + 61_000),          # late
+        tick_row(T + 400, seq=7002),                                              # outside the span
+        dict(ticks[10], seq=7003), dict(ticks[10], seq=7004),                     # two equal duplicates
+        tick_row(ticks[20]["source_time_ms"], "1.00", seq=7005),                  # with ticks[20]: a conflict of 3
+        tick_row(ticks[20]["source_time_ms"], "2.00", seq=7006),
+    ]
+    rec, _, _ = run(tmp_path, w, ticks=ticks + extra)
+    assert (rec["n_rows_malformed"], rec["n_rows_late"], rec["n_rows_outside_span"]) == (1, 1, 1)
+    assert rec["n_duplicates_dropped"] == 2 and rec["n_conflicting_source_times"] == 1
+    assert rec["n_conflicting_rows"] == 3 and len(rec["series"]) == 299 and rec["n_rows_read"] == 307
+    assert _reconciles(rec, len(rec["series"]))
+    ticks2, counts = L._ticks_in(ticks + extra, T - 300_000, T)
+    assert counts["n_rows_read"] == 307 and _reconciles(counts, len(ticks2))
+
+
+def test_the_close_record_carries_conflicting_rows_and_reconciles(tmp_path):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    rows = _close_rows(w, "100.10")
+    rows.append(dict(rows[30], seq=5000, last_15min_avg=_avg("999.99", C - 60_000, C)))
+    rows.append(dict(rows[31], seq=5001))                                         # an equal duplicate
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
+    assert rec["n_conflicting_rows"] == 2 and rec["n_duplicates_dropped"] == 1
+    ticks, _ = L._ticks_in(rows, C - 60_000, C + 10_000)
+    assert _reconciles(rec, len(ticks)) and rec["n_rows_read"] == 38
