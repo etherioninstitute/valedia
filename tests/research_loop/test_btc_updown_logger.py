@@ -1946,9 +1946,9 @@ def test_the_file_reader_hands_over_rows_that_fail_the_tick_checks_as_malformed(
     failing = [
         dict(tick_row(T - 100_500), seq="x"),                                         # bad seq
         tick_row(T - 100_400, "0"),                                                   # value 0
-        tick_row(T - 100_300, channel="orderbook_delta"),                             # wrong channel
-        dict(tick_row(T - 100_200), avg_60s={"value": "1.00", "window_size": 0, "window_start_ts_ms": T - 60_000,
-                                              "window_end_ts_exclusive": T}),         # window_size 0
+        {k: v for k, v in tick_row(T - 100_300).items() if k != "channel"},          # no channel
+        dict(tick_row(T - 100_200), avg_60s={"value": "1.00", "window_start_ts_ms": T - 60_000,
+                                              "window_end_ts_exclusive": T}),         # avg_60s without window_size
     ]
     for r in failing:
         assert L._parse_tick_row(r) is None
@@ -1957,7 +1957,9 @@ def test_the_file_reader_hands_over_rows_that_fail_the_tick_checks_as_malformed(
     edges = [dict(tick_row(T - 2000), seq="x", received_at_ms=b + L.LATE_MAX_MS),
              dict(tick_row(T - 298_000), seq="x", received_at_ms=a - L.LATE_MAX_MS)]   # exactly on the range: counted
     day = datetime.fromtimestamp(T / 1000, UTC).strftime("%Y-%m-%d")
-    _write(tick_dir, day, good[:100] + failing + not_this_span + edges + good[100:])
+    other_feeds = [tick_row(T - 100_100, channel="cfbenchmarks_value_5hz"), tick_row(T - 100_050, index_id="ETHUSD_RTI"),
+                   dict(tick_row(T - 100_025, channel="cfbenchmarks_value_5hz"), seq="x")]   # another feed: no count
+    _write(tick_dir, day, good[:100] + failing + not_this_span + edges + other_feeds + good[100:])
     with open(tick_dir / f"kalshi_index_ticks-{day}.jsonl", "a", encoding="utf-8") as fh:
         fh.write('{"index_id": "BRTI", "channel": "cfbenchmarks_value", "received_at_ms": ' + str(T))  # partial line
     got = read_tick_files(tick_dir, a, b, clock=lambda: EF)
@@ -1970,3 +1972,23 @@ def test_the_file_reader_hands_over_rows_that_fail_the_tick_checks_as_malformed(
     assert saved["n_rows_read"] == (saved["n_rows_malformed"] + saved["n_rows_late"] + saved["n_rows_outside_span"]
                                     + saved["n_ticks_kept"] + saved["n_duplicates_dropped"] + saved["n_conflicting_rows"])
     assert saved["status"] == "OK"                     # the malformed rows are counted, never used
+
+
+
+def test_an_avg_60s_window_of_size_0_never_costs_the_tick_and_is_not_a_close_candidate(tmp_path):
+    w = window(0)
+    T = tstar_ms(w)
+    ticks = series(T, n=300)
+    ticks[-1] = dict(ticks[-1], avg_60s={"value": "99999.99", "window_size": 0, "window_start_ts_ms": T - 60_000,
+                                         "window_end_ts_exclusive": T})
+    rec, _, _ = run(tmp_path, w, ticks=ticks)
+    assert rec["n_rows_malformed"] == 0 and rec["n_ticks_kept"] == 300
+    assert rec["tick_used"]["cf_source_ts_ms"] == T and rec["tick_used"]["avg_60s_data"]["window_size"] == 0
+    # the close: a last_15min_avg of window_size 0 with this quarter's bounds is not a candidate; it is not counted
+    # as a wrong window either (n_close_wrong_window counts window_size-60 averages with other bounds only)
+    C = int(round(w.close_ts * 1000))
+    rows = _close_rows(w, None)
+    rows[30] = dict(rows[30], last_15min_avg=_avg("100.10", C - 60_000, C, size=0))
+    close = log_close(tmp_path / "c", w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
+    assert close["n_rows_malformed"] == 0 and close["n_close_candidates"] == 0
+    assert close["n_close_wrong_window"] == 0 and close["settlement_estimate_reason"] == "no_close_tick"

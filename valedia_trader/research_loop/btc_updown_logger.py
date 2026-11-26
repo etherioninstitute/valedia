@@ -239,8 +239,6 @@ def _window_avg(node: Any) -> dict | None:
         if n is None:
             raise ValueError(f"{key} must be a whole number")
         out[key] = n
-    if out["window_size"] < 1:
-        raise ValueError("window_size must be at least 1")    # a window of no ticks is not an average
     return out
 
 
@@ -408,6 +406,12 @@ def _rows_backwards(path: Path, stop_before_ms: int) -> tuple[list, bool]:
     return rows, False
 
 
+def _other_feed(row: dict) -> bool:
+    """Another feed's row in the same files: a string index_id other than BRTI, or a string channel other than ours."""
+    index_id, channel = row.get("index_id"), row.get("channel")
+    return (isinstance(index_id, str) and index_id != INDEX_ID) or (isinstance(channel, str) and channel != INDEX_CHANNEL)
+
+
 def read_tick_files(tick_folder, t_from_ms: int, t_to_ms: int, *, clock: Callable[[], datetime]) -> list[dict]:
     """The tick-store rows of the span, in file order: (a) every row that parses to a tick with source time in
     [t_from_ms, t_to_ms]; and (b) every JSON-object row that does not parse to a tick but whose `received_at_ms` is a
@@ -417,8 +421,11 @@ def read_tick_files(tick_folder, t_from_ms: int, t_to_ms: int, *, clock: Callabl
     Why that receipt range for (b): a valid tick of the span is received within LATE_MAX_MS of a source time in the
     span, so a row received in that range is one that could have been a tick of this span; a row received outside it
     could not, so it is not this span's to count. Skipped, in no count: a line with no readable `received_at_ms` (a
-    partial last line, not JSON, not an object, oversized), which cannot be placed in time; and a tick whose source
-    time is outside the span (it belongs to another window), so `n_rows_outside_span` is 0 through this reader.
+    partial last line, not JSON, not an object, oversized), which cannot be placed in time; a tick whose source
+    time is outside the span (it belongs to another window), so `n_rows_outside_span` is 0 through this reader; and
+    another feed's row (the client can write `cfbenchmarks_value_5hz` or other index ids into the same files): an
+    `index_id` that is a string other than BRTI, or a `channel` that is a string other than `cfbenchmarks_value`.
+    A row whose index_id or channel is missing or not a string is malformed, and handed over by the receipt rule.
 
     The files are `<tick_folder>/kalshi_index_ticks-YYYY-MM-DD.jsonl`, one per UTC day of receipt; a missing file is
     no rows. Only the span is read: each file is read backwards from its end, newest day first (from the UTC day of
@@ -456,7 +463,7 @@ def read_tick_files(tick_folder, t_from_ms: int, t_to_ms: int, *, clock: Callabl
             if tick is not None:
                 if a <= tick.source_ms <= b:
                     out.append(row)                # (a) a tick of the span
-            elif isinstance(row, dict):
+            elif isinstance(row, dict) and not _other_feed(row):
                 recv = _whole(row.get("received_at_ms"))
                 if recv is not None and a - LATE_MAX_MS <= recv <= b + LATE_MAX_MS:
                     out.append(row)                # (b) a row that could have been a tick of the span: malformed
