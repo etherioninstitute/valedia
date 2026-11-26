@@ -335,6 +335,7 @@ def test_record_fields_at_t_star_with_decimals_as_strings(tmp_path):
     ch = saved["series_checks"]
     assert ch["n_ticks"] == 301 and ch["count_ok"] and ch["anchor_ok"] and ch["gap_ok"] and ch["warm"]
     assert ch["anchor_ts_ms"] == T - 180_000 and ch["anchor_tick_ms"] == T - 180_000 and ch["max_gap_ms"] == 1000
+    assert ch["first_gap_ms"] == 0 and ch["last_gap_ms"] == 0 and saved["n_rows_late"] == 0
     assert saved["n_rows_read"] == 301 and saved["n_rows_malformed"] == 0 and saved["n_duplicates_dropped"] == 0
     book = saved["book"]
     assert book["yes"] == [["0.49", "30.0"], ["0.48", "10.0"]] and book["no"] == [["0.5", "25.0"], ["0.49", "5.0"]]
@@ -425,45 +426,121 @@ def test_stale_rule_refuses_a_negative_lag():
 
 # ---------------------------------------------------------------- SKIP_WARMUP_OR_GAP
 
+def _thinned(T: int, n: int) -> list[dict]:
+    """n ticks covering the whole span [t* - 300 s, t*]: the full 1 Hz series less every second tick from the
+    middle outwards, so no gap exceeds 2 s and both edges are held."""
+    rows = series(T)
+    drop = 301 - n
+    keep = [r for i, r in enumerate(rows) if not (i % 2 == 1 and 1 <= i < 2 * drop)]
+    assert len(keep) == n
+    return keep
+
+
 def test_warmup_269_ticks_skips_and_270_is_ok(tmp_path):
     w = window(0)
     T = tstar_ms(w)
-    rec, _, _ = run(tmp_path, w, ticks=series(T, n=269))
+    rec, _, _ = run(tmp_path, w, ticks=_thinned(T, 269))
     assert rec["status"] == "SKIP_WARMUP_OR_GAP" and rec["skip_reasons"] == ["SKIP_WARMUP_OR_GAP"]
     assert rec["series_checks"]["n_ticks"] == 269 and rec["series_checks"]["count_ok"] is False
     assert rec["series_checks"]["anchor_ok"] and rec["series_checks"]["gap_ok"]
-    ok, _, _ = run(tmp_path, window(0), ticks=series(T, n=270))
+    ok, _, _ = run(tmp_path, window(0), ticks=_thinned(T, 270))
     assert ok["status"] == "OK" and ok["series_checks"]["n_ticks"] == 270
+
+
+def test_270_ticks_that_start_at_t_star_minus_270_no_longer_pass(tmp_path):
+    w = window(0)
+    T = tstar_ms(w)
+    rec, _, _ = run(tmp_path, w, ticks=series(T, n=270))        # 30 s of the span's start uncovered
+    ch = rec["series_checks"]
+    assert ch["count_ok"] and ch["anchor_ok"] and ch["max_gap_ms"] == 1000
+    assert ch["first_gap_ms"] == 31_000 and ch["gap_ok"] is False
+    assert rec["status"] == "SKIP_WARMUP_OR_GAP"
+
+
+def test_span_start_edge_gap_5000_ok_and_5001_skips(tmp_path):
+    w = window(0)
+    T = tstar_ms(w)
+    at_5000 = [r for r in series(T) if r["source_time_ms"] >= T - 295_000]
+    rec, _, _ = run(tmp_path, w, ticks=at_5000)
+    assert rec["series_checks"]["first_gap_ms"] == 5000 and rec["status"] == "OK"
+    at_5001 = [tick_row(T - 294_999, seq=0)] + [r for r in series(T) if r["source_time_ms"] >= T - 294_000]
+    rec2, _, _ = run(tmp_path, window(0), ticks=at_5001)
+    assert rec2["series_checks"]["first_gap_ms"] == 5001 and rec2["series_checks"]["gap_ok"] is False
+    assert rec2["status"] == "SKIP_WARMUP_OR_GAP" and rec2["skip_reasons"] == ["SKIP_WARMUP_OR_GAP"]
+
+
+def test_span_end_edge_gap_is_checked_the_same_way():
+    T = 1_000_000_000
+    def ticks_ending(last_ms):
+        return [L._parse_tick_row(tick_row(s, seq=1)) for s in range(T - 300_000, last_ms + 1, 1000)]
+    assert L._series_checks(ticks_ending(T - 5000), T)["last_gap_ms"] == 5000
+    assert L._series_checks(ticks_ending(T - 5000), T)["gap_ok"] is True
+    late = ticks_ending(T - 6000) + [L._parse_tick_row(tick_row(T - 5001, seq=1))]
+    ch = L._series_checks(late, T)
+    assert ch["last_gap_ms"] == 5001 and ch["max_gap_ms"] == 1000 and ch["gap_ok"] is False
+    assert L._series_checks([], T)["gap_ok"] is False and L._series_checks([], T)["first_gap_ms"] is None
 
 
 def test_warmup_counts_a_repeated_source_time_once(tmp_path):
     w = window(0)
     T = tstar_ms(w)
-    ticks = series(T, n=269)
+    ticks = _thinned(T, 269)
     ticks.append(dict(ticks[-1]))                                # a duplicate row is not a 270th tick
     rec, _, _ = run(tmp_path, w, ticks=ticks)
     assert rec["status"] == "SKIP_WARMUP_OR_GAP" and rec["n_duplicates_dropped"] == 1
 
 
-def test_no_tick_near_t_star_minus_180_skips_and_exactly_3_s_is_ok(tmp_path):
+def test_no_tick_near_t_star_minus_180_fails_and_exactly_3_s_holds():
+    # With both edges held and no gap over 5 s, a tick always lies within 2.5 s of t* - 180 s, so the anchor
+    # check can only fail together with a gap check; its own boundary is tested on the check itself.
+    T = 1_000_000_000
+    A = T - 180_000
+    def ticks(*src):
+        return [L._parse_tick_row(tick_row(s, seq=1)) for s in src]
+    assert L._series_checks(ticks(T - 300_000, A - 3000, T), T)["anchor_ok"] is True
+    assert L._series_checks(ticks(T - 300_000, A + 3000, T), T)["anchor_ok"] is True
+    assert L._series_checks(ticks(T - 300_000, A - 3001, A + 3001, T), T)["anchor_ok"] is False
+    assert L._series_checks(ticks(T - 300_000, A - 3001, T), T)["anchor_tick_ms"] == A - 3001
+
+
+def test_no_tick_near_t_star_minus_180_is_a_warmup_skip(tmp_path):
     w = window(0)
     T = tstar_ms(w)
-    # half-second ticks starting 170 s before t*: plenty of ticks, no gap, none near t* - 180 s
-    late_start = series(T, n=341, step_ms=500)
-    rec, _, _ = run(tmp_path, w, ticks=late_start)
-    ch = rec["series_checks"]
-    assert ch["count_ok"] and ch["gap_ok"] and ch["anchor_ok"] is False
-    assert rec["status"] == "SKIP_WARMUP_OR_GAP" and rec["skip_reasons"] == ["SKIP_WARMUP_OR_GAP"]
-    # the first tick exactly 3 s after t* - 180 s: ok
-    at_3s = series(T, n=355, step_ms=500)
-    assert int(at_3s[0]["source_time_ms"]) == T - 177_000
-    ok, _, _ = run(tmp_path, window(0), ticks=at_3s)
-    assert ok["series_checks"]["anchor_tick_ms"] == T - 177_000 and ok["status"] == "OK"
-    # 3.001 s: refused
-    at_3001 = [r for r in series(T, n=355, step_ms=500) if r["source_time_ms"] != T - 177_000]
-    at_3001.insert(0, tick_row(T - 176_999, seq=0))
-    rec3, _, _ = run(tmp_path, window(0), ticks=at_3001)
-    assert rec3["series_checks"]["anchor_ok"] is False and rec3["status"] == "SKIP_WARMUP_OR_GAP"
+    hole = [r for r in series(T) if abs(r["source_time_ms"] - (T - 180_000)) > 3000]
+    rec, _, _ = run(tmp_path, w, ticks=hole)
+    assert rec["series_checks"]["anchor_ok"] is False and rec["status"] == "SKIP_WARMUP_OR_GAP"
+
+
+# ---------------------------------------------------------------- late ticks
+
+def test_a_tick_late_by_61_s_is_counted_and_excluded_and_60_s_is_kept(tmp_path):
+    w = window(0)
+    T = tstar_ms(w)
+    base = series(T - 1000, n=300)
+    rec, _, _ = run(tmp_path, w, ticks=base + [tick_row(T, "777.00", seq=900, recv=T + 61_000)])
+    assert rec["n_rows_late"] == 1 and rec["tick_used"]["cf_source_ts_ms"] == T - 1000
+    assert all(p["brti_raw"] != "777.00" for p in rec["series"])
+    ok, _, _ = run(tmp_path, window(0), ticks=base + [tick_row(T, "777.00", seq=900, recv=T + 60_000)])
+    assert ok["n_rows_late"] == 0 and ok["tick_used"]["brti_raw"] == "777.00"
+
+
+def test_a_negative_lag_beyond_60_s_is_excluded_too(tmp_path):
+    w = window(0)
+    T = tstar_ms(w)
+    base = series(T - 1000, n=300)
+    rec, _, _ = run(tmp_path, w, ticks=base + [tick_row(T, "777.00", seq=900, recv=T - 60_001)])
+    assert rec["n_rows_late"] == 1 and rec["tick_used"]["cf_source_ts_ms"] == T - 1000
+    ok, _, _ = run(tmp_path, window(0), ticks=base + [tick_row(T, "777.00", seq=900, recv=T - 60_000)])
+    assert ok["n_rows_late"] == 0 and ok["tick_used"]["brti_raw"] == "777.00"
+
+
+def test_late_ticks_are_excluded_from_the_close_record_too(tmp_path):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    rows = _close_rows(w, "100.00")
+    rows[30] = dict(rows[30], received_at_ms=rows[30]["source_time_ms"] + 61_000)     # the k = 0 candidate, late
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 15.0), read_ticks=Spy(rows))
+    assert rec["n_rows_late"] == 1 and rec["close_tick"]["cf_source_ts_ms"] == C + 1000
 
 
 def _with_gap(T: int, gap_ms: int) -> list[dict]:
@@ -663,10 +740,52 @@ def _close_rows(w: Window, value: str | None, *, size: int = 60) -> list[dict]:
         src = C + 1000 * k
         last15 = None
         if value is not None and k >= 0:
-            last15 = {"value": value if k == 0 else "1.00", "window_size": size,
+            last15 = {"value": value, "window_size": size,
                       "window_start_ts_ms": C - 60000, "window_end_ts_exclusive": C}
         rows.append(tick_row(src, seq=k + 100, last15=last15))
     return rows
+
+
+def _avg(value: str, start: int, end: int, size: int = 60) -> dict:
+    return {"value": value, "window_size": size, "window_start_ts_ms": start, "window_end_ts_exclusive": end}
+
+
+def test_close_never_uses_the_previous_quarters_average(tmp_path):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    rows = _close_rows(w, None)
+    for i in range(0, 36):                         # every tick in the span still carries the last quarter's average
+        rows[i] = dict(rows[i], last_15min_avg=_avg("555.55", C - 960_000, C - 900_000))
+    rec = log_close(tmp_path / "a", w, clock=lambda: at(w.close_ts + 15.0), read_ticks=Spy(rows))
+    assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "no_close_tick"
+    assert rec["n_close_wrong_window"] == 36 and rec["n_close_candidates"] == 0
+    # opposite: this quarter's average arriving later in the span is used, the stale ones still rejected
+    for i in range(31, 36):
+        rows[i] = dict(rows[i], last_15min_avg=_avg("100.005", C - 60_000, C))
+    rec2 = log_close(tmp_path / "b", w, clock=lambda: at(w.close_ts + 15.0), read_ticks=Spy(rows))
+    assert rec2["settlement_estimate"] == "100.00" and rec2["close_tick"]["cf_source_ts_ms"] == C + 1000
+    assert rec2["n_close_wrong_window"] == 31 and rec2["n_close_candidates"] == 5
+
+
+@pytest.mark.parametrize("start_off,end_off", [(0, 1), (0, -1), (1, 0), (-1, 0)])
+def test_close_bounds_off_by_one_are_rejected(tmp_path, start_off, end_off):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    rows = _close_rows(w, None)
+    rows[30] = dict(rows[30], last_15min_avg=_avg("100.00", C - 60_000 + start_off, C + end_off))
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 15.0), read_ticks=Spy(rows))
+    assert rec["settlement_estimate"] is None and rec["n_close_wrong_window"] == 1
+    assert rec["settlement_estimate_reason"] == "no_close_tick"
+
+
+def test_close_candidates_that_disagree_give_none(tmp_path):
+    w = window(0)
+    rows = _close_rows(w, "100.00")
+    rows[33] = dict(rows[33], last_15min_avg=dict(rows[33]["last_15min_avg"], value="100.01"))
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 15.0), read_ticks=Spy(rows))
+    assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "close_candidates_disagree"
+    assert rec["close_candidates_agree"] is False and rec["n_close_candidates"] == 6
+    assert rec["close_tick"] is not None                       # the first candidate is still recorded, as metadata
 
 
 def test_close_estimate_rounds_half_even_on_a_half_cent(tmp_path):
@@ -681,7 +800,8 @@ def test_close_estimate_rounds_half_even_on_a_half_cent(tmp_path):
         assert rec["close_tick"]["cf_source_ts_ms"] == int(w.close_ts * 1000)     # the first tick with size 60
     saved = no_float_lines(tmp_path / "0")[0]
     assert saved["kind"] == "close" and saved["schema_version"] == 2 and saved["settlement_estimate"] == "100000.12"
-    assert saved["n_close_candidates"] == 6 and saved["close_candidates_agree"] is False
+    assert saved["n_close_candidates"] == 6 and saved["close_candidates_agree"] is True
+    assert saved["n_close_wrong_window"] == 0
     assert "Kalshi settled market" in saved["outcome_source"]
 
 
@@ -775,35 +895,32 @@ def test_adapter_reads_what_the_index_client_writes(tmp_path):
                                              "value": str(Decimal("100000.00") + Decimal(k))}),
                          "avg_60s_data": {"value": "1.00", "window_size": 60,
                                           "window_start_ts_ms": src - 60000, "window_end_ts_exclusive": src}}}
-        store.append(kis.parse_value_message(frame), "cfbenchmarks_value")
+        store.append(kis.parse_value_message(frame), "cfbenchmarks_value", local_receipt_ms=src + 40)
     out = tmp_path / "log"
     clk = lambda: at(w.open_ts + 301.0)
     rec = log_window(out, w, clock=clk, read_ticks=tick_file_reader(tmp_path, clock=clk), read_book=Spy(BOOK))
     assert rec["status"] == "OK" and rec["series_checks"]["n_ticks"] == 301
     assert rec["tick_used"]["brti_raw"] == "100000.00" and rec["tick_used"]["received_at"] == T + 25
     assert rec["tick_used"]["sending_ts_ms"] == T + 30 and rec["tick_used"]["seq"] == 301
+    assert type(rec["tick_used"]["local_receipt_ms"]) is int and rec["tick_used"]["local_receipt_ms"] == T + 40
+    assert rec["tick_used"]["local_receipt_note"] is None
     no_float_lines(out)
 
 
 # ---------------------------------------------------------------- the adapter reads only the span
 
 def _full_scan(folder: Path, a: int, b: int) -> list[dict]:
-    """The reference: every line of every day file the span (widened by the margin) touches, then the same filter."""
-    first = datetime.fromtimestamp((a - L.RECEIPT_MARGIN_MS) // 1000, UTC).date()
-    last = datetime.fromtimestamp((b + L.RECEIPT_MARGIN_MS) // 1000, UTC).date()
-    out, day = [], first
-    while day <= last:
-        path = folder / f"kalshi_index_ticks-{day.isoformat()}.jsonl"
-        if path.is_file():
-            for line in path.read_bytes().split(b"\n"):
-                try:
-                    row = json.loads(line.decode("utf-8", errors="replace"), parse_float=Decimal)
-                except ValueError:
-                    continue
-                tick = L._parse_tick_row(row)
-                if tick is not None and a <= tick.source_ms <= b:
-                    out.append(row)
-        day += timedelta(days=1)
+    """The reference: every line of every day file in the folder, oldest day first, then the same filter."""
+    out = []
+    for path in sorted(folder.glob("kalshi_index_ticks-*.jsonl")):
+        for line in path.read_bytes().split(b"\n"):
+            try:
+                row = json.loads(line.decode("utf-8", errors="replace"), parse_float=Decimal)
+            except ValueError:
+                continue
+            tick = L._parse_tick_row(row)
+            if tick is not None and a <= tick.source_ms <= b:
+                out.append(row)
     return out
 
 
@@ -843,6 +960,8 @@ def _midnight_store(folder: Path, M: int) -> list[dict]:
     rows = [tick_row(M + 1000 * k, seq=k + 2000, recv=M + 1000 * k + rng.choice((20, 900, 1500))) for k in
             range(-1800, 1801)]
     rows.append(tick_row(M - 100, seq=1, recv=M + 50))           # sourced on one day, received on the next
+    rows.append(tick_row(M - 30_500, seq=2, recv=M + 30_501))    # late by 61.001 s, across midnight: never valid
+    rows.append(tick_row(M - 20_500, seq=3, recv=M + 39_500))    # late by exactly 60 s, across midnight: valid
     rows.sort(key=lambda r: r["received_at_ms"])
     shuffled = []
     for i in range(0, len(rows), 60):                            # write order differs from receipt by < 60 s
@@ -869,8 +988,13 @@ def test_backward_reader_matches_the_full_scan(tmp_path, monkeypatch, block):
     clk = lambda: at(M / 1000 + 7200)
     for lo, hi in SPANS:
         got = read_tick_files(tmp_path, M + lo, M + hi, clock=clk)
-        assert got == _full_scan(tmp_path, M + lo, M + hi), (lo, hi)
-    assert len(read_tick_files(tmp_path, M - 300_000, M, clock=clk)) == 302      # 301 ticks plus the late one
+        full = _full_scan(tmp_path, M + lo, M + hi)
+        assert got == full, (lo, hi)
+        assert L._ticks_in(got, M + lo, M + hi) == L._ticks_in(full, M + lo, M + hi), (lo, hi)
+    got = read_tick_files(tmp_path, M - 300_000, M, clock=clk)
+    ticks, counts = L._ticks_in(got, M - 300_000, M)
+    assert len(got) == 304 and counts["n_rows_late"] == 1 and len(ticks) == 303      # 301 + the two valid strays
+    assert M - 20_500 in {t.source_ms for t in ticks} and M - 30_500 not in {t.source_ms for t in ticks}
 
 
 def test_backward_reader_stops_early_and_opens_the_day_before_only_when_needed(tmp_path, counted):
@@ -887,7 +1011,7 @@ def test_backward_reader_stops_early_and_opens_the_day_before_only_when_needed(t
     counted.clear()
     read_tick_files(tmp_path, M + 60_000, M + 100_000, clock=clk)
     read_before = sum(n for p, n in counted if p == before)
-    assert 0 < read_before <= 2 * L.READ_BLOCK_BYTES and read_before < os.path.getsize(before)
+    assert 0 < read_before <= 4 * L.READ_BLOCK_BYTES and read_before < os.path.getsize(before) / 4
 
 
 def test_backward_reader_skips_an_oversized_line(tmp_path, monkeypatch):

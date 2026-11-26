@@ -55,7 +55,8 @@ STALE_MAX_MS = 3_000        # t*_ms - cf_source_ts_ms of the tick used: below 0 
 MIN_TICKS = 270             # fewer valid ticks than this in the series span is SKIP_WARMUP_OR_GAP
 ANCHOR_BACK_MS = 180_000    # a tick is needed within ANCHOR_TOL_MS of t* - 180 s
 ANCHOR_TOL_MS = 3_000
-MAX_GAP_MS = 5_000          # a gap above this between consecutive ticks in the span is SKIP_WARMUP_OR_GAP
+MAX_GAP_MS = 5_000          # a gap above this between consecutive ticks, or at either edge of the span, is a skip
+LATE_MAX_MS = 60_000        # a tick whose Kalshi received_at differs from its source time by more is not valid
 SKIP_STALE_INDEX = "SKIP_STALE_INDEX"
 SKIP_WARMUP_OR_GAP = "SKIP_WARMUP_OR_GAP"
 SKIP_NO_BOOK = "SKIP_NO_BOOK"
@@ -63,7 +64,7 @@ SKIP_NO_BOOK = "SKIP_NO_BOOK"
 # The close record: the settlement estimate from the close tick.
 CLOSE_BEFORE_MS = 60_000    # the close span is [close - 60 s, close + 10 s]
 CLOSE_AFTER_MS = 10_000     # and the close record is refused before close + 10 s, so the span is complete
-CLOSE_WINDOW_SIZE = 60      # the close tick is the first tick whose 15-minute windowed average has window_size 60
+CLOSE_WINDOW_SIZE = 60      # a close candidate: window_size 60 and this quarter's last-minute bounds (see log_close)
 SETTLE_QUANTUM = Decimal("0.01")
 SETTLE_ROUNDING = ROUND_HALF_EVEN
 RECEIPT_MARGIN_MS = 120_000  # receipt time vs source time skew allowed for: which day files to open, and where to stop
@@ -253,14 +254,21 @@ def _parse_tick_row(row: Any) -> _Tick | None:
 
 
 def _ticks_in(rows: Iterable, t_from_ms: int, t_to_ms: int) -> tuple[list[_Tick], dict]:
-    """Valid ticks with source time in [t_from_ms, t_to_ms], one per source time (the first received), in time order."""
-    counts = {"n_rows_read": 0, "n_rows_malformed": 0, "n_rows_outside_span": 0, "n_duplicates_dropped": 0}
+    """Valid ticks with source time in [t_from_ms, t_to_ms], one per source time (the first received), in time order.
+
+    Valid: a well-formed BRTI `cfbenchmarks_value` row whose Kalshi `received_at` is within LATE_MAX_MS of its
+    source time (either way); a row that is not is counted as late and never used.
+    """
+    counts = {"n_rows_read": 0, "n_rows_malformed": 0, "n_rows_late": 0, "n_rows_outside_span": 0,
+              "n_duplicates_dropped": 0}
     kept: list[_Tick] = []
     for row in rows:
         counts["n_rows_read"] += 1
         tick = _parse_tick_row(row)
         if tick is None:
             counts["n_rows_malformed"] += 1
+        elif abs(tick.received_at_ms - tick.source_ms) > LATE_MAX_MS:
+            counts["n_rows_late"] += 1                  # one rule everywhere: a late (or early) tick is never used
         elif not (t_from_ms <= tick.source_ms <= t_to_ms):
             counts["n_rows_outside_span"] += 1
         else:
@@ -353,15 +361,23 @@ def read_tick_files(tick_folder, t_from_ms: int, t_to_ms: int, *, clock: Callabl
     """The tick-store rows whose source time is in [t_from_ms, t_to_ms], in file order, malformed lines skipped.
 
     The files are `<tick_folder>/kalshi_index_ticks-YYYY-MM-DD.jsonl`, one per UTC day of receipt; a missing file is
-    no rows. Only the span is read: each file is read backwards from its end, newest day first, and reading stops at
-    the first block whose rows were all received more than RECEIPT_MARGIN_MS before t_from_ms, so the day before
-    is opened only when the span (less the margin) reaches into it. Files only.
+    no rows. Only the span is read: each file is read backwards from its end, newest day first (from the UTC day of
+    t_to_ms + LATE_MAX_MS + RECEIPT_MARGIN_MS), and reading stops at the first block whose rows were all received
+    before t_from_ms - LATE_MAX_MS - RECEIPT_MARGIN_MS, so the day before is opened only when the span reaches into
+    it. Files only.
+
+    Why this returns every valid tick a full scan would: a valid tick (its received_at within LATE_MAX_MS of its
+    source time) with source time in the span was received in [t_from_ms - LATE_MAX_MS, t_to_ms + LATE_MAX_MS], so
+    it is filed on a day the read covers. If writes are out of receipt order by at most RECEIPT_MARGIN_MS, every row
+    written before the stopping block was received before t_from_ms - LATE_MAX_MS, so it is not such a tick. A late
+    tick is returned when the read reaches it (always, if it is late by no more than LATE_MAX_MS +
+    RECEIPT_MARGIN_MS), and the logger counts it and excludes it.
     """
     _gate(clock)
     _check_folder(tick_folder)
     a, b = _check_span(t_from_ms, t_to_ms)
-    stop_before = a - RECEIPT_MARGIN_MS
-    day = datetime.fromtimestamp((b + RECEIPT_MARGIN_MS) // 1000, timezone.utc).date()
+    stop_before = a - LATE_MAX_MS - RECEIPT_MARGIN_MS
+    day = datetime.fromtimestamp((b + LATE_MAX_MS + RECEIPT_MARGIN_MS) // 1000, timezone.utc).date()
     first = datetime.fromtimestamp(stop_before // 1000, timezone.utc).date()
     per_day: list[list] = []                       # newest day first, each day's rows in file order
     while day >= first:
@@ -477,13 +493,18 @@ def _series_checks(ticks: list[_Tick], t_star_ms: int) -> dict:
     nearest = min(ticks, key=lambda t: abs(t.source_ms - anchor), default=None)
     gaps = [b.source_ms - a.source_ms for a, b in zip(ticks, ticks[1:])]
     max_gap = max(gaps) if gaps else None
+    # the span's start and end count as gaps too (the lead's reading, 2026-11-26)
+    first_gap = ticks[0].source_ms - (t_star_ms - SERIES_SPAN_MS) if ticks else None
+    last_gap = t_star_ms - ticks[-1].source_ms if ticks else None
     count_ok = len(ticks) >= MIN_TICKS
     anchor_ok = nearest is not None and abs(nearest.source_ms - anchor) <= ANCHOR_TOL_MS
-    gap_ok = max_gap is None or max_gap <= MAX_GAP_MS
+    gap_ok = (bool(ticks) and (max_gap is None or max_gap <= MAX_GAP_MS)
+              and first_gap <= MAX_GAP_MS and last_gap <= MAX_GAP_MS)
     return {"n_ticks": len(ticks), "min_ticks": MIN_TICKS, "count_ok": count_ok,
             "anchor_ts_ms": anchor, "anchor_tick_ms": nearest.source_ms if nearest else None,
             "anchor_tol_ms": ANCHOR_TOL_MS, "anchor_ok": anchor_ok,
-            "max_gap_ms": max_gap, "max_gap_allowed_ms": MAX_GAP_MS, "gap_ok": gap_ok,
+            "max_gap_ms": max_gap, "first_gap_ms": first_gap, "last_gap_ms": last_gap,
+            "max_gap_allowed_ms": MAX_GAP_MS, "gap_ok": gap_ok,
             "warm": count_ok and anchor_ok and gap_ok}
 
 
@@ -558,9 +579,12 @@ def log_window(folder, window: Window, *, clock: Callable[[], datetime], read_ti
 def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_ticks: Callable) -> dict:
     """After the close, write the close record: the settlement estimate from the close tick, or None and why.
 
-    The close tick is the first tick (by source time) in [close - 60 s, close + 10 s] whose
-    `last_60s_windowed_average_15min` has window_size 60; the estimate is its value rounded to 2 dp, ROUND_HALF_EVEN.
-    It is an estimate only: the authoritative outcome is Kalshi's settled market, read later, offline.
+    A close candidate is a valid tick in [close - 60 s, close + 10 s] whose `last_60s_windowed_average_15min` is
+    THIS quarter's last minute: window_size 60, window_start_ts_ms == close - 60 s, window_end_ts_exclusive == close.
+    The estimate is the first candidate's value (by source time) rounded to 2 dp, ROUND_HALF_EVEN; if the
+    candidates' values disagree it is None ("close_candidates_disagree": fail closed). A window_size-60 average with
+    other bounds is counted (`n_close_wrong_window`) and never used. It is an estimate only: the authoritative
+    outcome is Kalshi's settled market, read later, offline.
     """
     entered = _gate(clock)
     _check_folder(folder)
@@ -574,15 +598,18 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
     rows, tick_error = _read_rows(read_ticks, window, t_from, t_to)
     written_at = _gate(clock).timestamp()
     ticks, counts = _ticks_in(rows, t_from, t_to)
-    candidates = [t for t in ticks if t.last_15min_avg is not None
-                  and t.last_15min_avg["window_size"] == CLOSE_WINDOW_SIZE]
+    full = [t for t in ticks if t.last_15min_avg is not None and t.last_15min_avg["window_size"] == CLOSE_WINDOW_SIZE]
+    candidates = [t for t in full if t.last_15min_avg["window_start_ts_ms"] == close_ms - CLOSE_BEFORE_MS
+                  and t.last_15min_avg["window_end_ts_exclusive"] == close_ms]
+    agree = len({t.last_15min_avg["value"] for t in candidates}) <= 1
     close_tick = candidates[0] if candidates else None
-    if close_tick is not None:
-        avg = close_tick.last_15min_avg
-        estimate, reason = avg["value"].quantize(SETTLE_QUANTUM, rounding=SETTLE_ROUNDING), None
+    avg = close_tick.last_15min_avg if close_tick is not None else None
+    if close_tick is None:
+        estimate, reason = None, ("tick_reader_error" if tick_error else "no_close_tick")
+    elif not agree:
+        estimate, reason = None, "close_candidates_disagree"
     else:
-        avg, estimate = None, None
-        reason = "tick_reader_error" if tick_error else "no_close_tick"
+        estimate, reason = avg["value"].quantize(SETTLE_QUANTUM, rounding=SETTLE_ROUNDING), None
     record = {
         "kind": "close", "schema_version": SCHEMA_VERSION, "window_ticker": window.window_ticker,
         "close_ts": window.close_ts, "close_ms": close_ms, "written_at": written_at,
@@ -593,8 +620,8 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
             "cf_source_ts_ms": close_tick.source_ms, "received_at": close_tick.received_at_ms,
             "sending_ts_ms": close_tick.sending_ts_ms, "seq": close_tick.seq,
             "local_receipt_ms": close_tick.local_receipt_ms, "last_60s_windowed_average_15min": avg},
-        "n_close_candidates": len(candidates),
-        "close_candidates_agree": len({t.last_15min_avg["value"] for t in candidates}) <= 1,
+        "n_close_candidates": len(candidates), "n_close_wrong_window": len(full) - len(candidates),
+        "close_candidates_agree": agree,
         "outcome_source": "Kalshi settled market (result, expiration_value), read later, offline",
         **counts, "tick_error": tick_error,
     }
