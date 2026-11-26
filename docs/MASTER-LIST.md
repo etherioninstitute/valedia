@@ -677,6 +677,11 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 55 addendum 3 (Carbon file "Valedia_Carbon_Reply55 Add 3.md"; NO reply, Carbon asked none): closes the paper
+  thread. Two of my reply-56 claims CORRECTED by Carbon and checked in the PDFs: MemOnce's 25.0 MB IS in the paper
+  (the 128K-1M blocks of its table and "near-constant 25 MB" in the text; 20.0 MB is the 32K block), and the DCA PDF
+  names ICML in full on page 1 ("Proceedings of the 42nd International Conference on Machine Learning ... PMLR 267,
+  2025"). Carbon confirmed MemOnce names no code repo. No IDEA rule changes. Next reply after Fri 11-27 7:25 AM.
   Round 55 addendum 2 (Carbon file "Valedia_Claude_Reply55 Add 2.md"; reply 56 sent 2026-11-25 ~6:55 PM PST):
   tracker 6/19, clean week 2/5 now unconditional. CORRECTED myself: r55 Q1-Q5 were answered in Carbon's round 55
   (Response53.md; all adopted: 0-order 12-02 counts, 11-25 counts, 300 s, stale_data exclusion, 1.19/1.20 retired);
