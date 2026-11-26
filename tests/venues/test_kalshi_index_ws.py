@@ -18,7 +18,7 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedOK, InvalidStatus
 from websockets.http11 import Response
 
-from valedia_trader.research_loop.btc_updown_logger import ENABLED_FROM, NotYetEnabled
+from valedia_trader.research_loop.btc_updown_logger import ENABLED_FROM, NaiveClock, NotYetEnabled
 from valedia_trader.venues import kalshi_index_ws as kis
 
 KEY_ID = "TEST-KEY-ID"
@@ -896,3 +896,126 @@ def test_a_naive_clock_after_the_gate_still_raises(tmp_path, creds):
         kis.stream(tmp_path / "ticks", clock=clock, connect=FakeConnect([FakeWS([j(value_msg(seq=1))])]),
                    credentials=creds, sleep=Sleeps())
     assert lines(tmp_path) == []
+
+
+class _ClaimsAfter(datetime):
+    """A datetime subclass whose timestamp(), epoch __sub__ and comparisons all claim a day after ENABLED_FROM."""
+    def timestamp(self):
+        return ENABLED_FROM.timestamp() + 86_400.0
+
+    def __sub__(self, other):
+        if isinstance(other, datetime) and other.year == 1970:
+            return (ENABLED_FROM - other) + timedelta(days=1)
+        return datetime.__sub__(self, other)
+
+    def __lt__(self, other): return False
+    def __le__(self, other): return False
+    def __gt__(self, other): return True
+    def __ge__(self, other): return True
+
+
+def _claims_after(true_value):
+    t = true_value.astimezone(UTC)
+    return _ClaimsAfter(t.year, t.month, t.day, t.hour, t.minute, t.second, t.microsecond, tzinfo=UTC)
+
+
+class _LyingTz(datetime):
+    """A datetime subclass that lies through its tzinfo property."""
+    @property
+    def tzinfo(self):
+        return timezone(timedelta(hours=-23))
+
+
+def test_every_lying_subclass_clock_is_refused_at_the_gate_with_no_credential_read_and_no_connect(tmp_path,
+                                                                                                  monkeypatch):
+    liar = _claims_after(ENABLED_FROM - timedelta(seconds=1))                     # truly one second before
+    assert liar.timestamp() > ENABLED_FROM.timestamp() and liar > ENABLED_FROM   # it lies
+    t = AFTER.astimezone(UTC)
+    tz_liar = _LyingTz(t.year, t.month, t.day, t.hour, t.minute, t.second, tzinfo=UTC)
+    reads = []
+    monkeypatch.setattr(kis, "load_credentials", lambda *a, **k: reads.append("default") or pytest.fail("read"))
+    for reading in (liar, _claims_after(AFTER), tz_liar):
+        connect = FakeConnect([FakeWS([])])
+        with pytest.raises(NaiveClock, match="not a subclass"):
+            kis.stream(tmp_path / "ticks", clock=lambda: reading, connect=connect, credentials=None, sleep=Sleeps())
+        with pytest.raises(NaiveClock, match="not a subclass"):
+            kis.stream(tmp_path / "ticks", clock=lambda: reading, connect=connect,
+                       credentials=lambda: reads.append("injected"), sleep=Sleeps())
+        assert connect.calls == []
+    assert reads == [] and not (tmp_path / "ticks").exists()
+
+
+def test_a_subclass_reading_at_receipt_is_refused_and_no_row_is_written(tmp_path, creds):
+    real = StepClock(start=AFTER, step=0.0)
+    readings = iter([real(), real()])                     # the gate and the connect headers read a real datetime
+    clock = lambda: next(readings, _claims_after(AFTER + timedelta(milliseconds=456)))
+    connect = FakeConnect([FakeWS([j(value_msg(seq=1)), KeyboardInterrupt()])])
+    with pytest.raises(NaiveClock, match="not a subclass"):          # connected, then refused at the receipt
+        kis.stream(tmp_path / "ticks", clock=clock, connect=connect, credentials=creds, sleep=Sleeps())
+    assert len(connect.calls) == 1 and lines(tmp_path) == []
+    with pytest.raises(NaiveClock, match="not a subclass"):
+        kis._gate(lambda: _claims_after(AFTER))
+
+
+def test_a_subclass_reading_at_the_deadline_check_is_refused_socket_closed_no_row(tmp_path, creds):
+    real = StepClock(start=AFTER, step=0.0)
+    readings = iter([real(), real(), real()])   # the gate, the loop's deadline check and the headers read a real one
+    clock = lambda: next(readings, _claims_after(AFTER + timedelta(seconds=1)))
+    ws = FakeWS([j(value_msg(seq=1)), KeyboardInterrupt()])
+    connect = FakeConnect([ws])
+    with pytest.raises(NaiveClock, match="not a subclass"):          # the first deadline read, before any recv
+        kis.stream(tmp_path / "ticks", clock=clock, connect=connect, credentials=creds, sleep=Sleeps(),
+                   max_seconds=30.0)
+    assert len(connect.calls) == 1 and ws.closed and lines(tmp_path) == []
+    assert len(ws.script) == 2                                       # refused before recv was ever called
+
+
+def test_every_fake_clock_reading_in_this_file_is_exactly_a_datetime():
+    for reading in (ENABLED_FROM, AFTER, ENABLED_FROM - timedelta(seconds=1), StepClock()()):
+        assert type(reading) is datetime
+
+
+def test_a_subclass_at_any_one_client_reading_is_refused_with_a_clean_close_and_no_row_after_it(tmp_path, creds):
+    def script():
+        return [j(value_msg(seq=1)), j(value_msg(seq=2)), KeyboardInterrupt()]
+
+    def counted(n, folder):
+        real, state = StepClock(start=AFTER, step=0.25), {"calls": 0, "held": []}
+
+        def clock():
+            state["calls"] += 1
+            state["held"].append(len(lines(folder)))
+            now = real()
+            return _claims_after(now) if state["calls"] == n else now
+        return clock, state
+
+    clock, state = counted(0, tmp_path / "normal")
+    ws = FakeWS(script())
+    kis.stream(tmp_path / "normal" / "ticks", clock=clock, connect=FakeConnect([ws]), credentials=creds,
+               sleep=Sleeps(), max_seconds=100.0)
+    n_readings = state["calls"]
+    assert n_readings >= 7 and len(lines(tmp_path / "normal")) == 2 and ws.closed   # gate, deadline, headers, 2x(deadline, receipt)
+    for n in range(1, n_readings + 1):
+        folder = tmp_path / f"bad{n}"
+        clock, state = counted(n, folder)
+        ws, connect = FakeWS(script()), None
+        connect = FakeConnect([ws])
+        with pytest.raises(NaiveClock, match="not a subclass"):
+            kis.stream(folder / "ticks", clock=clock, connect=connect, credentials=creds, sleep=Sleeps(),
+                       max_seconds=100.0)
+        assert state["calls"] == n, n                                     # refused at that reading, none after it
+        assert len(lines(folder)) == state["held"][n - 1], n
+        assert (connect.calls == []) if n <= 3 else ws.closed, n          # gate, loop deadline, headers; then closed
+
+
+def test_the_connect_header_timestamp_is_the_exact_ms_of_the_clock_reading(tmp_path, creds, rsa_key):
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    for i, dt in enumerate((datetime(2026, 12, 5, 12, 0, 0, 987654, tzinfo=UTC),
+                            datetime(2026, 12, 5, 4, 0, 0, 654321, tzinfo=timezone(timedelta(hours=-8))))):
+        _, connect, _ = run(tmp_path / str(i), [FakeWS([])], creds, clock=lambda dt=dt: dt)
+        want = str((dt - epoch) // timedelta(milliseconds=1))
+        h = connect.calls[0][1]["additional_headers"]
+        assert h["KALSHI-ACCESS-TIMESTAMP"] == want
+        rsa_key.public_key().verify(
+            base64.b64decode(h["KALSHI-ACCESS-SIGNATURE"]), f"{want}GET{kis.WS_PATH}".encode(),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
