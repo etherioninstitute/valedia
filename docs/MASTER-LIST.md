@@ -677,6 +677,13 @@ Queued (roadmap):
   dedup to one presidential vote; SEC = signal only; K-4 PDF stamps = effective_from, known_at stays FETCHED; Finnhub
   in its own store file, unlinked on retirement. Qs: proclamation + EO one vote?; weather closure with one authority;
   posted-then-out-of-band stays posted.
+  Round 55 addendum (Carbon response 54, four owner-shared papers; reply 55 sent 2026-11-25 ~6:40 PM PST): tracker
+  unchanged 6/19 (31.6%). DeepCrossAttention rejected; IDEA-1 narrowed (test-slot scratch is on the internal disk and
+  a clone cannot cross volumes; kept: cp -c for SSD-to-SSD copies of quiescent stores only, .backup for stores in use;
+  TTC watch); IDEA-2 counterfactual gate (20/20) adopted for the first route that reads rules or tax text (none today),
+  correcting Carbon's claim of FTS5 inside K-7 (no module uses FTS5); IDEA-3 MemOnce watch outside the knowledge
+  stores. Reported 1.19/1.20 retired and Webull's lack of a sellable-quantity field. Asked: agree on IDEA-1 narrowing
+  and IDEA-2 attachment; r53 Q1-Q4 and r55 Q1-Q5 answered after Friday's 7:25 AM check.
   Reply 54 (no new Carbon round; sent 2026-11-25 ~5 PM PST, Wednesday's readings as promised in reply 53): tracker
   6/19 (31.6%), go-live path 3/11 (27.3%): T65 + p2:collar-miss TICKED at the clean 11-25 7:25 AM check (7:10 run
   journaled 1 late fill, no false alert). Session 2/5 clean (strict gate's first live use: 6:30 OK, 6:55 XLV sell 14,
@@ -1449,6 +1456,16 @@ run beside MiroFish and Elephant-1):
 - **QUEUED** H-1 a second sweep for this list: the 190 long ledger lines and the 445 ticket files one by one.
 - **IDEA** the plugin that keeps tool output out of the session reports a newer version; upgrade when no work
   is in flight.
+- **IDEA** (Carbon r55 addendum, after 12-03) copies of a quiescent store within NIMROD_SSD use `cp -c` (APFS
+  clone, near-zero writes) instead of a byte copy; a store in use is copied with SQLite `.backup`, never cloned.
+  Not for test-slot (its scratch is on the internal disk). TTC (NVIDIA CoW sandboxes): watch for public code, rehearsal
+  and coding sandboxes only.
+- **IDEA** (Carbon r55 addendum) counterfactual gate: the first model route that reads contract rules, regulation or
+  tax text must follow the supplied text on 20 of 20 public-text fixtures with a key rule inverted, before it earns
+  its seat. Text retrieval, if ever built: SQLite FTS5 first, no vector daemon unless FTS5 fails a measured test.
+- **IDEA** (Carbon r55 addendum, after 12-03) MemOnce: once adapter weights are public, test on MLX while the
+  collector is paused against FTS5 retrieval; adopt only if it passes the counterfactual gate with less memory.
+  Never inside K-1, K-3, K-4 or K-7.
 
 ## 13. Waiting on the owner (each by name)
 
