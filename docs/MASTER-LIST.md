@@ -319,8 +319,12 @@ morning. On `main`:
   list 54 -> 56 paths** (added `core/decision_model.py`, `research_loop/decay.py`). Dry checks green at 4:31 AM;
   before about 6:35 AM a dry order step stops at the session check, so the changed code past it is covered by tests
   only (37 files). The old gate files are kept beside the new ones as `*.before-bigrun`.
-- **QUEUED** still open in the batch: the settled-cash SELL cap (needs one recorded answer from Webull first) and the
-  order step's own entry point (it changes what the 6:55 job starts; not a night job).
+- **BUILT + ACCEPTED 11-25 ~9:40 PM, UNMERGED** (branch `fix/c-f`): the settled-cash SELL cap (C 874cace + 76a6493),
+  the order step's own entry point (F 560bc72) and the 300 s quote age (Q2 253b059). Two blind checks
+  PASS_WITH_NOTES, notes fixed; the shortfall stop mutation-checked. The new order-path list is 35 paths
+  (`~/valedia-bigrun/cf/accepted-orderpath-files.new`: +order_step_cli, -22 desk/panel/research). MERGE after the
+  12-01 session: the order-path list + pin, the forecast list (+order_step_cli, staged) + pin, the grading pin
+  (webull.py), and the staged orderstep-paper.sh; then check all six gates.
 - **WATCH** if Webull ever answers EXPIRED (never seen): for an open order the new code books any partial fill, sends
   no cancel for it and may send a new order for the rest; for an order already held as finished it is a reconcile
   anomaly and the run stops (no test covers that second path). The lead to decide whether the second is wanted.
