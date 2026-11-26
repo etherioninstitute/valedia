@@ -1,6 +1,9 @@
 """Offline tests for the read-only Kalshi index websocket client: every connection is an injected fake."""
+import asyncio
 import base64
 import json
+import logging
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -476,10 +479,13 @@ def test_reconnect_after_a_close_and_after_429s_with_exponential_backoff(tmp_pat
     assert [e["kind"] for e in summary["errors"]] == ["connection_closed", "handshake_429", "handshake_429"]
 
 
-def test_backoff_restarts_after_a_connection_that_delivered_data(tmp_path, creds):
-    outcomes = [FakeWS([j(value_msg(seq=1))]), OSError("down"), OSError("down")]
-    _, _, sleeps = run(tmp_path, outcomes, creds)
-    assert sleeps.values == [1.0, 2.0, 4.0]   # the delivered data resets the count; then it doubles
+def test_backoff_restarts_after_every_connection_that_delivered_data(tmp_path, creds):
+    # Three refused handshakes (1, 2, 4), then three connections that each deliver a tick and then close: each of those
+    # closes is a fresh first failure, so the wait is 1 s again. Without the reset it would keep doubling (8, 16, 32).
+    outcomes = [status_error(429)] * 3 + [FakeWS([j(value_msg(seq=1))]) for _ in range(3)]
+    summary, connect, sleeps = run(tmp_path, outcomes, creds)
+    assert sleeps.values == [1.0, 2.0, 4.0, 1.0, 1.0, 1.0]
+    assert summary["ticks"] == 3 and summary["reconnects"] == 6 and len(connect.calls) == 7
 
 
 def test_backoff_doubles_to_a_sixty_second_cap():
@@ -514,6 +520,15 @@ def test_max_seconds_wins_over_a_long_backoff(tmp_path, creds):
     assert all(s <= 3.5 for s in sleeps.values) and len(connect.calls) < 5
 
 
+def test_a_cancellation_closes_the_socket_and_returns_the_summary(tmp_path, creds):
+    # a real Ctrl-C under asyncio.run arrives as a cancellation of the main task, not as KeyboardInterrupt
+    ws = FakeWS([j(value_msg(seq=1)), j(value_msg(seq=2)), asyncio.CancelledError()])
+    summary, connect, sleeps = run(tmp_path, [ws], creds)
+    assert ws.closed and summary["ticks"] == 2 and summary["reconnects"] == 0 and summary["errors"] == []
+    assert len(connect.calls) == 1 and sleeps.values == []
+    assert len(lines(tmp_path)) == 2
+
+
 def test_ctrl_c_closes_cleanly_and_returns_the_summary(tmp_path, creds):
     ws = FakeWS([j(value_msg(seq=1)), KeyboardInterrupt()])
     summary, _, sleeps = run(tmp_path, [ws], creds)
@@ -544,9 +559,15 @@ def test_store_writes_one_line_per_tick_dated_by_utc_received_time(tmp_path, cre
     assert json.loads(rows[0]["data"])["time"] == late - 20
 
 
-def test_store_lives_outside_the_repository(tmp_path):
+def test_store_path_and_line_content(tmp_path):
     store = kis.TickStore(tmp_path / "ticks")
-    assert kis._REPO_ROOT not in store.folder.parents and store.folder != kis._REPO_ROOT
+    assert store.folder == Path(os.path.realpath(tmp_path / "ticks"))
+    tick = kis.parse_value_message(value_msg(with_15min=True))
+    path = store.append(tick, "cfbenchmarks_value")
+    assert path == store.folder / "kalshi_index_ticks-2026-12-05.jsonl"
+    assert path.read_text() == json.dumps(tick.as_json("cfbenchmarks_value"), separators=(",", ":"), sort_keys=True) + "\n"
+    assert json.loads(path.read_text())["last_15min_avg"]["value"] == "67999.50000000"
+    assert kis._REPO_ROOT not in path.parents
 
 
 @pytest.mark.parametrize("where", ["root", "inside", "relative", "empty", "dotdot"])
@@ -653,3 +674,23 @@ def test_cli_defaults_and_refusals(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(kis, "stream", refuse)
     assert kis.main(["stream", "--out-dir", str(tmp_path)]) == 2
     assert "NotYetEnabled" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------------ the live connect never logs the handshake
+
+def test_the_live_connect_passes_a_logger_that_ignores_a_host_wide_debug(monkeypatch):
+    import websockets
+    seen = {}
+    monkeypatch.setattr(websockets, "connect", lambda url, **kw: seen.update(url=url, **kw) or "not-a-connection")
+    names = ["", "websockets", "websockets.client"]
+    old = {n: logging.getLogger(n).level for n in names}
+    try:
+        for n in names:
+            logging.getLogger(n).setLevel(logging.DEBUG)
+        assert kis._default_connect(kis.WS_URL, additional_headers={"X": "y"}) == "not-a-connection"
+        assert seen["url"] == kis.WS_URL and seen["additional_headers"] == {"X": "y"}
+        assert seen["logger"].isEnabledFor(logging.DEBUG) is False
+        assert logging.getLogger("websockets").isEnabledFor(logging.DEBUG) is True    # the host setting was really on
+    finally:
+        for n, level in old.items():
+            logging.getLogger(n).setLevel(level)

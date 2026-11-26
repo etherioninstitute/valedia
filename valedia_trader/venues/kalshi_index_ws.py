@@ -28,6 +28,7 @@ import asyncio
 import base64
 import inspect
 import json
+import logging
 import os
 import random
 import re
@@ -60,6 +61,11 @@ _ACTIONS_WITH_INDICES = frozenset({"subscribe_indices", "unsubscribe_indices"})
 _VALUE_TYPES = frozenset({CHANNEL_VALUE, CHANNEL_VALUE_5HZ})
 _INDEXLIST_TYPES = frozenset({CHANNEL_VALUE + "_indexlist", CHANNEL_VALUE_5HZ + "_indexlist"})
 _INDEX_RE = re.compile(r"[A-Z0-9_]{2,32}")        # matched with fullmatch: `^[A-Z0-9_]{2,32}$` without the newline slip
+
+# websockets logs every handshake header (the key id and the signature) at DEBUG when its logger is enabled for it. The
+# live connection gets this logger instead: its own level is pinned above DEBUG, so no host-wide DEBUG setting reaches it.
+_QUIET_LOGGER = logging.getLogger(__name__ + ".websocket")
+_QUIET_LOGGER.setLevel(logging.WARNING)
 
 STORE_PREFIX = "kalshi_index_ticks-"
 _REPO_ROOT = Path(__file__).resolve().parents[2]   # the folder that holds the `valedia_trader` package
@@ -423,6 +429,7 @@ class _Run:
         self.last_seq: dict[int, int] = {}
         self.signatures: set[str] = set()
         self.done = False
+        self._got_data = False      # did the current (or latest) connection deliver at least one frame?
 
     # -- bookkeeping
     def summary(self) -> dict:
@@ -499,22 +506,22 @@ class _Run:
             self.last_seq[sid] = seq
 
     # -- one connection
-    async def _read(self, ws: Any) -> bool:
-        got = False
+    async def _read(self, ws: Any) -> None:
         while True:
             remaining = self._remaining()
             if remaining is not None and remaining <= 0:
                 self.done = True
-                return got
+                return
             try:
                 async with asyncio.timeout(POLL_S if remaining is None else min(POLL_S, remaining)):
                     raw = await ws.recv()
             except TimeoutError:
                 continue
-            got = True
+            self._got_data = True
             self.handle(raw)
 
-    async def _one_connection(self) -> bool:
+    async def _one_connection(self) -> None:
+        self._got_data = False
         now = self.clock()
         headers = build_headers(self.creds.key_id, self.creds.private_key, int(now.timestamp() * 1000))
         self.signatures.add(headers["KALSHI-ACCESS-SIGNATURE"])
@@ -523,7 +530,7 @@ class _Run:
             ws = await _maybe_await(self.connect(WS_URL, additional_headers=headers))
             self.last_seq = {}
             await send_frame(ws, subscribe_frame(self.channel, self.index_ids))
-            return await self._read(ws)
+            await self._read(ws)
         finally:
             if ws is not None:
                 try:
@@ -541,18 +548,17 @@ class _Run:
             if not first:
                 self.reconnects += 1
             first = False
-            got = False
             try:
-                got = await self._one_connection()
-            except KeyboardInterrupt:
-                break
+                await self._one_connection()
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                break           # Ctrl-C reaches asyncio.run as a cancellation; the socket is already closed
             except StoreError:
                 raise
             except Exception as exc:    # noqa: BLE001 - a close, a refused handshake or a network error: back off and retry
                 self._record_exception(exc)
             if self.done:
                 break
-            failures = 1 if got else failures + 1
+            failures = 1 if self._got_data else failures + 1      # data on this connection restarts the backoff
             delay = backoff_delay(failures)
             remaining = self._remaining()
             if remaining is not None:
@@ -567,7 +573,7 @@ class _Run:
 
 def _default_connect(url: str, **kwargs: Any) -> Any:
     import websockets       # imported only for a live connection
-    return websockets.connect(url, **kwargs)
+    return websockets.connect(url, logger=_QUIET_LOGGER, **kwargs)
 
 
 def stream(folder: Any, *, index_ids: Sequence[str] = ("BRTI",), channel: str = CHANNEL_VALUE,
@@ -592,7 +598,7 @@ def stream(folder: Any, *, index_ids: Sequence[str] = ("BRTI",), channel: str = 
                sleep or asyncio.sleep, start)
     try:
         asyncio.run(run.main())
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     return run.summary()
 
