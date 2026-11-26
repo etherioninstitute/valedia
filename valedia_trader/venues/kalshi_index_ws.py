@@ -175,7 +175,8 @@ def _gate(clock: Callable[[], datetime]) -> datetime:
     now = clock()
     if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
         raise NaiveClock("the clock must return a timezone-aware datetime")
-    if now.timestamp() < ENABLED_FROM.timestamp():
+    # the base class's arithmetic, with the clock's utcoffset trusted (not the clock's own timestamp())
+    if datetime.timestamp(now) < ENABLED_FROM.timestamp():
         raise NotYetEnabled(f"disabled until {ENABLED_FROM.isoformat()}")
     return now
 
@@ -491,7 +492,8 @@ class _Run:
         now = self.clock()
         if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
             raise NaiveClock("the clock must return a timezone-aware datetime")
-        return (now - _EPOCH) // timedelta(milliseconds=1)
+        # the base class's arithmetic, with the clock's utcoffset trusted (not the clock's own __sub__)
+        return datetime.__sub__(now, _EPOCH) // timedelta(milliseconds=1)
 
     # -- one frame in
     def handle(self, raw: Any, local_receipt_ms: int | None = None) -> None:

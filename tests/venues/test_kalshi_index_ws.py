@@ -896,3 +896,44 @@ def test_a_naive_clock_after_the_gate_still_raises(tmp_path, creds):
         kis.stream(tmp_path / "ticks", clock=clock, connect=FakeConnect([FakeWS([j(value_msg(seq=1))])]),
                    credentials=creds, sleep=Sleeps())
     assert lines(tmp_path) == []
+
+
+class _ClaimsAfter(datetime):
+    """A datetime subclass whose timestamp(), epoch __sub__ and comparisons all claim a day after ENABLED_FROM."""
+    def timestamp(self):
+        return ENABLED_FROM.timestamp() + 86_400.0
+
+    def __sub__(self, other):
+        if isinstance(other, datetime) and other.year == 1970:
+            return (ENABLED_FROM - other) + timedelta(days=1)
+        return datetime.__sub__(self, other)
+
+    def __lt__(self, other): return False
+    def __le__(self, other): return False
+    def __gt__(self, other): return True
+    def __ge__(self, other): return True
+
+
+def _claims_after(true_value):
+    t = true_value.astimezone(UTC)
+    return _ClaimsAfter(t.year, t.month, t.day, t.hour, t.minute, t.second, t.microsecond, tzinfo=UTC)
+
+
+def test_the_gate_and_the_receipt_use_the_base_class_arithmetic_not_the_clock_s_own(tmp_path, monkeypatch, creds):
+    liar = _claims_after(ENABLED_FROM - timedelta(seconds=1))                     # truly one second before
+    assert liar.timestamp() > ENABLED_FROM.timestamp() and liar > ENABLED_FROM   # it lies
+    reads, connect = [], FakeConnect([FakeWS([])])
+    monkeypatch.setattr(kis, "load_credentials", lambda *a, **k: reads.append("default") or pytest.fail("read"))
+    with pytest.raises(NotYetEnabled):
+        kis.stream(tmp_path / "ticks", clock=lambda: liar, connect=connect, credentials=None, sleep=Sleeps())
+    with pytest.raises(NotYetEnabled):
+        kis.stream(tmp_path / "ticks", clock=lambda: liar, connect=connect,
+                   credentials=lambda: reads.append("injected"), sleep=Sleeps())
+    assert connect.calls == [] and reads == [] and not (tmp_path / "ticks").exists()
+    # after the gate, the receipt ms of such a clock is its true value
+    true_after = AFTER + timedelta(milliseconds=456)
+    after_liar = _claims_after(true_after)
+    run(tmp_path, [FakeWS([j(value_msg(seq=1)), KeyboardInterrupt()])], creds, clock=lambda: after_liar)
+    want = (true_after - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1)
+    assert (after_liar - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1) != want   # it lies
+    assert lines(tmp_path)[0]["local_receipt_ms"] == want

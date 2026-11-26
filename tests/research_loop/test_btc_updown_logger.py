@@ -315,7 +315,7 @@ def test_record_fields_at_t_star_with_decimals_as_strings(tmp_path):
     assert saved["kind"] == "window" and saved["schema_version"] == 2 == L.SCHEMA_VERSION
     assert saved["window_ticker"] == w.window_ticker
     assert saved["open_ts"] == D(w.open_ts) and saved["close_ts"] == D(w.close_ts)
-    assert saved["t_star"] == D(w.open_ts + 300.0) and saved["t_star_ms"] == T
+    assert saved["t_star"] == str(Decimal(T) / 1000) and saved["t_star_ms"] == T         # exact, from ms
     assert saved["floor_strike"] == "100002.0" and saved["written_at"] == D(w.open_ts + 300.0)
     assert saved["index_id"] == "BRTI" and saved["channel"] == "cfbenchmarks_value"
     assert saved["status"] == "OK" and saved["skip_reasons"] == []
@@ -1142,7 +1142,8 @@ def test_tape_rows_kept_only_inside_the_sixty_seconds(tmp_path):
     assert [r["trade_id"] for r in out["rows"]] == ["t1", "t2", "t3"]
     saved = lines(tmp_path)
     assert len(saved) == 1 and saved[0]["kind"] == "tape" and saved[0]["window_ticker"] == w.window_ticker
-    assert saved[0]["t_from"] == D(w.open_ts + 300.0) and saved[0]["t_to"] == D(w.open_ts + 360.0)
+    T = tstar_ms(w)
+    assert saved[0]["t_from"] == str(Decimal(T) / 1000) and saved[0]["t_to"] == str(Decimal(T + 60_000) / 1000)
     assert saved[0]["written_at"] == D(w.open_ts + 400.0)
     assert saved[0]["n_rows"] == 3 and [p.name for p in tmp_path.iterdir()] == [L.LOG_NAME]
 
@@ -1687,11 +1688,81 @@ def test_a_close_ts_that_is_not_a_plain_whole_millisecond_number_is_refused(tmp_
     for prec in (None, 5):
         for ok, want in ((C, C * 1000), (float(C), C * 1000), (C + 0.001, C * 1000 + 1)):
             if prec is None:
-                got = L._check_window(win(ok))
+                got = L._check_window(win(ok))[1]
             else:
                 with localcontext() as ctx:
                     ctx.prec = prec
-                    got = L._check_window(win(ok))
+                    got = L._check_window(win(ok))[1]
             assert type(got) is int and got == want, (prec, ok)
     rec = log_close(tmp_path, win(C + 0.001), clock=lambda: at(C + 195.0), read_ticks=Spy([]))
     assert rec["close_ms"] == C * 1000 + 1
+
+
+def test_an_int_window_time_beyond_float_range_is_a_value_error_in_every_function(tmp_path):
+    w = window(0)
+    huge = 10 ** 400
+    for open_ts, close_ts in ((huge, w.close_ts), (w.open_ts, huge)):
+        bad = Window(window_ticker=w.window_ticker, open_ts=open_ts, close_ts=close_ts, floor_strike=w.floor_strike)
+        ticks, book, tape = Spy([]), Spy(None), Spy([])
+        with pytest.raises(ValueError):
+            log_window(tmp_path, bad, clock=lambda: EF, read_ticks=ticks, read_book=book)
+        with pytest.raises(ValueError):
+            log_close(tmp_path, bad, clock=lambda: at(w.close_ts + 195.0), read_ticks=ticks)
+        budget = TapeBudget(1)
+        with pytest.raises(ValueError):
+            log_tape(tmp_path, bad, posted=True, read_tape=tape, clock=lambda: EF, budget=budget)
+        assert ticks.calls == book.calls == tape.calls == []
+    assert lines(tmp_path) == []
+
+
+def test_t_star_is_derived_exactly_from_a_whole_ms_open_time(tmp_path):
+    open_ts = 1764000000.123 + (EF.timestamp() - 1764000000.0) // 900 * 900       # a whole-ms open, after the gate
+    open_ms = L._window_ms(open_ts, "open_ts")
+    w = Window(window_ticker="KXBTC15M-TESTMS", open_ts=open_ts, close_ts=open_ts + 900.0, floor_strike=1.0)
+    clock = lambda: at(w.open_ts + 301.0)
+    spy = Spy([])
+    rec = log_window(tmp_path, w, clock=clock, read_ticks=spy, read_book=Spy(None))
+    assert rec["t_star_ms"] == open_ms + 300_000 and spy.calls[0][2] == open_ms + 300_000
+    assert rec["t_star"] == str(Decimal(open_ms + 300_000) / 1000) and rec["t_star"].endswith(".123")
+    # the literal case: open_ts 1764000000.123 gives t* "1764000300.123"
+    assert L._window_ms(1764000000.123, "open_ts") + 300_000 == 1764000300123
+    assert str(L._ms_to_s(1764000300123)) == "1764000300.123"
+    tape = log_tape(tmp_path, w, posted=True, read_tape=Spy([]), clock=clock, budget=TapeBudget(1))
+    assert tape["t_from"] == rec["t_star"] and tape["t_to"] == str(Decimal(open_ms + 360_000) / 1000)
+
+
+class _ClaimsAfter(datetime):
+    """A datetime subclass whose timestamp(), epoch __sub__ and comparisons all claim a day after ENABLED_FROM."""
+    def timestamp(self):
+        return EF.timestamp() + 86_400.0
+
+    def __sub__(self, other):
+        if isinstance(other, datetime) and other.year == 1970:
+            return (EF - other) + timedelta(days=1)
+        return datetime.__sub__(self, other)
+
+    def __lt__(self, other): return False
+    def __le__(self, other): return False
+    def __gt__(self, other): return True
+    def __ge__(self, other): return True
+
+
+def _claims_after(true_value: datetime) -> _ClaimsAfter:
+    t = true_value.astimezone(UTC)
+    return _ClaimsAfter(t.year, t.month, t.day, t.hour, t.minute, t.second, t.microsecond, tzinfo=UTC)
+
+
+def test_the_date_gate_uses_the_base_class_arithmetic_not_the_clock_s_own(tmp_path):
+    liar = _claims_after(EF - ONE_S)                                              # truly one second before
+    assert liar.timestamp() > EF.timestamp() and liar > EF                       # it lies
+    w = window(0)
+    ticks, book, tape = Spy([]), Spy(None), Spy([])
+    with pytest.raises(NotYetEnabled):
+        log_window(tmp_path, w, clock=lambda: liar, read_ticks=ticks, read_book=book)
+    with pytest.raises(NotYetEnabled):
+        log_close(tmp_path, w, clock=lambda: liar, read_ticks=ticks)
+    with pytest.raises(NotYetEnabled):
+        log_tape(tmp_path, w, posted=True, read_tape=tape, clock=lambda: liar, budget=TapeBudget(1))
+    with pytest.raises(NotYetEnabled):
+        read_tick_files(tmp_path, 0, 1, clock=lambda: liar)
+    assert ticks.calls == book.calls == tape.calls == [] and lines(tmp_path) == []

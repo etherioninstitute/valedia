@@ -45,6 +45,8 @@ LOG_NAME = "btc_updown_log.jsonl"
 _REPO_ROOT = Path(__file__).resolve().parents[2]   # the folder that holds the `valedia_trader` package
 T_STAR_OFFSET_S = 300.0     # t* = the window's open + 5 minutes
 TAPE_SPAN_S = 60.0          # the tape is read over [t*, t* + 60 s]
+T_STAR_OFFSET_MS = 300_000  # the same two, in exact ms: every time derived from a window uses these
+TAPE_SPAN_MS = 60_000
 
 # The BRTI input (Carbon round 58, adopted by the lead).
 INDEX_ID = "BRTI"
@@ -153,7 +155,8 @@ def _now(clock: Callable[[], datetime]) -> datetime:
 def _gate(clock: Callable[[], datetime]) -> datetime:
     """ONE clock reading, checked against ENABLED_FROM and returned, so a caller uses the reading it gated on."""
     now = _now(clock)
-    if now.timestamp() < ENABLED_FROM.timestamp():     # epoch seconds: a datetime subclass cannot vote on its own date
+    # the base class's arithmetic, with the clock's utcoffset trusted (not the clock's own timestamp())
+    if datetime.timestamp(now) < ENABLED_FROM.timestamp():
         raise NotYetEnabled(f"disabled until {ENABLED_FROM.isoformat()}")
     return now
 
@@ -198,6 +201,17 @@ def _whole(x: Any) -> int | None:
 
 def _ms(ts_s: float) -> int:
     return int(round(ts_s * 1000))
+
+
+def _clock_us(now: datetime) -> int:
+    """Exact integer microseconds since the epoch: the base class's arithmetic, with the clock's utcoffset trusted."""
+    return datetime.__sub__(now, _EPOCH) // timedelta(microseconds=1)
+
+
+def _ms_to_s(ms: int) -> Decimal:
+    """Exact seconds from exact integer ms (a local context: the caller's cannot change it)."""
+    with localcontext(_TS_CONTEXT):
+        return Decimal(ms) / 1000
 
 
 # ------------------------------------------------------------------ the tick rows
@@ -511,7 +525,8 @@ def _window_ms(ts, name: str) -> int:
     """
     if type(ts) not in (int, float):
         raise ValueError(f"a window's {name} must be an int or a float, got {type(ts).__name__}")
-    if not math.isfinite(ts) or not (0 <= ts <= WINDOW_TS_MAX_S):
+    # an int is range-tested as an int, never converted to float first (10**400 is a ValueError, not an overflow)
+    if (type(ts) is float and not math.isfinite(ts)) or not (0 <= ts <= WINDOW_TS_MAX_S):
         raise ValueError(f"a window's {name} must be finite and in [0, {WINDOW_TS_MAX_S}], got {ts!r}")
     with localcontext(_TS_CONTEXT):
         ms = (Decimal(repr(ts)) if type(ts) is float else Decimal(ts)) * 1000
@@ -520,13 +535,13 @@ def _window_ms(ts, name: str) -> int:
         return int(ms)
 
 
-def _check_window(window: Window) -> int:
-    """Check the window's times; return close_ms, exact."""
+def _check_window(window: Window) -> tuple[int, int]:
+    """Check the window's times; return (open_ms, close_ms), exact."""
     open_ms = _window_ms(window.open_ts, "open_ts")
     close_ms = _window_ms(window.close_ts, "close_ts")
     if close_ms <= open_ms:
         raise ValueError("a window must open before it closes")
-    return close_ms
+    return open_ms, close_ms
 
 
 def _read_rows(read_ticks: Callable, window: Window, t_from_ms: int, t_to_ms: int) -> tuple[list, str | None]:
@@ -588,11 +603,11 @@ def log_window(folder, window: Window, *, clock: Callable[[], datetime], read_ti
     _check_folder(folder)
     if not callable(read_ticks) or not callable(read_book):
         raise ValueError("read_ticks and read_book must be callables")
-    _check_window(window)
-    if entered.timestamp() >= window.close_ts:
+    open_ms, close_ms = _check_window(window)
+    if _clock_us(entered) >= close_ms * 1000:
         raise LateWindow(f"{window.window_ticker} is already closed")
-    t_star = window.open_ts + T_STAR_OFFSET_S
-    t_star_ms = _ms(t_star)
+    t_star_ms = open_ms + T_STAR_OFFSET_MS         # exact ints from the window's exact times
+    t_star = _ms_to_s(t_star_ms)
     span_from_ms = t_star_ms - SERIES_SPAN_MS
 
     rows, tick_error = _read_rows(read_ticks, window, span_from_ms, t_star_ms)
@@ -603,8 +618,9 @@ def log_window(folder, window: Window, *, clock: Callable[[], datetime], read_ti
     except Exception as exc:
         book, book_error = None, f"{type(exc).__name__}: {exc}"
 
-    written_at = _gate(clock).timestamp()          # one reading: gated on, checked against the close, and stamped
-    if written_at >= window.close_ts:
+    written = _gate(clock)                         # one reading: gated on, checked against the close, and stamped
+    written_at = datetime.timestamp(written)
+    if _clock_us(written) >= close_ms * 1000:
         raise LateWindow(f"{window.window_ticker} closed before its record could be written")
 
     ticks, counts = _ticks_in(rows, span_from_ms, t_star_ms)
@@ -645,15 +661,13 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
     _check_folder(folder)
     if not callable(read_ticks):
         raise ValueError("read_ticks must be a callable")
-    close_ms = _check_window(window)               # exact, from the same Decimal the check used
-    # exact integer microseconds: the subtraction and the comparison are the base class's, not the clock's; the
-    # clock's utcoffset is still trusted, as in the date gate
-    elapsed_us = datetime.__sub__(entered, _EPOCH) // timedelta(microseconds=1)
-    if elapsed_us < (close_ms + CLOSE_WAIT_MS) * 1000:
+    _, close_ms = _check_window(window)            # exact, from the same Decimal the check used
+    # exact integer microseconds: the base class's arithmetic, with the clock's utcoffset trusted
+    if _clock_us(entered) < (close_ms + CLOSE_WAIT_MS) * 1000:
         raise CloseNotReached(f"{window.window_ticker}: the close record waits until close + {CLOSE_WAIT_MS} ms")
     t_from, t_to = close_ms - CLOSE_BEFORE_MS, close_ms + CLOSE_AFTER_MS
     rows, tick_error = _read_rows(read_ticks, window, t_from, t_to)
-    written_at = _gate(clock).timestamp()
+    written_at = datetime.timestamp(_gate(clock))
     conflicting: list[_Tick] = []
     ticks, counts = _ticks_in(rows, t_from, t_to, conflicting)
 
@@ -713,19 +727,20 @@ def log_tape(folder, window: Window, *, posted: bool, read_tape: Callable, clock
         return None
     if not callable(read_tape):
         raise ValueError("read_tape must be a callable")
-    _check_window(window)
-    if entered.timestamp() >= window.close_ts:
+    open_ms, close_ms = _check_window(window)
+    if _clock_us(entered) >= close_ms * 1000:
         raise LateWindow(f"{window.window_ticker} is already closed")
     budget.take()
-    t_from = window.open_ts + T_STAR_OFFSET_S
-    t_to = t_from + TAPE_SPAN_S
+    t_star_ms = open_ms + T_STAR_OFFSET_MS
+    t_from, t_to = _ms_to_s(t_star_ms), _ms_to_s(t_star_ms + TAPE_SPAN_MS)   # exact: the filter below compares these
     tape_error = None
     try:
-        raw = list(read_tape(window, t_from, t_to) or ())
+        raw = list(read_tape(window, float(t_from), float(t_to)) or ())       # the reader is asked in float seconds
     except Exception as exc:
         raw, tape_error = [], f"{type(exc).__name__}: {exc}"
-    written_at = _gate(clock).timestamp()          # one reading: gated on, checked against the close, and stamped
-    if written_at >= window.close_ts:
+    written = _gate(clock)                         # one reading: gated on, checked against the close, and stamped
+    written_at = datetime.timestamp(written)
+    if _clock_us(written) >= close_ms * 1000:
         raise LateWindow(f"{window.window_ticker} closed before its tape could be written")
     rows = [r for r in raw if isinstance(r, dict) and _num(r.get("created_ts")) is not None
             and t_from <= r["created_ts"] <= t_to]
