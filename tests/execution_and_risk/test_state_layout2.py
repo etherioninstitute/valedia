@@ -932,7 +932,7 @@ def test_prop_every_refusal_leaves_the_folder_and_every_file_as_they_were(tmp_pa
 
 def test_the_order_step_without_the_owner_flag_is_called_as_before(tmp_path, monkeypatch):
     seen = []
-    monkeypatch.setattr(cli, "_order_step_build", lambda: seen.append("built") or None)
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_build", lambda: seen.append("built") or None)
     assert cli.main(["--root", str(tmp_path), "order-step"]) == 2
     assert seen == ["built"]
     monkeypatch.setattr(osx, "owner_entry_command", lambda *a, **k: seen.append("owner") or 0)

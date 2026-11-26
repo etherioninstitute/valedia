@@ -183,8 +183,8 @@ def order_step_project(tmp_path, monkeypatch):
         "last_day": "2026-11-12", "realized": {}, "panel_cases": []}))
     venue = _Venue()
     now = pd.Timestamp("2026-11-13 10:00", tz="America/New_York").timestamp()
-    monkeypatch.setattr(cli, "_order_step_venue", lambda: venue)
-    monkeypatch.setattr(cli, "_order_step_environment", lambda environ=None: "sandbox", raising=False)   # never the secrets file
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_venue", lambda: venue)
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_environment", lambda environ=None: "sandbox", raising=False)   # never the secrets file
     monkeypatch.setattr(order_step, "wall_clock", lambda: now)
     monkeypatch.setattr(order_step, "minute_quotes", lambda symbols: {s: (500.0, now - 60) for s in symbols})
     monkeypatch.setattr(risk_gate, "HALT_FILE", tmp_path / "no-halt.json")
@@ -217,8 +217,8 @@ def test_order_step_refuses_production_before_any_venue_call(order_step_project,
 def test_order_step_refuses_a_configured_environment_other_than_the_sandbox_before_building_anything(
         order_step_project, monkeypatch, capsys, configured):
     root, venue = order_step_project
-    monkeypatch.setattr(cli, "_order_step_environment", lambda environ=None: configured)
-    monkeypatch.setattr(cli, "_order_step_venue", lambda: pytest.fail("a venue was built"))
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_environment", lambda environ=None: configured)
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_venue", lambda: pytest.fail("a venue was built"))
     before = sorted(p.relative_to(root) for p in root.rglob("*"))
     assert cli.main(["--root", str(root), "order-step"]) == 2
     captured = capsys.readouterr()
@@ -241,8 +241,8 @@ def test_order_step_ends_with_one_plain_line_when_the_secrets_file_cannot_be_loa
             raise secrets.SecretError("/somewhere/trading.env is readable by group or others; WEBULL_APP_SECRET=Zq-from-the-file")
         raise UnicodeDecodeError("utf-8", b"Zq-from-the-file", 0, 1, "invalid start byte")
     monkeypatch.setattr(secrets, "load_env", load_env)
-    monkeypatch.setattr(cli, "_order_step_environment", REAL_ORDER_STEP_ENVIRONMENT)
-    monkeypatch.setattr(cli, "_order_step_venue", lambda: pytest.fail("a venue was built"))
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_environment", REAL_ORDER_STEP_ENVIRONMENT)
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_venue", lambda: pytest.fail("a venue was built"))
     before = sorted(p.relative_to(root) for p in root.rglob("*"))
     assert cli.main(["--root", str(root), "order-step"]) == 2
     captured = capsys.readouterr()
@@ -265,7 +265,7 @@ def test_order_step_ends_with_one_plain_line_and_creates_nothing_when_the_venue_
         if error == "webull":
             raise WebullError("could not open a session for account Zq-file in /somewhere/trading.env")
         raise PermissionError(13, "Permission denied", "/somewhere/trading.env")
-    monkeypatch.setattr(cli, "_order_step_venue", build)
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_venue", build)
     before = sorted(p.relative_to(root) for p in root.rglob("*"))
     assert cli.main(["--root", str(root), "order-step"]) == 2
     captured = capsys.readouterr()
@@ -277,7 +277,7 @@ def test_order_step_ends_with_one_plain_line_and_creates_nothing_when_the_venue_
 
 def test_order_step_lets_a_programming_error_in_building_the_venue_through(order_step_project, monkeypatch):
     root, venue = order_step_project
-    monkeypatch.setattr(cli, "_order_step_venue", lambda: (_ for _ in ()).throw(TypeError("a bug")))
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_venue", lambda: (_ for _ in ()).throw(TypeError("a bug")))
     with pytest.raises(TypeError):
         cli.main(["--root", str(root), "order-step"])
 
@@ -285,7 +285,7 @@ def test_order_step_lets_a_programming_error_in_building_the_venue_through(order
 @pytest.mark.parametrize("error", [RuntimeError, ValueError, KeyError, LookupError, ZeroDivisionError])
 def test_order_step_lets_every_error_but_webull_secrets_and_os_errors_through(order_step_project, monkeypatch, capsys, error):
     root, venue = order_step_project                                     # rev 6 outcome 4
-    monkeypatch.setattr(cli, "_order_step_venue", lambda: (_ for _ in ()).throw(error("a bug")))
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_venue", lambda: (_ for _ in ()).throw(error("a bug")))
     with pytest.raises(error):
         cli.main(["--root", str(root), "order-step"])
     assert "refused:" not in capsys.readouterr().err
@@ -362,7 +362,7 @@ def _class_run(root, monkeypatch, capsys, value, built):
         monkeypatch.delenv("WEBULL_ACCOUNT_CLASS")
     else:
         monkeypatch.setenv("WEBULL_ACCOUNT_CLASS", value)
-    monkeypatch.setattr(cli, "_order_step_venue", REAL_ORDER_STEP_VENUE)
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_venue", REAL_ORDER_STEP_VENUE)
     monkeypatch.setattr(webull.WebullVenue, "from_secrets", classmethod(lambda cls, *a, **k: built.append(1) or _Venue()))
     before = _tree(root)
     code = cli.main(["--root", str(root), "order-step"])
@@ -582,9 +582,9 @@ def live_project(order_step_project, monkeypatch, capsys):
     _followed_book(root)                                    # T32: live mode follows only what broker_book.json names
     venue = _LiveVenue()
     built, asked = [], []
-    monkeypatch.setattr(cli, "_live_environ", lambda: dict(LIVE_KEYS))             # never the secrets file
-    monkeypatch.setattr(cli, "_order_step_live_venue", lambda files, environ: built.append(files) or venue)
-    monkeypatch.setattr(cli, "_attended", lambda: True)                              # T50: a person at a terminal
+    monkeypatch.setattr(cli.order_step_cli, "_live_environ", lambda: dict(LIVE_KEYS))             # never the secrets file
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_live_venue", lambda files, environ: built.append(files) or venue)
+    monkeypatch.setattr(cli.order_step_cli, "_attended", lambda: True)                              # T50: a person at a terminal
     monkeypatch.setattr(second_quote, "second_opinion",
                         lambda price, symbol, **kw: asked.append(symbol) or {"verdict": "agree"})
     monkeypatch.setattr(webull, "ny_date", lambda t=None: date(2026, 11, 13))
@@ -623,7 +623,7 @@ def _tree(root):
                                   ["--live", "--check", "--fractional"]])       # T51 B repair2: as at 4db3192, never ignored
 def test_live_flags_that_cannot_run_are_refused_before_anything_is_read(live_project, monkeypatch, capsys, argv):
     root, venue, built, asked = live_project
-    monkeypatch.setattr(cli, "_live_environ", lambda: pytest.fail("the environment was loaded"))
+    monkeypatch.setattr(cli.order_step_cli, "_live_environ", lambda: pytest.fail("the environment was loaded"))
     before = _tree(root)
     assert cli.main(["--root", str(root), "order-step", *argv]) == 2
     err = capsys.readouterr().err
@@ -801,7 +801,7 @@ def test_the_live_venue_is_built_only_for_production_and_the_cash_account_with_t
 
 def test_a_paper_order_step_never_enters_live_mode(order_step_project, monkeypatch):
     root, venue = order_step_project
-    monkeypatch.setattr(cli, "live_order_step_command", lambda *a, **k: pytest.fail("live mode was entered"))
+    monkeypatch.setattr(cli.order_step_cli, "live_order_step_command", lambda *a, **k: pytest.fail("live mode was entered"))
     assert cli.main(["--root", str(root), "order-step"]) == 0
 
 
@@ -811,9 +811,9 @@ def test_a_paper_order_step_never_enters_live_mode(order_step_project, monkeypat
 
 def _no_reads(monkeypatch):
     from valedia_trader.execution_and_risk import go_live
-    monkeypatch.setattr(cli, "_live_environ", lambda: pytest.fail("the environment was loaded"))
+    monkeypatch.setattr(cli.order_step_cli, "_live_environ", lambda: pytest.fail("the environment was loaded"))
     monkeypatch.setattr(go_live, "judge_locks", lambda *a, **k: pytest.fail("an owner's file or the journal was read"))
-    monkeypatch.setattr(cli, "_order_step_live_venue", lambda *a, **k: pytest.fail("a venue was built"))
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_live_venue", lambda *a, **k: pytest.fail("a venue was built"))
 
 
 @pytest.mark.parametrize("argv", [["--live", "--shared", "--propose"], ["--live", "--shared", "--approve", "123456"],
@@ -847,7 +847,7 @@ def test_without_live_a_root_elsewhere_is_untouched(order_step_project, monkeypa
     from valedia_trader.venues import webull
     root, venue = order_step_project
     monkeypatch.setattr(webull, "LIVE_REPO", tmp_path_factory.mktemp("repo"), raising=False)
-    monkeypatch.setattr(cli, "live_order_step_command", lambda *a, **k: pytest.fail("live mode was entered"))
+    monkeypatch.setattr(cli.order_step_cli, "live_order_step_command", lambda *a, **k: pytest.fail("live mode was entered"))
     assert cli.main(["--root", str(root), "order-step"]) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "done" and venue.book
 
@@ -884,7 +884,7 @@ def test_nothing_a_caller_passes_opens_live_mode_with_every_owner_file_met_in_an
         monkeypatch.setenv(name, value)
     monkeypatch.chdir(other)
     env = {**LIVE_KEYS, **every}
-    monkeypatch.setattr(cli, "_live_environ", lambda: env)
+    monkeypatch.setattr(cli.order_step_cli, "_live_environ", lambda: env)
     before = _tree(other), _tree(repo)
     sent = []
 
@@ -961,7 +961,7 @@ def _capture_run_live(monkeypatch):
         seen.append(paths)
         return real(args, paths, venue, files, second_opinion)
 
-    monkeypatch.setattr(cli, "_run_live", capture)
+    monkeypatch.setattr(cli.order_step_cli, "_run_live", capture)
     return seen
 
 
@@ -1277,7 +1277,7 @@ def _secrets_watch(monkeypatch):
     from valedia_trader.core import secrets
     from valedia_trader.venues import webull
     seen = {"secret": [], "load_env": [], "from_secrets": [], "client": []}
-    monkeypatch.setattr(cli, "_order_step_live_venue", REAL_LIVE_VENUE)               # the command's own builder
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_live_venue", REAL_LIVE_VENUE)               # the command's own builder
     monkeypatch.setattr(secrets, "secret", lambda name, *a, **k: seen["secret"].append(name) or "x" * 16)
     monkeypatch.setattr(secrets, "load_env", lambda *a, **k: seen["load_env"].append(1) or [])
     monkeypatch.setattr(secrets, "read_live_pair", lambda *a, **k: seen["secret"].append("live file") or ("x" * 16,) * 2)
@@ -1381,7 +1381,7 @@ def test_t32_rev2_the_reading_function_refuses_a_strategy_without_a_plain_name(f
         odd = Odd()
         odd.name = name
         return odd, f
-    monkeypatch.setattr(cli, "_strategy_for", loaded)
+    monkeypatch.setattr(cli.order_step_cli, "_strategy_for", loaded)
     _book_file(root, {"follow": [26]})
     f = cli.broker_book_follow(cli.LoopPaths(root))
     assert f.refused == "config/broker_book.json names hypothesis 26, whose strategy has no plain name", f
@@ -2551,8 +2551,8 @@ def test_t50_attended_means_a_terminal_on_standard_input(monkeypatch):
 def test_t50_live_mode_needs_a_terminal_for_every_live_command_check_included(live_project, monkeypatch, capsys):
     import argparse as ap
     root, venue, built, asked = live_project
-    monkeypatch.setattr(cli, "_attended", lambda: False)
-    monkeypatch.setattr(cli, "_live_environ", lambda: pytest.fail("the environment was loaded"))
+    monkeypatch.setattr(cli.order_step_cli, "_attended", lambda: False)
+    monkeypatch.setattr(cli.order_step_cli, "_live_environ", lambda: pytest.fail("the environment was loaded"))
     before = _tree(root)
     for argv in LIVE_RUNS:
         assert cli.main(["--root", str(root), "order-step", *argv]) == 2
@@ -2571,7 +2571,7 @@ def test_t50_live_mode_needs_a_terminal_for_every_live_command_check_included(li
 def test_t50_live_mode_refuses_an_ordinary_environment_value_other_than_the_practice_one(live_project, monkeypatch, capsys,
                                                                                          word):
     root, venue, built, asked = live_project
-    monkeypatch.setattr(cli, "_live_environ", lambda: {**LIVE_KEYS, "WEBULL_ENV": word})
+    monkeypatch.setattr(cli.order_step_cli, "_live_environ", lambda: {**LIVE_KEYS, "WEBULL_ENV": word})
     before = _tree(root)
     for argv in LIVE_RUNS:
         assert cli.main(["--root", str(root), "order-step", *argv]) == 2
@@ -2584,7 +2584,7 @@ def test_t50_live_mode_refuses_an_ordinary_environment_value_other_than_the_prac
                                  {**LIVE_KEYS, "WEBULL_ENV": " Sandbox "}])
 def test_t50_live_mode_takes_a_missing_environment_value_as_the_practice_one(live_project, monkeypatch, capsys, env):
     root, venue, built, asked = live_project
-    monkeypatch.setattr(cli, "_live_environ", lambda: dict(env))
+    monkeypatch.setattr(cli.order_step_cli, "_live_environ", lambda: dict(env))
     assert cli.main(["--root", str(root), "order-step", "--live", "--check"]) == 0
     assert len(built) == 1
 
@@ -2593,7 +2593,7 @@ def test_t50_live_mode_takes_a_missing_environment_value_as_the_practice_one(liv
 def test_t50_live_mode_refuses_a_live_name_in_the_ordinary_file_or_the_process_environment(live_project, monkeypatch, capsys,
                                                                                            name):
     root, venue, built, asked = live_project
-    monkeypatch.setattr(cli, "_live_environ", lambda: {**LIVE_KEYS, name: T50_SECRET})
+    monkeypatch.setattr(cli.order_step_cli, "_live_environ", lambda: {**LIVE_KEYS, name: T50_SECRET})
     before = _tree(root)
     for argv in LIVE_RUNS:
         assert cli.main(["--root", str(root), "order-step", *argv]) == 2
@@ -2606,7 +2606,7 @@ def test_t50_live_mode_refuses_a_live_name_in_the_ordinary_file_or_the_process_e
 def test_t50_live_mode_loads_the_ordinary_file_and_refuses_production_or_a_live_name_found_there(live_project, monkeypatch,
                                                                                                 capsys, tmp_path):
     root, venue, built, asked = live_project
-    monkeypatch.setattr(cli, "_live_environ", REAL_LIVE_ENVIRON)
+    monkeypatch.setattr(cli.order_step_cli, "_live_environ", REAL_LIVE_ENVIRON)
     base = "ALPACA_API_KEY=a\nALPACA_SECRET_KEY=b\nFINNHUB_API_KEY=c\n"
     _t50_ordinary_file(tmp_path, monkeypatch, base + "WEBULL_ENV=production\n")
     assert cli.main(["--root", str(root), "order-step", "--live", "--check"]) == 2
@@ -2649,7 +2649,7 @@ def test_t50_a_live_value_never_reaches_stdout_stderr_the_journal_an_exception_o
         seen.append(secrets.read_live_pair(live) == (T50_KEY, T50_SECRET))
         return leaky
 
-    monkeypatch.setattr(cli, "_order_step_live_venue", build)
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_live_venue", build)
     codes = [cli.main(["--root", str(root), "order-step", "--live", "--check"]),
              cli.main(["--root", str(root), "order-step", "--live", "--shared", "--propose"])]
     captured = capsys.readouterr()
@@ -2674,7 +2674,7 @@ def test_t50_the_practice_order_step_refuses_a_live_name_in_the_process_environm
                                                                                     tmp_path, name, argv):
     root, venue = order_step_project
     _t50_no_live_file_read(monkeypatch, tmp_path)
-    monkeypatch.setattr(cli, "_order_step_venue", lambda: pytest.fail("a venue was built"))
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_venue", lambda: pytest.fail("a venue was built"))
     monkeypatch.setenv(name, T50_SECRET)
     before = _tree(root)
     assert cli.main(["--root", str(root), "order-step", *argv]) == 2
@@ -2691,7 +2691,7 @@ def test_t50_the_practice_order_step_refuses_a_live_name_in_the_ordinary_file(or
     _t50_no_live_file_read(monkeypatch, tmp_path)
     _t50_ordinary_file(tmp_path, monkeypatch, f"WEBULL_ACCOUNT_CLASS=INDIVIDUAL_CASH\n{name}={T50_SECRET}\n")
     built = []
-    monkeypatch.setattr(cli, "_order_step_venue", REAL_ORDER_STEP_VENUE)
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_venue", REAL_ORDER_STEP_VENUE)
     from valedia_trader.venues import webull
     monkeypatch.setattr(webull.WebullVenue, "from_secrets", classmethod(lambda cls, *a, **k: built.append(1) or _Venue()))
     before = _tree(root)
@@ -2716,8 +2716,8 @@ def test_t50_the_practice_order_step_runs_beside_a_live_file_it_never_opens(orde
                                    ["--propos"], ["--prop"], ["--approv", "1"], ["--capit", "100"], ["--fraction"],
                                    ["--live", "--propose", "--fractiona"]])
 def test_t50_a3_the_order_step_accepts_no_abbreviation_of_any_flag(tmp_path, monkeypatch, capsys, flags):
-    monkeypatch.setattr(cli, "live_order_step_command", lambda *a, **k: pytest.fail("live mode ran"))
-    monkeypatch.setattr(cli, "_order_step_build", lambda *a, **k: pytest.fail("the order step ran"))
+    monkeypatch.setattr(cli.order_step_cli, "live_order_step_command", lambda *a, **k: pytest.fail("live mode ran"))
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_build", lambda *a, **k: pytest.fail("the order step ran"))
     with pytest.raises(SystemExit) as exc:
         cli.main(["--root", str(tmp_path), "order-step", *flags])
     assert exc.value.code == 2 and "unrecognized arguments" in capsys.readouterr().err
@@ -2725,8 +2725,8 @@ def test_t50_a3_the_order_step_accepts_no_abbreviation_of_any_flag(tmp_path, mon
 
 
 def test_t50_a3_the_command_lines_own_flags_take_no_abbreviation_either(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(cli, "live_order_step_command", lambda *a, **k: pytest.fail("live mode ran"))
-    monkeypatch.setattr(cli, "_order_step_build", lambda *a, **k: pytest.fail("the order step ran"))
+    monkeypatch.setattr(cli.order_step_cli, "live_order_step_command", lambda *a, **k: pytest.fail("live mode ran"))
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_build", lambda *a, **k: pytest.fail("the order step ran"))
     with pytest.raises(SystemExit) as exc:
         cli.main(["--ro", str(tmp_path), "order-step", "--live"])
     assert exc.value.code == 2

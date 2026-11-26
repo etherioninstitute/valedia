@@ -1602,7 +1602,7 @@ class _EnvWatch:
 
 def _entry_order_step(root, watch, monkeypatch):
     from valedia_trader.research_loop import cli
-    monkeypatch.setattr(cli, "_order_step_venue", watch.stand_in("the order step's venue builder"))
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_venue", watch.stand_in("the order step's venue builder"))
     return cli.main(["--root", str(root), "order-step"]) == 2
 
 

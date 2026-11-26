@@ -189,7 +189,7 @@ def test_the_command_line_refuses_live_without_shared_before_anything_is_made(tm
 def test_the_live_command_hands_the_run_shared_and_no_capital_and_prints_a_shared_approve(tmp_path, monkeypatch, capsys):
     seen = {}
     monkeypatch.setattr(osx, "run_order_step", lambda **kw: (seen.update(kw), {"status": "done", "ticket_number": "123456"})[1])
-    monkeypatch.setattr(cli, "broker_book_follow", lambda *a, **k: "FOLLOW")
+    monkeypatch.setattr(cli.order_step_cli, "broker_book_follow", lambda *a, **k: "FOLLOW")
     paths = cli.LoopPaths(tmp_path)
     paths.ensure()
     assert cli._run_live(ns(live=True, shared=True, propose=True), paths, T.LiveVenue(), "FILES", None) == 0

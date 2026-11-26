@@ -761,7 +761,7 @@ def test_the_command_lines_shared_flag_reaches_the_run_and_is_refused_where_it_c
         "pending": [], "history": [{"day": "2026-11-12", "equity": 100_000.0, "capital_per_strategy": 100_000.0}],
         "peak_equity": 100_000.0, "last_day": "2026-11-12", "realized": {}, "panel_cases": []}))
     venue, now = T.Booked(), T.ny("2026-11-13 10:00")
-    monkeypatch.setattr(cli, "_order_step_build", lambda: venue)
+    monkeypatch.setattr(cli.order_step_cli, "_order_step_build", lambda: venue)
     monkeypatch.setattr(osx, "wall_clock", lambda: now)
     monkeypatch.setattr(osx, "minute_quotes", lambda symbols: {s: (500.0, now - 60) for s in symbols})
     monkeypatch.setattr(risk_gate, "HALT_FILE", tmp_path / "no-halt.json")
