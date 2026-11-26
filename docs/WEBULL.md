@@ -798,7 +798,8 @@ skipped; a fault is a fault):
    row at a run's first look, set again at each later look when it changed (as the equity row is) and after the last
    reconcile, so the next run has the marks of what this one bought.
 10. *Purchases* spend at most the smallest of the account's cash, its settled cash and the BOOK's own usable cash (its
-    cash less the proceeds of its sales that are unsettled today), each less the 1% kept; a purchase left over because
+    cash less the proceeds of its sales that are unsettled today: a sale settles on the first day after its trade date
+    that is both an exchange session and a settlement day), each less the 1% kept; a purchase left over because
     of the book's own bound says so ("the book's usable cash", `shared`; the account may hold more).
     `broker_equity` in a shared summary is the book's value (lower bound), not the account's.
 
