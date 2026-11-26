@@ -158,7 +158,7 @@ def _gate(clock: Callable[[], datetime]) -> datetime:
     """ONE clock reading, checked against ENABLED_FROM and returned, so a caller uses the reading it gated on."""
     now = _now(clock)
     # the base class's arithmetic, with the clock's utcoffset trusted (not the clock's own timestamp())
-    if datetime.timestamp(now) < ENABLED_FROM.timestamp():
+    if datetime.timestamp(now) < datetime.timestamp(ENABLED_FROM):
         raise NotYetEnabled(f"disabled until {ENABLED_FROM.isoformat()}")
     return now
 
@@ -563,9 +563,14 @@ def _check_window(window: Window) -> tuple[int, int]:
     return open_ms, close_ms
 
 
+_CLOCK_FAULTS = (NaiveClock, NotYetEnabled)   # raised by a reader that reads the clock: never turned into a record
+
+
 def _read_rows(read_ticks: Callable, window: Window, t_from_ms: int, t_to_ms: int) -> tuple[list, str | None]:
     try:
         return list(read_ticks(window, t_from_ms, t_to_ms) or ()), None
+    except _CLOCK_FAULTS:                         # a clock refused inside the reader is a refusal, not a reader error
+        raise
     except Exception as exc:                      # a failed reader is a skipped window, never a lost one
         return [], f"{type(exc).__name__}: {exc}"
 
@@ -634,6 +639,8 @@ def log_window(folder, window: Window, *, clock: Callable[[], datetime], read_ti
     try:
         raw_book = read_book(window.window_ticker)
         book = None if raw_book is None else _book_record(raw_book)
+    except _CLOCK_FAULTS:
+        raise
     except Exception as exc:
         book, book_error = None, f"{type(exc).__name__}: {exc}"
 
@@ -739,9 +746,9 @@ def log_tape(folder, window: Window, *, posted: bool, read_tape: Callable, clock
 
     Not posted: no read, no budget spent, nothing written (returns None). Posted: one budgeted read, and a
     refusal once the budget is used up. The logger does not decide whether an order was posted.
-    Counts: `n_rows` is the rows kept (== len(rows)); `n_tape_rows_malformed` is the rows skipped as malformed (not
-    a dict, or a created_ts that is not an exact-type int or float, finite and in range). The record has no
-    rows-read count, so it states no read identity; a well-formed row outside [t*, t* + 60 s] is not counted.
+    Counts: every row the reader returns is counted in exactly one field, so the record reconciles from its own fields:
+    n_tape_rows_read == n_rows (kept, == len(rows)) + n_tape_rows_outside_span + n_tape_rows_malformed (not a dict,
+    or a created_ts that is not an exact-type int or float, finite and in range). A failed read is 0 rows read.
     """
     entered = _gate(clock)
     _check_folder(folder)
@@ -758,13 +765,15 @@ def log_tape(folder, window: Window, *, posted: bool, read_tape: Callable, clock
     tape_error = None
     try:
         raw = list(read_tape(window, float(t_from), float(t_to)) or ())       # the reader is asked in float seconds
+    except _CLOCK_FAULTS:
+        raise
     except Exception as exc:
         raw, tape_error = [], f"{type(exc).__name__}: {exc}"
     written = _gate(clock)                         # one reading: gated on, checked against the close, and stamped
     written_at = datetime.timestamp(written)
     if _clock_us(written) >= close_ms * 1000:
         raise LateWindow(f"{window.window_ticker} closed before its tape could be written")
-    rows, n_malformed = [], 0
+    rows, n_malformed, n_outside = [], 0, 0
     with localcontext(_TS_CONTEXT):                # Decimal against Decimal only, in the module's own context
         for r in raw:
             ts = _exact_s(r.get("created_ts")) if isinstance(r, dict) else None
@@ -772,8 +781,11 @@ def log_tape(folder, window: Window, *, posted: bool, read_tape: Callable, clock
                 n_malformed += 1                   # a malformed row or row time is skipped and counted, never raised on
             elif t_from <= ts <= t_to:
                 rows.append(r)
+            else:
+                n_outside += 1
     record = {"kind": "tape", "schema_version": SCHEMA_VERSION, "window_ticker": window.window_ticker,
               "t_from": t_from, "t_to": t_to, "written_at": written_at, "n_rows": len(rows), "rows": rows,
+              "n_tape_rows_read": len(raw), "n_tape_rows_outside_span": n_outside,
               "n_tape_rows_malformed": n_malformed, "tape_error": tape_error}
     _append(folder, record)
     return _jsonable(record)

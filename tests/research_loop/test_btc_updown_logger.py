@@ -1845,3 +1845,68 @@ def test_num_is_none_for_an_int_beyond_float_range_never_an_overflow(tmp_path):
     huge = Window(window_ticker=w.window_ticker, open_ts=w.open_ts, close_ts=w.close_ts, floor_strike=10 ** 400)
     rec, _, _ = run(tmp_path, huge)
     assert rec["floor_strike"] is None
+
+
+# ---------------------------------------------------------------- every clock reading is checked (the Nth one too)
+
+def _nth_liar_clock(true_value, n: int, folder: Path):
+    """A clock that returns an exact datetime, except a lying subclass at its nth reading; it notes how many
+    records the folder held at each reading."""
+    state = {"calls": 0, "held": []}
+
+    def clock():
+        state["calls"] += 1
+        state["held"].append(len(lines(folder)))
+        real = true_value()
+        return _claims_after(real) if state["calls"] == n else real
+    return clock, state
+
+
+def test_a_subclass_at_any_one_reading_is_refused_and_nothing_is_written_after_it(tmp_path):
+    w0, w1 = window(0), window(1)
+    tick_dir = tmp_path / "ticks"
+    tick_dir.mkdir()
+    runs = {
+        "log_window": (lambda: at(w0.open_ts + 301.0), lambda f, c: log_window(
+            f, w0, clock=c, read_ticks=tick_file_reader(tick_dir, clock=c), read_book=Spy(BOOK))),
+        "log_close": (lambda: at(w0.close_ts + 195.0), lambda f, c: log_close(
+            f, w0, clock=c, read_ticks=tick_file_reader(tick_dir, clock=c))),
+        "log_tape": (lambda: at(w0.open_ts + 400.0), lambda f, c: log_tape(
+            f, w0, posted=True, read_tape=Spy([]), clock=c, budget=TapeBudget(1))),
+        "dry_run": (lambda: EF, lambda f, c: dry_run(
+            f, c, [Fixture(w0, series(tstar_ms(w0)), BOOK), Fixture(w1, series(tstar_ms(w1)), BOOK)])),
+        "check_enabled": (lambda: EF, lambda f, c: check_enabled(c)),
+    }
+    for name, (true_value, call) in runs.items():
+        folder = tmp_path / name / "normal"
+        clock, state = _nth_liar_clock(true_value, 0, folder)
+        call(folder, clock)                                   # a normal run: count its readings
+        n_readings = state["calls"]
+        assert n_readings >= 1, name
+        for n in range(1, n_readings + 1):
+            folder = tmp_path / name / f"bad{n}"
+            clock, state = _nth_liar_clock(true_value, n, folder)
+            with pytest.raises(NaiveClock, match="not a subclass"):
+                call(folder, clock)
+            assert state["calls"] == n, (name, n)               # refused at that reading, none after it
+            assert len(lines(folder)) == state["held"][n - 1], (name, n)
+
+
+def test_every_tape_row_is_counted_in_exactly_one_field(tmp_path):
+    w = window(0)
+    t = w.open_ts + 300.0
+    raw = ([{"trade_id": f"k{i}", "created_ts": t + i} for i in range(3)]                   # 3 kept
+           + [{"trade_id": "early", "created_ts": t - 0.5}, {"trade_id": "late", "created_ts": t + 60.5}]   # 2 out
+           + ["not a dict", {"trade_id": "no time"}, {"trade_id": "nan", "created_ts": float("nan")},
+              {"trade_id": "huge", "created_ts": 10 ** 400}])                                  # 4 malformed
+    log_tape(tmp_path, w, posted=True, read_tape=Spy(raw), clock=lambda: at(w.open_ts + 400.0), budget=TapeBudget(1))
+    rec = lines(tmp_path)[0]                                       # from the written record alone
+    assert rec["n_tape_rows_read"] == 9 and rec["n_rows"] == len(rec["rows"]) == 3
+    assert rec["n_tape_rows_outside_span"] == 2 and rec["n_tape_rows_malformed"] == 4
+    assert rec["n_tape_rows_read"] == rec["n_rows"] + rec["n_tape_rows_outside_span"] + rec["n_tape_rows_malformed"]
+
+    def broken(*a):
+        raise OSError("tape unreadable")
+    log_tape(tmp_path / "e", w, posted=True, read_tape=broken, clock=lambda: at(w.open_ts + 400.0), budget=TapeBudget(1))
+    err = lines(tmp_path / "e")[0]
+    assert err["n_tape_rows_read"] == err["n_rows"] == err["n_tape_rows_outside_span"] == 0 and err["tape_error"]

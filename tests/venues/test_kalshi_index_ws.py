@@ -959,7 +959,7 @@ def test_a_subclass_reading_at_receipt_is_refused_and_no_row_is_written(tmp_path
 
 def test_a_subclass_reading_at_the_deadline_check_is_refused_socket_closed_no_row(tmp_path, creds):
     real = StepClock(start=AFTER, step=0.0)
-    readings = iter([real(), real()])                     # the gate and the connect headers read a real datetime
+    readings = iter([real(), real(), real()])   # the gate, the loop's deadline check and the headers read a real one
     clock = lambda: next(readings, _claims_after(AFTER + timedelta(seconds=1)))
     ws = FakeWS([j(value_msg(seq=1)), KeyboardInterrupt()])
     connect = FakeConnect([ws])
@@ -973,3 +973,36 @@ def test_a_subclass_reading_at_the_deadline_check_is_refused_socket_closed_no_ro
 def test_every_fake_clock_reading_in_this_file_is_exactly_a_datetime():
     for reading in (ENABLED_FROM, AFTER, ENABLED_FROM - timedelta(seconds=1), StepClock()()):
         assert type(reading) is datetime
+
+
+def test_a_subclass_at_any_one_client_reading_is_refused_with_a_clean_close_and_no_row_after_it(tmp_path, creds):
+    def script():
+        return [j(value_msg(seq=1)), j(value_msg(seq=2)), KeyboardInterrupt()]
+
+    def counted(n, folder):
+        real, state = StepClock(start=AFTER, step=0.25), {"calls": 0, "held": []}
+
+        def clock():
+            state["calls"] += 1
+            state["held"].append(len(lines(folder)))
+            now = real()
+            return _claims_after(now) if state["calls"] == n else now
+        return clock, state
+
+    clock, state = counted(0, tmp_path / "normal")
+    ws = FakeWS(script())
+    kis.stream(tmp_path / "normal" / "ticks", clock=clock, connect=FakeConnect([ws]), credentials=creds,
+               sleep=Sleeps(), max_seconds=100.0)
+    n_readings = state["calls"]
+    assert n_readings >= 7 and len(lines(tmp_path / "normal")) == 2 and ws.closed   # gate, deadline, headers, 2x(deadline, receipt)
+    for n in range(1, n_readings + 1):
+        folder = tmp_path / f"bad{n}"
+        clock, state = counted(n, folder)
+        ws, connect = FakeWS(script()), None
+        connect = FakeConnect([ws])
+        with pytest.raises(NaiveClock, match="not a subclass"):
+            kis.stream(folder / "ticks", clock=clock, connect=connect, credentials=creds, sleep=Sleeps(),
+                       max_seconds=100.0)
+        assert state["calls"] == n, n                                     # refused at that reading, none after it
+        assert len(lines(folder)) == state["held"][n - 1], n
+        assert (connect.calls == []) if n <= 3 else ws.closed, n          # gate, loop deadline, headers; then closed

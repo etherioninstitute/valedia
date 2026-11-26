@@ -170,13 +170,24 @@ def _resolve_credentials(source: Any) -> Credentials:
 
 # ------------------------------------------------------------------ the date gate
 
+def _checked_now(clock: Callable[[], datetime]) -> datetime:
+    """The ONE way the injected clock is read: exactly a datetime (no subclass: it could lie) and timezone-aware,
+    else NaiveClock. Every use of a reading is the base class's arithmetic, with the clock's utcoffset trusted."""
+    now = clock()
+    if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:
+        raise NaiveClock("the clock must return a timezone-aware datetime (exactly a datetime, not a subclass)")
+    return now
+
+
+def _epoch_ms(now: datetime) -> int:
+    """Exact integer ms since the epoch of a checked reading (the base class's subtraction, no float)."""
+    return datetime.__sub__(now, _EPOCH) // timedelta(milliseconds=1)
+
+
 def _gate(clock: Callable[[], datetime]) -> datetime:
     """ONE clock reading, checked against ENABLED_FROM and returned. Runs before any credential or connect."""
-    now = clock()
-    if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:    # no subclass: it could lie
-        raise NaiveClock("the clock must return a timezone-aware datetime (exactly a datetime, not a subclass)")
-    # the base class's arithmetic, with the clock's utcoffset trusted (not the clock's own timestamp())
-    if datetime.timestamp(now) < ENABLED_FROM.timestamp():
+    now = _checked_now(clock)
+    if datetime.timestamp(now) < datetime.timestamp(ENABLED_FROM):
         raise NotYetEnabled(f"disabled until {ENABLED_FROM.isoformat()}")
     return now
 
@@ -482,19 +493,12 @@ class _Run:
     def _remaining(self) -> float | None:
         if self.max_seconds is None:
             return None
-        now = self.clock()
-        if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:    # no subclass: it could lie
-            raise NaiveClock("the clock must return a timezone-aware datetime (exactly a datetime, not a subclass)")
-        # the base class's arithmetic, with the clock's utcoffset trusted; self.start is the gate's exact reading
-        return self.max_seconds - datetime.__sub__(now, self.start).total_seconds()
+        now = _checked_now(self.clock)          # self.start is the gate's checked reading
+        return self.max_seconds - timedelta.total_seconds(datetime.__sub__(now, self.start))
 
     def _receipt_ms(self) -> int:
         """Unix ms UTC of now on the injected clock (the one the gate uses); a naive clock is refused."""
-        now = self.clock()
-        if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:    # no subclass: it could lie
-            raise NaiveClock("the clock must return a timezone-aware datetime (exactly a datetime, not a subclass)")
-        # the base class's arithmetic, with the clock's utcoffset trusted (not the clock's own __sub__)
-        return datetime.__sub__(now, _EPOCH) // timedelta(milliseconds=1)
+        return _epoch_ms(_checked_now(self.clock))
 
     # -- one frame in
     def handle(self, raw: Any, local_receipt_ms: int | None = None) -> None:
@@ -553,8 +557,8 @@ class _Run:
 
     async def _one_connection(self) -> None:
         self._got_data = False
-        now = self.clock()
-        headers = build_headers(self.creds.key_id, self.creds.private_key, int(now.timestamp() * 1000))
+        now = _checked_now(self.clock)
+        headers = build_headers(self.creds.key_id, self.creds.private_key, _epoch_ms(now))   # exact int ms
         self.signatures.add(headers["KALSHI-ACCESS-SIGNATURE"])
         ws = None
         try:
