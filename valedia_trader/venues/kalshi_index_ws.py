@@ -325,7 +325,8 @@ def _check_ms(ms: int) -> int:
 
 def parse_value_message(obj: Any) -> IndexTick:
     """A decoded `cfbenchmarks_value` (or `_5hz`) frame to an IndexTick; MalformedFrame when it is not one."""
-    if not isinstance(obj, dict) or obj.get("type") not in _VALUE_TYPES:
+    kind = obj.get("type") if isinstance(obj, dict) else None
+    if not isinstance(kind, str) or kind not in _VALUE_TYPES:      # a list or object `type` is unhashable: test str first
         raise MalformedFrame("not a value message")
     msg = obj.get("msg")
     if not isinstance(msg, dict):
@@ -338,7 +339,7 @@ def parse_value_message(obj: Any) -> IndexTick:
         raise MalformedFrame("data must be the raw string")
     try:
         raw = json.loads(data)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise MalformedFrame("data is not JSON") from None
     if not isinstance(raw, dict):
         raise MalformedFrame("data must be an object")
@@ -472,10 +473,13 @@ class _Run:
         try:
             text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
             obj = json.loads(text)
-        except (ValueError, TypeError, AttributeError):
+        except (ValueError, TypeError, AttributeError, RecursionError):      # not UTF-8, not JSON, or nested too deeply
             self.malformed += 1
             return
         kind = obj.get("type") if isinstance(obj, dict) else None
+        if not isinstance(kind, str):       # no type, or a list/object/number: not a message, and never hashed below
+            self.malformed += 1
+            return
         if kind in _VALUE_TYPES:
             try:
                 tick = parse_value_message(obj)
@@ -494,8 +498,6 @@ class _Run:
             message = body.get("msg", body.get("message"))
             self._record_error("server_error", code=code if _is_int(code) or isinstance(code, str) else None,
                                message=message if isinstance(message, str) else None)
-        elif not isinstance(kind, str):
-            self.malformed += 1
         # `subscribed`, `ok` and any other type carry no tick: nothing to record
 
     def _count_seq(self, sid: int, seq: int) -> None:

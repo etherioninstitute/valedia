@@ -445,6 +445,22 @@ def test_malformed_frames_are_counted_and_skipped(tmp_path, creds):
     assert len(lines(tmp_path)) == 1
 
 
+def test_odd_frames_are_malformed_and_the_connection_and_the_next_tick_survive(tmp_path, creds):
+    script = [j({"type": [1]}), j({"type": {"a": 1}}), "[" * 100_000, j(value_msg(seq=1)), KeyboardInterrupt()]
+    summary, connect, _ = run(tmp_path, [FakeWS(script)], creds)
+    assert summary["malformed"] == 3 and summary["ticks"] == 1
+    assert summary["reconnects"] == 0 and summary["errors"] == [] and len(connect.calls) == 1
+
+
+def test_a_deeply_nested_data_string_is_malformed_not_a_crash():
+    msg = value_msg()
+    msg["msg"]["data"] = "[" * 100_000
+    with pytest.raises(kis.MalformedFrame):
+        kis.parse_value_message(msg)
+    with pytest.raises(kis.MalformedFrame):
+        kis.parse_value_message({"type": [1]})
+
+
 def test_a_sequence_jump_is_a_gap(tmp_path, creds):
     script = [j(value_msg(seq=s)) for s in (1, 2, 5, 6)] + [j(value_msg(seq=1, sid=2)), KeyboardInterrupt()]
     summary, _, _ = run(tmp_path, [FakeWS(script)], creds)
@@ -540,6 +556,35 @@ def test_a_cancellation_closes_the_socket_and_returns_the_summary(tmp_path, cred
     assert ws.closed and summary["ticks"] == 2 and summary["reconnects"] == 0 and summary["errors"] == []
     assert len(connect.calls) == 1 and sleeps.values == []
     assert len(lines(tmp_path)) == 2
+
+
+def test_a_real_task_cancellation_closes_the_socket_and_keeps_the_ticks(tmp_path, creds):
+    class BlockingWS(FakeWS):
+        async def recv(self):
+            if self.script:
+                return self.script.pop(0)
+            await asyncio.Event().wait()        # waits for ever, like an idle socket
+
+    ws = BlockingWS([j(value_msg(seq=1))])
+    connect = FakeConnect([ws])
+    sleeps = Sleeps()
+
+    async def drive():
+        run_ = kis._Run(kis.TickStore(tmp_path / "ticks"), ["BRTI"], kis.CHANNEL_VALUE, StepClock(), connect, creds,
+                        None, sleeps, AFTER)
+        task = asyncio.ensure_future(run_.main())
+        for _ in range(200):
+            if run_.ticks:
+                break
+            await asyncio.sleep(0)
+        assert run_.ticks == 1 and not task.done()
+        task.cancel()
+        await task              # main ends quietly on a real cancellation
+        return run_.summary()
+
+    summary = asyncio.run(drive())
+    assert ws.closed and summary["ticks"] == 1 and summary["errors"] == [] and sleeps.values == []
+    assert len(lines(tmp_path)) == 1
 
 
 def test_ctrl_c_closes_cleanly_and_returns_the_summary(tmp_path, creds):
