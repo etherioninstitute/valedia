@@ -239,6 +239,8 @@ def _window_avg(node: Any) -> dict | None:
         if n is None:
             raise ValueError(f"{key} must be a whole number")
         out[key] = n
+    if out["window_size"] < 1:
+        raise ValueError("window_size must be at least 1")    # a window of no ticks is not an average
     return out
 
 
@@ -407,7 +409,16 @@ def _rows_backwards(path: Path, stop_before_ms: int) -> tuple[list, bool]:
 
 
 def read_tick_files(tick_folder, t_from_ms: int, t_to_ms: int, *, clock: Callable[[], datetime]) -> list[dict]:
-    """The tick-store rows whose source time is in [t_from_ms, t_to_ms], in file order, malformed lines skipped.
+    """The tick-store rows of the span, in file order: (a) every row that parses to a tick with source time in
+    [t_from_ms, t_to_ms]; and (b) every JSON-object row that does not parse to a tick but whose `received_at_ms` is a
+    whole number in [t_from_ms - LATE_MAX_MS, t_to_ms + LATE_MAX_MS], handed over so the logger counts it as
+    malformed (`n_rows_malformed`).
+
+    Why that receipt range for (b): a valid tick of the span is received within LATE_MAX_MS of a source time in the
+    span, so a row received in that range is one that could have been a tick of this span; a row received outside it
+    could not, so it is not this span's to count. Skipped, in no count: a line with no readable `received_at_ms` (a
+    partial last line, not JSON, not an object, oversized), which cannot be placed in time; and a tick whose source
+    time is outside the span (it belongs to another window), so `n_rows_outside_span` is 0 through this reader.
 
     The files are `<tick_folder>/kalshi_index_ticks-YYYY-MM-DD.jsonl`, one per UTC day of receipt; a missing file is
     no rows. Only the span is read: each file is read backwards from its end, newest day first (from the UTC day of
@@ -442,8 +453,13 @@ def read_tick_files(tick_folder, t_from_ms: int, t_to_ms: int, *, clock: Callabl
     for rows in reversed(per_day):
         for row in rows:
             tick = _parse_tick_row(row)
-            if tick is not None and a <= tick.source_ms <= b:
-                out.append(row)
+            if tick is not None:
+                if a <= tick.source_ms <= b:
+                    out.append(row)                # (a) a tick of the span
+            elif isinstance(row, dict):
+                recv = _whole(row.get("received_at_ms"))
+                if recv is not None and a - LATE_MAX_MS <= recv <= b + LATE_MAX_MS:
+                    out.append(row)                # (b) a row that could have been a tick of the span: malformed
     return out
 
 

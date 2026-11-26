@@ -867,7 +867,8 @@ def test_adapter_skips_malformed_lines(tmp_path):
                                     dict(good[1], received_at_ms=1.5e12), dict(good[1], data="nope"),
                                     "\x00\x01 binary", good[2]])
     rows = read_tick_files(tmp_path, M, M + 5000, clock=lambda: at(M / 1000 + 60))
-    assert [r["seq"] for r in rows] == [0, 1, 2]
+    # unplaceable lines are skipped; the row with data "nope" has a readable receipt, so it is handed over as malformed
+    assert [r["seq"] for r in rows] == [0, 1, 1, 2] and rows[2]["data"] == "nope"
     assert read_tick_files(tmp_path / "missing", M, M + 5000, clock=lambda: at(M / 1000 + 60)) == []
 
 
@@ -1922,12 +1923,50 @@ def test_a_non_ascii_digit_string_is_not_a_whole_number_and_the_row_is_skipped(t
     tick_dir.mkdir()
     good = series(T, n=300)
     bad_rows = [dict(tick_row(T - 500), received_at_ms="²"), dict(tick_row(T - 400), received_at_ms="١٢")]
+    bad_seq = dict(tick_row(T - 300), seq="²")                    # a readable receipt: handed over as malformed
     day = datetime.fromtimestamp(T / 1000, UTC).strftime("%Y-%m-%d")
-    _write(tick_dir, day, good[:150] + bad_rows + good[150:])
-    got = read_tick_files(tick_dir, T - 300_000, T, clock=lambda: EF)          # no exception; both skipped
-    assert len(got) == 300 and all(r["received_at_ms"] not in ("²", "١٢") for r in got)
+    _write(tick_dir, day, good[:150] + bad_rows + [bad_seq] + good[150:])
+    got = read_tick_files(tick_dir, T - 300_000, T, clock=lambda: EF)          # no exception; no receipt: skipped
+    assert len(got) == 301 and all(r["received_at_ms"] not in ("²", "١٢") for r in got) and bad_seq in got
     rec = log_window(tmp_path / "log", w, clock=lambda: EF, read_ticks=tick_file_reader(tick_dir, clock=lambda: EF),
                      read_book=Spy(BOOK))
-    assert rec["n_rows_read"] == 300 and rec["n_rows_malformed"] == 0 and rec["tick_error"] is None
+    assert rec["n_rows_read"] == 301 and rec["n_rows_malformed"] == 1 and rec["tick_error"] is None
     direct, _, _ = run(tmp_path / "direct", w, ticks=good + bad_rows)             # given to the logger directly
     assert direct["n_rows_malformed"] == 2 and direct["n_rows_read"] == 302
+
+
+
+def test_the_file_reader_hands_over_rows_that_fail_the_tick_checks_as_malformed(tmp_path):
+    w = window(0)
+    T = tstar_ms(w)
+    a, b = T - 300_000, T
+    tick_dir = tmp_path / "ticks"
+    tick_dir.mkdir()
+    good = series(T, n=300)
+    failing = [
+        dict(tick_row(T - 100_500), seq="x"),                                         # bad seq
+        tick_row(T - 100_400, "0"),                                                   # value 0
+        tick_row(T - 100_300, channel="orderbook_delta"),                             # wrong channel
+        dict(tick_row(T - 100_200), avg_60s={"value": "1.00", "window_size": 0, "window_start_ts_ms": T - 60_000,
+                                              "window_end_ts_exclusive": T}),         # window_size 0
+    ]
+    for r in failing:
+        assert L._parse_tick_row(r) is None
+    not_this_span = [dict(tick_row(T - 1000), seq="x", received_at_ms=b + L.LATE_MAX_MS + 1),
+                     dict(tick_row(T - 299_000), seq="x", received_at_ms=a - L.LATE_MAX_MS - 1)]
+    edges = [dict(tick_row(T - 2000), seq="x", received_at_ms=b + L.LATE_MAX_MS),
+             dict(tick_row(T - 298_000), seq="x", received_at_ms=a - L.LATE_MAX_MS)]   # exactly on the range: counted
+    day = datetime.fromtimestamp(T / 1000, UTC).strftime("%Y-%m-%d")
+    _write(tick_dir, day, good[:100] + failing + not_this_span + edges + good[100:])
+    with open(tick_dir / f"kalshi_index_ticks-{day}.jsonl", "a", encoding="utf-8") as fh:
+        fh.write('{"index_id": "BRTI", "channel": "cfbenchmarks_value", "received_at_ms": ' + str(T))  # partial line
+    got = read_tick_files(tick_dir, a, b, clock=lambda: EF)
+    assert len(got) == 300 + len(failing) + len(edges)
+    rec = log_window(tmp_path / "log", w, clock=lambda: EF, read_ticks=tick_file_reader(tick_dir, clock=lambda: EF),
+                     read_book=Spy(BOOK))
+    assert rec["n_rows_malformed"] == len(failing) + len(edges) == 6
+    assert rec["n_rows_read"] == 306 and rec["n_rows_outside_span"] == 0 and rec["n_ticks_kept"] == 300
+    saved = lines(tmp_path / "log")[0]
+    assert saved["n_rows_read"] == (saved["n_rows_malformed"] + saved["n_rows_late"] + saved["n_rows_outside_span"]
+                                    + saved["n_ticks_kept"] + saved["n_duplicates_dropped"] + saved["n_conflicting_rows"])
+    assert saved["status"] == "OK"                     # the malformed rows are counted, never used
