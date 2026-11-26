@@ -281,8 +281,9 @@ trading (his word, 2026-11-17).
    **WATCH 19 Nov 06:55** the first practice run on it: the state file moves to its new layout (code before
    T51c then refuses it; backups in the deploy folder), and the ledger is read for a `fee_unreadable` notice
    on an ordinary purchase (it must not open one; code before R33a would treat such a notice as blocking).
-   **NEXT** S4c practice shared mode (the bound left open for an unread fee; the practice book's opening
-   entry by the lead through the new command), S4d live, S4e alerts and the owner's page. What the record
+   **DONE 2026-11-21** (was NEXT): S4c practice shared mode (the bound left open for an unread fee; the practice
+   book's opening entry by the lead through the new command), S4d live, S4e alerts and the owner's page. All merged:
+   S4c 8908c4d, S4c-2 e375fc3, S4d 51d2641, S4e 169d4d8..75a51f5 (section 0, item 3). What the record
    catches is written in `docs/WEBULL.md`: a change to the state file OR to the journal is found; both
    rewritten to match are not. FOR S4, found on the way: Webull reports no fee on a purchase (the book then
    calls the fee unknown: a rule is needed); the marks of an entry must come from the order step's quote
@@ -339,7 +340,10 @@ morning. On `main`:
   blind checks failed it (design changed after the third); the fifth and a check of the lead's docstring fix passed;
   913 tests. Owner rule from this (11-24): a found defect is fixed at once, never accepted as a "stated limit".
 - **DONE 11-24** `low/ua-generic-k3-k4` merged (642f4cc): the two knowledge readers send `calendar-and-notice-reader/1.0`.
-- **NEXT** `docs/pooling-test-draft` (14ba870; one sentence left, then one fresh check).
+- **NEXT** `docs/pooling-test-draft` (branch tip 6e28318, unmerged, UNLOCKED). Since 14ba870: the 11-24 DNS-break
+  window excluded (36f9641); Carbon's Q4 stale_data rule added 11-25 (b953343, fb17866, 6e28318; two blind checks,
+  notes fixed). Left: the lead's ruling on every SLOT under "Not decided yet" (lock-rule-scope first), then the lock
+  (commit + hash recorded) BEFORE any scored result of the period is read; the period ends 12-03 at the earliest.
 - **IDEA** the practice gate passes silently over a malformed list line (line ending, trailing space, misspelt
   path). Tonight's lists were checked byte by byte. A stricter check was drafted and has NOT passed its blind
   checks; applied nowhere.
@@ -358,7 +362,12 @@ After a first attended order:
   buffer: `execution_and_risk/buffering.py` is called only by `backtest/walkforward.py`. Check whether the
   daily rebalance trades every small drift; if so, apply the same buffer to the book's targets (full blind
   check; it touches the accepted order path).
-- **QUEUED** (2026-11-22) a settled-cash guard for T+1 before any stock order: the account is a shared cash
+- **BUILT, the sale half unmerged** (status 2026-11-25; was QUEUED): BUYS are on main (live needs the venue's
+  settled cash and stops without it; the budget is min(cash, settled cash) less the kept share, and the shared
+  book's usable cash is a third bound: `order_step.py` 5824-5826, 5870-5875). SALES are C on `fix/c-f` (874cace +
+  76a6493, accepted, merge after 12-01): min(the book's settled units by T+1 from the lot's DAY-order day, the
+  account's sellable quantity), fail closed. The original item, kept for its rules:
+  (2026-11-22) a settled-cash guard for T+1 before any stock order: the account is a shared cash
   account; no Valedia lot bought with unsettled proceeds is sold before it settles, and new buys are capped by
   settled cash on Valedia's own book. Goes on the stricter go-live gate's list. Round 6: cap = min(book
   settled cash, the account's `settled_cash`); live answers carry it, paper gives none, so it fails closed when
