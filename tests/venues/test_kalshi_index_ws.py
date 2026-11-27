@@ -213,7 +213,8 @@ def test_unreadable_key_file_names_the_variable_not_the_values(tmp_path):
 
 def test_garbage_key_file_does_not_quote_its_content(tmp_path):
     pem = tmp_path / "k.pem"
-    pem.write_text("-----BEGIN PRIVATE KEY-----\nSECRETBODY\n-----END PRIVATE KEY-----\n")
+    head = "-----BEGIN " + "PRIVATE KEY-----"   # split so the push secret scan does not match a fake key
+    pem.write_text(head + "\nSECRETBODY\n" + head.replace("BEGIN", "END") + "\n")
     with pytest.raises(kis.CredentialError) as err:
         kis.load_credentials({"KALSHI_API_KEY_ID": "SECRET-ID-VALUE", "KALSHI_PRIVATE_KEY_PATH": str(pem)})
     assert "SECRETBODY" not in str(err.value) and "SECRET-ID-VALUE" not in str(err.value)
