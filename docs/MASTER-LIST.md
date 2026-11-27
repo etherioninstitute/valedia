@@ -464,6 +464,10 @@ passing idea can trade at once.
     bound at parse time; JSON number hooks that never raise; one duplicate-rule equality; records independent of row
     order. Seven blind-verified repairs; tests 200/147/38; five job gates pass; no order-path file. CF-G (send-time
     guards, from Grok's review of fix/c-f): fixes 1-4 at dbdabcc, fix 5 and the pacer-wait check in build.
+  - 2026-11-26 SCHEDULE AUDIT: every launchd job dry-checked; 11-27 practice gates pass. The Sunday research loop
+    fails on KeyError turn_of_month (RL-1 fix 24e4a6f on fix/research-turn-of-month, pinned files: merges with the
+    12-01 re-pin, then one catch-up cycle by hand). The BTC desk has no launchd job for 12-04 yet (owner's yes).
+    Carbon reply 59 written to open a new Carbon conversation.
 
 ## 4. Finding what makes money (tests and ideas)
 
