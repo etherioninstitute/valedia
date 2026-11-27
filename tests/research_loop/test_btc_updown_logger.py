@@ -1701,6 +1701,39 @@ def test_a_same_value_row_with_another_close_average_gives_none(tmp_path):
     assert rec4["settlement_estimate"] == "100.10" and rec4["n_dup_diff_meta"] == 1
 
 
+def test_close_disagreement_compares_values_only_and_only_in_the_tier_used(tmp_path):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    after = lambda: at(w.close_ts + 195.0)
+
+    def close(sub, rows):
+        return log_close(tmp_path / sub, w, clock=after, read_ticks=Spy(rows))
+
+    def p59(value, seq, price="100000.00"):
+        return tick_row(C - 500, price, seq=seq, last15=_avg(value, C - 60_000, C - 500, size=59))
+    # the same value with other bounds at Q: one tick, the estimate kept
+    rows = _close_rows(w, "100.10")
+    rows.append(dict(rows[30], seq=5000, last_15min_avg=_avg("100.10", C - 59_000, C + 999)))
+    a = close("a", rows)
+    assert a["settlement_estimate"] == "100.10" and a["close_quality"] == "exact_60"
+    assert a["n_dup_diff_meta"] == 1 and a["n_close_dup_diff_meta_candidates"] == 0
+    # a fallback-tier disagreement beside an exact tick: the exact tick's estimate; the twins are still counted
+    b = close("b", _close_rows(w, "100.20") + [p59("100.10", 1), p59("100.30", 2)])
+    assert b["settlement_estimate"] == "100.20" and b["close_quality"] == "exact_60"
+    assert b["close_candidates_agree"] is True and b["n_close_dup_diff_meta_candidates"] == 2
+    c = close("c", _close_rows(w, "100.20") + [p59("100.10", 1, "1.00"), p59("100.30", 2, "2.00")])   # two prices
+    assert c["settlement_estimate"] == "100.20" and c["n_close_conflicting_candidates"] == 2
+    # a size-59 twin at Q itself with another value: still the fallback tier, so the exact value stands
+    rows_e = _close_rows(w, "100.20")
+    rows_e.append(dict(rows_e[30], seq=5000, last_15min_avg=_avg("100.40", C - 60_000, C, size=59)))
+    e = close("e", rows_e)
+    assert e["settlement_estimate"] == "100.20" and e["close_quality"] == "exact_60"
+    # the same fallback-tier disagreement with no exact tick: None
+    d = close("d", _close_rows(w, None) + [p59("100.10", 1), p59("100.30", 2)])
+    assert d["settlement_estimate"] is None and d["settlement_estimate_reason"] == "close_candidates_disagree"
+    assert d["close_quality"] is None and d["close_candidates_agree"] is False
+
+
 def test_a_wrong_bounds_row_first_and_a_right_candidate_second_is_a_disagreement(tmp_path):
     w = window(0)
     C = int(round(w.close_ts * 1000))

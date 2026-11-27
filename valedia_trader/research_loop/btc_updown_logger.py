@@ -722,12 +722,15 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
       differ give None ("close_candidates_disagree"); otherwise the first by source time is the close tick.
     - Only when there is no exact candidate, the fallback: the tick with the latest source time in [Q - 2 s, Q + 1 s)
       whose average is present with 55 <= window_size <= 59 (`close_quality` "partial_<k>").
-    - Fail closed: if a source time dropped as conflicting (different values) held a row that would be a candidate
-      (exact or fallback), or a same-value group whose rows carry different last_15min_avg held a row that would
-      be one, the estimate is None ("close_candidates_disagree").
+    - Fail closed, within the tier used only (exact if any exact-tier row exists, kept, a same-price twin or in a
+      source time dropped as conflicting; else the fallback), comparing Decimal(last_15min_avg.value) only (bounds
+      are logged, never used): exact-tier rows with more than one value, or no kept exact tick, give None
+      ("close_candidates_disagree"); in the fallback tier, the latest fallback source time must be the kept tick's
+      and its rows must carry one value. The other tier's disagreements are counted, never used.
     - Counted: `n_close_wrong_window` = window_size-60 averages whose source time is outside [Q, Q + 1 s);
-      `n_close_running` = averages with window_size below 60 (the running last minute). A window_size above 60 is
-      in neither count, and is never used.
+      `n_close_running` = averages with window_size below 60 (the running last minute); `n_close_conflicting_candidates`
+      and `n_close_dup_diff_meta_candidates` count candidate rows in dropped and in value-differing same-price
+      groups, of either tier. A window_size above 60 is in neither count, and is never used.
     The estimate is `settlement_estimate` (2 dp, ROUND_HALF_EVEN) with `settlement_estimate_half_even` (the same) and
     `settlement_estimate_half_up` (2 dp, ROUND_HALF_UP) beside it, and `settlement_value_raw` (the Decimal as
     received); Step 0's read of the market rules decides which rounding applies. `local_brti_mean` is the exact mean
@@ -770,24 +773,35 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
     n_wrong = sum(1 for t in ticks if size(t) == CLOSE_WINDOW_SIZE and not is_exact(t))
     n_running = sum(1 for t in ticks if size(t) is not None and size(t) < CLOSE_WINDOW_SIZE)
     n_conflicting_candidates = sum(1 for t in conflicting if eligible(t))
-    meta_disagree = [g for g in meta_groups
-                     if any(t.last_15min_avg != g[0].last_15min_avg for t in g[1:]) and any(eligible(t) for t in g)]
-    if exact:
-        close_tick, quality = exact[0], "exact_60"
-        agree = len({t.last_15min_avg["value"] for t in exact}) <= 1    # Decimal equality: 100.1 == 100.10
+
+    def value(t: _Tick) -> Decimal | None:
+        return None if t.last_15min_avg is None else t.last_15min_avg["value"]
+
+    # same-price twins whose rows differ in the average's VALUE (bounds-only differences are not a disagreement)
+    meta_disagree = [g for g in meta_groups if any(eligible(t) for t in g) and len({value(t) for t in g}) > 1]
+    twins = [t for g in meta_groups for t in g[1:]]          # rows beyond the kept first of each same-price group
+    # The tier used: exact if a row of the exact tier exists anywhere (kept, a same-price twin, or in a source time
+    # dropped as conflicting); else the fallback. Only the tier used can make the estimate None.
+    exact_rows = exact + [t for t in twins + conflicting if is_exact(t)]
+    if exact_rows:
+        close_tick, quality, tier_rows = (exact[0] if exact else None), "exact_60", exact_rows
+        # one value over every exact-tier row (Decimal equality: 100.1 == 100.10), and a kept exact tick
+        disagree = len({value(t) for t in exact_rows}) > 1 or not exact
     else:
+        tier_rows = partial + [t for t in twins + conflicting if is_partial(t)]
         close_tick = partial[-1] if partial else None                    # the latest source time (ticks are in order)
         quality = None if close_tick is None else f"partial_{size(close_tick)}"
-        agree = True
-    agree = agree and n_conflicting_candidates == 0 and not meta_disagree
+        latest = max((t.source_ms for t in tier_rows), default=None)
+        # the fallback's source time must be the tier's latest, kept, with one value over its rows
+        disagree = bool(tier_rows) and (close_tick is None or close_tick.source_ms != latest
+                                        or len({value(t) for t in tier_rows if t.source_ms == latest}) > 1)
+    agree = not disagree
     avg = close_tick.last_15min_avg if close_tick is not None else None
     raw = half_even = half_up = None
-    if n_conflicting_candidates or meta_disagree:
-        reason = "close_candidates_disagree"       # a dropped or differing row would have been a candidate
+    if disagree:
+        reason = "close_candidates_disagree"       # within the tier used: differing values, or a dropped candidate
     elif close_tick is None:
         reason = "tick_reader_error" if tick_error else "no_close_tick"
-    elif not agree:
-        reason = "close_candidates_disagree"
     else:
         raw, reason = avg["value"], None
         try:
