@@ -256,10 +256,10 @@ def test_a_purchase_is_never_capped_and_a_run_without_a_sale_reports_no_caps(tmp
     assert "sale_caps" not in out and "sales_left_unsettled" not in out and w.venue.sellable_calls == []
 
 
-def test_the_cap_is_read_once_per_sale_symbol(tmp_path):
+def test_the_cap_is_read_once_per_sale_symbol_and_again_at_its_last_look(tmp_path):
     w = bought(tmp_path / "w")
     sell_all(w, "2026-11-25 10:00")
-    assert w.venue.sellable_calls == [SYM]
+    assert w.venue.sellable_calls == [SYM, SYM]                      # CF-G: the last look reads it once more
 
 
 # ---- the stop in front of the cap: the account holding less than the book counts as its own

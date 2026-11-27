@@ -3660,11 +3660,14 @@ def every_lot_settled():
     """CF-C, for a test of something other than the sale cap: every lot of the book whose trade date can be
     established counts as settled (the real book_settled_units, asked for a day far ahead), so a sale is bounded by
     the book and the account's sellable quantity alone, as before the cap. Its own MonkeyPatch, so a scenario's
-    monkeypatch.undo() leaves it in place. The cap itself is tested in test_sale_cap.py."""
+    monkeypatch.undo() leaves it in place. The cap itself is tested in test_sale_cap.py. CF-G: every sale's proceeds
+    count as settled too (a run that is not shared spends the venue's cash, as before the book's bound), tested in
+    test_send_time_guards.py."""
     real = osx.book_settled_units
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(osx, "book_settled_units",
                    lambda fills, orders, entries, calendar, day: real(fills, orders, entries, calendar, "9999-12-31"))
+        mp.setattr(osx._Run, "_unshared_usable", lambda self, cash: float(cash))   # CF-G: and every sale's proceeds
         yield
 
 
@@ -4335,9 +4338,13 @@ def test_no_order_is_sent_on_a_reading_past_the_tickets_expiry(tw, start, step):
             box["checks"] = tw.clock.readings[box["from"]:]               # every reading between intend and here
             return real_submit(*a, **k)
         led.intend, led.submit_once = intend, submit_once
-    approve(tw, number, patch=patch)
+    out = approve(tw, number, patch=patch)
     if tw.venue.submits():
         assert box["checks"] and max(box["checks"]) <= ticket["expires"], box
+    elif [o["state"] for o in tw.orders()] == ["refused"]:            # CF-G: held at transmission, the quote stale by
+        assert box["checks"] and max(box["checks"]) <= ticket["expires"], box   # then; the venue never called
+        assert [e["reason"] for e in out["left_over"]] == [
+            "the quote went stale while the order waited for the ledger, before it was transmitted"], out
     else:
         assert [o["state"] for o in tw.orders()] == ["intended"]
 
@@ -5624,8 +5631,8 @@ def test_once_a_reading_is_past_the_expiry_no_later_reading_makes_the_ticket_liv
         return answer
     monkeypatch.setattr(osx._Run, "_ticket_expired", judged)
 
-    def go_past():
-        tw.clock.past, tw.clock.back = ticket["expires"] + 1, ticket["expires"] - 200
+    def go_past():                                       # CF-G: set back by less than CLOCK_BACK_TOLERANCE_SECONDS
+        tw.clock.past, tw.clock.back = ticket["expires"] + 0.5, ticket["expires"] - 0.4   # (further stops the run)
     if where == "after the first send":
         real_submit = tw.venue.submit
 

@@ -25,7 +25,8 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
     lock         one run at a time per state file. Only the venue's name, environment, host and (when it is not a
                  property) account class are read before the lock; everything below runs under it, and once it is held a summary is always journaled: a fault
                  of the run's own stops it at stage "unexpected" rather than raising. A run stopped before the lock
-                 (clock, environment, lock taken) only returns its summary: it writes nothing anywhere. Every
+                 (clock, environment, lock taken) only returns its summary: it writes nothing anywhere. CF-G: a
+                 clock reading more than CLOCK_BACK_TOLERANCE_SECONDS below the run's highest stops it ("clock"). Every
                  journal write happens under the lock, after the journal scan.
     journal      every journal file is read line by line before any venue call. A torn last line of the newest file
                  (a crash mid-write) is skipped, recorded once and reported in the summary (`torn_lines`); a torn
@@ -102,7 +103,8 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
                  `purchases_left_unsettled`; over the cash budget only, "cash"; over both, the one with less left;
                  one that fits both after purchases stopped keeps the label of the purchase that stopped them. The
                  summary also gives the `cash` and `settled_cash` read; at most max_orders_per_day sent in one New
-                 York day across runs. What is not sent is journaled, not queued.
+                 York day across runs. What is not sent is journaled, not queued. CF-G: a run that is not shared is
+                 also bounded by the book's usable cash (the cash less the book's sale proceeds not settled today).
 10. send         an order above MAX_UNITS in size is left over, never sent. For each other order, in this order:
                   a. the quote's age on the clock: older than PRIMARY_QUOTE_MAX_AGE_SECONDS (the quote an order is
                      priced from; a holding's limit stays QUOTE_MAX_AGE_SECONDS), the quote function is asked once
@@ -115,7 +117,9 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
                      second time, the order is left over. What is sent always uses the quote of the last round's (b), the one the gate judged;
                   e. the window check, then ledger.intend;
                   f. the environment and host read; a last look: the quote's age once more, the halt file and (for an
-                     order that adds risk) the latch file; the window check again, then ledger.submit_once.
+                     order that adds risk) the latch file, and (CF-G) a sale's cap read again (a sale above it is
+                     refused); the window check again, then ledger.submit_once, whose venue call waits behind the
+                     quote's age once more (CF-G: after the ledger's write lock; stale, it is not transmitted).
                  Nothing that can take time sits between a window check and the call it guards; an order failing the
                  last look or the second window check stays `intended`, never sent, and is reported left over with
                  the reason. A day limit order in the regular session. Each `order` line of the journal carries
@@ -339,6 +343,7 @@ PRIMARY_QUOTE_MAX_AGE_SECONDS = 300               # CF-Q2: the quote an order is
 SETTLEMENT_SEARCH_DAYS = 14                       # CF-C: a lot's settlement day (T+1) looked for this many days on, at most
 QUOTE_MAX_AHEAD_SECONDS = 60                      # a quote stamped later than this after now is not believed
 QUOTE_ASK_GAP_SECONDS = 60                        # a holding is not asked for again sooner than this in one run
+CLOCK_BACK_TOLERANCE_SECONDS = 1.0                # CF-G: a clock reading more than this below the run's highest stops it
 MAX_CASH = 1e12                                   # cash and equity outside 0 to this are unusable, like a non-finite one
 MAX_QUOTE_PRICE = 1e7                             # a quote price must be above 0 and at most this
 MAX_UNITS = 1e12                                  # a position size above this (in size) is unusable
@@ -3754,14 +3759,30 @@ class _Stop(Exception):
 
 class _SubmitWatch:
     """The venue as handed to ledger.submit_once: it remembers the call's exception or answer, so that what the run
-    writes about the outcome comes from the order step's own words, not from the venue's text in the ledger's note."""
+    writes about the outcome comes from the order step's own words, not from the venue's text in the ledger's note.
+    CF-G: `guard` (the run's check at transmission) is asked first, after the ledger has taken its write lock and
+    marked the order sent, immediately before the venue is called: words (or a stop, or any failure of its own) mean
+    the venue is not called and NotTransmitted is raised, which the ledger records as not sent (`held` says why)."""
 
-    def __init__(self, venue, extra: dict | None = None) -> None:
+    def __init__(self, venue, extra: dict | None = None, guard: Callable[[], str | None] | None = None) -> None:
         self._venue = venue
         self._extra = dict(extra or {})                  # T51 B3: arguments added to every submit (the live remainder's flag)
+        self._guard = guard
         self.called, self.error, self.answer = False, None, None
+        self.held: str | None = None                     # CF-G: why the guard kept the order from the venue
+        self.stop: _Stop | None = None                   # ... and the run's stop, when the guard's check raised one
 
     def submit(self, *args, **kwargs):
+        if self._guard is not None:
+            try:
+                why = self._guard()
+            except _Stop as stop:
+                self.stop, why = stop, stop.reason
+            except Exception as exc:                     # fail closed: a check that cannot be made holds the order
+                why = f"the check at transmission failed: {_local_error(exc)}"
+            if why is not None:
+                self.held = str(why)
+                raise NotTransmitted(self.held)
         self.called = True
         try:
             self.answer = self._venue.submit(*args, **{**kwargs, **self._extra})
@@ -3949,6 +3970,8 @@ class _Run:
         self.shortfalls: dict = {}                       # ... the shortfalls the run saw and did not set aside
         self.journaled_units: dict[str, float] = {}      # ... the units of the fills this run journaled, per symbol
         self.owner_surplus: set[str] = set()             # ... the latest reconcile's symbols the owner holds beyond the book
+        self.clock_peak: float | None = None             # CF-G: the highest clock reading of this run
+        self.clock_fault: str | None = None              # ... why the clock stepped back too far, once it has
 
     # -- helpers
     def _follow_view(self) -> dict:
@@ -3987,10 +4010,30 @@ class _Run:
             _sync_file(path)
 
     def _now(self) -> float:
+        """The clock's reading: a finite number of seconds, and (CF-G) never more than CLOCK_BACK_TOLERANCE_SECONDS
+        below the highest reading of this run (one within it is used as is, never clamped). A step back further stops
+        the run at stage "clock", and every later reading of the run stops it again."""
+        self._clock_back(None)
         now = self.clock()
         if not _finite(now):
             raise _Stop("clock", f"the clock gave {now!r}, not a finite number of seconds")
-        return float(now)
+        now = float(now)
+        self._clock_back(now)
+        return now
+
+    def _clock_back(self, now: float | None) -> None:
+        """CF-G, for _now: raise the run's clock stop when the clock has stepped back too far, earlier in the run
+        (`now` None) or on the reading `now`, which otherwise may raise the run's highest reading. It never stops a
+        run's first reading, so never a run before its lock (there is no earlier reading then)."""
+        if self.clock_fault is None and now is not None:
+            peak = self.clock_peak
+            if peak is not None and now < peak - CLOCK_BACK_TOLERANCE_SECONDS:
+                self.clock_fault = (f"the clock went back {peak - now:.3f} seconds from its highest reading in this run, "
+                                    f"more than {CLOCK_BACK_TOLERANCE_SECONDS:g}; nothing more is sent")
+            elif peak is None or now > peak:
+                self.clock_peak = now
+        if self.clock_fault is not None:
+            raise _Stop("clock", self.clock_fault)
 
     def _live_place(self) -> str | None:
         """Live mode reads the owner's files and the paper record only from the repository (go_live.live_repo()): the
@@ -5866,7 +5909,8 @@ class _Run:
     def _sale_cap(self, sym: str) -> tuple[float, float, float | None, str | None]:
         """CF-C: (cap, book settled, account sellable, why) for a sale of `sym`: the cap is the smaller of the book's
         settled units of it (book_settled_units on the run's calendar and New York day, worked out once a run) and
-        the quantity the account lets a sale draw on (the venue's `sellable`, read once per sale). Either one that
+        the quantity the account lets a sale draw on (the venue's `sellable`, read when the sale is cut and again at its
+        last look, CF-G). Either one that
         cannot be had makes the cap 0 (fail closed), and `why` says which: a venue without `sellable`, one whose read
         raises or gives anything but a finite number from 0 to MAX_UNITS, or a book whose figures cannot be read."""
         if self._settled_book is None:
@@ -6096,12 +6140,19 @@ class _Run:
             usable = self.last_fig.usable_cash
             book_budget = float(usable) * (1.0 - CASH_KEPT) if usable is not None and usable > 0 else 0.0
             budget = min(budget, book_budget)
+        else:                                            # CF-G: not shared, the account's cash is the book's; its usable
+            usable = self._unshared_usable(cash)         # part is that cash less the book's sale proceeds not settled
+            book_budget = usable * (1.0 - CASH_KEPT) if usable is not None and usable > 0 else 0.0
+            budget = min(budget, book_budget)
         words = {"cash": f"the purchases would exceed the cash the venue reports less {CASH_KEPT:.0%} ({cash_budget:.2f})",
                  "settled": f"the purchases would exceed the settled cash the venue reports less {CASH_KEPT:.0%} "
                             f"({(settled_budget or 0.0):.2f})"}
-        if book_budget is not None:
+        if self.shared:
             words["book"] = (f"the purchases would exceed the book's usable cash less {CASH_KEPT:.0%} ({book_budget:.2f}): "
                              "the account may hold more, but the book spends only its own")
+        else:
+            words["book"] = (f"the purchases would exceed the book's usable cash less {CASH_KEPT:.0%} ({book_budget:.2f}): "
+                             "the cash the venue reports less the proceeds of the book's sales not settled today")
         spent = 0.0
         purchases_stopped = None
 
@@ -6113,7 +6164,7 @@ class _Run:
             when it fits both."""
             cash_left = cash_budget - spent - self.purchases_left_unsettled
             settled_left = math.inf if settled_budget is None else settled_budget - spent
-            if book_budget is not None and cost > book_budget - spent:   # the book's own bound: the one with least left
+            if self.shared and cost > book_budget - spent:   # the book's own bound: the one with least left
                 lefts = {"cash": cash_left, "settled": settled_left, "book": book_budget - spent}
                 return min((k for k in lefts if cost > lefts[k]), key=lambda k: lefts[k])
             over_cash, over_settled = cost > cash_left, cost > settled_left
@@ -6124,6 +6175,8 @@ class _Run:
                 return "cash"
             if over_cash:
                 return "settled" if settled_left < cash_left else "cash"
+            if cost > book_budget - spent:               # CF-G, not shared: it fits the cash and the settled cash but
+                return "book"                            # not the book's usable cash
             return None
         if self.mode == "approve":                       # the sending stage: the ticket is used before the first intend
             try:
@@ -6248,7 +6301,8 @@ class _Run:
                     self._leave(c, held_back[1], collar=held_back[0])
                     continue
             tag = f"{self.batch}-{sym}" + (".r" if c.get("leg") == "remainder" else "")
-            watch = _SubmitWatch(self.venue, {"fractional_live": True} if market and self.live is not None else None)
+            watch = _SubmitWatch(self.venue, {"fractional_live": True} if market and self.live is not None else None,
+                                 guard=lambda s=sym: self._at_transmission(s))   # CF-G: the quote's age once more
             if self.mode == "approve":                   # the line's tag, on file before its intend
                 self.tickets.note_tag(self.ticket["day"], self.ticket["number"], c["line"], tag, self.batch)
                 c["tag_noted"] = tag
@@ -6280,7 +6334,8 @@ class _Run:
                     self.ledger.intend(tag, sym, units, quote, limit_price=limit, batch=self.batch, parts=c["parts"])
                 self.state.note_sending(tag, self.day)
                 self._check_environment()                # 6. the environment and host again ...
-                late = self._last_look(sym, reduces)     # ... the quote's age, the halt and latch files ...
+                late_by, late = self._last_look(sym, reduces, units)   # ... the quote's age, the halt and latch
+                                                         # files, a sale's cap (CF-G) ...
                 if late is None and self.mode == "approve":
                     late = self._ticket_held()           # ... the ticket still this run's ...
                 lost = late_collar = None
@@ -6298,6 +6353,9 @@ class _Run:
                                                   if w is not None), (None, None))
                 if late is not None:
                     self.state.note_outcome(tag, "not sent")             # it stays intended, never sent
+                    if late_by is not None:              # CF-G: a sale above its cap at the last look is refused
+                        self._refuse(c, late_by, late)
+                        continue
                     self._leave(c, late, collar=late_collar)
                     if lost is not None:                 # the lock gone: the run stops here
                         self._hold_remainders(c, queue[i + 1:])
@@ -6314,6 +6372,12 @@ class _Run:
                                     "reconcile settles it") from None
             outcome = rec["state"] if rec.get("state") in STATES else "unknown"
             self.state.note_outcome(tag, outcome)
+            if watch.held is not None and outcome == "refused":   # CF-G: held at transmission; the venue was not called
+                self._leave(c, watch.held)
+                if watch.stop is not None:
+                    self._hold_remainders(c, queue[i + 1:], tag)
+                    raise watch.stop
+                continue
             if outcome == "refused":
                 why = f"the venue did not take it: {_venue_error(watch.error)}" if watch.error is not None else "the venue did not take it"
                 self._refuse(c, "venue", why, tag=tag)
@@ -6348,6 +6412,25 @@ class _Run:
                          "quote_ts": _iso_utc(quote_t), "quote_age_s": round(priced_at - quote_t, 3)})   # time, its age priced
             self._ticket_note(c, "sent", tag=tag)
 
+    def _unshared_usable(self, cash: float) -> float | None:
+        """CF-G: a run that is not shared, whose account cash is all the book's: the book's usable cash, the venue's
+        `cash` less what book_figures (on the run's calendar) counts as the proceeds of the book's sales not settled
+        today (its `cash_low` less its `usable_cash`). None (no purchase: fail closed) when the figures cannot be had."""
+        try:
+            fig = book_figures(self.ledger.fills(), self.ledger.orders(), self.entries, {}, self.day, now=self._now(),
+                               calendar=self.calendar)
+        except _Stop:
+            raise
+        except Exception:
+            return None
+        if fig.cash_low is None or fig.usable_cash is None:
+            return None
+        try:
+            usable = float(Decimal(repr(float(cash))) - (fig.cash_low - fig.usable_cash))
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+        return usable if math.isfinite(usable) else None
+
     def _equity(self, cash: float, held: dict, in_hand: dict) -> float:
         """The venue's cash plus every holding at its quote in hand; a number outside 0 to MAX_CASH stops the run."""
         equity = _as_float(cash + math.fsum(u * in_hand[sym] for sym, u in held.items() if u > UNITS_EPS))
@@ -6355,16 +6438,33 @@ class _Run:
             raise _Stop("prices", f"the broker equity is not a usable number ({_EQUITY_BOUNDS}); nothing more is sent")
         return equity
 
-    def _last_look(self, sym: str, reduces: bool) -> str | None:
-        """Why an intended order may not be sent after all (its quote is too old now, the halt file or, for an order
-        that adds risk, the latch has appeared), or None. A file that cannot be looked at counts as there."""
+    def _at_transmission(self, sym: str) -> str | None:
+        """CF-G: the check the venue call waits behind (_SubmitWatch's guard): the order's quote still within
+        PRIMARY_QUOTE_MAX_AGE_SECONDS on the clock now, after the ledger's write lock (up to BUSY_SECONDS) was waited
+        for. Why the order is not transmitted, or None."""
         if not self._quote_fresh(sym, PRIMARY_QUOTE_MAX_AGE_SECONDS):
-            return "the quote went stale before the order was sent"
-        if _present(self.halt_file):
-            return "the operator halt file is there at the last look before sending"
-        if not reduces and _present(self.latch_file):
-            return "the drawdown latch is there at the last look before sending"
+            return "the quote went stale while the order waited for the ledger, before it was transmitted"
         return None
+
+    def _last_look(self, sym: str, reduces: bool, units: float = 0.0) -> tuple[str | None, str | None]:
+        """Why an intended order may not be sent after all, as (who refuses it, words): (None, words) leaves it over
+        (its quote is too old now, the halt file or, for an order that adds risk, the latch has appeared); CF-G:
+        ("sale cap", words) refuses a sale of more units than its cap (_sale_cap) read again now; (None, None) passes.
+        A file that cannot be looked at counts as there."""
+        if not self._quote_fresh(sym, PRIMARY_QUOTE_MAX_AGE_SECONDS):
+            return None, "the quote went stale before the order was sent"
+        if _present(self.halt_file):
+            return None, "the operator halt file is there at the last look before sending"
+        if not reduces and _present(self.latch_file):
+            return None, "the drawdown latch is there at the last look before sending"
+        if units < 0:                                    # CF-G: the sale cap again (defence in depth): fail closed
+            cap, settled, account, why = self._sale_cap(sym)
+            if abs(units) > cap + UNITS_EPS:
+                inputs = f"the book's settled units {settled:g}, the account's sellable quantity " + \
+                    ("not known" if account is None else f"{account:g}")
+                return "sale cap", (f"at the last look the sale of {abs(units):g} units is above its cap of {cap:g} "
+                                    f"({inputs}{'; ' + why if why else ''}); nothing is sold")
+        return None, None
 
     def _leave(self, c: dict, reason: str, collar: str | None = None) -> None:
         """Left over, with its reason; `collar` names the check of T51 R5 that held a MARKET leg back (B1 quote_age,
