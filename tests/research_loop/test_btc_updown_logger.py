@@ -880,7 +880,8 @@ def test_a_huge_or_tiny_price_is_malformed_at_parse_time_and_the_record_is_writt
     started = time.monotonic()
     rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows + [brti]))
     assert time.monotonic() - started < 1.0
-    assert rec["n_rows_malformed"] == 2 and len(lines(tmp_path)) == 1
+    assert rec["n_rows_malformed"] == 1 and len(lines(tmp_path)) == 1       # brti_raw: the row; the average: not
+    assert rec["n_close_avg_unusable"] == 1 and rec["n_avg_unusable"] == 1
     assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "no_close_tick"
     assert len((tmp_path / L.LOG_NAME).read_bytes()) < 20_000
 
@@ -893,7 +894,39 @@ def test_the_price_bound_is_15_digits_before_the_point_and_12_after():
         assert L._parse_tick_row(tick_row(1_000_000, last15=_avg(v, 0, 1))) is not None, v
     for v in bad:
         assert L._parse_tick_row(tick_row(1_000_000, v)) is None, v
-        assert L._parse_tick_row(tick_row(1_000_000, last15=_avg(v, 0, 1))) is None, v
+        t = L._parse_tick_row(tick_row(1_000_000, last15=_avg(v, 0, 1)))      # the average only is unusable
+        assert t is not None and t.last_15min_avg is None and t.last15_unusable and t.value == Decimal("100000.00"), v
+    for bad_shape in ("x", {"value": "1.00", "window_size": "x", "window_start_ts_ms": 0, "window_end_ts_exclusive": 1}):
+        assert L._parse_tick_row(tick_row(1_000_000, last15=bad_shape)) is None   # structurally bad: malformed
+
+
+@pytest.mark.parametrize("bad", ["0", "100.0000000000001", "1E+999999999999999999"])
+def test_an_unusable_avg_60s_never_costs_the_tick_its_price(tmp_path, bad):
+    w = window(0)
+    T = tstar_ms(w)
+    ticks = series(T, n=300)
+    ticks[-1] = dict(ticks[-1], avg_60s=dict(ticks[-1]["avg_60s"], value=bad))
+    rec, _, _ = run(tmp_path, w, ticks=ticks)
+    assert rec["n_rows_malformed"] == 0 and rec["n_avg_unusable"] == 1 and rec["n_ticks_kept"] == 300
+    assert rec["tick_used"]["cf_source_ts_ms"] == T and rec["tick_used"]["brti_raw"] == ticks[-1]["value"]
+    assert rec["tick_used"]["avg_60s_data"] is None and rec["status"] == "OK" and _reconciles(rec)
+    assert lines(tmp_path)[0]["tick_used"]["avg_60s_data"] is None
+    assert len(bad) < 3 or bad not in (tmp_path / L.LOG_NAME).read_text()      # the bad value is never written
+
+
+def test_an_unusable_close_average_gives_no_estimate_and_is_counted(tmp_path):
+    import time
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    rows = _close_rows(w, "100.10")
+    rows[30] = dict(rows[30], last_15min_avg=_avg("1E+999999999999999999", C - 60_000, C))   # the close tick's
+    started = time.monotonic()
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
+    assert time.monotonic() - started < 1.0 and len(lines(tmp_path)) == 1
+    assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "no_close_tick"
+    assert rec["n_close_avg_unusable"] == 1 and rec["n_rows_malformed"] == 0 and rec["n_close_candidates"] == 0
+    text = (tmp_path / L.LOG_NAME).read_text()
+    assert "999999999999999999" not in text and len(text) < 20_000 and _reconciles(rec)
 
 
 def test_a_window_size_above_60_is_in_neither_close_count_and_never_used(tmp_path):

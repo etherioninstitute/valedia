@@ -133,6 +133,8 @@ class _Tick:
     local_receipt_ms: int | None   # the local receipt time, when the row carries one
     avg_60s: dict | None           # metadata only
     last_15min_avg: dict | None
+    avg_60s_unusable: bool = False      # the row carried an avg_60s whose value failed `_price`: set to None
+    last15_unusable: bool = False       # the same for last_15min_avg: no close candidate in either tier
 
 
 class TapeBudget:
@@ -248,18 +250,27 @@ def _ms_to_s(ms: int) -> Decimal:
 # ------------------------------------------------------------------ the tick rows
 
 def _window_avg(node: Any) -> dict | None:
-    """A windowed-average object from the store row (value, window_size, window_start_ts_ms, window_end_ts_exclusive)."""
+    """A windowed-average object from the store row (value, window_size, window_start_ts_ms, window_end_ts_exclusive).
+
+    A structurally bad average (not an object, a float value, a window field that is not a whole number) raises
+    ValueError: the row is malformed. A value that fails `_price` makes the AVERAGE unusable, not the row: None is
+    returned, and the out-of-bound value is never kept (an average never costs a tick its price).
+    """
     if not isinstance(node, dict):
         raise ValueError("a window average must be an object")
     value = node.get("value")
     if isinstance(value, float):
         raise ValueError("a window average value must not be a float")
-    out = {"value": _price(value)}
+    out: dict = {}
     for key in ("window_size", "window_start_ts_ms", "window_end_ts_exclusive"):
         n = _whole(node.get(key))
         if n is None:
             raise ValueError(f"{key} must be a whole number")
         out[key] = n
+    try:
+        out = {"value": _price(value), **out}
+    except ValueError:
+        return None                                  # unusable average: the tick keeps its price
     return out
 
 
@@ -295,16 +306,19 @@ def _parse_tick_row(row: Any) -> _Tick | None:
         value = _price(raw.get("value"))
         avg = None if row.get("avg_60s") is None else _window_avg(row.get("avg_60s"))
         last15 = None if row.get("last_15min_avg") is None else _window_avg(row.get("last_15min_avg"))
+        avg_bad = row.get("avg_60s") is not None and avg is None
+        last15_bad = row.get("last_15min_avg") is not None and last15 is None
     except ValueError:
         return None
     if value <= 0:
         return None
     return _Tick(source_ms=source_ms, value=value, received_at_ms=received, sending_ts_ms=sending, seq=seq, sid=sid,
-                 local_receipt_ms=local, avg_60s=avg, last_15min_avg=last15)
+                 local_receipt_ms=local, avg_60s=avg, last_15min_avg=last15,
+                 avg_60s_unusable=avg_bad, last15_unusable=last15_bad)
 
 
 def _ticks_in(rows: Iterable, t_from_ms: int, t_to_ms: int, conflicts: list | None = None,
-              meta_groups: list | None = None) -> tuple[list[_Tick], dict]:
+              meta_groups: list | None = None, in_span: list | None = None) -> tuple[list[_Tick], dict]:
     """Valid ticks with source time in [t_from_ms, t_to_ms], one per source time, in time order.
 
     Valid: a well-formed BRTI `cfbenchmarks_value` row with -EARLY_MAX_MS <= received_at - source time <=
@@ -318,10 +332,13 @@ def _ticks_in(rows: Iterable, t_from_ms: int, t_to_ms: int, conflicts: list | No
       if `conflicts` is given, the dropped rows are appended to it; `n_conflicting_rows` counts those rows.
     The counts reconcile: n_rows_read == n_rows_malformed + n_rows_late + n_rows_outside_span + n_ticks_kept
     + n_duplicates_dropped + n_dup_diff_meta + n_conflicting_rows, where n_ticks_kept is the number of ticks returned.
+    `n_avg_unusable` is outside that identity: it counts the valid rows in the span (any of the last four buckets)
+    that carried an average made unusable by `_price` (one per row, whichever average). If `in_span` is given, every
+    valid row in the span is appended to it.
     """
     counts = {"n_rows_read": 0, "n_rows_malformed": 0, "n_rows_late": 0, "n_rows_outside_span": 0,
               "n_duplicates_dropped": 0, "n_dup_diff_meta": 0, "n_conflicting_source_times": 0,
-              "n_conflicting_rows": 0}
+              "n_conflicting_rows": 0, "n_avg_unusable": 0}
     kept: list[_Tick] = []
     for row in rows:
         counts["n_rows_read"] += 1
@@ -334,6 +351,9 @@ def _ticks_in(rows: Iterable, t_from_ms: int, t_to_ms: int, conflicts: list | No
             counts["n_rows_outside_span"] += 1
         else:
             kept.append(tick)
+            counts["n_avg_unusable"] += tick.avg_60s_unusable or tick.last15_unusable
+    if in_span is not None:
+        in_span.extend(kept)
     kept.sort(key=lambda t: (t.source_ms, t.received_at_ms, t.seq))
     groups: list[list[_Tick]] = []
     for tick in kept:
@@ -745,6 +765,8 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
       `n_close_running` = averages with window_size below 60 (the running last minute); `n_close_conflicting_candidates`
       and `n_close_dup_diff_meta_candidates` count candidate rows in dropped and in value-differing same-price
       groups, of either tier. A window_size above 60 is in neither count, and is never used.
+      `n_close_avg_unusable` counts the valid rows in the span whose last_15min_avg failed the price bound and was
+      set to None, so a missing close tick is visible.
     The estimate is `settlement_estimate` (2 dp, ROUND_HALF_EVEN) with `settlement_estimate_half_even` (the same) and
     `settlement_estimate_half_up` (2 dp, ROUND_HALF_UP) beside it, and `settlement_value_raw` (the Decimal as
     received); Step 0's read of the market rules decides which rounding applies. `local_brti_mean` is the exact mean
@@ -765,7 +787,8 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
     written_at = datetime.timestamp(_gate(clock))
     conflicting: list[_Tick] = []
     meta_groups: list[list[_Tick]] = []
-    ticks, counts = _ticks_in(rows, t_from, t_to, conflicting, meta_groups)
+    valid_rows: list[_Tick] = []
+    ticks, counts = _ticks_in(rows, t_from, t_to, conflicting, meta_groups, valid_rows)
     Q = close_ms
 
     def size(t: _Tick) -> int | None:
@@ -842,6 +865,8 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
             "local_receipt_ms": close_tick.local_receipt_ms, "last_60s_windowed_average_15min": avg},
         "n_close_candidates": len(exact), "n_close_partial_candidates": len(partial),
         "n_close_wrong_window": n_wrong, "n_close_running": n_running,
+        # rows whose last_15min_avg failed the price bound and was set to None: no candidate in either tier
+        "n_close_avg_unusable": sum(1 for t in valid_rows if t.last15_unusable),
         "n_close_conflicting_candidates": n_conflicting_candidates,   # rows, not source times
         "n_close_dup_diff_meta_candidates": sum(len(g) for g in meta_disagree),   # rows, in same-value groups
         "close_candidates_agree": agree,
