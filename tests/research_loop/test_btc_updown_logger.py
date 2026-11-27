@@ -1002,7 +1002,8 @@ def test_numeric_literals_beyond_decimal_or_64_digits_through_the_file_reader(tm
 
 def test_json_number_hooks_never_raise():
     assert L._json_int("7" * 64) == int("7" * 64) and L._json_int("7" * 65) is L._BAD_NUMBER
-    assert L._json_int("-" + "7" * 65) is L._BAD_NUMBER
+    assert L._json_int("-" + "7" * 65) is L._BAD_NUMBER and L._json_int("-" + "7" * 64) is L._BAD_NUMBER
+    assert L._json_int("-" + "7" * 63) == -int("7" * 63)                 # 64 characters, sign included: an int
     assert L._json_float("1E+999999") == Decimal("1E+999999") and L._json_float("1E+1000000") is L._BAD_NUMBER
     assert L._json_float("1." + "0" * 63) is L._BAD_NUMBER and L._json_float(NINETEEN_NINES) is L._BAD_NUMBER
     assert L._whole(L._BAD_NUMBER) is None and L._jsonable({"x": L._BAD_NUMBER}) == {"x": None}
@@ -1023,6 +1024,109 @@ def test_close_twins_with_one_unusable_average_give_the_same_estimate_in_either_
     assert rec["settlement_estimate"] == "100.10" and rec["close_quality"] == "exact_60"
     assert rec["n_close_avg_unusable"] == 1 and rec["close_candidates_agree"] is True
     assert rec["n_dup_diff_meta"] == 1 and rec["n_close_dup_diff_meta_candidates"] == 0
+
+
+@pytest.mark.parametrize("src_off,size", [(-1000, 58), (2000, 60)])
+def test_close_counts_do_not_depend_on_twin_order(tmp_path, src_off, size):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    src = C + src_off
+    base = [r for r in _close_rows(w, None) if r["source_time_ms"] != src]
+    usable = tick_row(src, seq=1, last15=_avg("100.10", C - 60_000, src, size=size))
+    unusable = tick_row(src, seq=1, last15=_avg("0", C - 60_000, src, size=size))
+    counts = []
+    for k, (first, second) in enumerate(((usable, unusable), (unusable, usable))):  # which twin arrives first (seq)
+        pair = [dict(first, seq=1), dict(second, seq=2)]
+        recs = [log_close(tmp_path / f"{k}-{j}", w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
+                for j, rows in enumerate((base + pair, base + pair[::-1]))]          # and the input order
+        assert recs[0] == recs[1]                                                    # whole record, counts included
+        counts.append({f: v for f, v in recs[0].items() if f.startswith("n_close_")})
+    assert counts[0] == counts[1]
+    assert counts[0]["n_close_avg_unusable"] == 1
+    assert (counts[0]["n_close_running"], counts[0]["n_close_wrong_window"]) == ((1, 0) if size == 58 else (0, 1))
+
+
+def test_identical_rows_count_once_in_the_close_pool(tmp_path):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    a = tick_row(C, seq=1, last15=_avg("100.10", C - 60_000, C))
+    a_prime = dict(a, seq=2, avg_60s=dict(a["avg_60s"], value="1.00"))
+    rows = [r for r in _close_rows(w, None) if r["source_time_ms"] != C]
+    same = log_close(tmp_path / "a", w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows + [a, dict(a)]))
+    diff = log_close(tmp_path / "b", w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows + [a, a_prime]))
+    assert same["n_close_candidates"] == 1 and diff["n_close_candidates"] == 2
+    assert same["settlement_estimate"] == diff["settlement_estimate"] == "100.10"
+    # [A, A, A']: the group reaches the pool whole, and the two identical rows still count once
+    trio = log_close(tmp_path / "c", w, clock=lambda: at(w.close_ts + 195.0),
+                     read_ticks=Spy(rows + [a, dict(a), a_prime]))
+    assert trio["n_close_candidates"] == 2 and trio["n_duplicates_dropped"] == 1 and trio["n_dup_diff_meta"] == 1
+    # [U, U, A] with U's last_15min_avg unusable: n_close_avg_unusable counts distinct rows too
+    u = dict(a, seq=0, last_15min_avg=_avg("0", C - 60_000, C))
+    unus = log_close(tmp_path / "d", w, clock=lambda: at(w.close_ts + 195.0),
+                     read_ticks=Spy(rows + [u, dict(u), a]))
+    assert unus["n_close_avg_unusable"] == 1 and unus["n_close_candidates"] == 1
+    assert unus["settlement_estimate"] == "100.10"
+
+
+def _random_rows(rng, centre: int, span_s: int) -> list[dict]:
+    rows = []
+    for k in range(-span_s, span_s + 1):
+        src = centre + 1000 * k
+        for _ in range(rng.choice((0, 1, 1, 2, 3))):
+            size = rng.choice((None, 55, 58, 59, 60, 60, 61))
+            last15 = None if size is None else _avg(rng.choice(("100.10", "100.20", "0")), centre - 60_000, src, size)
+            row = tick_row(src, rng.choice(("100.00", "100.00", "100.01")), seq=rng.choice((1, 2)),
+                           recv=src + rng.choice((20, 50)), avg=rng.choice(("99.99", "99.99", "0")), last15=last15)
+            rows.append(row)
+    return rows
+
+
+def test_close_and_t_star_records_are_identical_under_any_row_order(tmp_path):
+    import random
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    T = tstar_ms(w)
+    for trial in range(200):
+        rng = random.Random(trial)
+        close_rows, star_rows = _random_rows(rng, C, 8), _random_rows(rng, T, 8)
+        close_recs, star_recs = [], []
+        for k in range(3):
+            order = random.Random(1000 * trial + k)
+            c, t = list(close_rows), list(star_rows)
+            order.shuffle(c)
+            order.shuffle(t)
+            folder = tmp_path / f"{trial}-{k}"
+            close_recs.append(log_close(folder, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(c)))
+            star_recs.append(log_window(folder, w, clock=lambda: at(w.open_ts + 300.0), read_ticks=Spy(t),
+                                        read_book=Spy(BOOK)))
+        assert close_recs[0] == close_recs[1] == close_recs[2], trial
+        assert star_recs[0] == star_recs[1] == star_recs[2], trial
+
+
+def test_an_exponent_of_minus_9999999_as_raw_and_as_an_average_value(tmp_path):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    tiny = "1E-9999999"
+    rows = _close_rows(w, "100.10")
+    rows.append(dict(tick_row(C - 500, seq=9), data=_raw_data(C - 500, tiny)))            # as the raw value
+    rows.append(tick_row(C - 1500, seq=9, last15=_avg(tiny, C - 60_000, C - 1500, size=58)))  # as an average value
+    with _deadline(5):
+        rec = log_close(tmp_path / "a", w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
+    assert rec["n_rows_malformed"] == 1 and rec["n_close_avg_unusable"] == 1 and rec["settlement_estimate"] == "100.10"
+    # and both as JSON number literals in a store line, through the file reader
+    tick_dir = tmp_path / "ticks"
+    tick_dir.mkdir()
+    day = datetime.fromtimestamp(C / 1000, UTC).strftime("%Y-%m-%d")
+    store = [json.dumps(r) for r in _close_rows(w, "100.10")]
+    store.append(json.dumps(dict(tick_row(C - 500, seq=9), data=_raw_data(C - 500, tiny))))
+    store.append(json.dumps(tick_row(C - 1500, seq=9, last15=_avg("1", C - 60_000, C - 1500, size=58)))
+                 .replace('"value": "1"', '"value": ' + tiny))
+    (tick_dir / f"kalshi_index_ticks-{day}.jsonl").write_text("\n".join(store) + "\n", encoding="utf-8")
+    with _deadline(5):
+        rec2 = log_close(tmp_path / "b", w, clock=lambda: at(w.close_ts + 195.0),
+                         read_ticks=tick_file_reader(tick_dir, clock=lambda: EF))
+    assert rec2["n_rows_malformed"] == 1 and rec2["n_close_avg_unusable"] == 1
+    assert rec2["settlement_estimate"] == "100.10" and "9999999" not in (tmp_path / "b" / L.LOG_NAME).read_text()
 
 
 def test_a_window_size_above_60_is_in_neither_close_count_and_never_used(tmp_path):

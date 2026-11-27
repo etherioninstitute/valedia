@@ -231,8 +231,9 @@ def _json_float(text: str) -> Any:
 
 
 def _json_int(text: str) -> Any:
-    """json's parse_int hook: an int, or _BAD_NUMBER for more than JSON_NUMBER_MAX_CHARS digits. Never raises."""
-    if len(text.lstrip("-")) > JSON_NUMBER_MAX_CHARS:
+    """json's parse_int hook: an int, or _BAD_NUMBER for a literal longer than JSON_NUMBER_MAX_CHARS characters,
+    sign included. Never raises."""
+    if len(text) > JSON_NUMBER_MAX_CHARS:
         return _BAD_NUMBER
     try:
         return int(text)
@@ -357,6 +358,17 @@ def _parse_tick_row(row: Any) -> _Tick | None:
                  avg_60s_unusable=avg_bad, last15_unusable=last15_bad)
 
 
+def _row_order(t: _Tick) -> tuple:
+    """(source time, received_at, seq), then the parsed row itself, so rows that tie on the first three are still
+    ordered by their content and never by the order the reader returned them in."""
+    return (t.source_ms, t.received_at_ms, t.seq, repr(t))
+
+
+def _same_tick(t: _Tick) -> tuple:
+    """What the dedupe compares: rows equal in this are one row (identical rows counted once)."""
+    return (t.source_ms, t.value, repr(t.avg_60s), repr(t.last_15min_avg), t.avg_60s_unusable, t.last15_unusable)
+
+
 def _ticks_in(rows: Iterable, t_from_ms: int, t_to_ms: int, conflicts: list | None = None,
               meta_groups: list | None = None, in_span: list | None = None) -> tuple[list[_Tick], dict]:
     """Valid ticks with source time in [t_from_ms, t_to_ms], one per source time, in time order.
@@ -394,7 +406,7 @@ def _ticks_in(rows: Iterable, t_from_ms: int, t_to_ms: int, conflicts: list | No
             counts["n_avg_unusable"] += tick.avg_60s_unusable or tick.last15_unusable
     if in_span is not None:
         in_span.extend(kept)
-    kept.sort(key=lambda t: (t.source_ms, t.received_at_ms, t.seq))
+    kept.sort(key=_row_order)                     # a total order: the input's row order never decides anything
     groups: list[list[_Tick]] = []
     for tick in kept:
         if groups and groups[-1][0].source_ms == tick.source_ms:
@@ -798,8 +810,11 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
       differ give None ("close_candidates_disagree"); otherwise the first by source time is the close tick.
     - Only when there is no exact candidate, the fallback: the tick with the latest source time in [Q - 2 s, Q + 1 s)
       whose average is present with 55 <= window_size <= 59 (`close_quality` "partial_<k>").
-    - Candidates come from every valid row of a kept source time (the kept row and its same-price twins); only
-      rows with a usable last_15min_avg take part, so the twins' arrival order cannot change the result.
+    - One pool for the candidates and all four close counts (n_close_candidates, n_close_partial_candidates,
+      n_close_running, n_close_wrong_window): the distinct valid rows of each kept source time (the kept row and
+      its same-price twins; identical rows counted once) that carry a usable last_15min_avg. A row whose average
+      was made unusable counts only in n_close_avg_unusable (distinct rows too). Rows are ordered by `_row_order`,
+      a total order, so no count and no choice depends on the order the reader returned the rows in.
     - Fail closed, within the tier used only (exact if any exact-tier row exists, kept, a same-price twin or in a
       source time dropped as conflicting; else the fallback), comparing Decimal(last_15min_avg.value) only (bounds
       are logged, never used): exact-tier rows with more than one value, or no kept exact tick, give None
@@ -853,11 +868,16 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
     # The candidate pool: every valid row of a kept source time (the kept row and its same-price twins), in
     # (source time, received_at, seq) order; a row without a usable last_15min_avg (absent, or made unusable) is
     # in no tier, so it takes no part in candidates or disagreement whichever order the twins arrived in.
-    pool = sorted(ticks + twins, key=lambda t: (t.source_ms, t.received_at_ms, t.seq))
+    # One pool for every close count: the distinct rows (identical rows counted once) with a usable average.
+    distinct: dict[tuple, _Tick] = {}
+    for t in sorted(ticks + twins, key=_row_order):
+        if t.last_15min_avg is not None:
+            distinct.setdefault(_same_tick(t), t)
+    pool = sorted(distinct.values(), key=_row_order)
     exact = [t for t in pool if is_exact(t)]
     partial = [t for t in pool if is_partial(t)]
-    n_wrong = sum(1 for t in ticks if size(t) == CLOSE_WINDOW_SIZE and not is_exact(t))
-    n_running = sum(1 for t in ticks if size(t) is not None and size(t) < CLOSE_WINDOW_SIZE)
+    n_wrong = sum(1 for t in pool if size(t) == CLOSE_WINDOW_SIZE and not is_exact(t))
+    n_running = sum(1 for t in pool if size(t) < CLOSE_WINDOW_SIZE)
     n_conflicting_candidates = sum(1 for t in conflicting if eligible(t))
 
     def value(t: _Tick) -> Decimal | None:
@@ -915,7 +935,7 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
         "n_close_candidates": len(exact), "n_close_partial_candidates": len(partial),
         "n_close_wrong_window": n_wrong, "n_close_running": n_running,
         # rows whose last_15min_avg failed the price bound and was set to None: no candidate in either tier
-        "n_close_avg_unusable": sum(1 for t in valid_rows if t.last15_unusable),
+        "n_close_avg_unusable": len({_same_tick(t) for t in valid_rows if t.last15_unusable}),   # distinct rows
         "n_close_conflicting_candidates": n_conflicting_candidates,   # rows, not source times
         "n_close_dup_diff_meta_candidates": sum(len(g) for g in meta_disagree),   # rows, in same-value groups
         "close_candidates_agree": agree,
