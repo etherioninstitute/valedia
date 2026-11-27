@@ -524,23 +524,30 @@ def test_a_tick_late_by_61_s_is_counted_and_excluded_and_60_s_is_kept(tmp_path):
     assert ok["n_rows_late"] == 0 and ok["tick_used"]["brti_raw"] == "777.00"
 
 
-def test_a_negative_lag_beyond_60_s_is_excluded_too(tmp_path):
+def test_the_validity_bound_is_signed_minus_2_s_to_plus_60_s(tmp_path):
     w = window(0)
     T = tstar_ms(w)
     base = series(T - 1000, n=300)
-    rec, _, _ = run(tmp_path, w, ticks=base + [tick_row(T, "777.00", seq=900, recv=T - 60_001)])
-    assert rec["n_rows_late"] == 1 and rec["tick_used"]["cf_source_ts_ms"] == T - 1000
-    ok, _, _ = run(tmp_path, window(0), ticks=base + [tick_row(T, "777.00", seq=900, recv=T - 60_000)])
-    assert ok["n_rows_late"] == 0 and ok["tick_used"]["brti_raw"] == "777.00"
+    for i, (lag, late) in enumerate(((-2000, 0), (-2001, 1), (60_000, 0), (60_001, 1), (-60_000, 1))):
+        rec, _, _ = run(tmp_path / str(i), w, ticks=base + [tick_row(T, "777.00", seq=900, recv=T + lag)])
+        assert rec["n_rows_late"] == late, lag
+        assert (rec["tick_used"]["brti_raw"] == "777.00") is (late == 0), lag
+        assert rec["tick_used"]["cf_source_ts_ms"] == (T if late == 0 else T - 1000), lag
 
 
 def test_late_ticks_are_excluded_from_the_close_record_too(tmp_path):
     w = window(0)
     C = int(round(w.close_ts * 1000))
-    rows = _close_rows(w, "100.00")
-    rows[30] = dict(rows[30], received_at_ms=rows[30]["source_time_ms"] + 61_000)     # the k = 0 candidate, late
-    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
-    assert rec["n_rows_late"] == 1 and rec["close_tick"]["cf_source_ts_ms"] == C + 1000
+    after = lambda: at(w.close_ts + 195.0)
+    for i, (recv, late) in enumerate(((C + 61_000, 1), (C - 2001, 1), (C + 60_000, 0), (C - 2000, 0))):
+        rows = _close_rows(w, "100.00")
+        rows[30] = dict(rows[30], received_at_ms=recv)                         # the exact close tick at Q
+        rec = log_close(tmp_path / str(i), w, clock=after, read_ticks=Spy(rows))
+        assert rec["n_rows_late"] == late, recv
+        if late:
+            assert rec["close_tick"] is None and rec["settlement_estimate_reason"] == "no_close_tick"
+        else:
+            assert rec["close_tick"]["cf_source_ts_ms"] == C and rec["settlement_estimate"] == "100.00"
 
 
 def _with_gap(T: int, gap_ms: int) -> list[dict]:
@@ -750,58 +757,142 @@ def _avg(value: str, start: int, end: int, size: int = 60) -> dict:
     return {"value": value, "window_size": size, "window_start_ts_ms": start, "window_end_ts_exclusive": end}
 
 
-def test_close_never_uses_the_previous_quarters_average(tmp_path):
+def test_a_size_60_average_away_from_the_close_is_never_used(tmp_path):
     w = window(0)
     C = int(round(w.close_ts * 1000))
     rows = _close_rows(w, None)
-    for i in range(0, 36):                         # every tick in the span still carries the last quarter's average
-        rows[i] = dict(rows[i], last_15min_avg=_avg("555.55", C - 960_000, C - 900_000))
+    for i in range(0, 36):                         # every tick but the one at Q carries a size-60 average
+        if i != 30:
+            rows[i] = dict(rows[i], last_15min_avg=_avg("555.55", C - 960_000, C - 900_000))
     rec = log_close(tmp_path / "a", w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
     assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "no_close_tick"
-    assert rec["n_close_wrong_window"] == 36 and rec["n_close_candidates"] == 0
-    # opposite: this quarter's average arriving later in the span is used, the stale ones still rejected
-    for i in range(31, 36):
-        rows[i] = dict(rows[i], last_15min_avg=_avg("100.005", C - 60_000, C))
+    assert rec["n_close_wrong_window"] == 35 and rec["n_close_candidates"] == 0 and rec["close_quality"] is None
+    # opposite: a size-60 average at Q is used, whatever its bounds say; the others are still counted
+    rows[30] = dict(rows[30], last_15min_avg=_avg("100.005", C - 960_000, C - 900_000))
     rec2 = log_close(tmp_path / "b", w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
-    assert rec2["settlement_estimate"] == "100.00" and rec2["close_tick"]["cf_source_ts_ms"] == C + 1000
-    assert rec2["n_close_wrong_window"] == 31 and rec2["n_close_candidates"] == 5
+    assert rec2["settlement_estimate"] == "100.00" and rec2["close_tick"]["cf_source_ts_ms"] == C
+    assert rec2["n_close_wrong_window"] == 35 and rec2["n_close_candidates"] == 1 and rec2["close_quality"] == "exact_60"
 
 
-@pytest.mark.parametrize("start_off,end_off", [(0, 1), (0, -1), (1, 0), (-1, 0)])
-def test_close_bounds_off_by_one_are_rejected(tmp_path, start_off, end_off):
+@pytest.mark.parametrize("off,used", [(0, True), (999, True), (1000, False), (-1, False)])
+@pytest.mark.parametrize("bounds", [(-60_000, 0), (-59_000, 999), (-920_000, -1)])
+def test_the_exact_close_tick_is_size_60_in_q_to_q_plus_1_s_whatever_its_bounds(tmp_path, off, used, bounds):
     w = window(0)
     C = int(round(w.close_ts * 1000))
-    rows = _close_rows(w, None)
-    rows[30] = dict(rows[30], last_15min_avg=_avg("100.00", C - 60_000 + start_off, C + end_off))
+    rows = [r for r in _close_rows(w, None) if r["source_time_ms"] not in (C, C + off)]
+    rows.append(tick_row(C + off, seq=500, last15=_avg("100.10", C + bounds[0], C + bounds[1])))
     rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
-    assert rec["settlement_estimate"] is None and rec["n_close_wrong_window"] == 1
-    assert rec["settlement_estimate_reason"] == "no_close_tick"
+    if used:
+        assert rec["settlement_estimate"] == "100.10" and rec["close_quality"] == "exact_60"
+        assert rec["close_tick"]["cf_source_ts_ms"] == C + off
+        assert rec["close_tick"]["last_60s_windowed_average_15min"]["window_start_ts_ms"] == C + bounds[0]
+        assert rec["n_close_candidates"] == 1 and rec["n_close_wrong_window"] == 0
+    else:
+        assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "no_close_tick"
+        assert rec["n_close_candidates"] == 0 and rec["n_close_wrong_window"] == 1 and rec["close_quality"] is None
+
+
+def test_59_running_ticks_are_counted_running_and_never_wrong_window(tmp_path):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    running = [tick_row(C - 60_000 + 1000 * k, seq=k, last15=_avg("100.10", C - 60_000, C - 60_000 + 1000 * k, size=k))
+               for k in range(1, 60)]                                  # sizes 1..59 over the last minute
+    rec = log_close(tmp_path / "a", w, clock=lambda: at(w.close_ts + 195.0),
+                    read_ticks=Spy(running + [tick_row(C, seq=60, last15=_avg("100.20", C - 60_000, C))]))
+    assert rec["n_close_running"] == 59 and rec["n_close_wrong_window"] == 0
+    assert rec["settlement_estimate"] == "100.20" and rec["close_quality"] == "exact_60"
+    # the same stream without its close tick: the latest of the running minute in [Q - 2 s, Q + 1 s) is the fallback
+    rec2 = log_close(tmp_path / "b", w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(running))
+    assert rec2["n_close_running"] == 59 and rec2["n_close_partial_candidates"] == 2
+    assert rec2["close_quality"] == "partial_59" and rec2["close_tick"]["cf_source_ts_ms"] == C - 1000
+
+
+def test_the_fallback_is_the_latest_size_55_to_59_tick_in_q_minus_2_s_to_q_plus_1_s(tmp_path):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    after = lambda: at(w.close_ts + 195.0)
+
+    def close(sub, *extra, drop=()):
+        rows = [r for r in _close_rows(w, None) if r["source_time_ms"] not in drop] + list(extra)
+        return log_close(tmp_path / sub, w, clock=after, read_ticks=Spy(rows))
+
+    def part(src, size, value="100.10"):
+        return tick_row(src, seq=700 + size, last15=_avg(value, C - 60_000, src, size=size))
+    a = close("a", part(C - 500, 59))
+    assert a["settlement_estimate"] == "100.10" and a["close_quality"] == "partial_59"
+    assert a["close_tick"]["cf_source_ts_ms"] == C - 500 and a["n_close_candidates"] == 0
+    b = close("b", part(C - 1500, 58, "100.30"), part(C - 500, 59))          # the latest source time wins
+    assert b["settlement_estimate"] == "100.10" and b["close_tick"]["cf_source_ts_ms"] == C - 500
+    c = close("c", part(C - 500, 54))                                        # 54 is below the fallback's floor
+    assert c["settlement_estimate"] is None and c["settlement_estimate_reason"] == "no_close_tick"
+    assert c["close_quality"] is None and c["n_close_running"] == 1
+    d = close("d", part(C - 2001, 58))                                       # 1 ms before Q - 2 s: not used
+    assert d["settlement_estimate"] is None and d["settlement_estimate_reason"] == "no_close_tick"
+    e = close("e", part(C - 2000, 58), drop=(C - 2000,))                     # exactly Q - 2 s: used
+    assert e["close_quality"] == "partial_58" and e["close_tick"]["cf_source_ts_ms"] == C - 2000
+    f = close("f", part(C + 999, 59), drop=(C,)) , close("g", part(C + 1000, 59), drop=(C + 1000,))
+    assert f[0]["close_quality"] == "partial_59" and f[1]["close_quality"] is None
+    g = close("h", tick_row(C, seq=9, last15=_avg("100.20", C - 60_000, C)), part(C - 500, 59), drop=(C,))
+    assert g["settlement_estimate"] == "100.20" and g["close_quality"] == "exact_60"   # exact first, always
+
+
+def test_the_local_brti_mean_is_exact_over_q_minus_60_s_to_q_half_even_to_8_dp(tmp_path):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    after = lambda: at(w.close_ts + 195.0)
+    rows = [tick_row(C - 60_000, "999.00", seq=1), tick_row(C - 30_000, "100.000000020", seq=2),
+            tick_row(C, "100.000000030", seq=3), tick_row(C + 1000, "999.00", seq=4)]
+    rec = log_close(tmp_path / "a", w, clock=after, read_ticks=Spy(rows))
+    assert rec["local_brti_mean"] == "100.00000002" and rec["local_brti_n"] == 2    # .025 to the even 2, not 3
+    thirds = [tick_row(C - 2000, "1", seq=1), tick_row(C - 1000, "1", seq=2), tick_row(C, "2", seq=3)]
+    rec2 = log_close(tmp_path / "b", w, clock=after, read_ticks=Spy(thirds))
+    assert rec2["local_brti_mean"] == "1.33333333" and rec2["local_brti_n"] == 3
+    rec3 = log_close(tmp_path / "c", w, clock=after, read_ticks=Spy([tick_row(C + 1000, seq=1)]))
+    assert rec3["local_brti_mean"] is None and rec3["local_brti_n"] == 0
+    assert no_float_lines(tmp_path / "a")[0]["local_brti_mean"] == "100.00000002"
+
+
+def test_a_close_value_beyond_the_local_context_gives_no_estimate_not_a_crash(tmp_path):
+    w = window(0)
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(_close_rows(w, "1E+100")))
+    assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "close_value_out_of_range"
+    assert rec["settlement_value_raw"] is None and rec["close_quality"] is None
 
 
 def test_close_candidates_that_disagree_give_none(tmp_path):
     w = window(0)
-    rows = _close_rows(w, "100.00")
-    rows[33] = dict(rows[33], last_15min_avg=dict(rows[33]["last_15min_avg"], value="100.01"))
-    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
+    C = int(round(w.close_ts * 1000))
+    rows = _close_rows(w, "100.00") + [tick_row(C + 500, seq=600, last15=_avg("100.01", C - 60_000, C))]
+    rec = log_close(tmp_path / "a", w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
     assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "close_candidates_disagree"
-    assert rec["close_candidates_agree"] is False and rec["n_close_candidates"] == 6
-    assert rec["close_tick"] is not None                       # the first candidate is still recorded, as metadata
+    assert rec["close_candidates_agree"] is False and rec["n_close_candidates"] == 2
+    assert rec["close_tick"] is not None and rec["close_quality"] is None   # the first candidate is still recorded
+    # Decimal equality: 100.0 and 100.00 are one value
+    rows[-1] = tick_row(C + 500, seq=600, last15=_avg("100.0", C - 60_000, C))
+    rec2 = log_close(tmp_path / "b", w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
+    assert rec2["settlement_estimate"] == "100.00" and rec2["n_close_candidates"] == 2
 
 
 def test_close_estimate_rounds_half_even_on_a_half_cent(tmp_path):
     w = window(0)
     after = lambda: at(w.close_ts + 195.0)
-    for i, (raw, want) in enumerate((("100000.125", "100000.12"), ("100000.135", "100000.14"),
-                                     ("100000.1251", "100000.13"), ("99999.995", "100000.00"))):
+    for i, (raw, even, up) in enumerate((("100000.125", "100000.12", "100000.13"),
+                                         ("100000.135", "100000.14", "100000.14"),
+                                         ("100000.1251", "100000.13", "100000.13"),
+                                         ("99999.995", "100000.00", "100000.00"),
+                                         ("100000.12500000", "100000.12", "100000.13"))):
         rec = log_close(tmp_path / str(i), w, clock=after, read_ticks=Spy(_close_rows(w, raw)))
-        assert rec["settlement_estimate"] == want, raw
+        assert rec["settlement_estimate"] == rec["settlement_estimate_half_even"] == even, raw
+        assert rec["settlement_estimate_half_up"] == up and rec["settlement_value_raw"] == raw, raw
         assert rec["settlement_estimate_reason"] is None and rec["rounding"] == "2 dp, ROUND_HALF_EVEN"
         assert rec["close_tick"]["last_60s_windowed_average_15min"]["value"] == raw
-        assert rec["close_tick"]["cf_source_ts_ms"] == int(w.close_ts * 1000)     # the first tick with size 60
+        assert rec["close_tick"]["cf_source_ts_ms"] == int(w.close_ts * 1000)     # the size-60 tick at Q
+    saved = no_float_lines(tmp_path / "4")[0]
+    assert saved["settlement_value_raw"] == "100000.12500000" and saved["settlement_estimate_half_up"] == "100000.13"
     saved = no_float_lines(tmp_path / "0")[0]
     assert saved["kind"] == "close" and saved["schema_version"] == 2 and saved["settlement_estimate"] == "100000.12"
-    assert saved["n_close_candidates"] == 6 and saved["close_candidates_agree"] is True
-    assert saved["n_close_wrong_window"] == 0
+    assert saved["n_close_candidates"] == 1 and saved["close_candidates_agree"] is True
+    assert saved["n_close_wrong_window"] == 5 and saved["close_quality"] == "exact_60"
     assert "Kalshi settled market" in saved["outcome_source"]
 
 
@@ -810,8 +901,8 @@ def test_close_estimate_absent_gives_none_and_a_reason(tmp_path):
     after = lambda: at(w.close_ts + 195.0)
     none_at_all = log_close(tmp_path / "a", w, clock=after, read_ticks=Spy(_close_rows(w, None)))
     assert none_at_all["settlement_estimate"] is None and none_at_all["settlement_estimate_reason"] == "no_close_tick"
-    assert none_at_all["close_tick"] is None
-    short = log_close(tmp_path / "b", w, clock=after, read_ticks=Spy(_close_rows(w, "100000.125", size=59)))
+    assert none_at_all["close_tick"] is None and none_at_all["settlement_value_raw"] is None
+    short = log_close(tmp_path / "b", w, clock=after, read_ticks=Spy(_close_rows(w, "100000.125", size=54)))
     assert short["settlement_estimate"] is None and short["settlement_estimate_reason"] == "no_close_tick"
 
     def broken(win, a, b):
@@ -1563,30 +1654,54 @@ def test_conflicting_values_at_t_star_drop_that_source_time(tmp_path):
     assert rec2["n_conflicting_source_times"] == 4 and rec2["status"] == "SKIP_STALE_INDEX"
 
 
-def test_a_conflict_only_in_avg_60s_at_an_ordinary_tick_is_dropped_and_counted(tmp_path):
+def test_an_equal_value_with_another_avg_60s_is_one_tick_counted_dup_diff_meta(tmp_path):
     w = window(0)
     T = tstar_ms(w)
     ticks = series(T, n=300)
     i = 150
     other = dict(ticks[i], seq=5000, avg_60s=dict(ticks[i]["avg_60s"], value="12345.67"))
     rec, _, _ = run(tmp_path, w, ticks=ticks + [other])
-    assert rec["n_conflicting_source_times"] == 1 and rec["n_duplicates_dropped"] == 0
-    assert ticks[i]["source_time_ms"] not in {p["cf_source_ts_ms"] for p in rec["series"]}
-    assert len(rec["series"]) == 299
+    assert rec["n_dup_diff_meta"] == 1 and rec["n_conflicting_source_times"] == 0 and rec["n_duplicates_dropped"] == 0
+    assert ticks[i]["source_time_ms"] in {p["cf_source_ts_ms"] for p in rec["series"]}
+    assert len(rec["series"]) == 300 and rec["series_checks"]["max_gap_ms"] == 1000 and rec["status"] == "OK"
 
 
-def test_conflicting_close_candidates_at_one_source_time_give_none(tmp_path):
+def test_a_same_value_row_with_another_close_average_gives_none(tmp_path):
     w = window(0)
     C = int(round(w.close_ts * 1000))
+    after = lambda: at(w.close_ts + 195.0)
     rows = _close_rows(w, "100.10")
-    rows.append(dict(rows[30], seq=5000, last_15min_avg=_avg("999.99", C - 60_000, C)))   # k = 0, other value
-    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
+    rows.append(dict(rows[30], seq=5000, last_15min_avg=_avg("999.99", C - 60_000, C)))   # at Q, same price
+    rec = log_close(tmp_path / "a", w, clock=after, read_ticks=Spy(rows))
     assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "close_candidates_disagree"
-    assert rec["close_candidates_agree"] is False and rec["n_close_conflicting_candidates"] == 2
-    assert rec["n_conflicting_source_times"] == 1
+    assert rec["close_candidates_agree"] is False and rec["n_close_dup_diff_meta_candidates"] == 2
+    assert rec["n_dup_diff_meta"] == 1 and rec["n_conflicting_source_times"] == 0
+    # a different price at Q: the source time is dropped and its candidate rows make it a disagreement too
+    rows2 = _close_rows(w, "100.10") + [tick_row(C, "1.00", seq=5000, last15=_avg("100.10", C - 60_000, C))]
+    rec2 = log_close(tmp_path / "b", w, clock=after, read_ticks=Spy(rows2))
+    assert rec2["settlement_estimate_reason"] == "close_candidates_disagree"
+    assert rec2["n_close_conflicting_candidates"] == 2 and rec2["n_conflicting_source_times"] == 1
+    # a fallback tick with a same-price twin carrying another average: disagreement
+    base = _close_rows(w, None)
+    twin = [tick_row(C - 500, seq=1, last15=_avg("100.10", C - 60_000, C - 500, size=59)),
+            tick_row(C - 500, seq=2, last15=_avg("100.30", C - 60_000, C - 500, size=59))]
+    rec3 = log_close(tmp_path / "c", w, clock=after, read_ticks=Spy(base + twin))
+    assert rec3["settlement_estimate_reason"] == "close_candidates_disagree" and rec3["n_dup_diff_meta"] == 1
+    # a fallback source time with two prices: dropped, and its fallback rows make it a disagreement
+    clash = [tick_row(C - 500, "1.00", seq=1, last15=_avg("100.10", C - 60_000, C - 500, size=59)),
+             tick_row(C - 500, "2.00", seq=2, last15=_avg("100.10", C - 60_000, C - 500, size=59)),
+             tick_row(C - 1500, seq=3, last15=_avg("100.20", C - 60_000, C - 1500, size=58))]
+    rec5 = log_close(tmp_path / "e", w, clock=after, read_ticks=Spy(base + clash))
+    assert rec5["settlement_estimate_reason"] == "close_candidates_disagree"
+    assert rec5["n_close_conflicting_candidates"] == 2 and rec5["settlement_estimate"] is None
+    # only avg_60s differs at Q: one tick, no disagreement
+    rows4 = _close_rows(w, "100.10")
+    rows4.append(dict(rows4[30], seq=5000, avg_60s=dict(rows4[30]["avg_60s"], value="1.00")))
+    rec4 = log_close(tmp_path / "d", w, clock=after, read_ticks=Spy(rows4))
+    assert rec4["settlement_estimate"] == "100.10" and rec4["n_dup_diff_meta"] == 1
 
 
-def test_a_wrong_bounds_row_first_and_a_right_candidate_second_is_a_conflict(tmp_path):
+def test_a_wrong_bounds_row_first_and_a_right_candidate_second_is_a_disagreement(tmp_path):
     w = window(0)
     C = int(round(w.close_ts * 1000))
     first = tick_row(C, seq=1, recv=C + 20, last15=_avg("555.55", C - 960_000, C - 900_000))
@@ -1594,13 +1709,15 @@ def test_a_wrong_bounds_row_first_and_a_right_candidate_second_is_a_conflict(tmp
     rows = [r for r in _close_rows(w, None) if r["source_time_ms"] != C] + [first, second]
     rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
     assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "close_candidates_disagree"
-    assert rec["n_close_conflicting_candidates"] == 1 and rec["n_close_candidates"] == 0
+    assert rec["n_close_dup_diff_meta_candidates"] == 2 and rec["n_close_conflicting_candidates"] == 0
+    assert rec["n_close_candidates"] == 1 and rec["close_tick"]["seq"] == 1     # the first received is the tick
 
 
 def _reconciles(rec: dict) -> bool:
     """The count identity, from the record's own fields only."""
     return rec["n_rows_read"] == (rec["n_rows_malformed"] + rec["n_rows_late"] + rec["n_rows_outside_span"]
-                                  + rec["n_ticks_kept"] + rec["n_duplicates_dropped"] + rec["n_conflicting_rows"])
+                                  + rec["n_ticks_kept"] + rec["n_duplicates_dropped"] + rec["n_dup_diff_meta"]
+                                  + rec["n_conflicting_rows"])
 
 
 def test_the_row_counts_reconcile_over_every_kind_of_row(tmp_path):
@@ -1614,11 +1731,13 @@ def test_the_row_counts_reconcile_over_every_kind_of_row(tmp_path):
         dict(ticks[10], seq=7003), dict(ticks[10], seq=7004),                     # two equal duplicates
         tick_row(ticks[20]["source_time_ms"], "1.00", seq=7005),                  # with ticks[20]: a conflict of 3
         tick_row(ticks[20]["source_time_ms"], "2.00", seq=7006),
+        dict(ticks[30], seq=7007, avg_60s=dict(ticks[30]["avg_60s"], value="1.00")),   # same price, other avg
+        tick_row(T - 3000, "777.00", seq=7008, recv=T - 3000 - 2001),                 # early by 2001 ms: late
     ]
     rec, _, _ = run(tmp_path, w, ticks=ticks + extra)
-    assert (rec["n_rows_malformed"], rec["n_rows_late"], rec["n_rows_outside_span"]) == (1, 1, 1)
-    assert rec["n_duplicates_dropped"] == 2 and rec["n_conflicting_source_times"] == 1
-    assert rec["n_conflicting_rows"] == 3 and len(rec["series"]) == 299 and rec["n_rows_read"] == 307
+    assert (rec["n_rows_malformed"], rec["n_rows_late"], rec["n_rows_outside_span"]) == (1, 2, 1)
+    assert rec["n_duplicates_dropped"] == 2 and rec["n_conflicting_source_times"] == 1 and rec["n_dup_diff_meta"] == 1
+    assert rec["n_conflicting_rows"] == 3 and len(rec["series"]) == 299 and rec["n_rows_read"] == 309
     assert rec["n_ticks_kept"] == len(rec["series"]) == 299 and _reconciles(rec)
     assert _reconciles(lines(tmp_path)[0])                                        # and as written
 
@@ -1627,12 +1746,13 @@ def test_the_close_record_carries_conflicting_rows_and_reconciles(tmp_path):
     w = window(0)
     C = int(round(w.close_ts * 1000))
     rows = _close_rows(w, "100.10")
-    rows.append(dict(rows[30], seq=5000, last_15min_avg=_avg("999.99", C - 60_000, C)))
+    rows.append(tick_row(C - 10_000, "1.00", seq=5000))                         # another price: a conflict of 2
     rows.append(dict(rows[31], seq=5001))                                         # an equal duplicate
+    rows.append(dict(rows[32], seq=5002, avg_60s=dict(rows[32]["avg_60s"], value="1.00")))   # same price, other avg
     rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
-    assert rec["n_conflicting_rows"] == 2 and rec["n_duplicates_dropped"] == 1
-    assert rec["n_rows_read"] == 38 and rec["n_ticks_kept"] == 35 and _reconciles(rec)
-    assert _reconciles(lines(tmp_path)[0])
+    assert rec["n_conflicting_rows"] == 2 and rec["n_duplicates_dropped"] == 1 and rec["n_dup_diff_meta"] == 1
+    assert rec["n_rows_read"] == 39 and rec["n_ticks_kept"] == 35 and _reconciles(rec)
+    assert rec["settlement_estimate"] == "100.10" and _reconciles(lines(tmp_path)[0])
 
 
 class _NeverBefore(datetime):
@@ -1953,9 +2073,9 @@ def test_the_file_reader_hands_over_rows_that_fail_the_tick_checks_as_malformed(
     for r in failing:
         assert L._parse_tick_row(r) is None
     not_this_span = [dict(tick_row(T - 1000), seq="x", received_at_ms=b + L.LATE_MAX_MS + 1),
-                     dict(tick_row(T - 299_000), seq="x", received_at_ms=a - L.LATE_MAX_MS - 1)]
+                     dict(tick_row(T - 299_000), seq="x", received_at_ms=a - L.EARLY_MAX_MS - 1)]
     edges = [dict(tick_row(T - 2000), seq="x", received_at_ms=b + L.LATE_MAX_MS),
-             dict(tick_row(T - 298_000), seq="x", received_at_ms=a - L.LATE_MAX_MS)]   # exactly on the range: counted
+             dict(tick_row(T - 298_000), seq="x", received_at_ms=a - L.EARLY_MAX_MS)]  # exactly on the range: counted
     day = datetime.fromtimestamp(T / 1000, UTC).strftime("%Y-%m-%d")
     other_feeds = [tick_row(T - 100_100, channel="cfbenchmarks_value_5hz"), tick_row(T - 100_050, index_id="ETHUSD_RTI"),
                    dict(tick_row(T - 100_025, channel="cfbenchmarks_value_5hz"), seq="x")]   # another feed: no count
@@ -1970,7 +2090,8 @@ def test_the_file_reader_hands_over_rows_that_fail_the_tick_checks_as_malformed(
     assert rec["n_rows_read"] == 306 and rec["n_rows_outside_span"] == 0 and rec["n_ticks_kept"] == 300
     saved = lines(tmp_path / "log")[0]
     assert saved["n_rows_read"] == (saved["n_rows_malformed"] + saved["n_rows_late"] + saved["n_rows_outside_span"]
-                                    + saved["n_ticks_kept"] + saved["n_duplicates_dropped"] + saved["n_conflicting_rows"])
+                                    + saved["n_ticks_kept"] + saved["n_duplicates_dropped"] + saved["n_dup_diff_meta"]
+                                    + saved["n_conflicting_rows"])
     assert saved["status"] == "OK"                     # the malformed rows are counted, never used
 
 
@@ -1984,11 +2105,12 @@ def test_an_avg_60s_window_of_size_0_never_costs_the_tick_and_is_not_a_close_can
     rec, _, _ = run(tmp_path, w, ticks=ticks)
     assert rec["n_rows_malformed"] == 0 and rec["n_ticks_kept"] == 300
     assert rec["tick_used"]["cf_source_ts_ms"] == T and rec["tick_used"]["avg_60s_data"]["window_size"] == 0
-    # the close: a last_15min_avg of window_size 0 with this quarter's bounds is not a candidate; it is not counted
-    # as a wrong window either (n_close_wrong_window counts window_size-60 averages with other bounds only)
+    # the close: a last_15min_avg of window_size 0 is not a candidate; it is counted as running, never as a wrong
+    # window (n_close_wrong_window counts window_size-60 averages outside [Q, Q + 1 s) only)
     C = int(round(w.close_ts * 1000))
     rows = _close_rows(w, None)
     rows[30] = dict(rows[30], last_15min_avg=_avg("100.10", C - 60_000, C, size=0))
     close = log_close(tmp_path / "c", w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
     assert close["n_rows_malformed"] == 0 and close["n_close_candidates"] == 0
     assert close["n_close_wrong_window"] == 0 and close["settlement_estimate_reason"] == "no_close_tick"
+    assert close["n_close_running"] == 1                  # a window_size below 60 is the running minute

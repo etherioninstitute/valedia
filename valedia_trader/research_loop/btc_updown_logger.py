@@ -33,7 +33,7 @@ import os
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_HALF_EVEN, Context, Decimal, InvalidOperation, localcontext
+from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Context, Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any
 
@@ -58,7 +58,8 @@ MIN_TICKS = 270             # fewer valid ticks than this in the series span is 
 ANCHOR_BACK_MS = 180_000    # a tick is needed within ANCHOR_TOL_MS of t* - 180 s
 ANCHOR_TOL_MS = 3_000
 MAX_GAP_MS = 5_000          # a gap above this between consecutive ticks, or at either edge of the span, is a skip
-LATE_MAX_MS = 60_000        # a tick whose Kalshi received_at differs from its source time by more is not valid
+LATE_MAX_MS = 60_000        # a tick is valid only if -EARLY_MAX_MS <= received_at - source time <= LATE_MAX_MS
+EARLY_MAX_MS = 2_000        # (signed: a tick received more than 2 s before its own source time is not valid)
 SKIP_STALE_INDEX = "SKIP_STALE_INDEX"
 SKIP_WARMUP_OR_GAP = "SKIP_WARMUP_OR_GAP"
 SKIP_NO_BOOK = "SKIP_NO_BOOK"
@@ -66,12 +67,18 @@ SKIP_NO_BOOK = "SKIP_NO_BOOK"
 # The close record: the settlement estimate from the close tick.
 CLOSE_BEFORE_MS = 60_000    # the close span is [close - 60 s, close + 10 s] by source time
 CLOSE_AFTER_MS = 10_000     # the record is refused before close + CLOSE_WAIT_MS (see below)
-CLOSE_WINDOW_SIZE = 60      # a close candidate: window_size 60 and this quarter's last-minute bounds (see log_close)
+CLOSE_WINDOW_SIZE = 60      # an exact close tick: window_size 60 and source time in [close, close + CLOSE_EXACT_MS)
+CLOSE_EXACT_MS = 1_000
+CLOSE_PARTIAL_BACK_MS = 2_000   # the fallback: source time in [close - 2 s, close + 1 s), window_size 55..59
+CLOSE_PARTIAL_MIN_SIZE = 55
+LOCAL_MEAN_SPAN_MS = 60_000     # local_brti_mean: brti_raw over source times in (close - 60 s, close]
+LOCAL_MEAN_DP = 8
 SETTLE_QUANTUM = Decimal("0.01")
 SETTLE_ROUNDING = ROUND_HALF_EVEN
+_SETTLE_CONTEXT = Context(prec=60, rounding=ROUND_HALF_EVEN, traps=[InvalidOperation])   # local: not the caller's
 RECEIPT_MARGIN_MS = 120_000  # receipt time vs source time skew allowed for: which day files to open, and where to stop
 # The close record waits until close + 10 s + 60 s + 120 s = close + 190 s: a valid tick of the span has Kalshi
-# received_at within LATE_MAX_MS of its source time, and is delivered and written within RECEIPT_MARGIN_MS of that
+# received_at at most LATE_MAX_MS after its source time, and is delivered and written within RECEIPT_MARGIN_MS of that
 # (the reader's own bound). A tick delivered and written later than that can be missed by the close record.
 CLOSE_WAIT_MS = CLOSE_AFTER_MS + LATE_MAX_MS + RECEIPT_MARGIN_MS
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -282,28 +289,31 @@ def _parse_tick_row(row: Any) -> _Tick | None:
                  local_receipt_ms=local, avg_60s=avg, last_15min_avg=last15)
 
 
-def _ticks_in(rows: Iterable, t_from_ms: int, t_to_ms: int,
-              conflicts: list | None = None) -> tuple[list[_Tick], dict]:
+def _ticks_in(rows: Iterable, t_from_ms: int, t_to_ms: int, conflicts: list | None = None,
+              meta_groups: list | None = None) -> tuple[list[_Tick], dict]:
     """Valid ticks with source time in [t_from_ms, t_to_ms], one per source time, in time order.
 
-    Valid: a well-formed BRTI `cfbenchmarks_value` row whose Kalshi `received_at` is within LATE_MAX_MS of its
-    source time (either way); a row that is not is counted as late and never used.
-    Rows are grouped by source time. A group whose rows are all the same tick (equal value, avg_60s and
-    last_15min_avg, compared parsed) keeps the first received; the rest count in `n_duplicates_dropped`. A group
-    whose rows differ in any of those is dropped whole and counted in `n_conflicting_source_times` (fail closed);
-    if `conflicts` is given, the dropped rows are appended to it; `n_conflicting_rows` counts those rows.
+    Valid: a well-formed BRTI `cfbenchmarks_value` row with -EARLY_MAX_MS <= received_at - source time <=
+    LATE_MAX_MS (signed); a row that is not is counted as late (`n_rows_late`) and never used.
+    Rows are grouped by source time, and each group is ordered by (received_at, seq).
+    - Every row has an equal Decimal value: one tick, the first row kept. If the rows are equal in avg_60s and
+      last_15min_avg too (compared parsed), the rest count in `n_duplicates_dropped`; if not, the rest count in
+      `n_dup_diff_meta` (the whole group's rows are appended to `meta_groups` when it is given).
+    - Any two values differ: the group is dropped whole and counted in `n_conflicting_source_times` (fail closed);
+      if `conflicts` is given, the dropped rows are appended to it; `n_conflicting_rows` counts those rows.
     The counts reconcile: n_rows_read == n_rows_malformed + n_rows_late + n_rows_outside_span + n_ticks_kept
-    + n_duplicates_dropped + n_conflicting_rows, where n_ticks_kept is the number of ticks returned.
+    + n_duplicates_dropped + n_dup_diff_meta + n_conflicting_rows, where n_ticks_kept is the number of ticks returned.
     """
     counts = {"n_rows_read": 0, "n_rows_malformed": 0, "n_rows_late": 0, "n_rows_outside_span": 0,
-              "n_duplicates_dropped": 0, "n_conflicting_source_times": 0, "n_conflicting_rows": 0}
+              "n_duplicates_dropped": 0, "n_dup_diff_meta": 0, "n_conflicting_source_times": 0,
+              "n_conflicting_rows": 0}
     kept: list[_Tick] = []
     for row in rows:
         counts["n_rows_read"] += 1
         tick = _parse_tick_row(row)
         if tick is None:
             counts["n_rows_malformed"] += 1
-        elif abs(tick.received_at_ms - tick.source_ms) > LATE_MAX_MS:
+        elif not (-EARLY_MAX_MS <= tick.received_at_ms - tick.source_ms <= LATE_MAX_MS):
             counts["n_rows_late"] += 1                  # one rule everywhere: a late (or early) tick is never used
         elif not (t_from_ms <= tick.source_ms <= t_to_ms):
             counts["n_rows_outside_span"] += 1
@@ -319,9 +329,13 @@ def _ticks_in(rows: Iterable, t_from_ms: int, t_to_ms: int,
     out: list[_Tick] = []
     for group in groups:
         first = group[0]
-        if all((t.value, t.avg_60s, t.last_15min_avg) == (first.value, first.avg_60s, first.last_15min_avg)
-               for t in group[1:]):
-            counts["n_duplicates_dropped"] += len(group) - 1   # a repeated source time is the same tick
+        if all(t.value == first.value for t in group[1:]):    # one tick: the first received is kept
+            if all((t.avg_60s, t.last_15min_avg) == (first.avg_60s, first.last_15min_avg) for t in group[1:]):
+                counts["n_duplicates_dropped"] += len(group) - 1   # a repeated source time is the same tick
+            else:
+                counts["n_dup_diff_meta"] += len(group) - 1        # same price, different averages: still one tick
+                if meta_groups is not None:
+                    meta_groups.append(group)
             out.append(first)
         else:
             counts["n_conflicting_source_times"] += 1          # two different ticks at one source time: use neither
@@ -415,11 +429,11 @@ def _other_feed(row: dict) -> bool:
 def read_tick_files(tick_folder, t_from_ms: int, t_to_ms: int, *, clock: Callable[[], datetime]) -> list[dict]:
     """The tick-store rows of the span, in file order: (a) every row that parses to a tick with source time in
     [t_from_ms, t_to_ms]; and (b) every JSON-object row that does not parse to a tick but whose `received_at_ms` is a
-    whole number in [t_from_ms - LATE_MAX_MS, t_to_ms + LATE_MAX_MS], handed over so the logger counts it as
+    whole number in [t_from_ms - EARLY_MAX_MS, t_to_ms + LATE_MAX_MS], handed over so the logger counts it as
     malformed (`n_rows_malformed`).
 
-    Why that receipt range for (b): a valid tick of the span is received within LATE_MAX_MS of a source time in the
-    span, so a row received in that range is one that could have been a tick of this span; a row received outside it
+    Why that receipt range for (b): a valid tick of the span is received at most EARLY_MAX_MS before and at most
+    LATE_MAX_MS after a source time in the span, so a row received in that range is one that could have been a tick of this span; a row received outside it
     could not, so it is not this span's to count. Skipped, in no count: a line with no readable `received_at_ms` (a
     partial last line, not JSON, not an object, oversized), which cannot be placed in time; a tick whose source
     time is outside the span (it belongs to another window), so `n_rows_outside_span` is 0 through this reader; and
@@ -433,9 +447,11 @@ def read_tick_files(tick_folder, t_from_ms: int, t_to_ms: int, *, clock: Callabl
     before t_from_ms - LATE_MAX_MS - RECEIPT_MARGIN_MS, so the day before is opened only when the span reaches into
     it. Files only.
 
-    Why this returns every valid tick a full scan would: a valid tick (its received_at within LATE_MAX_MS of its
-    source time) with source time in the span was received in [t_from_ms - LATE_MAX_MS, t_to_ms + LATE_MAX_MS], so
-    it is filed on a day the read covers. If writes are out of receipt order by at most RECEIPT_MARGIN_MS, every row
+    Why this returns every valid tick a full scan would: a valid tick (received at most EARLY_MAX_MS before and at
+    most LATE_MAX_MS after its source time) with source time in the span was received in [t_from_ms - EARLY_MAX_MS,
+    t_to_ms + LATE_MAX_MS], so it is filed on a day the read covers. The day coverage and the stop rule still allow
+    LATE_MAX_MS before the span, wider than EARLY_MAX_MS needs, so they read a little more than needed and miss
+    nothing; they are kept as they were. If writes are out of receipt order by at most RECEIPT_MARGIN_MS, every row
     written before the stopping block was received before t_from_ms - LATE_MAX_MS, so it is not such a tick. A late
     tick is returned when the read reaches it (always, if it is late by no more than LATE_MAX_MS +
     RECEIPT_MARGIN_MS), and the logger counts it and excludes it.
@@ -465,7 +481,7 @@ def read_tick_files(tick_folder, t_from_ms: int, t_to_ms: int, *, clock: Callabl
                     out.append(row)                # (a) a tick of the span
             elif isinstance(row, dict) and not _other_feed(row):
                 recv = _whole(row.get("received_at_ms"))
-                if recv is not None and a - LATE_MAX_MS <= recv <= b + LATE_MAX_MS:
+                if recv is not None and a - EARLY_MAX_MS <= recv <= b + LATE_MAX_MS:
                     out.append(row)                # (b) a row that could have been a tick of the span: malformed
     return out
 
@@ -699,14 +715,25 @@ def log_window(folder, window: Window, *, clock: Callable[[], datetime], read_ti
 def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_ticks: Callable) -> dict:
     """After the close, write the close record: the settlement estimate from the close tick, or None and why.
 
-    A close candidate is a valid tick in [close - 60 s, close + 10 s] whose `last_60s_windowed_average_15min` is
-    THIS quarter's last minute: window_size 60, window_start_ts_ms == close - 60 s, window_end_ts_exclusive == close.
-    The estimate is the first candidate's value (by source time) rounded to 2 dp, ROUND_HALF_EVEN; if the
-    candidates' values disagree, or a source time dropped as conflicting held a row that would be a candidate, it is
-    None ("close_candidates_disagree": fail closed). A window_size-60 average with other bounds is counted
-    (`n_close_wrong_window`) and never used. Refused (CloseNotReached) before close + CLOSE_WAIT_MS (190 s),
-    compared exactly on the aware clock reading (no rounding). It is an estimate only: the authoritative outcome is Kalshi's
-    settled market, read later, offline.
+    Q = close_ms. The span read is [Q - 60 s, Q + 10 s] by source time; ticks are deduped by `_ticks_in`.
+    - An exact candidate: a valid tick whose `last_60s_windowed_average_15min` is present with window_size 60 and
+      whose source time is in [Q, Q + 1 s). The average's window bounds fields are logged as received and are NOT
+      used to select (Kalshi's own example contradicts its formula for them). Exact candidates whose Decimal values
+      differ give None ("close_candidates_disagree"); otherwise the first by source time is the close tick.
+    - Only when there is no exact candidate, the fallback: the tick with the latest source time in [Q - 2 s, Q + 1 s)
+      whose average is present with 55 <= window_size <= 59 (`close_quality` "partial_<k>").
+    - Fail closed: if a source time dropped as conflicting (different values) held a row that would be a candidate
+      (exact or fallback), or a same-value group whose rows carry different last_15min_avg held a row that would
+      be one, the estimate is None ("close_candidates_disagree").
+    - Counted: `n_close_wrong_window` = window_size-60 averages whose source time is outside [Q, Q + 1 s);
+      `n_close_running` = averages with window_size below 60 (the running last minute). A window_size above 60 is
+      in neither count, and is never used.
+    The estimate is `settlement_estimate` (2 dp, ROUND_HALF_EVEN) with `settlement_estimate_half_even` (the same) and
+    `settlement_estimate_half_up` (2 dp, ROUND_HALF_UP) beside it, and `settlement_value_raw` (the Decimal as
+    received); Step 0's read of the market rules decides which rounding applies. `local_brti_mean` is the exact mean
+    of brti_raw over the ticks with source time in (Q - 60 s, Q], rounded half-even to 8 dp, with `local_brti_n`.
+    Refused (CloseNotReached) before close + CLOSE_WAIT_MS (190 s), compared exactly on the aware clock reading (no
+    rounding). It is an estimate only: the authoritative outcome is Kalshi's settled market, read later, offline.
     """
     entered = _gate(clock)
     _check_folder(folder)
@@ -720,47 +747,101 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
     rows, tick_error = _read_rows(read_ticks, window, t_from, t_to)
     written_at = datetime.timestamp(_gate(clock))
     conflicting: list[_Tick] = []
-    ticks, counts = _ticks_in(rows, t_from, t_to, conflicting)
+    meta_groups: list[list[_Tick]] = []
+    ticks, counts = _ticks_in(rows, t_from, t_to, conflicting, meta_groups)
+    Q = close_ms
 
-    def is_full(t: _Tick) -> bool:
-        return t.last_15min_avg is not None and t.last_15min_avg["window_size"] == CLOSE_WINDOW_SIZE
+    def size(t: _Tick) -> int | None:
+        return None if t.last_15min_avg is None else t.last_15min_avg["window_size"]
 
-    def is_candidate(t: _Tick) -> bool:
-        return (is_full(t) and t.last_15min_avg["window_start_ts_ms"] == close_ms - CLOSE_BEFORE_MS
-                and t.last_15min_avg["window_end_ts_exclusive"] == close_ms)
+    def is_exact(t: _Tick) -> bool:
+        return size(t) == CLOSE_WINDOW_SIZE and Q <= t.source_ms < Q + CLOSE_EXACT_MS
 
-    full = [t for t in ticks if is_full(t)]
-    candidates = [t for t in full if is_candidate(t)]
-    n_conflicting_candidates = sum(1 for t in conflicting if is_candidate(t))
-    agree = n_conflicting_candidates == 0 and len({t.last_15min_avg["value"] for t in candidates}) <= 1
-    close_tick = candidates[0] if candidates else None
-    avg = close_tick.last_15min_avg if close_tick is not None else None
-    if n_conflicting_candidates:
-        estimate, reason = None, "close_candidates_disagree"   # a conflicting row would have been a candidate
-    elif close_tick is None:
-        estimate, reason = None, ("tick_reader_error" if tick_error else "no_close_tick")
-    elif not agree:
-        estimate, reason = None, "close_candidates_disagree"
+    def is_partial(t: _Tick) -> bool:
+        k = size(t)
+        return (k is not None and CLOSE_PARTIAL_MIN_SIZE <= k < CLOSE_WINDOW_SIZE
+                and Q - CLOSE_PARTIAL_BACK_MS <= t.source_ms < Q + CLOSE_EXACT_MS)
+
+    def eligible(t: _Tick) -> bool:
+        return is_exact(t) or is_partial(t)
+
+    exact = [t for t in ticks if is_exact(t)]
+    partial = [t for t in ticks if is_partial(t)]
+    n_wrong = sum(1 for t in ticks if size(t) == CLOSE_WINDOW_SIZE and not is_exact(t))
+    n_running = sum(1 for t in ticks if size(t) is not None and size(t) < CLOSE_WINDOW_SIZE)
+    n_conflicting_candidates = sum(1 for t in conflicting if eligible(t))
+    meta_disagree = [g for g in meta_groups
+                     if any(t.last_15min_avg != g[0].last_15min_avg for t in g[1:]) and any(eligible(t) for t in g)]
+    if exact:
+        close_tick, quality = exact[0], "exact_60"
+        agree = len({t.last_15min_avg["value"] for t in exact}) <= 1    # Decimal equality: 100.1 == 100.10
     else:
-        estimate, reason = avg["value"].quantize(SETTLE_QUANTUM, rounding=SETTLE_ROUNDING), None
+        close_tick = partial[-1] if partial else None                    # the latest source time (ticks are in order)
+        quality = None if close_tick is None else f"partial_{size(close_tick)}"
+        agree = True
+    agree = agree and n_conflicting_candidates == 0 and not meta_disagree
+    avg = close_tick.last_15min_avg if close_tick is not None else None
+    raw = half_even = half_up = None
+    if n_conflicting_candidates or meta_disagree:
+        reason = "close_candidates_disagree"       # a dropped or differing row would have been a candidate
+    elif close_tick is None:
+        reason = "tick_reader_error" if tick_error else "no_close_tick"
+    elif not agree:
+        reason = "close_candidates_disagree"
+    else:
+        raw, reason = avg["value"], None
+        try:
+            with localcontext(_SETTLE_CONTEXT):
+                half_even = raw.quantize(SETTLE_QUANTUM, rounding=SETTLE_ROUNDING)
+                half_up = raw.quantize(SETTLE_QUANTUM, rounding=ROUND_HALF_UP)
+        except InvalidOperation:                   # more digits than the local context holds: no estimate
+            raw, half_even, half_up, reason = None, None, None, "close_value_out_of_range"
+    if half_even is None:
+        quality = None
+    mean_ticks = [t for t in ticks if Q - LOCAL_MEAN_SPAN_MS < t.source_ms <= Q]
     record = {
         "kind": "close", "schema_version": SCHEMA_VERSION, "window_ticker": window.window_ticker,
         "close_ts": window.close_ts, "close_ms": close_ms, "written_at": written_at,
         "index_id": INDEX_ID, "channel": INDEX_CHANNEL, "span_from_ms": t_from, "span_to_ms": t_to,
-        "settlement_estimate": estimate, "settlement_estimate_reason": reason,
+        "settlement_estimate": half_even, "settlement_estimate_reason": reason,
         "rounding": "2 dp, ROUND_HALF_EVEN",
+        "settlement_value_raw": raw, "settlement_estimate_half_even": half_even,
+        "settlement_estimate_half_up": half_up, "close_quality": quality,
+        "local_brti_mean": _exact_mean(t.value for t in mean_ticks), "local_brti_n": len(mean_ticks),
         "close_tick": None if close_tick is None else {
             "cf_source_ts_ms": close_tick.source_ms, "received_at": close_tick.received_at_ms,
             "sending_ts_ms": close_tick.sending_ts_ms, "seq": close_tick.seq,
             "local_receipt_ms": close_tick.local_receipt_ms, "last_60s_windowed_average_15min": avg},
-        "n_close_candidates": len(candidates), "n_close_wrong_window": len(full) - len(candidates),
+        "n_close_candidates": len(exact), "n_close_partial_candidates": len(partial),
+        "n_close_wrong_window": n_wrong, "n_close_running": n_running,
         "n_close_conflicting_candidates": n_conflicting_candidates,   # rows, not source times
+        "n_close_dup_diff_meta_candidates": sum(len(g) for g in meta_disagree),   # rows, in same-value groups
         "close_candidates_agree": agree,
         "outcome_source": "Kalshi settled market (result, expiration_value), read later, offline",
         **counts, "tick_error": tick_error,
     }
     _append(folder, record)
     return _jsonable(record)
+
+
+def _exact_mean(values: Iterable[Decimal]) -> str | None:
+    """The exact mean of the Decimals, rounded half-even to LOCAL_MEAN_DP places, as a string (None if empty).
+
+    Integer arithmetic on the Decimals' own digits: no decimal context is involved, so the caller's cannot change it.
+    """
+    terms = [v.as_tuple() for v in values]
+    if not terms:
+        return None
+    low = min(min(t.exponent for t in terms), -LOCAL_MEAN_DP)
+    total = 0
+    for sign, digits, exponent in terms:
+        n = int("".join(map(str, digits)) or "0") * 10 ** (exponent - low)
+        total += -n if sign else n
+    num, den = total, len(terms) * 10 ** (-LOCAL_MEAN_DP - low)    # mean * 10**LOCAL_MEAN_DP == num / den
+    q, r = divmod(num, den)
+    if 2 * r > den or (2 * r == den and q % 2):
+        q += 1
+    return format(Decimal(f"{q}E-{LOCAL_MEAN_DP}"), "f")
 
 
 # ------------------------------------------------------------------ the tape (only for a window the caller says posted)
