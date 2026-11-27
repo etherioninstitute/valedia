@@ -163,10 +163,13 @@ cancelled; the account ended with no open order and no holding):
 - **Cash after a sale.** Webull adds the proceeds to `cash` and `buying_power` at once; `settled_cash` does not
   rise the same day (and a purchase lowers it at once). The order step spends against `cash`. In a cash account
   that allows buying with unsettled proceeds; before live trading it must spend against settled cash (roadmap 4.8).
-  CF-G: a run that is not shared also spends at most `cash` less the book's own sale proceeds not settled today.
+  CF-G: a run that is not shared also spends at most `cash` less the book's sale proceeds not settled on the run's
+  calendar (the book figures' `cash_low` less `usable_cash`); nothing is bought when those figures cannot be read.
 - **Send-time checks (CF-G).** An order's quote is judged against `PRIMARY_QUOTE_MAX_AGE_SECONDS` once more after the
-  ledger's write lock, just before `submit` (stale: not transmitted, left over); a clock reading more than
-  `CLOCK_BACK_TOLERANCE_SECONDS` (1 s) below the run's highest stops the run at stage `clock`.
+  ledger's write lock, just before `submit`, and again inside `submit` (its `before_send`) after the pacer's wait,
+  just before the order request (stale: not transmitted, left over); a clock reading more than
+  `CLOCK_BACK_TOLERANCE_SECONDS` (1 s) below the run's highest stops the run at stage `clock`; `run_order_step`
+  itself refuses a live run that is not shared (ValueError, the command line's words) before any venue call.
 - **The order step, end to end.** At 09:55 New York it read the paper book (one strategy), took minute quotes
   from the price source (not from Webull), passed the risk gate, and sent two day limit orders through the order
   ledger: 146 XLE (quote 64.54, limit 65.18) and 43 XLK (quote 170.97, limit 172.67). A second run three minutes

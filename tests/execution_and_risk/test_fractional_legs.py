@@ -543,7 +543,7 @@ def test_a_live_run_with_fractional_on_still_stops_before_anything_is_read_or_wr
                                      journal=_Untouchable(seen, "journal"), limits_file=w.limits, state=w.state_path,
                                      clock=w.clock, calendar=_Untouchable(seen, "calendar"), halt_file=w.halt,
                                      latch_file=w.latch, live=_Untouchable(seen, "live"),
-                                     second_opinion=_Untouchable(seen, "second"), **kw)
+                                     second_opinion=_Untouchable(seen, "second"), _unshared_live_test_only=True, **kw)
         finally:
             led.close()
         assert out["status"] == "stopped" and out["stage"] == "live" and words in out["reason"], out

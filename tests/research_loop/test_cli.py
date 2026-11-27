@@ -924,7 +924,7 @@ def test_nothing_a_caller_passes_opens_live_mode_with_every_owner_file_met_in_an
                                      limits_file=cfg / "risk.json", state=tmp_path_factory.mktemp("st") / "s.sqlite",
                                      clock=lambda: 0.0, halt_file=None, latch_file=None, capital=100000.0,
                                      fractional=False, live=live, second_opinion=lambda *a, **k: pytest.fail("asked"),
-                                     propose=True)
+                                     propose=True, _unshared_live_test_only=True)
             assert out["status"] == "stopped" and out["stage"] == "lock", out
     finally:
         led.close()

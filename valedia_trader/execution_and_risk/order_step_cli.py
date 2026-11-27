@@ -501,8 +501,8 @@ def _live_args_refusal(args) -> str | None:
         return ("live mode runs only as a ticket: order-step --live --shared --propose, then order-step --live --shared "
                 "--approve NUMBER (or order-step --live --check)")
     if not shared:                                      # T51c S4d (addendum 7): live is the shared account's book, always
-        return ("a live run is always the shared account's book (the owner also trades that account): add --shared, as in "
-                "order-step --live --shared --propose; it is not implied, so that the command says what it runs")
+        from valedia_trader.execution_and_risk.order_step import LIVE_NEEDS_SHARED   # CF-G: one text, the library's too
+        return LIVE_NEEDS_SHARED
     if capital is not None:                             # R26: the capital is the book's own value; lock 1 binds it
         return ("--capital is refused in the shared mode: the capital is the book's own value (the cautious bound), so a "
                 "stake is changed by the owner's entry and never by a figure typed to a run; the confirmation's "

@@ -1619,6 +1619,15 @@ class _Pacer:
         return now
 
 
+def _before_send(check: Any) -> None:
+    """CF-G: ask submit's `before_send` (None: nothing to ask); its words are NotTransmitted, and so is its raising
+    (submit turns any other exception into NotTransmitted)."""
+    if check is not None:
+        why = check()
+        if why is not None:
+            raise NotTransmitted(f"not sent: {why}")
+
+
 def _too_many(exc_or_res: Any, raised: bool) -> bool:
     """A 429: the SDK's ServerException with http_status 429, or an answer with status 429."""
     if raised:
@@ -2354,7 +2363,7 @@ class WebullVenue:
 
     @_public
     def submit(self, symbol: str, units: float, tag: str, price: float | None = None, limit_price: float | None = None,
-               session: str = "CORE", fractional_live: bool = False) -> dict:
+               session: str = "CORE", fractional_live: bool = False, before_send: Any = None) -> dict:
         """Place one order. `price` is the last known price, used only to value the order for the live cap. `session`:
         CORE (regular hours, the default), ALL or NIGHT, sent as support_trading_session; NIGHT takes limit orders
         only, crypto takes none (see _session).
@@ -2377,6 +2386,9 @@ class WebullVenue:
         the order call could all be made at once, then reads; if more than SALE_READ_MAX_AGE (5) seconds on the clock
         still pass between the holdings read and the order call, it reads open orders and holdings again and checks
         again, at most SALE_REREADS (3) times, and is then NotTransmitted.
+
+        CF-G: `before_send` (a callable giving words or None) is asked after the place slot's wait, immediately before
+        the order request: words, or its raising, are NotTransmitted (no request is made).
 
         In an Events venue the order is an event contract's, and only that: see _submit_event. In any other venue a
         `symbol` holding a colon (every event name) is NotTransmitted before anything is read or sent.
@@ -2414,7 +2426,7 @@ class WebullVenue:
         documented order_id when it is a plain id holding no run of a secret, else None), environment, side,
         quantity}. Webull's answer itself is never handed back."""
         if self._events:
-            return self._submit_event(symbol, units, tag, limit_price)
+            return self._submit_event(symbol, units, tag, limit_price, before_send)
         if isinstance(symbol, str) and str.find(symbol, ":") >= 0:
             raise NotTransmitted("a name holding a colon is an event contract's (TICKER:yes or TICKER:no); event orders are sent "
                                  "only by a venue built for the EVENTS_CASH class, never by this one")
@@ -2443,6 +2455,7 @@ class WebullVenue:
             placed_at = self._pacer.wait("place")                         # the place slot, taken before the call
             if read_at is not None and placed_at - read_at > SALE_READ_MAX_AGE:
                 raise NotTransmitted(f"the holdings were read {placed_at - read_at:.0f} seconds before the order call could be made; not sent")
+            _before_send(before_send)                                     # CF-G: the caller's check, after the wait
         except NotTransmitted:                                            # raised here, or rebuilt through the gate by _call
             raise
         except WebullError as exc:
@@ -2451,7 +2464,7 @@ class WebullVenue:
             raise NotTransmitted(f"not sent: {_class_name(exc, secrets)}: {_gate(exc, secrets)}") from None
         return self._place(account, order, secrets, market_ok=market_ok)
 
-    def _submit_event(self, symbol: Any, units: Any, tag: str, limit_price: Any) -> dict:
+    def _submit_event(self, symbol: Any, units: Any, tag: str, limit_price: Any, before_send: Any = None) -> dict:
         """submit in an Events venue. Everything that can refuse runs before the single place_order call and raises
         NotTransmitted: first the test environment (_event_environment, before anything is read: production refuses
         whatever config/webull_live.json says), then the order itself (event_order_payload: the name, whole contracts,
@@ -2473,6 +2486,7 @@ class WebullVenue:
             placed_at = self._pacer.wait("place")
             if read_at is not None and placed_at - read_at > SALE_READ_MAX_AGE:
                 raise NotTransmitted(f"the holdings were read {placed_at - read_at:.0f} seconds before the order call could be made; not sent")
+            _before_send(before_send)                                     # CF-G: as for stocks
         except NotTransmitted:
             raise
         except WebullError as exc:

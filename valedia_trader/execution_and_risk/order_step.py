@@ -104,7 +104,8 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
                  one that fits both after purchases stopped keeps the label of the purchase that stopped them. The
                  summary also gives the `cash` and `settled_cash` read; at most max_orders_per_day sent in one New
                  York day across runs. What is not sent is journaled, not queued. CF-G: a run that is not shared is
-                 also bounded by the book's usable cash (the cash less the book's sale proceeds not settled today).
+                 also bounded by the venue's cash less the book's sale proceeds not settled on the run's calendar
+                 (book_figures' cash_low less its usable_cash); nothing is bought when those figures cannot be read.
 10. send         an order above MAX_UNITS in size is left over, never sent. For each other order, in this order:
                   a. the quote's age on the clock: older than PRIMARY_QUOTE_MAX_AGE_SECONDS (the quote an order is
                      priced from; a holding's limit stays QUOTE_MAX_AGE_SECONDS), the quote function is asked once
@@ -119,7 +120,8 @@ One run, in order. A failure in steps 1 to 6 sends nothing; the reason is journa
                   f. the environment and host read; a last look: the quote's age once more, the halt file and (for an
                      order that adds risk) the latch file, and (CF-G) a sale's cap read again (a sale above it is
                      refused); the window check again, then ledger.submit_once, whose venue call waits behind the
-                     quote's age once more (CF-G: after the ledger's write lock; stale, it is not transmitted).
+                     quote's age once more (CF-G: after the ledger's write lock, and in the Webull adapter after its
+                     pacer, just before the request; stale, it is not transmitted).
                  Nothing that can take time sits between a window check and the call it guards; an order failing the
                  last look or the second window check stays `intended`, never sent, and is reported left over with
                  the reason. A day limit order in the regular session. Each `order` line of the journal carries
@@ -344,6 +346,10 @@ SETTLEMENT_SEARCH_DAYS = 14                       # CF-C: a lot's settlement day
 QUOTE_MAX_AHEAD_SECONDS = 60                      # a quote stamped later than this after now is not believed
 QUOTE_ASK_GAP_SECONDS = 60                        # a holding is not asked for again sooner than this in one run
 CLOCK_BACK_TOLERANCE_SECONDS = 1.0                # CF-G: a clock reading more than this below the run's highest stops it
+QUOTE_STALE_AT_TRANSMISSION = ("the quote went stale before the order was transmitted (it waited for the ledger's "
+                               "write lock or the venue's pacer)")
+LIVE_NEEDS_SHARED = ("a live run is always the shared account's book (the owner also trades that account): add --shared, "
+                     "as in order-step --live --shared --propose; it is not implied, so that the command says what it runs")
 MAX_CASH = 1e12                                   # cash and equity outside 0 to this are unusable, like a non-finite one
 MAX_QUOTE_PRICE = 1e7                             # a quote price must be above 0 and at most this
 MAX_UNITS = 1e12                                  # a position size above this (in size) is unusable
@@ -3762,7 +3768,9 @@ class _SubmitWatch:
     writes about the outcome comes from the order step's own words, not from the venue's text in the ledger's note.
     CF-G: `guard` (the run's check at transmission) is asked first, after the ledger has taken its write lock and
     marked the order sent, immediately before the venue is called: words (or a stop, or any failure of its own) mean
-    the venue is not called and NotTransmitted is raised, which the ledger records as not sent (`held` says why)."""
+    the venue is not called and NotTransmitted is raised, which the ledger records as not sent (`held` says why). A
+    venue whose submit takes `before_send` (the Webull adapter) is handed the same check, which it asks after its
+    pacer's wait, immediately before the order request: words there and it raises NotTransmitted itself."""
 
     def __init__(self, venue, extra: dict | None = None, guard: Callable[[], str | None] | None = None) -> None:
         self._venue = venue
@@ -3772,20 +3780,28 @@ class _SubmitWatch:
         self.held: str | None = None                     # CF-G: why the guard kept the order from the venue
         self.stop: _Stop | None = None                   # ... and the run's stop, when the guard's check raised one
 
+    def _check(self) -> str | None:
+        """The guard's words (kept in `held`), or None; a stop or any failure of the check is words (fail closed)."""
+        try:
+            why = self._guard()
+        except _Stop as stop:
+            self.stop, why = stop, stop.reason
+        except Exception as exc:                         # fail closed: a check that cannot be made holds the order
+            why = f"the check at transmission failed: {_local_error(exc)}"
+        if why is not None:
+            self.held = str(why)
+        return self.held if why is not None else None
+
     def submit(self, *args, **kwargs):
+        extra = dict(self._extra)
         if self._guard is not None:
-            try:
-                why = self._guard()
-            except _Stop as stop:
-                self.stop, why = stop, stop.reason
-            except Exception as exc:                     # fail closed: a check that cannot be made holds the order
-                why = f"the check at transmission failed: {_local_error(exc)}"
-            if why is not None:
-                self.held = str(why)
+            if self._check() is not None:
                 raise NotTransmitted(self.held)
+            if _takes_before_send(self._venue):          # CF-G: again after the venue's pacer, just before its request
+                extra["before_send"] = self._check
         self.called = True
         try:
-            self.answer = self._venue.submit(*args, **{**kwargs, **self._extra})
+            self.answer = self._venue.submit(*args, **{**kwargs, **extra})
         except BaseException as exc:
             self.error = exc
             raise
@@ -3793,6 +3809,15 @@ class _SubmitWatch:
 
     def __getattr__(self, name):
         return getattr(self._venue, name)
+
+
+def _takes_before_send(venue) -> bool:
+    """CF-G: whether the venue's submit names a `before_send` keyword (the Webull adapter's does); False when its
+    signature cannot be read."""
+    try:
+        return "before_send" in inspect.signature(venue.submit).parameters
+    except Exception:
+        return False
 
 
 class _NoSend:
@@ -3818,7 +3843,7 @@ def run_order_step(*, ledger: OrderLedger, venue, paper, quotes: Callable, journ
                    clock: Callable[[], float] = wall_clock, calendar=None, halt_file=risk_gate.HALT_FILE,
                    latch_file=None, capital: float | None = None, fractional: bool = False, propose: bool = False,
                    approve: str | None = None, live=None, second_opinion=None, follow=None, shared: bool = False,
-                   practice_ledger=None) -> dict:
+                   practice_ledger=None, _unshared_live_test_only: bool = False) -> dict:
     """One order step (see the module notes). `paper` is PaperTargets or a callable giving them; `quotes(symbols)`
     gives {symbol: (price, time)}; `state` is an OrderStepState or the path of its file; `calendar` answers
     is_session, session_open and session_close (default: the XNYS calendar). Returns the summary, also journaled.
@@ -3832,7 +3857,11 @@ def run_order_step(*, ledger: OrderLedger, venue, paper, quotes: Callable, journ
     whole book, except in live mode, which stops without one. `shared` (T51c S4c; live mode takes it from S4d, and the
     command line requires it there) is the shared-account mode: the book is judged on its own figures (see the module
     notes, "The shared run"). `practice_ledger` (T51 B1; a live fractional run only): the PRACTICE order ledger's path, read
-    read-only for the proof reading; None: the practice ledger beside this run's own ledger file."""
+    read-only for the proof reading; None: the practice ledger beside this run's own ledger file. CF-G: a live run that
+    is not shared raises ValueError (LIVE_NEEDS_SHARED) before anything is built or any venue call; only the tests'
+    own live worlds pass the keyword after `practice_ledger`, never the command line or any other caller."""
+    if live is not None and not shared and not _unshared_live_test_only:
+        raise ValueError(LIVE_NEEDS_SHARED)
     mode = "propose" if propose else ("approve" if approve is not None else None)
     run = _Run(ledger, venue, paper, quotes, journal, limits_file, state, clock, calendar, halt_file, latch_file,
                capital, fractional)
@@ -6441,9 +6470,9 @@ class _Run:
     def _at_transmission(self, sym: str) -> str | None:
         """CF-G: the check the venue call waits behind (_SubmitWatch's guard): the order's quote still within
         PRIMARY_QUOTE_MAX_AGE_SECONDS on the clock now, after the ledger's write lock (up to BUSY_SECONDS) was waited
-        for. Why the order is not transmitted, or None."""
+        for, and again after the venue's pacer (`before_send`). Why the order is not transmitted, or None."""
         if not self._quote_fresh(sym, PRIMARY_QUOTE_MAX_AGE_SECONDS):
-            return "the quote went stale while the order waited for the ledger, before it was transmitted"
+            return QUOTE_STALE_AT_TRANSMISSION
         return None
 
     def _last_look(self, sym: str, reduces: bool, units: float = 0.0) -> tuple[str | None, str | None]:

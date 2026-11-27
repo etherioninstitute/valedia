@@ -3804,6 +3804,9 @@ def _run_with(mod, w, **kw):
         if book.day == AUTO:
             prev = CAL.sessions[CAL.sessions.searchsorted(ny_day(w.clock.t)) - 1]
             book = dataclasses.replace(book, day=str(prev.date()))
+    import inspect                                                 # CF-G: these live worlds are not shared (a base
+    if kw.get("live") is not None and "_unshared_live_test_only" in inspect.signature(mod.run_order_step).parameters:
+        kw.setdefault("_unshared_live_test_only", True)            # commit's order step takes no such keyword)
     try:
         return mod.run_order_step(ledger=led, venue=w.venue, paper=book, quotes=w.quotes, journal=w.journal,
                                   limits_file=w.limits, state=w.state_path, clock=w.clock, calendar=CAL,
@@ -4343,8 +4346,7 @@ def test_no_order_is_sent_on_a_reading_past_the_tickets_expiry(tw, start, step):
         assert box["checks"] and max(box["checks"]) <= ticket["expires"], box
     elif [o["state"] for o in tw.orders()] == ["refused"]:            # CF-G: held at transmission, the quote stale by
         assert box["checks"] and max(box["checks"]) <= ticket["expires"], box   # then; the venue never called
-        assert [e["reason"] for e in out["left_over"]] == [
-            "the quote went stale while the order waited for the ledger, before it was transmitted"], out
+        assert [e["reason"] for e in out["left_over"]] == [osx.QUOTE_STALE_AT_TRANSMISSION], out
     else:
         assert [o["state"] for o in tw.orders()] == ["intended"]
 
@@ -4918,6 +4920,7 @@ def _follow_the_book(w):
 
 def lrun(w, **kw):
     kw.setdefault("live", w.live)
+    kw.setdefault("_unshared_live_test_only", True)                # CF-G: these live worlds are not shared
     kw.setdefault("second_opinion", w.second)
     if "follow" not in kw:                                         # T32: decided when the run is made, from the book
         kw["follow"] = _follow_the_book(w)
