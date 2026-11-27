@@ -1068,6 +1068,44 @@ def test_identical_rows_count_once_in_the_close_pool(tmp_path):
     assert unus["settlement_estimate"] == "100.10"
 
 
+def _wrong_window_rows(w, extra: list[dict]) -> list[dict]:
+    C = int(round(w.close_ts * 1000))
+    return [r for r in _close_rows(w, "100.10") if r["source_time_ms"] != C - 5000] + extra
+
+
+def test_the_close_pool_uses_the_duplicate_rule_s_equality(tmp_path):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    src = C - 5000                                                    # a size-60 average outside [Q, Q + 1 s)
+    k = tick_row(src, seq=1, last15=_avg("100.10", C - 65_000, src))
+    t = tick_row(src, seq=2, last15=_avg("100.1", C - 65_000, src))  # equal to K by value: a pure duplicate
+    u = dict(tick_row(src, seq=3, last15=_avg("100.10", C - 65_000, src)),
+             avg_60s=dict(k["avg_60s"], window_start_ts_ms=k["avg_60s"]["window_start_ts_ms"] - 1))
+    clock = lambda: at(w.close_ts + 195.0)
+    base = log_close(tmp_path / "b", w, clock=clock, read_ticks=Spy(_wrong_window_rows(w, [])))["n_close_wrong_window"]
+    kt = log_close(tmp_path / "kt", w, clock=clock, read_ticks=Spy(_wrong_window_rows(w, [k, t])))
+    ktu = log_close(tmp_path / "ktu", w, clock=clock, read_ticks=Spy(_wrong_window_rows(w, [k, t, u])))
+    assert kt["n_duplicates_dropped"] == 1 and kt["n_close_wrong_window"] - base == 1
+    assert ktu["n_duplicates_dropped"] == 1 and ktu["n_dup_diff_meta"] == 1
+    assert ktu["n_close_wrong_window"] - base == 2                     # classes {K, T} and {U}
+    assert kt["settlement_estimate"] == ktu["settlement_estimate"] == "100.10"
+
+
+def test_an_absent_and_an_unusable_avg_60s_are_one_class(tmp_path):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    src = C - 5000
+    k = dict(tick_row(src, seq=1, last15=_avg("100.10", C - 65_000, src)), avg_60s=None)   # absent
+    t = tick_row(src, seq=2, avg="0", last15=_avg("100.10", C - 65_000, src))            # unusable: None
+    u = tick_row(src, seq=3, last15=_avg("100.10", C - 65_000, src))                     # a usable avg_60s
+    clock = lambda: at(w.close_ts + 195.0)
+    base = log_close(tmp_path / "b", w, clock=clock, read_ticks=Spy(_wrong_window_rows(w, [])))["n_close_wrong_window"]
+    kt = log_close(tmp_path / "kt", w, clock=clock, read_ticks=Spy(_wrong_window_rows(w, [k, t])))
+    ktu = log_close(tmp_path / "ktu", w, clock=clock, read_ticks=Spy(_wrong_window_rows(w, [k, t, u])))
+    assert kt["n_duplicates_dropped"] == 1 and kt["n_close_wrong_window"] - base == 1
+    assert ktu["n_close_wrong_window"] - base == 2 and ktu["n_avg_unusable"] == 1    # classes {K, T} and {U}
+
+
 def _random_rows(rng, centre: int, span_s: int) -> list[dict]:
     rows = []
     for k in range(-span_s, span_s + 1):
