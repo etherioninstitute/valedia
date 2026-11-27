@@ -459,6 +459,11 @@ passing idea can trade at once.
     reader counts bad rows as malformed). Blind verifications passed; tests 153/147/38. C fixed and accepted on
     fix/c-f (CF-C2 settlement holidays, CF-C3 usable cash from the settlement day); merge after the 12-01 session.
     First live run after 12-03: check the close-window semantics and the malformed count.
+  - 2026-11-26 BUILT AND MERGED (6eac81a): the close record by window_size and source time. Exact tier size 60 in
+    [Q, Q+1000); fallback 55..59 only without an exact row; fail closed on disagreement in the tier used; price
+    bound at parse time; JSON number hooks that never raise; one duplicate-rule equality; records independent of row
+    order. Seven blind-verified repairs; tests 200/147/38; five job gates pass; no order-path file. CF-G (send-time
+    guards, from Grok's review of fix/c-f): fixes 1-4 at dbdabcc, fix 5 and the pacer-wait check in build.
 
 ## 4. Finding what makes money (tests and ideas)
 
