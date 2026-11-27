@@ -198,11 +198,51 @@ def _dec(x: Any) -> Decimal:
         raise ValueError("a boolean is not a number")
     try:
         d = Decimal(repr(x)) if isinstance(x, float) else Decimal(x)
-    except (InvalidOperation, TypeError, ValueError):
+    except (ArithmeticError, TypeError, ValueError):     # InvalidOperation is an ArithmeticError
         raise ValueError("not a decimal number") from None
     if not d.is_finite():
         raise ValueError("not a finite number")
     return d
+
+
+class _BadNumber:
+    """An inert stand-in for a JSON numeric literal too long to parse safely: it is not a number to any check
+    (`_dec` refuses it, `_whole` gives None), and it is never written."""
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<bad number>"
+
+
+_BAD_NUMBER = _BadNumber()
+JSON_NUMBER_MAX_CHARS = 64     # a numeric literal longer than this, or with an exponent of more than 6 digits,
+JSON_EXPONENT_MAX_DIGITS = 6   # becomes _BAD_NUMBER instead of a number
+
+
+def _json_float(text: str) -> Any:
+    """json's parse_float hook: a Decimal keeping every digit sent, or _BAD_NUMBER. Never raises."""
+    exp = text.lower().partition("e")[2].lstrip("+-")
+    if len(text) > JSON_NUMBER_MAX_CHARS or len(exp) > JSON_EXPONENT_MAX_DIGITS:
+        return _BAD_NUMBER
+    try:
+        return Decimal(text)
+    except (ArithmeticError, ValueError):
+        return _BAD_NUMBER
+
+
+def _json_int(text: str) -> Any:
+    """json's parse_int hook: an int, or _BAD_NUMBER for more than JSON_NUMBER_MAX_CHARS digits. Never raises."""
+    if len(text.lstrip("-")) > JSON_NUMBER_MAX_CHARS:
+        return _BAD_NUMBER
+    try:
+        return int(text)
+    except (ArithmeticError, ValueError):
+        return _BAD_NUMBER
+
+
+def _json(text: str) -> Any:
+    """json.loads with the two number hooks (the raw `data` frame and the store line alike)."""
+    return json.loads(text, parse_float=_json_float, parse_int=_json_int)
 
 
 PRICE_INT_DIGITS = 15   # a price-like Decimal has at most 15 digits before the point (adjusted() <= 14)
@@ -285,8 +325,8 @@ def _parse_tick_row(row: Any) -> _Tick | None:
     if not isinstance(data, str):
         return None
     try:
-        raw = json.loads(data, parse_float=Decimal)    # a number in the raw frame keeps every digit it was sent with
-    except (ValueError, RecursionError):
+        raw = _json(data)                              # a number in the raw frame keeps every digit it was sent with
+    except (ValueError, RecursionError, ArithmeticError):
         return None
     if not isinstance(raw, dict):
         return None
@@ -308,7 +348,7 @@ def _parse_tick_row(row: Any) -> _Tick | None:
         last15 = None if row.get("last_15min_avg") is None else _window_avg(row.get("last_15min_avg"))
         avg_bad = row.get("avg_60s") is not None and avg is None
         last15_bad = row.get("last_15min_avg") is not None and last15 is None
-    except ValueError:
+    except (ValueError, ArithmeticError):
         return None
     if value <= 0:
         return None
@@ -401,8 +441,8 @@ def _check_span(t_from_ms: Any, t_to_ms: Any) -> tuple[int, int]:
 
 def _load_line(raw: bytes) -> Any:
     try:
-        return json.loads(raw.decode("utf-8", errors="replace"), parse_float=Decimal)
-    except (ValueError, RecursionError):
+        return _json(raw.decode("utf-8", errors="replace"))
+    except (ValueError, RecursionError, ArithmeticError):
         return None
 
 
@@ -561,6 +601,8 @@ def _jsonable(x: Any) -> Any:
         return {str(k): _jsonable(v) for k, v in x.items()}
     if isinstance(x, (list, tuple)):
         return [_jsonable(v) for v in x]
+    if isinstance(x, _BadNumber):
+        return None                                 # never written
     return x
 
 
@@ -756,6 +798,8 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
       differ give None ("close_candidates_disagree"); otherwise the first by source time is the close tick.
     - Only when there is no exact candidate, the fallback: the tick with the latest source time in [Q - 2 s, Q + 1 s)
       whose average is present with 55 <= window_size <= 59 (`close_quality` "partial_<k>").
+    - Candidates come from every valid row of a kept source time (the kept row and its same-price twins); only
+      rows with a usable last_15min_avg take part, so the twins' arrival order cannot change the result.
     - Fail closed, within the tier used only (exact if any exact-tier row exists, kept, a same-price twin or in a
       source time dropped as conflicting; else the fallback), comparing Decimal(last_15min_avg.value) only (bounds
       are logged, never used): exact-tier rows with more than one value, or no kept exact tick, give None
@@ -805,8 +849,13 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
     def eligible(t: _Tick) -> bool:
         return is_exact(t) or is_partial(t)
 
-    exact = [t for t in ticks if is_exact(t)]
-    partial = [t for t in ticks if is_partial(t)]
+    twins = [t for g in meta_groups for t in g[1:]]          # rows beyond the kept first of each same-price group
+    # The candidate pool: every valid row of a kept source time (the kept row and its same-price twins), in
+    # (source time, received_at, seq) order; a row without a usable last_15min_avg (absent, or made unusable) is
+    # in no tier, so it takes no part in candidates or disagreement whichever order the twins arrived in.
+    pool = sorted(ticks + twins, key=lambda t: (t.source_ms, t.received_at_ms, t.seq))
+    exact = [t for t in pool if is_exact(t)]
+    partial = [t for t in pool if is_partial(t)]
     n_wrong = sum(1 for t in ticks if size(t) == CLOSE_WINDOW_SIZE and not is_exact(t))
     n_running = sum(1 for t in ticks if size(t) is not None and size(t) < CLOSE_WINDOW_SIZE)
     n_conflicting_candidates = sum(1 for t in conflicting if eligible(t))
@@ -814,23 +863,23 @@ def log_close(folder, window: Window, *, clock: Callable[[], datetime], read_tic
     def value(t: _Tick) -> Decimal | None:
         return None if t.last_15min_avg is None else t.last_15min_avg["value"]
 
-    # same-price twins whose rows differ in the average's VALUE (bounds-only differences are not a disagreement)
-    meta_disagree = [g for g in meta_groups if any(eligible(t) for t in g) and len({value(t) for t in g}) > 1]
-    twins = [t for g in meta_groups for t in g[1:]]          # rows beyond the kept first of each same-price group
-    # The tier used: exact if a row of the exact tier exists anywhere (kept, a same-price twin, or in a source time
-    # dropped as conflicting); else the fallback. Only the tier used can make the estimate None.
-    exact_rows = exact + [t for t in twins + conflicting if is_exact(t)]
+    # same-price twins whose USABLE averages differ in VALUE (bounds-only differences are not a disagreement)
+    meta_disagree = [g for g in meta_groups if any(eligible(t) for t in g)
+                     and len({value(t) for t in g if t.last_15min_avg is not None}) > 1]
+    # The tier used: exact if a row of the exact tier exists anywhere (in the pool, or in a source time dropped as
+    # conflicting); else the fallback. Only the tier used can make the estimate None.
+    exact_rows = exact + [t for t in conflicting if is_exact(t)]
     if exact_rows:
         close_tick, quality, tier_rows = (exact[0] if exact else None), "exact_60", exact_rows
-        # one value over every exact-tier row (Decimal equality: 100.1 == 100.10), and a kept exact tick
+        # one value over every exact-tier row (Decimal equality: 100.1 == 100.10), and one in the pool
         disagree = len({value(t) for t in exact_rows}) > 1 or not exact
     else:
-        tier_rows = partial + [t for t in twins + conflicting if is_partial(t)]
-        close_tick = partial[-1] if partial else None                    # the latest source time (ticks are in order)
-        quality = None if close_tick is None else f"partial_{size(close_tick)}"
+        tier_rows = partial + [t for t in conflicting if is_partial(t)]
         latest = max((t.source_ms for t in tier_rows), default=None)
-        # the fallback's source time must be the tier's latest, kept, with one value over its rows
-        disagree = bool(tier_rows) and (close_tick is None or close_tick.source_ms != latest
+        close_tick = next((t for t in partial if t.source_ms == latest), None)   # the first row at the latest time
+        quality = None if close_tick is None else f"partial_{size(close_tick)}"
+        # the fallback's source time must be the tier's latest, in the pool, with one value over its rows
+        disagree = bool(tier_rows) and (close_tick is None
                                         or len({value(t) for t in tier_rows if t.source_ms == latest}) > 1)
     agree = not disagree
     avg = close_tick.last_15min_avg if close_tick is not None else None

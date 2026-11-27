@@ -10,9 +10,12 @@ from __future__ import annotations
 import ast
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -73,6 +76,20 @@ def series(end_ms: int, n: int = 301, step_ms: int = 1000, *, base: str = "10000
     """n ticks, step_ms apart, the last at end_ms; values rise by one cent per tick."""
     start = end_ms - (n - 1) * step_ms
     return [tick_row(start + k * step_ms, str(Decimal(base) + Decimal("0.01") * k), seq=k + 1) for k in range(n)]
+
+
+@contextmanager
+def _deadline(seconds: float = 5.0):
+    """A hang becomes a test failure: SIGALRM after `seconds` raises in the test; restored afterwards."""
+    def expired(signum, frame):
+        raise TimeoutError(f"took more than {seconds} s")
+    old = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
 
 
 class Spy:
@@ -868,7 +885,6 @@ HUGE_OR_TINY = ["1E+999999999999999999", "1E+3000000", "1E+4300", "1E-3000000"]
 @pytest.mark.parametrize("as_number", [False, True])
 @pytest.mark.parametrize("bad", HUGE_OR_TINY)
 def test_a_huge_or_tiny_price_is_malformed_at_parse_time_and_the_record_is_written(tmp_path, bad, as_number):
-    import time
     w = window(0)
     C = int(round(w.close_ts * 1000))
     v = Decimal(bad) if as_number else bad                  # a JSON number arrives as a Decimal (parse_float)
@@ -878,7 +894,8 @@ def test_a_huge_or_tiny_price_is_malformed_at_parse_time_and_the_record_is_writt
     brti["data"] = (f'{{"type": "value", "id": "BRTI", "time": {C - 500}, "value": {bad}}}' if as_number
                     else json.dumps({"type": "value", "id": "BRTI", "time": C - 500, "value": bad}))
     started = time.monotonic()
-    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows + [brti]))
+    with _deadline(5):
+        rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows + [brti]))
     assert time.monotonic() - started < 1.0
     assert rec["n_rows_malformed"] == 1 and len(lines(tmp_path)) == 1       # brti_raw: the row; the average: not
     assert rec["n_close_avg_unusable"] == 1 and rec["n_avg_unusable"] == 1
@@ -915,18 +932,97 @@ def test_an_unusable_avg_60s_never_costs_the_tick_its_price(tmp_path, bad):
 
 
 def test_an_unusable_close_average_gives_no_estimate_and_is_counted(tmp_path):
-    import time
     w = window(0)
     C = int(round(w.close_ts * 1000))
     rows = _close_rows(w, "100.10")
     rows[30] = dict(rows[30], last_15min_avg=_avg("1E+999999999999999999", C - 60_000, C))   # the close tick's
     started = time.monotonic()
-    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
+    with _deadline(5):
+        rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
     assert time.monotonic() - started < 1.0 and len(lines(tmp_path)) == 1
     assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "no_close_tick"
     assert rec["n_close_avg_unusable"] == 1 and rec["n_rows_malformed"] == 0 and rec["n_close_candidates"] == 0
     text = (tmp_path / L.LOG_NAME).read_text()
     assert "999999999999999999" not in text and len(text) < 20_000 and _reconciles(rec)
+
+
+NINETEEN_NINES = "1E+9999999999999999999"     # an exponent beyond Decimal's limit: json would raise InvalidOperation
+
+
+def _raw_data(src: int, literal: str) -> str:
+    return f'{{"type": "value", "id": "BRTI", "time": {src}, "value": {literal}}}'
+
+
+def test_a_numeric_literal_beyond_decimal_never_crashes_a_direct_row(tmp_path):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    rows = _close_rows(w, "100.10")
+    bad_raw = dict(tick_row(C - 500, seq=9), data=_raw_data(C - 500, NINETEEN_NINES))      # as the raw value
+    rows[30] = dict(rows[30], last_15min_avg=_avg(NINETEEN_NINES, C - 60_000, C))         # as an average value
+    with _deadline(5):
+        rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows + [bad_raw]))
+    assert rec["n_rows_malformed"] == 1 and rec["n_close_avg_unusable"] == 1 and len(lines(tmp_path)) == 1
+    assert rec["settlement_estimate_reason"] == "no_close_tick"
+    assert L._json(_raw_data(1, NINETEEN_NINES))["value"] is L._BAD_NUMBER
+
+
+@pytest.mark.parametrize("case", ["raw_19_nines", "seq_70_digits", "avg_19_nines", "avg_4301_digits"])
+def test_numeric_literals_beyond_decimal_or_64_digits_through_the_file_reader(tmp_path, case):
+    w = window(0)
+    T = tstar_ms(w)
+    tick_dir = tmp_path / "ticks"
+    tick_dir.mkdir()
+    good = series(T, n=300)
+    day = datetime.fromtimestamp(T / 1000, UTC).strftime("%Y-%m-%d")
+    lines_out = [json.dumps(r) for r in good]
+    i = 10
+    if case == "raw_19_nines":           # the raw value as a float literal inside the data frame: malformed
+        lines_out.append(json.dumps(dict(tick_row(T - 100_500, seq=7001),
+                                         data=_raw_data(T - 100_500, NINETEEN_NINES))))
+        want = (1, 0)
+    elif case == "seq_70_digits":        # a 70-digit int seq is not a whole number: malformed (else a valid tick)
+        lines_out.append(json.dumps(tick_row(T - 100_400, seq=1)).replace('"seq": 1', '"seq": ' + "7" * 70))
+        want = (1, 0)
+    else:                                # an average value in the store line itself: that average is unusable
+        literal = NINETEEN_NINES if case == "avg_19_nines" else "9" * 4301
+        lines_out[i] = json.dumps(good[i]).replace('"value": "99999.99"', '"value": ' + literal)
+        assert literal in lines_out[i]
+        want = (0, 1)
+    (tick_dir / f"kalshi_index_ticks-{day}.jsonl").write_text("\n".join(lines_out) + "\n", encoding="utf-8")
+    with _deadline(5):
+        got = read_tick_files(tick_dir, T - 300_000, T, clock=lambda: EF)
+        rec = log_window(tmp_path / "log", w, clock=lambda: EF,
+                         read_ticks=tick_file_reader(tick_dir, clock=lambda: EF), read_book=Spy(BOOK))
+    assert len(got) == 300 + want[0] and (rec["n_rows_malformed"], rec["n_avg_unusable"]) == want
+    assert rec["n_ticks_kept"] == 300 and rec["status"] == "OK" and _reconciles(rec)
+    assert good[i]["source_time_ms"] in {p["cf_source_ts_ms"] for p in rec["series"]}   # the tick keeps its price
+    text = (tmp_path / "log" / L.LOG_NAME).read_text()
+    assert "9" * 100 not in text and "7" * 70 not in text
+
+
+def test_json_number_hooks_never_raise():
+    assert L._json_int("7" * 64) == int("7" * 64) and L._json_int("7" * 65) is L._BAD_NUMBER
+    assert L._json_int("-" + "7" * 65) is L._BAD_NUMBER
+    assert L._json_float("1E+999999") == Decimal("1E+999999") and L._json_float("1E+1000000") is L._BAD_NUMBER
+    assert L._json_float("1." + "0" * 63) is L._BAD_NUMBER and L._json_float(NINETEEN_NINES) is L._BAD_NUMBER
+    assert L._whole(L._BAD_NUMBER) is None and L._jsonable({"x": L._BAD_NUMBER}) == {"x": None}
+    with pytest.raises(ValueError):
+        L._price(L._BAD_NUMBER)
+
+
+@pytest.mark.parametrize("unusable_first", [False, True])
+def test_close_twins_with_one_unusable_average_give_the_same_estimate_in_either_order(tmp_path, unusable_first):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    rows = [r for r in _close_rows(w, None) if r["source_time_ms"] != C]
+    usable = tick_row(C, seq=1, last15=_avg("100.10", C - 60_000, C))
+    unusable = tick_row(C, seq=2, last15=_avg("1E+999999999999999999", C - 60_000, C))
+    if unusable_first:
+        usable, unusable = dict(usable, seq=2), dict(unusable, seq=1)
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows + [usable, unusable]))
+    assert rec["settlement_estimate"] == "100.10" and rec["close_quality"] == "exact_60"
+    assert rec["n_close_avg_unusable"] == 1 and rec["close_candidates_agree"] is True
+    assert rec["n_dup_diff_meta"] == 1 and rec["n_close_dup_diff_meta_candidates"] == 0
 
 
 def test_a_window_size_above_60_is_in_neither_close_count_and_never_used(tmp_path):
@@ -1844,7 +1940,7 @@ def test_a_wrong_bounds_row_first_and_a_right_candidate_second_is_a_disagreement
     rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows))
     assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "close_candidates_disagree"
     assert rec["n_close_dup_diff_meta_candidates"] == 2 and rec["n_close_conflicting_candidates"] == 0
-    assert rec["n_close_candidates"] == 1 and rec["close_tick"]["seq"] == 1     # the first received is the tick
+    assert rec["n_close_candidates"] == 2 and rec["close_tick"]["seq"] == 1     # both rows; the first is the tick
 
 
 def _reconciles(rec: dict) -> bool:
