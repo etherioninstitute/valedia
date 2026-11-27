@@ -468,6 +468,9 @@ passing idea can trade at once.
     fails on KeyError turn_of_month (RL-1 fix 24e4a6f on fix/research-turn-of-month, pinned files: merges with the
     12-01 re-pin, then one catch-up cycle by hand). The BTC desk has no launchd job for 12-04 yet (owner's yes).
     Carbon reply 59 written to open a new Carbon conversation.
+  - 2026-11-27 SESSION 3/5 CLEAN (half day: both practice runs COMPLETED, 0 faults, 0 alerts). Grok rounds 15
+    and 16 adjudicated, 0 findings open; rc/repin-12-01 at bff6404 and the BTC desk at 21d2d7e accepted, both
+    merging after the 12-01 session. Carbon reply 60 sent.
 
 ## 4. Finding what makes money (tests and ideas)
 
