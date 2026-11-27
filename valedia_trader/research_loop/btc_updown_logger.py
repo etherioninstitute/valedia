@@ -203,6 +203,20 @@ def _dec(x: Any) -> Decimal:
     return d
 
 
+PRICE_INT_DIGITS = 15   # a price-like Decimal has at most 15 digits before the point (adjusted() <= 14)
+PRICE_DP = 12           # and at most 12 after it (exponent >= -12)
+
+
+def _price(x: Any) -> Decimal:
+    """A price-like Decimal (a tick's value, a window average's value): finite, positive, at most PRICE_INT_DIGITS
+    digits before the point and PRICE_DP after, by its Decimal tuple, from a string or a JSON number alike. Checked
+    before any arithmetic, so a huge or tiny value never reaches rounding, the mean or the writer."""
+    d = _dec(x)
+    if d <= 0 or d.as_tuple().exponent < -PRICE_DP or d.adjusted() > PRICE_INT_DIGITS - 1:
+        raise ValueError("not a price: positive, at most 15 digits before the point and 12 after")
+    return d
+
+
 def _whole(x: Any) -> int | None:
     """A whole number (int, or a string of ASCII digits), else None. A float or a boolean is not one, and neither is
     a string of other Unicode digits ("²", "١٢"), which int() would refuse or misread."""
@@ -240,7 +254,7 @@ def _window_avg(node: Any) -> dict | None:
     value = node.get("value")
     if isinstance(value, float):
         raise ValueError("a window average value must not be a float")
-    out = {"value": _dec(value)}
+    out = {"value": _price(value)}
     for key in ("window_size", "window_start_ts_ms", "window_end_ts_exclusive"):
         n = _whole(node.get(key))
         if n is None:
@@ -278,7 +292,7 @@ def _parse_tick_row(row: Any) -> _Tick | None:
             or (local_raw is not None and local is None):
         return None
     try:
-        value = _dec(raw.get("value"))
+        value = _price(raw.get("value"))
         avg = None if row.get("avg_60s") is None else _window_avg(row.get("avg_60s"))
         last15 = None if row.get("last_15min_avg") is None else _window_avg(row.get("last_15min_avg"))
     except ValueError:
@@ -296,9 +310,10 @@ def _ticks_in(rows: Iterable, t_from_ms: int, t_to_ms: int, conflicts: list | No
     Valid: a well-formed BRTI `cfbenchmarks_value` row with -EARLY_MAX_MS <= received_at - source time <=
     LATE_MAX_MS (signed); a row that is not is counted as late (`n_rows_late`) and never used.
     Rows are grouped by source time, and each group is ordered by (received_at, seq).
-    - Every row has an equal Decimal value: one tick, the first row kept. If the rows are equal in avg_60s and
-      last_15min_avg too (compared parsed), the rest count in `n_duplicates_dropped`; if not, the rest count in
-      `n_dup_diff_meta` (the whole group's rows are appended to `meta_groups` when it is given).
+    - Every row has an equal Decimal value: one tick, the first row kept. Each other row is counted against the
+      kept row: in `n_duplicates_dropped` if its avg_60s and last_15min_avg are equal too (compared parsed), else in
+      `n_dup_diff_meta` (so [A, A, A'] counts 1 and 1); a group with any such row is appended whole to
+      `meta_groups` when it is given.
     - Any two values differ: the group is dropped whole and counted in `n_conflicting_source_times` (fail closed);
       if `conflicts` is given, the dropped rows are appended to it; `n_conflicting_rows` counts those rows.
     The counts reconcile: n_rows_read == n_rows_malformed + n_rows_late + n_rows_outside_span + n_ticks_kept
@@ -330,12 +345,11 @@ def _ticks_in(rows: Iterable, t_from_ms: int, t_to_ms: int, conflicts: list | No
     for group in groups:
         first = group[0]
         if all(t.value == first.value for t in group[1:]):    # one tick: the first received is kept
-            if all((t.avg_60s, t.last_15min_avg) == (first.avg_60s, first.last_15min_avg) for t in group[1:]):
-                counts["n_duplicates_dropped"] += len(group) - 1   # a repeated source time is the same tick
-            else:
-                counts["n_dup_diff_meta"] += len(group) - 1        # same price, different averages: still one tick
-                if meta_groups is not None:
-                    meta_groups.append(group)
+            same = [(t.avg_60s, t.last_15min_avg) == (first.avg_60s, first.last_15min_avg) for t in group[1:]]
+            counts["n_duplicates_dropped"] += sum(same)          # per row, against the kept row: fully equal
+            counts["n_dup_diff_meta"] += len(same) - sum(same)   # same price, another average: still one tick
+            if meta_groups is not None and not all(same):
+                meta_groups.append(group)
             out.append(first)
         else:
             counts["n_conflicting_source_times"] += 1          # two different ticks at one source time: use neither

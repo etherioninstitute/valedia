@@ -852,11 +852,79 @@ def test_the_local_brti_mean_is_exact_over_q_minus_60_s_to_q_half_even_to_8_dp(t
     assert no_float_lines(tmp_path / "a")[0]["local_brti_mean"] == "100.00000002"
 
 
-def test_a_close_value_beyond_the_local_context_gives_no_estimate_not_a_crash(tmp_path):
+def test_a_close_value_beyond_the_local_context_gives_no_estimate_not_a_crash(tmp_path, monkeypatch):
+    # defensive: parse-time bounds keep such a value out; a narrower context shows the branch still holds
+    from decimal import Context, InvalidOperation
+    monkeypatch.setattr(L, "_SETTLE_CONTEXT", Context(prec=3, traps=[InvalidOperation]))
     w = window(0)
-    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(_close_rows(w, "1E+100")))
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(_close_rows(w, "100000.12")))
     assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "close_value_out_of_range"
     assert rec["settlement_value_raw"] is None and rec["close_quality"] is None
+
+
+HUGE_OR_TINY = ["1E+999999999999999999", "1E+3000000", "1E+4300", "1E-3000000"]
+
+
+@pytest.mark.parametrize("as_number", [False, True])
+@pytest.mark.parametrize("bad", HUGE_OR_TINY)
+def test_a_huge_or_tiny_price_is_malformed_at_parse_time_and_the_record_is_written(tmp_path, bad, as_number):
+    import time
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    v = Decimal(bad) if as_number else bad                  # a JSON number arrives as a Decimal (parse_float)
+    rows = _close_rows(w, "100.10")
+    rows[30] = dict(rows[30], last_15min_avg=_avg("100.10", C - 60_000, C) | {"value": v})   # the average's value
+    brti = tick_row(C - 500, seq=9)                         # the tick's own value, in the raw data frame
+    brti["data"] = (f'{{"type": "value", "id": "BRTI", "time": {C - 500}, "value": {bad}}}' if as_number
+                    else json.dumps({"type": "value", "id": "BRTI", "time": C - 500, "value": bad}))
+    started = time.monotonic()
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(rows + [brti]))
+    assert time.monotonic() - started < 1.0
+    assert rec["n_rows_malformed"] == 2 and len(lines(tmp_path)) == 1
+    assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "no_close_tick"
+    assert len((tmp_path / L.LOG_NAME).read_bytes()) < 20_000
+
+
+def test_the_price_bound_is_15_digits_before_the_point_and_12_after():
+    ok = ["999999999999999.999999999999", "0.000000000001", "100.000000000000"]
+    bad = ["1000000000000000", "0.0000000000001", "100.0000000000000", "0", "-1", "NaN", "Infinity"]
+    for v in ok:
+        assert L._parse_tick_row(tick_row(1_000_000, v)) is not None, v
+        assert L._parse_tick_row(tick_row(1_000_000, last15=_avg(v, 0, 1))) is not None, v
+    for v in bad:
+        assert L._parse_tick_row(tick_row(1_000_000, v)) is None, v
+        assert L._parse_tick_row(tick_row(1_000_000, last15=_avg(v, 0, 1))) is None, v
+
+
+def test_a_window_size_above_60_is_in_neither_close_count_and_never_used(tmp_path):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    after = lambda: at(w.close_ts + 195.0)
+    rows = [r for r in _close_rows(w, None) if r["source_time_ms"] != C]
+    rows += [tick_row(C, seq=1, last15=_avg("100.10", C - 60_000, C, size=61)),
+             tick_row(C - 500, seq=2, last15=_avg("100.20", C - 60_000, C - 500, size=61))]
+    rec = log_close(tmp_path / "a", w, clock=after, read_ticks=Spy(rows))
+    assert rec["n_close_wrong_window"] == 0 and rec["n_close_running"] == 0
+    assert rec["n_close_candidates"] == 0 and rec["n_close_partial_candidates"] == 0
+    assert rec["settlement_estimate"] is None and rec["settlement_estimate_reason"] == "no_close_tick"
+    # beside an exact tick at Q + 500 it changes nothing
+    rec2 = log_close(tmp_path / "b", w, clock=after,
+                     read_ticks=Spy(rows + [tick_row(C + 500, seq=3, last15=_avg("100.30", C - 60_000, C))]))
+    assert rec2["settlement_estimate"] == "100.30" and rec2["n_close_wrong_window"] == 0
+    assert rec2["n_close_running"] == 0
+
+
+def test_a_group_a_a_a_prime_counts_one_duplicate_and_one_dup_diff_meta(tmp_path):
+    w = window(0)
+    T = tstar_ms(w)
+    ticks = series(T, n=300)
+    i = 150
+    again = dict(ticks[i], seq=5000, received_at_ms=ticks[i]["received_at_ms"] + 1)            # A again
+    other = dict(ticks[i], seq=5001, received_at_ms=ticks[i]["received_at_ms"] + 2,
+                 avg_60s=dict(ticks[i]["avg_60s"], value="12345.67"))                          # A'
+    rec, _, _ = run(tmp_path, w, ticks=ticks + [again, other])
+    assert rec["n_duplicates_dropped"] == 1 and rec["n_dup_diff_meta"] == 1 and rec["n_ticks_kept"] == 300
+    assert _reconciles(rec)
 
 
 def test_close_candidates_that_disagree_give_none(tmp_path):
