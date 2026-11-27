@@ -1106,6 +1106,52 @@ def test_an_absent_and_an_unusable_avg_60s_are_one_class(tmp_path):
     assert ktu["n_close_wrong_window"] - base == 2 and ktu["n_avg_unusable"] == 1    # classes {K, T} and {U}
 
 
+@pytest.mark.parametrize("other", ["spelling", "absent_vs_unusable"])
+def test_n_close_avg_unusable_counts_classes_of_the_duplicate_rule(tmp_path, other):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    src = C - 5000
+    a = tick_row(src, seq=1, avg="99.99", last15=_avg("0", C - 65_000, src))          # last15 unusable
+    b = tick_row(src, seq=2, avg="99.990", last15=_avg("0", C - 65_000, src))         # avg_60s spelled otherwise
+    if other == "absent_vs_unusable":
+        a, b = dict(a, avg_60s=None), tick_row(src, seq=2, avg="0", last15=_avg("0", C - 65_000, src))
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(_wrong_window_rows(w, [a, b])))
+    assert rec["n_duplicates_dropped"] == 1 and rec["n_dup_diff_meta"] == 0
+    assert rec["n_close_avg_unusable"] == 1                                         # one class, two rows
+
+
+def test_n_close_avg_unusable_keeps_rows_of_different_prices_apart(tmp_path):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    src = C - 5000
+    a = tick_row(src, "100000.00", seq=1, last15=_avg("0", C - 65_000, src))
+    b = tick_row(src, "100000.01", seq=2, recv=a["received_at_ms"], last15=_avg("0", C - 65_000, src))
+    b["avg_60s"] = dict(a["avg_60s"])
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(_wrong_window_rows(w, [a, b])))
+    assert rec["n_conflicting_source_times"] == 1 and rec["n_conflicting_rows"] == 2
+    assert rec["n_close_avg_unusable"] == 2                                         # two prices: two classes
+
+
+def test_rows_at_different_source_times_are_different_classes(tmp_path):
+    w = window(0)
+    C = int(round(w.close_ts * 1000))
+    avg_60s = {"value": "99.99", "window_size": 60, "window_start_ts_ms": C - 70_000, "window_end_ts_exclusive": C - 10_000}
+    usable = {"value": "100.20", "window_size": 58, "window_start_ts_ms": C - 60_000, "window_end_ts_exclusive": C}
+    unusable = {"value": "0", "window_size": 50, "window_start_ts_ms": C - 60_000, "window_end_ts_exclusive": C}
+    def row(src, last15):                                              # by hand: equal but for source and receipt
+        return dict(tick_row(src, "100000.00", seq=1), avg_60s=dict(avg_60s), last_15min_avg=dict(last15))
+    srcs = {C - 1000: usable, C - 2000: usable, C - 3000: unusable, C - 4000: unusable}
+    base = [r for r in _close_rows(w, "100.10") if r["source_time_ms"] not in srcs]
+    rec = log_close(tmp_path, w, clock=lambda: at(w.close_ts + 195.0),
+                    read_ticks=Spy(base + [row(s, l) for s, l in srcs.items()]))
+    ref = log_close(tmp_path / "ref", w, clock=lambda: at(w.close_ts + 195.0), read_ticks=Spy(base))
+    assert rec["n_duplicates_dropped"] == ref["n_duplicates_dropped"] == 0
+    assert rec["n_close_partial_candidates"] - ref["n_close_partial_candidates"] == 2
+    assert rec["n_close_running"] - ref["n_close_running"] == 2
+    assert rec["n_close_avg_unusable"] - ref["n_close_avg_unusable"] == 2
+    assert rec["settlement_estimate"] == "100.10"                                   # the exact tier still wins
+
+
 def _random_rows(rng, centre: int, span_s: int) -> list[dict]:
     rows = []
     for k in range(-span_s, span_s + 1):
