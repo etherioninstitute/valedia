@@ -471,6 +471,9 @@ passing idea can trade at once.
   - 2026-11-27 SESSION 3/5 CLEAN (half day: both practice runs COMPLETED, 0 faults, 0 alerts). Grok rounds 15
     and 16 adjudicated, 0 findings open; rc/repin-12-01 at bff6404 and the BTC desk at 21d2d7e accepted, both
     merging after the 12-01 session. Carbon reply 60 sent.
+  - 2026-11-27 CARBON ROUND 61: Grok round 16 ruled clean (no round 17); second_quote's ahead bound goes from
+    300 s to 5 s (fix/second-quote-ahead, in build, merges into rc before the batch blind check); the open-buy check
+    joins the order-#1 checklist. Carbon now reads the rc and BTC branches directly, read-only. Carbon reply 61 sent.
 
 ## 4. Finding what makes money (tests and ideas)
 
