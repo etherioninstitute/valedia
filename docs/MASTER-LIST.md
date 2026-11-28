@@ -491,6 +491,12 @@ passing idea can trade at once.
     STANDING RULE: order-step loads strategies/*_h<id>.py (or a ledger strategy_file) as code, unpinned. Before any
     non-.json strategy file exists, either repin.sh adds it to accepted-orderpath-files or order_step_cli refuses
     unpinned non-.json strategies. Today: 10 .json, 0 .py. Nothing open before the 12-01 re-pin. Carbon reply 65 sent.
+  - 2026-11-28 CARBON ROUND 66 + OWNER ITEMS: corollary kept with the rule above: a ledger strategy_file can point
+    anywhere (an absolute path overrides the root), so a pin on strategies/*.py alone is not enough; order_step_cli
+    must refuse non-.json or check the resolved path is in the root and pinned. Live ledger checked: 11 strategy
+    files, all strategies/*.json. Found: all 5 of the owner's items for 12-03 are still open (live key file,
+    webull_live.json, go_live.json, max_orders_per_day in risk.json, the stake); go_live.json and ladder.json
+    were not gitignored (fixed, b7728b1). Owner checklist sent; risk.json edit after the 12-01 re-pin.
 
 ## 4. Finding what makes money (tests and ideas)
 
