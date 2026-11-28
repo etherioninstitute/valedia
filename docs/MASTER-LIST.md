@@ -487,6 +487,10 @@ passing idea can trade at once.
     (exit 0) on them; nothing from the Sunday cycle or the 2:30 PM paper-step can send an order (no gate before
     12-03). Restore on a test copy removed 12/12 planted strays and kept the decoys; live untouched. Asked: should
     cycle refuse .py strategies after 12-03? Carbon reply 64 sent.
+  - 2026-11-28 CARBON ROUND 65: copy restore test closed; cycle and paper-step keep .py strategies (no change).
+    STANDING RULE: order-step loads strategies/*_h<id>.py (or a ledger strategy_file) as code, unpinned. Before any
+    non-.json strategy file exists, either repin.sh adds it to accepted-orderpath-files or order_step_cli refuses
+    unpinned non-.json strategies. Today: 10 .json, 0 .py. Nothing open before the 12-01 re-pin. Carbon reply 65 sent.
 
 ## 4. Finding what makes money (tests and ideas)
 
