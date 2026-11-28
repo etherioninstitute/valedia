@@ -483,6 +483,10 @@ passing idea can trade at once.
     re-pin kit (scripts first, then list, then pin; every stop fails closed; restore and check) passed six fresh
     verifiers after four fix rounds. Re-pin Tue 12-01 8:12-8:20 AM PT; check again Wed 12-02 before 6:25 AM.
     Carbon reply 63 sent.
+  - 2026-11-27 CARBON ROUND 64: kit and 12-01 runbook accepted; leftover temp kinds stay out of restore; check WARNs
+    (exit 0) on them; nothing from the Sunday cycle or the 2:30 PM paper-step can send an order (no gate before
+    12-03). Restore on a test copy removed 12/12 planted strays and kept the decoys; live untouched. Asked: should
+    cycle refuse .py strategies after 12-03? Carbon reply 64 sent.
 
 ## 4. Finding what makes money (tests and ideas)
 
