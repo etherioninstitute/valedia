@@ -517,6 +517,19 @@ passing idea can trade at once.
     min(settled_cash, buying_power) x (1 - CASH_KEPT); no fault on a mismatch (shared account, owner activity).
     P3: every Kalshi pull (CPI Stage 0, Candidate C) waits for Fri 12-04; before 12-03 only locked spec files,
     the pooling-test draft locked before any 12-03 score is read, and weight-0 dry runs on the internal-disk copy.
+  - 2026-11-28 CARBON ROUND 69, T22d-1b TRIAGE (its header: close or consciously accept before the first real
+    order): 0 items block order #1; rc stays frozen at 1fdc6f7. CLOSED at 1fdc6f7: V114 n2 (peak half), V114 n3,
+    3 of the V108/V110 notes, V118 n1 (EXPIRED half), all of V123, decay's public paper_record and the summary
+    fields, CF-C..CF-I, T34b-3's reconcile notices and V130 (1)-(4), the both-sources holdings line (R30).
+    ACCEPTED FOR ORDER #1 (12, each with its 12-03 safeguard; listed on the owner's sheet): the must_exist and
+    floor wirings, V114 n6, the rest of V108/V110, V118 n1 (CANCELED/REJECTED/FAILED half), V118 n2, V118 n9 and
+    V116 n5, V116 n1, V116 n3, group-3 builder items and V117 n1/n3/n4/n6, V128 and V130 (5), the settled-cash
+    read (--live --check does not read cash; propose stops at `prices` without it). NEW TICKETS after 12-03:
+    T22d-1b-core (the accepted items, V117 n2, `orders attention --close`, doctor polish, WEBULL.md
+    filled_quantity) before T34b-4; T22d-1b-tests (V115, V114 n1, V114 n2 second half, V118 n5, V117 n5).
+    V125, V126, V127 F1-F5 and D13 go into T34b-4; V118 n7 into T45-3; V119-V122, V129 and T36a into T36b. OWNER
+    (later, not for 12-03): SSD ownership on or kept off (V116 n1); a ladder start_day (V127 F3).
+    Branch fix/cli-usage-live (0a153ad, item (a): live usage text and WEBULL.md, no --capital) built, unmerged.
 
 ## 4. Finding what makes money (tests and ideas)
 
