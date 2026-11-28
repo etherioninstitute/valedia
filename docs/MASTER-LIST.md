@@ -530,6 +530,16 @@ passing idea can trade at once.
     V125, V126, V127 F1-F5 and D13 go into T34b-4; V118 n7 into T45-3; V119-V122, V129 and T36a into T36b. OWNER
     (later, not for 12-03): SSD ownership on or kept off (V116 n1); a ladder start_day (V127 F3).
     Branch fix/cli-usage-live (0a153ad, item (a): live usage text and WEBULL.md, no --capital) built, unmerged.
+  - 2026-11-28 CARBON ROUND 70, THE WEEKEND BRANCHES: four branches off rc 1fdc6f7, each passed a fresh blind
+    verifier, none merged: (a) fix/cli-usage-live 3aa4eef (docs); (b) test/ticket-expiry-asserts eb409d8 (tests,
+    V115); (f) fix/strategy-json-only 2cc9d23 (strict .json loader on the order path, refuses at `follow`); (c)
+    feat/buying-power-guard 18c5ef1 (round 68's buying_power budget, fail-closed at `prices`, approve refuses the
+    whole batch at `ticket`). Merge (a) after the 12-01 re-pin, then re-run its check. After order #1: (b), then
+    (c), then (f), one at a time, gates and re-pin each. Before (c) merges: the buying_power mask in
+    test_fractional_off_against_base.py and its 4 test gaps, on (c). Rulings: an absent strategy file stays passed
+    over in whole-book mode; approve keeps step-6 quotes (no 0.5% widening); no tickets-table column. To
+    T22d-1b-core: approve's exact bound, the strategies/ traceback as a clean refusal. To T22d-1b-tests: the
+    hand-worked expiry tests, a FIFO test.
 
 ## 4. Finding what makes money (tests and ideas)
 
