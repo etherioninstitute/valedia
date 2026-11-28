@@ -474,6 +474,10 @@ passing idea can trade at once.
   - 2026-11-27 CARBON ROUND 61: Grok round 16 ruled clean (no round 17); second_quote's ahead bound goes from
     300 s to 5 s (fix/second-quote-ahead, in build, merges into rc before the batch blind check); the open-buy check
     joins the order-#1 checklist. Carbon now reads the rc and BTC branches directly, read-only. Carbon reply 61 sent.
+  - 2026-11-27 CARBON ROUND 62 + WEEKEND CHECKS: rc held at 3960666; no buying_power cap before order #1 (the owner's
+    0-open-orders check at propose and approve instead). Batch blind check: two defects fixed on branches, RL-1d
+    (research loop output) and CF-I (the window and ticket checked again at transmission), both blind-verified.
+    Re-pin dry run on copies: all 7 gates MATCH after the moves; repin.sh needs a patch for 12-01. Carbon reply 62 sent.
 
 ## 4. Finding what makes money (tests and ideas)
 
