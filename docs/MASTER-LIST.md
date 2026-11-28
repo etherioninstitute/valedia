@@ -478,6 +478,11 @@ passing idea can trade at once.
     0-open-orders check at propose and approve instead). Batch blind check: two defects fixed on branches, RL-1d
     (research loop output) and CF-I (the window and ticket checked again at transmission), both blind-verified.
     Re-pin dry run on copies: all 7 gates MATCH after the moves; repin.sh needs a patch for 12-01. Carbon reply 62 sent.
+  - 2026-11-27 CARBON ROUND 63 + 12-01 KIT: RL-1d, CF-I and the second-quote comment merged into rc/repin-12-01
+    (now 1fdc6f7); touched tests green on the merged tip; 7-gate dry run on copies 7/7 MATCH -> P1 4/7. The 12-01
+    re-pin kit (scripts first, then list, then pin; every stop fails closed; restore and check) passed six fresh
+    verifiers after four fix rounds. Re-pin Tue 12-01 8:12-8:20 AM PT; check again Wed 12-02 before 6:25 AM.
+    Carbon reply 63 sent.
 
 ## 4. Finding what makes money (tests and ideas)
 
