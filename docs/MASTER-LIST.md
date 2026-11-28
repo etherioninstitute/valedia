@@ -497,6 +497,16 @@ passing idea can trade at once.
     files, all strategies/*.json. Found: all 5 of the owner's items for 12-03 are still open (live key file,
     webull_live.json, go_live.json, max_orders_per_day in risk.json, the stake); go_live.json and ladder.json
     were not gitignored (fixed, b7728b1). Owner checklist sent; risk.json edit after the 12-01 re-pin.
+  - 2026-11-28 CARBON ROUND 67 (FIRST DIRECT ROUND): Carbon now gets rounds straight from the lead through its
+    command-line tool, read-only (plan mode, writes denied, 2 exchanges per topic), seeded with a full brief.
+    Carbon confirmed all 10 standing rulings and set the tick rules: the batch ticks on the 12-01 re-pin passing
+    7/7 on main plus a clean Wed check (0 WARNs); Gate #7 ticks on a fault-free scheduled session on the new pin,
+    the attended propose/approve pair done, and the 4 balance fields plus open_orders 0 recorded. FIXED: the owner
+    checklist said the stake was --capital; a live run refuses --capital (order_step_cli.py:505-508), so the stake
+    is the owner's own `--owner-entry cash_in --live --venue webull-production` entry (preview, then --confirm),
+    bounded by max_capital. A risk.json commit after the re-pin cannot trip the pin (the gate compares only the
+    listed files, and config/ is in none of them). QUEUED for main after the 12-01 merge: research_loop/cli.py:16-17
+    usage text still shows `--live --propose/--approve --capital C` (text only; the file is not pinned).
 
 ## 4. Finding what makes money (tests and ideas)
 
