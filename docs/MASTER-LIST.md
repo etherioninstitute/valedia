@@ -507,6 +507,16 @@ passing idea can trade at once.
     bounded by max_capital. A risk.json commit after the re-pin cannot trip the pin (the gate compares only the
     listed files, and config/ is in none of them). QUEUED for main after the 12-01 merge: research_loop/cli.py:16-17
     usage text still shows `--live --propose/--approve --capital C` (text only; the file is not pinned).
+  - 2026-11-28 CARBON ROUND 68: build order after order #1 = (a) cli.py usage text, (f) the order path's .py and
+    path-containment refusal, (b) ticket_expiry + sends-at-least-once test asserts, (c) the buying_power guard,
+    (e) T22d-1b triage, (d) T34b-4 last. (a), (f), (b), (c) may be built on branches this weekend (never in rc, no
+    merge, one targeted test file at a time, no fork or SIGKILL suites, no 88-world archive test, nothing in
+    3:35-4:15 AM); (e) and (d) spec only (T34b-4 needs a shared-book spec: its ladder still assumes --capital).
+    buying_power RULED option (ii): read at propose and approve; live fails closed if missing or invalid; the
+    propose budget includes buying_power x (1 - CASH_KEPT); approve refuses the batch (0 sent) when buys exceed
+    min(settled_cash, buying_power) x (1 - CASH_KEPT); no fault on a mismatch (shared account, owner activity).
+    P3: every Kalshi pull (CPI Stage 0, Candidate C) waits for Fri 12-04; before 12-03 only locked spec files,
+    the pooling-test draft locked before any 12-03 score is read, and weight-0 dry runs on the internal-disk copy.
 
 ## 4. Finding what makes money (tests and ideas)
 
